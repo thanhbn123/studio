@@ -22,7 +22,16 @@ bán hàng tiếng Việt → bằng chứng + lịch sử + usage.
 
 ## MVP-02 — Image Translation Studio
 
-**Trạng thái: ĐÃ TRIỂN KHAI trên nhánh `feat/mvp02-imagelab` — CHỜ OWNER NGHIỆM THU.**
+**Trạng thái: ĐÃ MERGE VÀO `develop`** (PR [#20](https://github.com/thanhbn123/studio/pull/20),
+merge commit `55aed67`, 03/10/2026) **— CHỜ OWNER NGHIỆM THU.**
+
+Bằng chứng đi kèm: **510 test · 509 pass · 0 fail · 1 skipped** · `npm run verify` EXIT=0 ·
+**CI 5/5 job xanh** (Linux · **PostgreSQL 16 thật** · smoke server thật · Docker + chạy luồng MVP-02
+trong image · quét secret) · **4 lượt phản biện độc lập**: lượt đầu **FAIL** (1 CRITICAL — hộp chữ
+chồng nhau xoá pixel logo mà hệ thống vẫn báo “không xoá”), các lượt sau **PASS CÓ ĐIỀU KIỆN** →
+**PASS**; 14 phát hiện đã vá và được kiểm lại độc lập. Chi tiết đo được:
+[`docs/VERIFICATION.md`](VERIFICATION.md) §8–§12 · báo cáo phản biện nguyên văn:
+[`docs/MVP-02-REVIEW.md`](MVP-02-REVIEW.md).
 
 **Mục tiêu:** dịch chữ Trung trên ảnh sản phẩm sang tiếng Việt, giữ nguyên bố cục và phong cách.
 
