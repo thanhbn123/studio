@@ -683,3 +683,45 @@ bắt buộc (N-5/N-1/N-2) và 4 phát hiện phụ (N-3/N-4/N-6/N-7). Tất c�
 - N-6: so khớp thêm bản **KHÔNG DẤU** (`deaccent()`) cho cả từ khoá khẳng định và cụm
   số-bằng-chữ; thêm `№` vào nhóm ký hiệu số. Giới hạn còn lại (`xii` chữ thường, homoglyph,
   “tốt nhứt”) ghi ở `docs/VERIFICATION.md` §10.3.
+
+---
+
+## 9. SỬA ĐỔI SAU PHẢN BIỆN VÒNG 3 (vòng 5 — bổ sung, không đổi tên đã đóng băng)
+
+Nguồn: `docs/MVP-02-REVIEW.md` mục “VÒNG 3 — chấm lại” (**PASS CÓ ĐIỀU KIỆN**, không còn
+CRITICAL/MAJOR) với **một điều kiện còn lại** (N-1 ở tầng store) và 4 phát hiện MINOR (N-8…N-11).
+
+**N-1 (store) — toạ độ rác KHÔNG được hoá thành số khi đọc DB**
+
+- `src/store/index.js#toNum` dùng cùng luật với `geometry.strictCoordinate`: `null`/`undefined`/
+  `''`/chuỗi chỉ có khoảng trắng/`NaN`/`±Infinity`/boolean/mảng/object/chuỗi không phải số thập
+  phân ⇒ `null`; **không** nhận hex (`'0x10'` KHÔNG được thành `16`) và **không** biến
+  `'  '` thành `0`. Lý do: `Number('  ') === 0` từng biến hộp vùng nhãn hiệu thành hộp "ảo" ở gốc
+  toạ độ ⇒ pixel nhãn hiệu bị xoá thật (đo được 2800/4000) trong khi `skipped` vẫn nói "không xoá".
+
+**N-8 — hậu kiểm ảnh provider `http` không chỉ dựa vào hash (một chiều)**
+
+- (a) Ảnh trả về **cùng pixel nhưng khác byte** (ví dụ remote thêm chunk `tEXt`) mà khai `applied`
+  ⇒ hậu kiểm **so PIXEL trong hộp của từng op đã gửi**; không hộp nào đổi ⇒ bỏ `applied`,
+  `PARTIAL` + `error_code = NO_OPS` + cảnh báo “không tin lời khai `applied`”.
+- (b) Remote chỉ đổi pixel **ngoài** mọi hộp op ⇒ cũng `PARTIAL` + `NO_OPS` (không được báo `OK`).
+- (c) Ảnh trả về **sai `width`/`height`** ⇒ TỪ CHỐI LƯU: `FAILED` + `RENDER_SIZE_MISMATCH`,
+  `output = null` — kiểm cả khi job **không có** vùng bảo vệ nào.
+- (d) Dữ liệu trả về không phải ảnh (magic bytes sai) ⇒ từ chối, không lưu asset.
+
+**N-9 — từ vựng đơn vị**
+
+- Bổ sung đơn vị khối lượng/đo lường còn thiếu để bắt ca **đổi đơn vị** (`500克` → “500 tấn”);
+  dịch đúng đơn vị (`500克` → “500 gram”) vẫn `TRANSLATED`.
+
+**N-10 — nhánh so khớp bỏ dấu phải hẹp**
+
+- Chỉ dùng `deaccent()` khi **văn bản ứng viên không có dấu tiếng Việt nào** (đúng ca
+  “bao hanh mot nam”); văn bản CÓ DẤU thì so khớp như cũ ⇒ hết dương tính giả kiểu
+  “Chỉnh hàng”, “Đất chuẩn bị trồng”, “Tột nhất”.
+
+**N-11 — `only_region_ids` rỗng**
+
+- Trường **vắng mặt** ⇒ render tất cả dòng đã duyệt (hành vi cũ).
+- Mảng **rỗng** `[]` ⇒ `400 EMPTY_REGION_IDS` (người dùng chưa chọn vùng nào ⇒ không render gì),
+  KHÔNG được hiểu thành “không lọc” rồi âm thầm render tất cả.

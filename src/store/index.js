@@ -73,11 +73,31 @@ function fromJson(text) {
   }
 }
 
-/** Số hữu hạn, hoặc fallback (không bao giờ trả NaN ra ngoài DB). */
+/**
+ * Số hữu hạn ĐỌC TỪ DB, hoặc `fallback`.
+ *
+ * ⚠️ N-1 (vòng 5): KHÔNG dùng `Number(value)` trực tiếp. `Number('  ') === 0`,
+ * `Number('\t') === 0`, `Number('0x10') === 16`, `Number([]) === 0` — nên toạ độ
+ * rác trong DB bị biến thành SỐ ngay ở tầng đọc, và tầng `geometry.strictCoordinate`
+ * phía sau không bao giờ nhìn thấy "rác" để mà chặn (hộp bảo vệ "ảo" ở x=0 ⇒ pixel
+ * nhãn hiệu bị xoá thật trong khi `skipped` vẫn báo "không xoá").
+ *
+ * Luật (giống hệt `strictCoordinate` của `src/imagelab/geometry.js`):
+ *   - `number` hữu hạn ⇒ nhận;
+ *   - CHUỖI đã `trim()` khác rỗng và đúng dạng số THẬP PHÂN ⇒ nhận;
+ *   - mọi thứ khác (null/undefined/''/'  '/hex/NaN/±Infinity/boolean/mảng/object) ⇒ `fallback`.
+ */
+const DECIMAL_RE = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+
 function toNum(value, fallback = null) {
-  if (value === null || value === undefined || value === '') return fallback;
-  const n = Number(value);
-  return Number.isFinite(n) ? n : fallback;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : fallback;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed || !DECIMAL_RE.test(trimmed)) return fallback;
+    const n = Number(trimmed);
+    return Number.isFinite(n) ? n : fallback;
+  }
+  return fallback;
 }
 
 /** Số nguyên, hoặc null — dùng cho toạ độ pixel. */

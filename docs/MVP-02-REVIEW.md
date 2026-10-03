@@ -384,3 +384,117 @@ Phần B (đường OCR `normalizeRegions`): `x=-30,w=240 → kept=1 box={"x":0,
 6. **Trình duyệt thật**: các hàm UI (`renderIlWarnings`) được trích và **chạy thật** trong Node, nhưng chưa mở DOM/CSS thật, chưa bấm nút override trong trình duyệt, chưa kiểm `Set-Cookie` (`SameSite`/`Path`) trên trình duyệt thật.
 7. **`data/studio.db` thật**: vẫn chỉ chạy migration trên bản sao trong `/tmp`.
 8. **Giới hạn phương pháp của guardrail** (N-6): không có cách nào chặn `xii`/homoglyph/không-dấu bằng regex mà không tăng dương tính giả; tôi **không** đề xuất ngưỡng cụ thể — cần Owner quyết định đánh đổi.
+
+---
+---
+
+# VÒNG 3 — chấm lại tại commit `3644d4f`
+
+PHÁN QUYẾT CUỐI: **PASS CÓ ĐIỀU KIỆN** *(1 điều kiện nhỏ còn lại: vá `store.toNum` — N-1 phần chưa kín; mọi phát hiện khác đều MINOR)*
+
+- Commit chấm: `3644d4fc52cfdc392828445e8b9a7cb2bc0ce1e6` (03/10/2026 ~12:3x–13:0x UTC). `git status --short` sau khi làm việc: **sạch** (chỉ `docs/MVP-02-REVIEW.md` được ghi; không sửa mã nguồn, không sửa `test/**`).
+- Toàn bộ nội dung VÒNG 1 + VÒNG 2 ở trên được **giữ nguyên**. Script vòng 3 ở **`/tmp/atk5/`** (bản sao đòn vòng 2 đã trỏ lại `/tmp/atk5/`, cộng `x20…x29`). Bằng chứng gộp: `/tmp/atk5/out-rerun1.txt`, `out-rerun2.txt`, `out-x3b.txt`, `out-tests.txt`.
+- Tự đo tại commit này: `npm test` → **tests 408 · suites 72 · pass 407 · fail 0 · cancelled 0 · skipped 1 · todo 0** (skip duy nhất vẫn là PostgreSQL `test/store.test.js:162`); `node tools/verify.mjs` → **EXIT=0**. Khớp đúng con số nhóm gộp công bố.
+- **Kết luận ngắn:** cả 3 điều kiện của vòng 2 đều **đã được xử lý thật**, N-5 và N-2 **đã thoả**, N-1 **thoả một phần** (còn một đường qua tầng `store`). Không còn lỗi CRITICAL/MAJOR. Bản vá N-5 (hậu kiểm pixel) là bản vá **chất lượng cao**: đo pixel thật, từ chối lưu khi hộp bảo vệ đổi, giữ ảnh gốc nguyên vẹn và ghi vết đầy đủ.
+
+## V3.1 — Bảng 3 điều kiện + N-3/N-4/N-6/N-7
+
+| # | Điều kiện vòng 2 | Kết luận vòng 3 | Bằng chứng (output thật) |
+|---|---|---|---|
+| **N-5** | Kiểm pixel hộp bảo vệ trên đường `http` hoặc từ chối lưu | **ĐÃ THOẢ** (còn 1 điểm mù MINOR — **N-8**) | `node x9-http-provider.mjs`: `naive` → `rs.status="OK"`, brand `0/8000`, vùng sạch `6000/6000`; `liar` → `PARTIAL` + `NO_OPS` + job `RENDER_NO_OPS` + `applied=[]`; `evil` → job **failed** `PROTECTED_PIXELS_CHANGED`, `ảnhMới=0`. `node x29-refuse-trace.mjs`: `error_message="…8000/8000 pixel tại hộp {"x":40,"y":40,"w":200,"h":40}. TỪ CHỐI lưu ảnh này…"`, `rendered mới: 0`, `sha256 ảnh gốc trước/sau: 14efcb0d3b29024f / 14efcb0d3b29024f`, vết nằm trong `content_meta.imagelab.render.warnings` |
+| **N-1** | Fail-closed với toạ độ NULL/rác | **THOẢ MỘT PHẦN** — tầng `geometry`/pipeline đã kín, **tầng `store` vẫn ép rác thành 0** (xem V3.3) | `node x25-n1-coordinates.mjs`: 18/18 loại rác → `strictCoordinate=null`, `intersect=null`; API: `x=NULL/''/'abc'/'12abc'/'NaN'/'Infinity'/'[]'/'{}'`, `y/w/h=NULL`, `box+box_normalized` đều rác → nhãn hiệu **`0/4000`** pixel đổi (ca cuối job `failed IMAGELAB_NO_LINES`). **NHƯNG** `node x26-n1-store-gap.mjs`: `x='  '` (2 dấu cách) → `STORE trả về box … {"x":0,…}` → `PIXEL VÙNG NHÃN HIỆU THẬT … 2800/4000` |
+| **N-2** | Đẩy `NO_OPS` lên `job.error_code` | **ĐÃ THOẢ** | `node x27-n2-n3-n4.mjs`: mọi dòng `NO_GLYPH` → `job.status="succeeded"` nhưng `job.error_code="RENDER_NO_OPS"` + `error_message` giải thích; `GET` lại job vẫn giữ `RENDER_NO_OPS`. `node x3-api-noops-poison.mjs` ca dims: `job.error_code="RENDER_NO_OPS"`, `rs.status="PARTIAL"`, `applied=[]` |
+| **N-3** | Danh sách lịch sử có nhãn MOCK/kind | **ĐÃ THOẢ** | `node x27…`: item `GET /api/jobs` = `{"kind":"image_translation",…,"mock":true,"mock_steps":["ocr","translate"]}`, `có session_id? false | có content_meta thô? false`; hàm UI THẬT `historyItemHtml` in ra `"(chưa có tên) Thủ công · 19:38:32 3/10/2026 Dịch ảnh MOCK awaiting_review"` |
+| **N-4** | `only_region_ids` fail-closed | **ĐÃ THOẢ** (còn khe biên `[]` — **N-11**) | `node x27…`: `["khong-ton-tai"]` → `409 UNKNOWN_REGION_IDS`; `[null,1,{}]` → `409`; `"r1"` (chuỗi) → `400 BAD_REGION_IDS`. `node x28b-only-partial2.mjs`: `[r3, bogus-1, bogus-2]` → `202`, `applied=["r3"]`, `warnings:["⚠️ 2 id trong only_region_ids không khớp vùng nào…"]`. **Khe:** `only_region_ids: []` → `202` và `applied=["r3"]` (= render TẤT CẢ) |
+| **N-6** | Guardrail bỏ dấu + `№` | **ĐÃ THOẢ phần lớn** (còn `xii`/homoglyph/`tốt nhứt` — đã ghi ở `docs/VERIFICATION.md §10.3`) | `node x22-guardrail-regression.mjs`: **hồi quy MẤT 0/21** (vẫn bắt `một trăm hai mươi nghìn đồng`, `BH 12 tháng`, `①② tháng`, `ｂảo hành`, `１２ tháng`, ZWSP/NBSP, `Ⅻ`/`ⅻ`, `№1` **và `№` trơ**, kana/Hangul, `chống nước IP68`); 7/7 ca không-dấu nay **BẮT** (`bao hanh mot nam`, `muoi hai thang`, `tot nhat`, `chinh hang`, `chong nuoc`, `cam ket`) — `node x24-old-vs-new.mjs` xác nhận 2 ca này **đổi hành vi từ LỌT sang BẮT** |
+| **N-7** | Sửa dương tính giả | **ĐÃ THOẢ** (nhưng sinh 3 dương tính giả MỚI — **N-10**) | `node x22…`: `纯棉100%T恤` + `"Áo thun cotton 100%"` → `TRANSLATED` (hết tố oan); `"Một chiếc áo thun cotton"` → `TRANSLATED`. `node x24-old-vs-new.mjs`: 2 ca này **đổi từ BẮT sang lọt** (đúng như chủ ý); 3 ca `"Chỉnh hàng"`, `"Đất chuẩn bị trồng"`, `"Tột nhất"` **đổi từ lọt sang BẮT** (dương tính giả mới) |
+
+## V3.2 — N-5: tấn công hậu kiểm bằng 14 chế độ server giả
+
+`cd /tmp/atk5 && node x20-http-hardening.mjs` (server render giả ở `127.0.0.1`, `ALLOW_PRIVATE_NETWORK=true`; job có 1 vùng nhãn hiệu `[40,40,200,40]` + 1 vùng mô tả sạch):
+
+| Chế độ server giả | job | `rs.status` | `rs.error_code` | `verified` | ảnh mới | Nhận xét |
+|---|---|---|---|---|---|---|
+| `naive` (vẽ đúng op) | succeeded | `OK` | null | true | 1 | Đúng: brand `0/8000`, vùng sạch `6000/6000` |
+| `liar` (trả ảnh y hệt + khai `applied`) | succeeded | `PARTIAL` | `NO_OPS` | true | 1 | **Bắt được** — bỏ lời khai `applied`, job `RENDER_NO_OPS` |
+| `onepixel` (đổi **đúng 1 pixel** trong hộp bảo vệ) | **failed** | – | – | – | **0** | **Từ chối lưu** đúng mức |
+| `alphaonly` (chỉ đổi **kênh alpha** 1 pixel) | **failed** | – | – | – | **0** | So RGBA nên vẫn bắt |
+| `evil` (xoá cả nhãn hiệu) | **failed** | – | – | – | **0** | `PROTECTED_PIXELS_CHANGED` |
+| `bigger` / `smaller` (ảnh khác kích thước) | **failed** | – | – | – | **0** | `SIZE_MISMATCH` ⇒ từ chối |
+| `white` (ảnh trắng toàn bộ) | **failed** | – | – | – | **0** | Từ chối |
+| `jpeg` (trả JPEG) | succeeded | `PARTIAL` | `PROTECTED_PIXELS_UNVERIFIED` | **false** | 1 | Không báo `OK`, có cảnh báo “⚠️ KHÔNG kiểm chứng được pixel vùng bảo vệ…” |
+| `garbage` (base64 rác) | succeeded | `PARTIAL` | `PROTECTED_PIXELS_UNVERIFIED` | false | 1 | Có cảnh báo, **nhưng xem N-8d** |
+| `applied-huge` (khai 999 op) | succeeded | `PARTIAL` | `RENDER_APPLIED_MISMATCH` | true | 1 | `applied=1` (giữ đúng số op đã gửi) + cảnh báo |
+| `applied-string` (không phải mảng) | succeeded | `PARTIAL` | `NO_OPS` | true | 1 | Fail-closed |
+| `applied-empty` | succeeded | `PARTIAL` | `NO_OPS` | true | 1 | Fail-closed |
+
+⇒ **Không chế độ nào báo `OK` khi chưa kiểm được**, và mọi ca hộp bảo vệ bị đổi (kể cả 1 pixel, kể cả chỉ alpha) đều **không sinh ảnh mới**.
+
+## V3.3 — N-1: tầng `geometry` đã kín, tầng `store` thì chưa (điều kiện còn lại)
+
+`node x25-n1-coordinates.mjs` (A) 18/18 phép kiểm đúng: `null/undefined/''/'  '/'abc'/'12abc'/NaN/±Infinity/true/false/[]/{}/new Date/'NaN'` → `strictCoordinate=null` **và** `intersectBoxWithImage=null`; số âm, số thực, chuỗi số vẫn hợp lệ.
+(B) API thật — đầu độc từng cột của vùng **nhãn hiệu** trong khi có một vùng mô tả **chồng đúng vị trí thật**, đo pixel:
+
+```
+x=NULL / '' / 'abc' / '12abc' / 'NaN' / 'Infinity' / '[]' / '{}' / y=NULL / w=NULL / h=NULL
+   → applied=1, skipped có BOX_OVERLAPS_PROTECTED: r2 (brand)  |  PIXEL NHÃN HIỆU ĐỔI=0/4000
+box + box_normalized đều rác → job failed "IMAGELAB_NO_LINES", applied=0, KHÔNG render gì (fail-closed)
+```
+⇒ Với `NULL`/chuỗi rác, bản vá **thậm chí còn tốt hơn yêu cầu**: `#boxOf` lấy lại hộp ĐÚNG từ `box_normalized` nên vẫn chặn được op chồng lấn (thay vì chỉ chặn mù).
+
+**Nhưng còn một đường qua `store`:** `src/store/index.js#toNum` dùng `Number(value)` — mà `Number('  ') === 0`, `Number('\t') === 0`, `Number('0x10') === 16`. Toạ độ rác dạng **chuỗi chỉ có khoảng trắng** (hoặc hex) bị biến thành **SỐ** ngay ở tầng đọc, nên `strictCoordinate` không bao giờ nhìn thấy "rác" để mà chặn:
+
+```
+$ cd /tmp/atk5 && node x26-n1-store-gap.mjs
+=== x = '  ' (2 dấu cách) ===
+  DB thô: {"region_key":"r2","x":"  ","t":"text","x_norm":0.625}
+  STORE trả về box của vùng nhãn hiệu: {"x":0,"y":100,"w":100,"h":40}   <-- pipeline dùng hộp này
+  render=202 | job=succeeded | applied=["r1","r3"]
+  skipped: [["r2","Vùng nhãn hiệu — không dịch, không xoá (luật bất khả xâm phạm #3)."]]
+  ➜ PIXEL VÙNG NHÃN HIỆU THẬT [200,100,100,40] BỊ ĐỔI: 2800/4000
+```
+Giống hệt với `x='\t'`, `x='\n'`, `x='0x10'`. Đối chứng `x=NULL` / `x=''` → `STORE trả về box {"x":null,…}` → `0/4000` (an toàn).
+**Cách sửa (1 chỗ, ~3 dòng):** cho `toNum` dùng đúng luật của `strictCoordinate` (chỉ nhận `typeof === 'number'` hữu hạn, hoặc chuỗi đã `trim()` khác rỗng mà `Number()` ra hữu hạn), hoặc gọi thẳng `strictCoordinate` từ `geometry.js` trong `store`. Đây là **điều kiện duy nhất còn lại** của phán quyết.
+*(Mức MINOR vì cần dữ liệu DB hỏng/dị thường — pipeline luôn ghi số — nhưng đây đúng là kịch bản mà N-1 được đặt ra để chặn.)*
+
+## V3.4 — N-6/N-7: hồi quy và dương tính giả mới
+
+- **Hồi quy 0/21** (`node x22-guardrail-regression.mjs` phần A): mọi ca từng bắt được vẫn bắt — kể cả `một trăm hai mươi nghìn đồng`, `BH 12 tháng`, `①② tháng`, `ｂảo hành`, `１２ tháng`, `bảo\u200bhành`, `Ⅻ`, `ⅻ`, `№1`, `№` trơ, kana/Hangul, chữ Trung sót.
+- **Ca vừa sửa nay BẮT (7/7)**: `Ao thun cotton bao hanh mot nam`, `… 12 thang`, `tot nhat`, `chinh hang`, `chong nuoc`, `cam ket`, `muoi hai thang`.
+- **Dương tính giả cũ đã hết (2/2)**: `纯棉100%T恤`+“100%”, `"Một chiếc áo thun cotton"`.
+- **Dương tính giả MỚI do so khớp bỏ dấu (N-10)**: `"Chỉnh hàng theo yêu cầu"` → bị tố `Chinh hang` (chính hãng); `"Đất chuẩn bị trồng"` → `Dat chuan` (đạt chuẩn); `"Tột nhất là màu đen"` → `Tot nhat` (tốt nhất). `node x24-old-vs-new.mjs` chứng minh cả 3 **lọt ở vòng 3 và bị bắt ở vòng 4**. Đối chứng sạch không bị bắt oan: `"Áo dài tay"`, `"đồng phục"`, `"Bảo quản nơi khô ráo"`, `"Bao bì đẹp"`, `"Giao hàng toàn quốc"`, `"Ủy tin cậy"`, `"Áo thun cotton một lớp"`, `"Màu sắc: đen, trắng"`.
+- **Đơn vị (N-9, có từ trước, không phải hồi quy)**: `node x23-unit-substitution.mjs` — thay đơn vị **bị bắt tốt** (`12 tháng→12 tuần/năm/ngày`, `500克→500 kg`, `100cm→100 m`), nhưng lọt khi đơn vị nằm ngoài từ vựng: `纯棉T恤 500克` + `"500 tấn"` → `LỌT n=0` (`unitsIn(vi)=[]`), `3件装` + `"3 bộ"` → `LỌT`. `node x24-old-vs-new.mjs` xác nhận **cả hai đều lọt ở cả vòng 3 lẫn vòng 4** ⇒ lỗ hổng cũ, chỉ ra rằng từ vựng đơn vị còn thiếu (`tấn`, danh từ đếm).
+
+## V3.5 — LỖ HỔNG MỚI (vòng 3)
+
+| # | Mức | Phát hiện | Bằng chứng thật | Vì sao quan trọng |
+|---|---|---|---|---|
+| N-8 | MINOR | **Hậu kiểm N-5 chỉ một chiều và dựa vào HASH, không dựa vào PIXEL.** (a) remote trả PNG **cùng pixel nhưng khác byte** (thêm chunk `tEXt`) + khai `applied` ⇒ repo tưởng “đã vẽ” dù **0 pixel** thay đổi; (b) remote chỉ đổi **1 pixel ở góc xa**, không vẽ op ⇒ cũng `OK` + `applied=1`; (c) job **không có vùng bảo vệ** ⇒ không kiểm gì cả, ảnh trả về khác kích thước vẫn được lưu; (d) base64 rác được lưu thành asset `.png` | `node x21-n5-blindspot.mjs`: (a) `status="OK" | job=succeeded | jobErr=null | applied=1 | verified=true` nhưng `pixel đổi | vùng sạch [30,200,200,30]: 0/6000`; (b) y hệt, `0/6000`; (c) `nobrand-small`: asset `100×100` cho job ảnh `320×320`, `status="OK"`, không cảnh báo. `node x20`: `garbage` → asset `bytes=519 magic="646179206b686f6e"` (= chữ “day khon”), `job=succeeded` | Không vi phạm luật #3 (hộp bảo vệ vẫn được đo), nhưng là **báo cáo sai sự thật**: job nói đã dịch/dịch xong trong khi ảnh giao cho khách **y hệt ảnh gốc** (chữ Trung còn nguyên) hoặc là ảnh sai kích thước/rác. Một remote chỉ cần **decode rồi encode lại** (hành vi rất phổ biến) là lách được. Cách sửa rẻ: so **pixel** thay vì hash, và kiểm chiều ngược lại — hộp của các op PHẢI đổi; kiểm `width/height` ảnh trả về == ảnh gốc **kể cả khi không có hộp bảo vệ**; từ chối ảnh không nhận dạng được magic bytes |
+| N-9 | MINOR | **Từ vựng đơn vị của guardrail còn thiếu** (`tấn`, danh từ đếm `bộ/chiếc/…`) ⇒ số đúng nhưng **đơn vị sai** vẫn lọt | `node x23-unit-substitution.mjs`: `纯棉T恤 500克` + `"Áo thun cotton 500 tấn"` → `LỌT n=0`, `unitsIn(vi)=[]`; `3件装` + `"3 bộ"` → `LỌT` | “500克 → 500 tấn” là sai 1000 lần mà guardrail im lặng; `node x24-old-vs-new.mjs` xác nhận lỗi **có từ vòng 3** (không phải hồi quy) nhưng cùng nhóm luật (a) mà N-7 vừa sửa |
+| N-10 | MINOR | **So khớp BỎ DẤU sinh dương tính giả** khi từ khác dấu trùng chuỗi ASCII với từ khoá khẳng định | `node x24-old-vs-new.mjs`: `"Chỉnh hàng theo yêu cầu"`, `"Đất chuẩn bị trồng"`, `"Tột nhất là màu đen"` → **lọt ở vòng 3, BẮT ở vòng 4** | Hậu quả an toàn (chỉ tốn công duyệt tay), nhưng là đánh đổi mới do N-6; nên ghi vào hợp đồng để người duyệt biết vì sao bị hỏi |
+| N-11 | MINOR | **`only_region_ids: []` (mảng rỗng) vẫn render TẤT CẢ** — cùng lớp fail-open mà N-4 vừa bịt, chỉ khác giá trị biên; hợp đồng không nói rõ `[]` = “không lọc” | `node x27-n2-n3-n4.mjs`: `[] (mảng RỖNG) → HTTP 202`; `node x28-only-partial.mjs`: `chỉ định [] → 202 | job=succeeded | applied=["r3"]` (r3 = vùng duy nhất render được) | Client lọc ra danh sách rỗng (ví dụ “chưa chọn vùng nào”) rồi bấm Render sẽ nhận **nhiều hơn** yêu cầu. Không vi phạm luật #3 (vùng bảo vệ vẫn chặn), nhưng trái tinh thần “không vẽ nhiều hơn yêu cầu” của N-4 |
+
+## V3.6 — VẪN KHÔNG PHÁ ĐƯỢC (đo lại tại `3644d4f`)
+
+| # | Tuyên bố | Đòn tấn công vòng 3 | Kết quả |
+|---|---|---|---|
+| F-01 | Nhãn hiệu không bị xoá pixel (purejs) | `node x2-geometry-mask-noops.mjs` | **KHÔNG PHÁ ĐƯỢC.** 27/27 phép hình học đúng; `TỔNG: 0 phép kiểm LỆCH kỳ vọng`; mọi ca mặt nạ giữ `0` pixel đổi trong hộp bảo vệ |
+| F-01 (http) | Op chồng hộp bảo vệ không được gửi đi | `node x9` chế độ `naive` | **KHÔNG PHÁ ĐƯỢC.** `server nhận 1 op; op GIAO với hộp nhãn hiệu: []`; brand `0/8000` |
+| F-02 | Override phải có vết | `node x6-f02-override.mjs` | **KHÔNG PHÁ ĐƯỢC** (vẫn `0/8000` cho mọi đường tắt; chỉ override `USER_EDITED`+`provenance=user` mới vẽ) |
+| H-1 | Kẹp hộp = giao, không nới rộng | `node x3b-poison-targeted.mjs` ca `x3b-h1` | **KHÔNG PHÁ ĐƯỢC.** Op `{"x":0,"y":150,"w":210,"h":40}` được vẽ (`8400/8400`), nhãn hiệu `0/2400` |
+| H-2 / N-2 | 0 op ⇒ không được im lặng | `node x2` phần D, `node x27` | **KHÔNG PHÁ ĐƯỢC** — `PARTIAL`+`NO_OPS` ở engine, `RENDER_NO_OPS` ở job |
+| — | Fail-closed khi hộp bảo vệ không xác định được | `node x25` phần C | **KHÔNG PHÁ ĐƯỢC.** `job=failed "IMAGELAB_NO_LINES"`, `applied=0`, không render gì |
+| — | Từ chối lưu ảnh làm hỏng vùng bảo vệ | `node x29-refuse-trace.mjs` | **KHÔNG PHÁ ĐƯỢC.** `rendered mới: 0`; thư mục job chỉ còn ảnh gốc; `sha256 … trước/sau: 14efcb0d3b29024f / 14efcb0d3b29024f` |
+| N-3 | Danh sách không lộ dữ liệu nội bộ | `node x27` | **KHÔNG PHÁ ĐƯỢC.** `có session_id? false | có content_meta thô? false` |
+| — | `npm test` / `verify.mjs` (tự đo) | `npm test`, `node tools/verify.mjs` | **XANH THẬT.** `tests 408 · pass 407 · fail 0 · skipped 1`; verify `EXIT=0` |
+
+## V3.7 — CHƯA KIỂM ĐƯỢC (vòng 3)
+
+1. **Service render `http` THẬT** (trả tiền / inpainting thật): N-5 được chứng minh bằng server GIẢ ở `127.0.0.1` với 14 chế độ; tôi vẫn **không** đo được hành vi của một service thật (tần suất “vẽ lem”, có trả `applied` trung thực không, có re-encode không — chính N-8a).
+2. **Nguồn sinh ra toạ độ rác dạng chuỗi khoảng trắng** (N-1 phần còn lại): tôi đầu độc DB bằng `node:sqlite`; chưa xác minh được SQLite có ràng buộc kiểu cho `ocr_regions` và liệu vận hành thật có tạo được giá trị TEXT như vậy không.
+3. **PNG 16-bit / interlaced / palette**: `decodePng` từ chối các dạng này — nghĩa là provider `http` trả PNG 16-bit sẽ rơi vào nhánh “không giải mã được ⇒ TỪ CHỐI lưu”; tôi **chưa** kiểm nhánh này bằng ảnh 16-bit thật.
+4. **PostgreSQL**: vẫn chỉ chạy SQLite; test PostgreSQL vẫn là test **skip** duy nhất.
+5. **Hai request `render` đồng thời** trên cùng job (đua ghi DB) và nhiều instance chia sẻ `IMAGELAB_DIR`: vẫn chưa kiểm.
+6. **DOM/trình duyệt thật**: các hàm UI (`renderIlWarnings`, `historyItemHtml`) được trích và **chạy thật** trong Node; chưa mở DOM/CSS thật, chưa bấm nút trong trình duyệt. `protected_pixels_verified` có trong `render_summary`/meta nhưng **UI chưa hiện badge riêng** (chỉ hiện qua câu cảnh báo).
+7. **`data/studio.db` thật**: vẫn chỉ chạy migration trên bản sao trong `/tmp`.
+8. **Đánh đổi của guardrail**: không có ngưỡng nào chặn được `xii`/homoglyph/`tốt nhứt` mà không tăng dương tính giả (N-10 là ví dụ vừa xảy ra); cần Owner quyết định mức đánh đổi, tôi không tự chọn.

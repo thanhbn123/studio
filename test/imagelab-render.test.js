@@ -216,7 +216,12 @@ describe('MVP-02 render — provider purejs (ảnh gốc bất biến, pixel, h�
       image: { buffer: original, mime: 'image/png' },
       ops: [{ region_id: 'r1', box, action: 'erase' }],
     });
-    assert.equal(res.status, 'OK');
+    // SỬA THEO N-8a (vòng 5): hộp này trên fixture `headphones.png` vốn đã là nền đồng nhất,
+    // nên `erase` KHÔNG làm đổi một pixel nào ⇒ engine không được báo `OK` (báo OK là nói
+    // rằng đã render trong khi ảnh y hệt ảnh gốc). Khẳng định cốt lõi của test giữ nguyên.
+    assert.equal(res.status, 'PARTIAL');
+    assert.equal(res.error_code, 'NO_OPS');
+    assert.match(res.warnings.join(' '), /KHÔNG có pixel nào thay đổi|Không vẽ được vùng nào/);
     const before = toRgba(decodePng(original));
     const after = toRgba(decodePng(res.output.buffer));
     for (let y = 0; y < 320; y += 1) {

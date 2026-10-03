@@ -677,9 +677,20 @@ export function buildRouter(app) {
       throw HttpError.safe(409, 'IMAGELAB_NO_LINES', 'Job chưa có dòng chữ nào để render.');
     }
 
-    // N-4 (vòng 4): `only_region_ids` phải FAIL-CLOSED — trước đây id rác bị lọc sạch
-    // thành `[]` và pipeline hiểu là "không lọc" ⇒ ÂM THẦM render TẤT CẢ (nhiều hơn yêu cầu).
-    if (requestedRegionIds && requestedRegionIds.length > 0) {
+    // N-4 (vòng 4) + N-11 (vòng 5): `only_region_ids` phải FAIL-CLOSED.
+    //  - Trường VẮNG MẶT            ⇒ "render tất cả dòng đã duyệt" (hành vi cũ, hợp đồng 4.4).
+    //  - Mảng RỖNG `[]`             ⇒ người dùng KHÔNG chọn vùng nào ⇒ KHÔNG render gì
+    //    (trước đây bị hiểu là "không lọc" ⇒ ÂM THẦM render TẤT CẢ: nhiều hơn yêu cầu).
+    //  - Có id nhưng KHÔNG id nào khớp ⇒ 409 UNKNOWN_REGION_IDS + danh sách id không khớp.
+    if (requestedRegionIds) {
+      if (requestedRegionIds.length === 0) {
+        throw HttpError.safe(
+          400,
+          'EMPTY_REGION_IDS',
+          '`only_region_ids` là mảng RỖNG — bạn chưa chọn vùng nào nên KHÔNG render gì cả. Bỏ hẳn trường này nếu muốn render tất cả các dòng đã duyệt.',
+          { only_region_ids: [] },
+        );
+      }
       const known = new Set(lines.map((l) => String(l.region_id)));
       const matched = onlyRegionIds.filter((id) => known.has(id));
       const rawIds = requestedRegionIds

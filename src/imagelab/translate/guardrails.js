@@ -54,6 +54,19 @@ export function deaccent(text) {
     .normalize('NFC');
 }
 
+/**
+ * Văn bản có dấu tiếng Việt (hoặc dấu tổ hợp bất kỳ) hay không — N-10 (vòng 5).
+ *
+ * Nhánh so khớp KHÔNG DẤU chỉ được dùng khi câu ứng viên **không có dấu nào**; nếu câu đã
+ * có dấu thì so khớp như cũ. Nếu không, các từ KHÁC NGHĨA nhưng trùng chuỗi bỏ dấu sẽ bị
+ * tố oan: "Chỉnh hàng" → "chinh hang" (chính hãng), "Đất chuẩn bị trồng" → "dat chuan"
+ * (đạt chuẩn), "Tột nhất" → "tot nhat" (tốt nhất).
+ */
+export function hasDiacritics(text) {
+  const s = String(text ?? '');
+  return deaccent(s) !== s;
+}
+
 /** Ký tự vô hình: zero-width space/non-joiner/joiner, BOM, word-joiner. */
 const INVISIBLE_RE = /[\u200B-\u200D\uFEFF\u2060]/g;
 
@@ -383,9 +396,12 @@ export function wordNumberUnitsIn(text) {
     out.push({ phrase, unit: String(rawUnit), value: vietnameseWordsToNumber(rawRun) });
   };
   for (const m of s.matchAll(VI_WORD_NUMBER_UNIT_RE)) push(`${m[1]} ${m[2]}`, m[1], m[2]);
-  // N-6: bản KHÔNG DẤU — "mot nam", "hai thang", "mot tram hai muoi nghin dong"…
-  const plain = deaccent(s);
-  for (const m of plain.matchAll(VI_WORD_NUMBER_UNIT_RE_PLAIN)) push(`${m[1]} ${m[2]}`, m[1], m[2]);
+  // N-6 + N-10: bản KHÔNG DẤU ("mot nam", "hai thang"…) — chỉ khi câu KHÔNG có dấu nào,
+  // để "Chỉnh hàng"/"một chiếc" kiểu có dấu không rơi vào nhánh này.
+  if (!hasDiacritics(s)) {
+    const plain = deaccent(s);
+    for (const m of plain.matchAll(VI_WORD_NUMBER_UNIT_RE_PLAIN)) push(`${m[1]} ${m[2]}`, m[1], m[2]);
+  }
   return out;
 }
 
@@ -449,6 +465,14 @@ const CN_UNIT_ALIASES = Object.freeze([
   [/伏特|伏/, 'v'],
   [/升/, 'l'],
   [/米/, 'm'],
+  // N-9 (vòng 5): bổ sung đơn vị khối lượng/diện tích/điện mà bản dịch hay dùng
+  [/吨/, 'tấn'],
+  [/两/, 'lạng'],
+  [/平方米/, 'm²'],
+  [/立方米/, 'm³'],
+  [/安培/, 'a'],
+  [/赫兹/, 'hz'],
+  [/摄氏度/, '°c'],
   [/克/, 'g'],
 ]);
 
@@ -461,29 +485,72 @@ const CN_UNIT_ALIASES = Object.freeze([
  * trung thành "Áo thun cotton 100%" bị tố oan. Ký hiệu `%` không phải chữ cái nên còn
  * được kiểm thêm bằng `SYMBOL_UNITS` bên dưới (không phụ thuộc biên từ).
  */
-const VI_NUM_UNIT_SOURCE =
-  '(\\d+(?:[.,]\\d+)?)\\s*(mAh|kWh|kW|Hz|ml|kg|mg|mm|cm|km|inch|W|V|L|l|g|m|giờ|ngày|tuần|tháng|năm|phút|giây|độ|đ|vnđ)(?![\\p{L}\\p{N}])';
+const VI_UNIT_TOKENS = Object.freeze([
+  // Khối lượng / thể tích (N-9 vòng 5: bổ sung gram, kilogam, tấn, tạ, yến, lạng, lít…)
+  'kilogam', 'kilôgam', 'gram', 'gam', 'kg', 'mg', 'g', 'tấn', 'tạ', 'yến', 'lạng',
+  'ml', 'lít', 'l',
+  // Độ dài / diện tích / thể tích hình học
+  'cm', 'mm', 'km', 'm²', 'm³', 'm', 'inch',
+  // Điện / năng lượng / tần số / nhiệt độ
+  'mAh', 'kWh', 'kW', 'Hz', 'W', 'V', 'A', '°C',
+  // Thời gian
+  'giờ', 'ngày', 'tuần', 'tháng', 'năm', 'phút', 'giây',
+  // Khác
+  'độ', 'đ', 'vnđ',
+]);
+
+/** Đơn vị Latin/đo lường: dài trước để 'm²' không bị cắt thành 'm'. */
+const VI_UNIT_ALT = VI_UNIT_TOKENS
+  .slice()
+  .sort((a, b) => b.length - a.length)
+  .map((u) => u.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  .join('|');
+
+/**
+ * Mẫu "số + đơn vị" phía tiếng Việt.
+ * Lookahead `(?![\p{L}\p{N}])` (Unicode) để "12 lần" KHÔNG bị hiểu thành "12 l".
+ *
+ * N-7a (vòng 4): bản cũ dùng `(?![a-zà-ỹ0-9])` — với cờ `/i`, lớp này khớp cả CHỮ HOA,
+ * nên `纯棉100%T恤` (chữ Trung viết liền số) bị coi là KHÔNG có đơn vị `%` ⇒ bản dịch
+ * trung thành "Áo thun cotton 100%" bị tố oan. Ký hiệu `%` không phải chữ cái nên còn
+ * được kiểm thêm bằng `SYMBOL_UNITS` bên dưới (không phụ thuộc biên từ).
+ */
+const VI_NUM_UNIT_SOURCE = `(\\d+(?:[.,]\\d+)?)\\s*(${VI_UNIT_ALT})(?![\\p{L}\\p{N}])`;
 
 /** Ký hiệu đơn vị KHÔNG phải chữ cái ⇒ không cần biên từ, chỉ cần đứng sau một con số. */
 const SYMBOL_UNITS = Object.freeze([['%', '%']]);
 
+/** Token → đơn vị chuẩn (so khớp giữa hai ngôn ngữ). */
 const UNIT_CANON = Object.freeze({
+  kilogam: 'kg',
+  kilôgam: 'kg',
+  kg: 'kg',
+  gram: 'g',
+  gam: 'g',
+  g: 'g',
+  mg: 'mg',
+  tấn: 'tấn',
+  tạ: 'tạ',
+  yến: 'yến',
+  lạng: 'lạng',
+  ml: 'ml',
+  lít: 'l',
+  l: 'l',
+  cm: 'cm',
+  mm: 'mm',
+  km: 'km',
+  'm²': 'm²',
+  'm³': 'm³',
+  m: 'm',
+  inch: 'inch',
   mah: 'mah',
   kwh: 'kwh',
   kw: 'kw',
+  hz: 'hz',
   w: 'w',
   v: 'v',
-  hz: 'hz',
-  ml: 'ml',
-  kg: 'kg',
-  mg: 'mg',
-  mm: 'mm',
-  cm: 'cm',
-  km: 'km',
-  m: 'm',
-  l: 'l',
-  g: 'g',
-  inch: 'inch',
+  a: 'a',
+  '°c': '°c',
   '%': '%',
   'giờ': 'giờ',
   'ngày': 'ngày',
@@ -653,18 +720,22 @@ export function checkClaimWords(textOriginal, textVi) {
   // F-08: bỏ ký tự vô hình trước khi so khớp ("bảo\u200bhành" vẫn là "bảo hành").
   const original = normalizeForMatch(textOriginal);
   const viText = normalizeForMatch(textVi);
-  // N-6 (vòng 4): soi thêm bản KHÔNG DẤU của cùng câu ("bao hanh mot nam").
+  // N-6 (vòng 4) + N-10 (vòng 5): soi thêm bản KHÔNG DẤU — nhưng CHỈ khi câu ứng viên
+  // không có dấu tiếng Việt nào (nếu không sẽ tố oan "Chỉnh hàng"/"Đất chuẩn bị trồng").
+  const usePlainMatch = !hasDiacritics(viText);
   const originalPlain = deaccent(original);
-  const viPlain = deaccent(viText);
+  const viPlain = usePlainMatch ? deaccent(viText) : viText;
   for (const group of CLAIM_GROUPS) {
     const flags = group.vi.flags.includes('g') ? group.vi.flags : `${group.vi.flags}g`;
     // Gộp hai dạng về MỘT mục cho mỗi khẳng định (ưu tiên hiển thị bản CÓ DẤU) để không
     // báo trùng hai lần cùng một lỗi ("bảo hành" + "bao hanh").
     const hits = new Map();
     for (const m of viText.matchAll(new RegExp(group.vi.source, flags))) hits.set(deaccent(m[0]).toLowerCase(), m[0]);
-    for (const m of viPlain.matchAll(new RegExp(deaccent(group.vi.source), flags))) {
-      const key = deaccent(m[0]).toLowerCase();
-      if (!hits.has(key)) hits.set(key, m[0]);
+    if (usePlainMatch) {
+      for (const m of viPlain.matchAll(new RegExp(deaccent(group.vi.source), flags))) {
+        const key = deaccent(m[0]).toLowerCase();
+        if (!hits.has(key)) hits.set(key, m[0]);
+      }
     }
     if (hits.size === 0) continue;
     // Chữ gốc đã có khẳng định tương đương (tiếng Trung) ⇒ bản dịch trung thực, không bịa.

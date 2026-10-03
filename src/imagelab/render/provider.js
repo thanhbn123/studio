@@ -12,8 +12,8 @@
 
 import { Buffer } from 'node:buffer';
 import { RenderError, RENDER_CODES, UNSUPPORTED_IMAGE_CODES } from './errors.js';
-import { probeImage, normalizeProtectedBoxes } from './image.js';
-import { verifyProtectedPixels, PROTECTED_CHECK } from './verify.js';
+import { detectImageMime, probeImage, normalizeProtectedBoxes } from './image.js';
+import { inspectRenderedPixels, verifyProtectedPixels, PROTECTED_CHECK } from './verify.js';
 import { sha256 } from './png.js';
 import { normalizeOps } from './ops.js';
 
@@ -187,6 +187,85 @@ export class RenderProvider {
         (p) => p.region_id === null || !normalized.ops.some((op) => String(op.region_id) === String(p.region_id)),
       );
 
+      // ── N-8 (vòng 5): kiểm ảnh trả về bằng PIXEL + MAGIC BYTES + KÍCH THƯỚC ─────
+      // (không chỉ hash — remote chỉ cần decode rồi encode lại là hash đổi mà pixel y nguyên)
+      const opBoxes = normalized.ops.map((op) => op.box).filter(Boolean);
+      const skipInspection = rawStatus === RENDER_STATUS.FAILED || !outputBuffer;
+
+      // (N-8c) ảnh trả về phải nhận dạng được bằng magic bytes — không thì TỪ CHỐI lưu.
+      const outputMime = skipInspection ? null : detectImageMime(outputBuffer);
+      if (!skipInspection && !outputMime) {
+        const message = `Ảnh do provider "${this.name}" trả về KHÔNG nhận dạng được định dạng ảnh (magic bytes lạ) — TỪ CHỐI lưu để không tạo asset rác.`;
+        partialWarnings.push(message);
+        this.#logger?.warn?.('imagelab.render.bad_magic', { provider: this.name, bytes: outputBuffer.length });
+        return finish({
+          ...base,
+          ...partial,
+          status: RENDER_STATUS.FAILED,
+          provider: this.name,
+          model: this.model,
+          is_mock: this.isMock,
+          original_sha256: originalSha,
+          output: null,
+          applied: [],
+          skipped: skippedAll,
+          warnings: [...warnings, ...partialWarnings],
+          protected_pixels_verified: false,
+          error_code: RENDER_CODES.RENDER_BAD_RESPONSE,
+          error_message: message,
+        });
+      }
+
+      // (N-8b) kích thước phải khớp ảnh gốc — kiểm CẢ khi job không có vùng bảo vệ nào.
+      const originalInfo = img.buffer ? probeImage(img.buffer) : null;
+      const outputInfo = skipInspection ? null : probeImage(outputBuffer);
+      if (originalInfo && outputInfo && (originalInfo.width !== outputInfo.width || originalInfo.height !== outputInfo.height)) {
+        const message =
+          `Ảnh do provider "${this.name}" trả về có kích thước ${outputInfo.width}×${outputInfo.height} KHÁC ảnh gốc ` +
+          `${originalInfo.width}×${originalInfo.height} — TỪ CHỐI lưu (ảnh giao cho khách phải cùng khung hình với ảnh gốc).`;
+        partialWarnings.push(message);
+        return finish({
+          ...base,
+          ...partial,
+          status: RENDER_STATUS.FAILED,
+          provider: this.name,
+          model: this.model,
+          is_mock: this.isMock,
+          original_sha256: originalSha,
+          output: null,
+          applied: [],
+          skipped: skippedAll,
+          warnings: [...warnings, ...partialWarnings],
+          protected_pixels_verified: false,
+          error_code: RENDER_CODES.RENDER_SIZE_MISMATCH,
+          error_message: message,
+        });
+      }
+
+      // (N-8a) soi PIXEL: hộp của từng op gửi đi có THỰC SỰ đổi không?
+      const pixelScan = skipInspection || outputMime !== 'image/png'
+        ? null
+        : inspectRenderedPixels({
+            originalBuffer: img.buffer,
+            outputBuffer,
+            protectedBoxes: guardBoxes.map((b) => b.box),
+            opBoxes,
+            maxPixels: this.limits.maxPixels,
+          });
+      const nothingDrawnByPixels = Boolean(
+        pixelScan
+        && pixelScan.readable
+        && pixelScan.reason === PROTECTED_CHECK.OK
+        && ops.length > 0
+        && opBoxes.length > 0
+        && pixelScan.opBoxesChanged === 0,
+      );
+      if (nothingDrawnByPixels) {
+        partialWarnings.push(
+          `Provider "${this.name}" trả về ảnh CÙNG KÍCH THƯỚC nhưng KHÔNG có pixel nào thay đổi trong hộp của ${opBoxes.length} op đã gửi — ảnh chỉ được giải mã/mã hoá lại (hoặc trả nguyên ảnh gốc). KHÔNG tính là đã vẽ.`,
+        );
+      }
+
       // ── N-5 (vòng 4): KHÔNG TIN provider, nhất là `http` ─────────────────────
       const outputSha = outputBuffer ? sha256(outputBuffer) : null;
       const unchangedOutput = Boolean(outputSha && originalSha && outputSha === originalSha && ops.length > 0);
@@ -201,6 +280,15 @@ export class RenderProvider {
         status = RENDER_STATUS.PARTIAL;
         errorCode = errorCode ?? RENDER_CODES.NO_OPS;
         partialWarnings.push('Ảnh trả về giống hệt ảnh gốc (0 pixel thay đổi) — đây KHÔNG phải kết quả đã render; cần kiểm tra provider.');
+      } else if (nothingDrawnByPixels) {
+        if (applied.length > 0) {
+          partialWarnings.push(
+            `Provider khai đã áp dụng ${applied.length}/${ops.length} op nhưng PIXEL trong hộp các op KHÔNG đổi — không tin lời khai \`applied\` (bỏ).`,
+          );
+        }
+        applied = [];
+        status = RENDER_STATUS.PARTIAL;
+        errorCode = errorCode ?? RENDER_CODES.NO_OPS;
       } else if (applied.length > ops.length) {
         partialWarnings.push(
           `Provider khai áp dụng ${applied.length} op trong khi chỉ nhận ${ops.length} op — không tin phần khai thêm (giữ ${ops.length}).`,
@@ -212,12 +300,20 @@ export class RenderProvider {
 
       // Hậu kiểm PIXEL vùng bảo vệ trên chính ảnh trả về (chỉ khi có hộp cần bảo vệ).
       if (guardBoxes.length > 0 && outputBuffer && rawStatus !== RENDER_STATUS.FAILED) {
-        const check = verifyProtectedPixels({
-          originalBuffer: img.buffer,
-          outputBuffer,
-          protectedBoxes: guardBoxes.map((b) => b.box),
-          maxPixels: this.limits.maxPixels,
-        });
+        const check = pixelScan
+          ? {
+              verified: pixelScan.reason === PROTECTED_CHECK.OK ? true : false,
+              reason: pixelScan.reason,
+              mime: pixelScan.mime,
+              detail: pixelScan.detail,
+              changed: pixelScan.protectedChanged,
+            }
+          : verifyProtectedPixels({
+              originalBuffer: img.buffer,
+              outputBuffer,
+              protectedBoxes: guardBoxes.map((b) => b.box),
+              maxPixels: this.limits.maxPixels,
+            });
 
         if (check.reason === PROTECTED_CHECK.PROTECTED_PIXELS_CHANGED || check.reason === PROTECTED_CHECK.SIZE_MISMATCH) {
           const detail = check.reason === PROTECTED_CHECK.SIZE_MISMATCH

@@ -62,6 +62,11 @@ export const RENDER_CODES = Object.freeze({
    * như đã kiểm.
    */
   PROTECTED_PIXELS_UNVERIFIED: 'PROTECTED_PIXELS_UNVERIFIED',
+  /**
+   * Vòng 5 (N-8b): ảnh trả về KHÁC kích thước ảnh gốc ⇒ từ chối lưu (kể cả khi job không có
+   * vùng bảo vệ nào — ảnh giao cho khách phải cùng khung hình với ảnh gốc).
+   */
+  RENDER_SIZE_MISMATCH: 'RENDER_SIZE_MISMATCH',
 });
 
 /**

@@ -294,9 +294,11 @@ describe('VÒNG 4 · N-5 — không tin provider (nhất là http)', () => {
   test('khai `applied` nhiều hơn số op đã gửi ⇒ cảnh báo + hạ trạng thái, chỉ giữ đúng số op', async () => {
     const image = tinyImage([]);
     const provider = new FakeRemoteRenderProvider(({ image: img }) => {
-      // đổi 1 pixel để ảnh KHÁC gốc (nếu không sẽ rơi vào nhánh sha trùng)
+      // đổi 1 pixel TRONG hộp op để ảnh KHÁC gốc và thật sự "có vẽ" (nếu không sẽ rơi vào
+      // nhánh N-8a `NO_OPS`), nhưng vẫn khai thừa số op đã áp dụng.
       const data = rgbaOf(img.buffer);
-      data[0] = 1;
+      const i = ((SAFE_BOX.y + 1) * 64 + SAFE_BOX.x + 1) * 4;
+      data[i] = 1;
       const buf = pngFromRgba(data);
       return {
         status: RENDER_STATUS.OK,
