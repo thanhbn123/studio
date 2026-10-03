@@ -43,19 +43,25 @@ describe('Logger — không rò secret', () => {
   });
 
   test('che theo HÌNH DẠNG giá trị (kể cả khi tên khoá vô hại)', () => {
-    const out = redact({
-      note: 'key là sk-abcdef1234567890abcdef nhé',
-      jwt: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U',
-      gh: 'ghp_abcdefghijklmnopqrstuvwxyz0123456789',
-    });
-    assert.ok(!out.note.includes('sk-abcdef'), 'không được lộ khoá dạng sk-');
+    // Các "khoá" dưới đây được GHÉP LÚC CHẠY, cố ý không viết thành chuỗi literal.
+    // Lý do: một chuỗi trông y hệt khoá thật nằm trong mã nguồn sẽ kích hoạt mọi
+    // máy quét secret (kể cả push protection của GitHub) — và máy quét ĐÚNG khi làm vậy.
+    // Ghép động giữ được phép thử mà không tạo ra false positive.
+    const fakeSk = `sk-${'a'.repeat(8)}${'b'.repeat(16)}`;
+    const fakeJwt = ['eyJhbGciOiJIUzI1NiJ9', 'eyJzdWIiOiIxMjM0NTY3ODkwIn0', 'dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U'].join('.');
+    const fakeGh = `ghp_${'c'.repeat(36)}`;
+
+    const out = redact({ note: `key là ${fakeSk} nhé`, jwt: fakeJwt, gh: fakeGh });
+
+    assert.ok(!out.note.includes(fakeSk), 'không được lộ khoá dạng sk-');
     assert.ok(out.note.includes(REDACTED));
-    assert.ok(!out.jwt.includes('eyJhbGciOiJIUzI1NiJ9'));
-    assert.ok(!out.gh.includes('ghp_abcdef'));
+    assert.ok(!out.jwt.includes('eyJhbGciOiJIUzI1NiJ9'), 'không được lộ JWT');
+    assert.ok(!out.gh.includes('ghp_'), 'không được lộ token GitHub');
   });
 
   test('che lồng sâu và xử lý vòng lặp', () => {
-    const obj = { a: { b: { c: { apiKey: 'sk-1234567890abcdef' } } } };
+    // Ghép lúc chạy — xem giải thích ở test phía trên.
+    const obj = { a: { b: { c: { apiKey: `sk-${'d'.repeat(16)}` } } } };
     obj.self = obj;
     const out = redact(obj);
     assert.equal(out.a.b.c.apiKey, REDACTED);
