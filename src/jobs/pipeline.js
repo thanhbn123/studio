@@ -21,17 +21,36 @@ import { addWarning, recomputeEvidence } from '../product-master.js';
 import { sanitizeText, sanitizeUrl, sanitizeImageRef } from '../security/sanitize.js';
 import { detectSource } from '../sources/detect.js';
 
-/** Mức độ bằng chứng của một lần trích xuất — verifier PHẢI phân biệt được. */
-export function determineVerificationLevel(master, { isMock = false } = {}) {
-  if (isMock) return 'MOCK_VERIFIED';
-  const st = master?.extraction?.field_status || {};
+/**
+ * Mức độ bằng chứng của một lần trích xuất — verifier PHẢI phân biệt được.
+ *
+ * LUẬT: mức này do **NGUỒN GỐC DỮ LIỆU** quyết định, KHÔNG phải do "có lấy được field hay không".
+ *
+ * Bản trước chỉ nhìn `isMock` (vốn chỉ nói về provider SINH NỘI DUNG) và xem master có
+ * tiêu đề/ảnh hay không. Hệ quả đã bị verifier độc lập bắt: một Product Master dựng HOÀN TOÀN
+ * từ fixture trong test, qua fetcher giả, KHÔNG hề mở socket nào — vẫn bị ghi là
+ * `LIVE_VERIFIED`. Đó đúng là kiểu "thứ dùng để kiểm chứng lại tự nó không trung thực".
+ *
+ * Nay cổng chặn là `extraction.transport`:
+ *   'http'    → dữ liệu thật sự đi qua mạng  → mới được xét LIVE
+ *   'manual'  → người dùng tự nhập            → MANUAL_INPUT
+ *   khác/none → fixture, fetcher giả, hoặc không tải được → MOCK_VERIFIED
+ */
+export function determineVerificationLevel(master, { usedSession = false } = {}) {
+  const ex = master?.extraction || {};
+  const transport = ex.transport || 'unknown';
+
+  // UNSUPPORTED phải xét TRƯỚC cổng transport: nguồn không được hỗ trợ thì không có
+  // transport nào cả, nên nếu xét transport trước sẽ trả nhầm MOCK_VERIFIED.
+  if (ex.error_code === 'UNSUPPORTED_SOURCE') return 'UNSUPPORTED';
+
+  if (transport === 'manual') return 'MANUAL_INPUT';
+  if (transport !== 'http') return 'MOCK_VERIFIED';
+
   const anyFound = (master?.images?.length || 0) > 0 || Boolean(master?.title_original);
-  if (master?.extraction?.error_code === 'UNSUPPORTED_SOURCE' || st.title_original === STATUS.UNSUPPORTED) {
-    return 'UNSUPPORTED';
-  }
   if (!anyFound) return 'BLOCKED';
-  // Có dữ liệu thật + có session => mức cao nhất
-  if (master?.extraction?.used_session) return 'AUTHENTICATED_LIVE_VERIFIED';
+
+  if (usedSession || ex.used_session) return 'AUTHENTICATED_LIVE_VERIFIED';
   return 'LIVE_VERIFIED';
 }
 
@@ -338,7 +357,7 @@ export class Pipeline {
 
     /* ── 7. Bằng chứng (G14) + lưu (G12) ───────────────────────────────── */
     const evidence = evidenceTable(master);
-    evidence.verification = determineVerificationLevel(master, { isMock: contentMeta?.is_mock });
+    evidence.verification = determineVerificationLevel(master);
     evidence.vision_provider = vision?.provider || '';
     evidence.content_provider = contentMeta?.provider || this.contentEngine?.providerName || '';
     evidence.connector = master.extraction.connector || master.source;
@@ -461,6 +480,8 @@ export class Pipeline {
       }
     }
     m.extraction.method = 'manual-input';
+    // Dữ liệu người dùng tự nhập KHÔNG BAO GIỜ được coi là LIVE_VERIFIED.
+    m.extraction.transport = 'manual';
     m.extraction.extracted_at = new Date().toISOString();
     return m;
   }

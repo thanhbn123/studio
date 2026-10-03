@@ -9,57 +9,78 @@
  */
 
 import { sanitizeText } from '../security/sanitize.js';
+import { PROVENANCE } from '../product-master.js';
 
 /** Nhóm khẳng định bị soi. `allowIfEvidence` = true nghĩa là có bằng chứng thì cho qua. */
 export const CLAIM_RULES = [
   {
     id: 'warranty',
     label: 'bảo hành',
-    // Gồm cả cách viết tắt và cách nói vòng: "BH 12 tháng", "bảo đảm 1 năm", "đổi trả 12 tháng".
-    re: /(?:\bbh\b|bảo hành|bảo đảm|bảo trì|đổi trả|hoàn tiền|1\s*đổi\s*1)\s*(?:trong\s*)?(?:\d+|\d+\s*(?:năm|tháng|ngày))?|cam kết bảo hành|\b\d+\s*(?:năm|tháng)\s*bảo hành/gi,
+    // KHÔNG dùng `\b` quanh từ tiếng Việt: `\b` của JS chỉ hiểu [A-Za-z0-9_], nên
+    // `\b(?:…|đạt chuẩn|…)` KHÔNG BAO GIỜ khớp với "đạt chuẩn" — nhánh chết.
+    // Chỉ giữ `\b` cho token thuần ASCII (bh).
+    re: /bảo hành|bảo đảm\s*(?:trong\s*)?(?:\d+|một|1)\s*(?:năm|tháng|ngày)|bảo trì|đổi trả|hoàn tiền|1\s*đổi\s*1|cam kết bảo hành|\bbh\b/gi,
   },
   {
     id: 'certification',
     label: 'chứng nhận',
-    re: /\b(?:chứng nhận|đạt chuẩn|tiêu chuẩn|kiểm định|công bố)\s*(?:ISO|CE|FDA|RoHS|FCC|GMP|HACCP|IEC|TUV)?\b|\b(?:ISO|CE|FDA|RoHS|FCC|GMP|HACCP)\s*\d*/gi,
+    re: /chứng nhận|đạt chuẩn|kiểm định|\biso\b|\bce\b|\bfda\b|\brohs\b|\bfcc\b|\bgmp\b|\bhaccp\b|an toàn thực phẩm|không chứa\s*bpa|\bbpa\b/gi,
   },
   {
     id: 'waterproof',
     label: 'chống nước',
-    // "ngâm nước", "đi mưa", "kháng ẩm" là những cách nói vòng phổ biến của tiếng Việt.
-    re: /chống nước|kháng nước|ngâm nước|không thấm nước|waterproof|đi mưa|kháng ẩm|chống ẩm|\bIP\d{2}\b/gi,
+    re: /chống nước|kháng nước|ngâm nước|không thấm nước|chống thấm|chống bụi nước|waterproof|đi mưa|kháng ẩm|chống ẩm|lặn sâu|rửa trực tiếp|vòi nước|\bipx?\d{1,2}\b|\b\d+atm\b/gi,
   },
   {
     id: 'spec_unit',
     label: 'đơn vị thông số',
-    // Đơn vị kỹ thuật gần như không xuất hiện trong văn bản bán hàng thường — thấy là nghi ngay.
-    re: /\b\d+(?:[.,]\d+)?\s*(?:mAh|kWh|kW|W|V|Hz|inch|ml|kg|mm|cm|lít|L)\b|\b(?:mAh|kWh|IP\d{2}|Hz)\b/gi,
+    // Gồm cả cách nói thuần Việt: "miliampe", "oát", "ký", "phân", "xị", và dạng "1m8".
+    // KHÔNG có `\b` ở cuối nhóm đầu: đơn vị tiếng Việt (ký, xị, phân) kết thúc bằng
+    // ký tự non-ASCII nên `\b` không bao giờ khớp — đúng họ lỗi với `\b` phía trước.
+    re: /\d+(?:[.,]\d+)?\s*(?:mAh|kWh|kW|W|V|Hz|inch|ml|kg|mm|cm|lít|miliampe|oát|watt|ký|gam|phân|xị|mét|m2|m3)|\b(?:mAh|kWh|IP\d{2}|IPX\d|Hz|ATM)\b|\d+\s*m\d|(?:pin|dùng|sử dụng|chạy|hoạt động)\s*(?:được|liên tục)?\s*\d+\s*(?:ngày|giờ|tuần|tháng|năm)/gi,
   },
   {
     id: 'capacity',
     label: 'dung tích/công suất',
-    re: /\b\d+(?:[.,]\d+)?\s*(?:ml|l|L|mAh|W|kW|V|Hz|inch|cm|mm|kg|g|lít)\b/gi,
+    re: /\d+(?:[.,]\d+)?\s*(?:ml|l|L|mAh|W|kW|V|Hz|inch|cm|mm|kg|g|lít|xị|oát|watt|miliampe)/gi,
   },
   {
     id: 'material',
     label: 'chất liệu',
-    re: /da thật|da bò|da cá sấu|cotton|nhôm nguyên khối|thép không gỉ|inox|titan|gốm sứ|cao su|silicon|nhựa ABS|gỗ tự nhiên|carbon/gi,
+    re: /da thật|da bò|da pu|da microfiber|microfiber|cotton|nhôm|hợp kim|thép không gỉ|inox|titan|gỗ sồi|gỗ tự nhiên|gốm sứ|thủy tinh|cao su|silicon|nhựa abs|vàng \d+k|bạc \d{3}|carbon/gi,
   },
   {
     id: 'origin',
     label: 'nguồn gốc',
-    re: /xuất xứ|nguồn gốc|made in|sản xuất tại|nhập khẩu|nội địa|chính hãng|hàng chính hãng/gi,
+    re: /xuất xứ|nguồn gốc|nguồn hàng|made in|sản xuất tại|nhập khẩu|nội địa|chính hãng|xách tay|quảng châu|tận xưởng|tận gốc/gi,
   },
   {
     id: 'price_claim',
     label: 'giá/khuyến mãi',
-    re: /\b(?:sale|giảm giá|giảm|ưu đãi|khuyến mãi|voucher|mã giảm)\s*(?:đến\s*)?\d+\s*%|\b\d+\s*%\s*(?:off|giảm)?|freeship|miễn phí (?:vận chuyển|giao hàng|ship)|tặng kèm|quà tặng|số lượng có hạn|chỉ còn\s*\d+|nhanh tay/gi,
+    // Từ khoá khuyến mãi PHẢI đi kèm một con số/đơn vị cụ thể mới tính là lời chào bán.
+    // Lý do: câu trung thực "giá có thể thay đổi theo chương trình khuyến mãi của sàn"
+    // (nguyên văn ghi chú giá của chính Taobao) từng bị bắt oan chỉ vì có chữ "khuyến mãi".
+    re: /(?:sale|giảm giá|giảm|ưu đãi|khuyến mãi|voucher|mã giảm|đồng giá|giá chỉ|giá sốc)\s*(?:đến\s*|chỉ\s*|từ\s*)?\d|\d+\s*%|flash sale|freeship|free ship|miễn phí (?:vận chuyển|giao hàng|ship)|tặng kèm|tặng ngay|mua \d+ tặng \d+|quà tặng|số lượng có hạn|chỉ còn\s*\d+|nhanh tay/gi,
+  },
+  {
+    id: 'price_value',
+    label: 'giá cụ thể',
+    // Bắt MỌI con số tiền tệ. Nhóm này dùng `numeric: true` để được miễn nếu con số
+    // đó thật sự có trong bằng chứng (giá sàn lấy được) — xem `checkContent`.
+    numeric: true,
+    re: /\d+(?:[.,]\d+)?\s*(?:đ|vnđ|vnd|usd|cny|¥|tệ|triệu|nghìn|k\b)/gi,
   },
   {
     id: 'rating',
     label: 'số liệu xã hội',
-    // "nghìn người mua", "4.9 sao", "1000+ review" — kể cả khi không ghi chữ "đánh giá".
-    re: /\b\d+(?:[.,]\d+)?\s*(?:k|nghìn|ngàn|trăm|triệu)?\+?\s*(?:khách hàng|người mua|người dùng|đánh giá|review|sao|lượt mua|lượt bán)\b|\b\d+(?:[.,]\d+)?\s*\/\s*5\b|\bđược đánh giá\b|\btin dùng\b|\bbán chạy\b/gi,
+    re: /\d+(?:[.,]\d+)?\s*(?:k|nghìn|ngàn|trăm|triệu)?\+?\s*(?:khách hàng|người mua|người dùng|đánh giá|review|sao|đơn hàng|lượt mua|lượt bán)|\d+(?:[.,]\d+)?\s*\/\s*5|được đánh giá|được yêu thích|yêu thích nhất|tin dùng|bán chạy/gi,
+  },
+  {
+    id: 'overclaim',
+    label: 'cam kết quá mức / YMYL',
+    // Nhóm này bắt các khẳng định TUYỆT ĐỐI và các tuyên bố sức khoẻ — loại rủi ro
+    // pháp lý và đạo đức cao nhất, đồng thời gần như không bao giờ có bằng chứng.
+    re: /tốt nhất thị trường|số 1 (?:việt nam|thị trường|châu)|độc quyền|duy nhất|tuyệt đối an toàn|an toàn tuyệt đối|chữa khỏi|chữa bệnh|trị bệnh|giảm cân|thần tốc|100% (?:an toàn|hiệu quả)|cam kết hiệu quả/gi,
   },
 ];
 
@@ -87,7 +108,19 @@ export function buildEvidenceText(master, knowledge, vision) {
   for (const t of master?.price?.tiers || []) push(JSON.stringify(t));
   push(master?.store?.name);
 
-  for (const f of knowledge?.facts || []) push(f.value);
+  // CẢNH BÁO — đây từng là lỗ hổng nghiêm trọng nhất của cả hệ thống.
+  //
+  // Bản dịch (`translation.title_vi`) do CHÍNH model sinh ra, và nó bị gắn nhãn `inference`.
+  // Nếu đưa nó vào bằng chứng thì model chỉ cần "dịch" điều nó vừa bịa là đủ để lượt sinh
+  // nội dung sau đó được miễn kiểm: đo được là "Bảo hành 12 tháng, chống nước IP68" cho
+  // 4 vi phạm khi bằng chứng rỗng, nhưng **0 vi phạm** khi bản dịch của model đã nói điều đó trước.
+  //
+  // Luật: bằng chứng CHỈ được đến từ nguồn thật (source), từ ảnh (vision), hoặc từ người dùng (user).
+  // Tuyệt đối không lấy văn bản do model sinh làm căn cứ để miễn kiểm cho văn bản do model sinh.
+  for (const f of knowledge?.facts || []) {
+    if (f.provenance === PROVENANCE.INFERENCE) continue;
+    push(f.value);
+  }
   for (const f of knowledge?.visual_features || []) push(f);
   for (const f of knowledge?.visual_text || []) push(f);
   for (const f of knowledge?.colors || []) push(f);
@@ -123,8 +156,9 @@ export function checkContent(content, { evidenceText = '', strict = true } = {})
       // Có trong bằng chứng (nguồn/vision) => hợp lệ.
       if (evidence.includes(hit.toLowerCase())) continue;
 
-      // Với rule định lượng: nếu con số trong hit xuất hiện trong bằng chứng thì bỏ qua.
-      if (rule.id === 'capacity') {
+      // Với luật định lượng: nếu MỌI con số trong hit đều có trong bằng chứng thì bỏ qua.
+      // (Trước đây chỉ áp cho 'capacity' — nay dùng cờ `numeric` để áp cho cả giá.)
+      if (rule.numeric || rule.id === 'capacity' || rule.id === 'spec_unit') {
         const nums = numbersIn(hit);
         const allKnown = [...nums].every((n) => evidenceNumbers.has(n));
         if (allKnown && nums.size > 0) continue;

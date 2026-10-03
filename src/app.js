@@ -51,6 +51,26 @@ export async function createApp(opts = {}) {
     logger: rootLogger,
   });
 
+  // Nếu KHÔNG có người nghe sự kiện 'failed', một job ném lỗi sẽ để `jobs.status` mãi ở
+  // 'running' (queue trong bộ nhớ báo failed, nhưng DB thì không) — và vì front-end chỉ
+  // poll `job.status`, người dùng thấy vòng xoay vĩnh viễn mà không có thông báo lỗi nào.
+  // Verifier độc lập đã dựng được đúng ca này.
+  queue.on('failed', async ({ id, error }) => {
+    try {
+      await store.updateJob(id, {
+        status: 'failed',
+        stage: 'failed',
+        error_code: error?.code || 'JOB_FAILED',
+        error_message: error?.message || 'Job thất bại không rõ nguyên nhân.',
+        finished_at: new Date().toISOString(),
+      });
+      rootLogger.error('queue.job_failed', { job_id: id, error });
+    } catch (err) {
+      // Không được để lỗi khi ghi trạng thái thất bại làm sập tiến trình.
+      rootLogger.error('queue.failed_handler_error', { job_id: id, error: err });
+    }
+  });
+
   const pipeline = new Pipeline({
     config,
     logger: rootLogger,

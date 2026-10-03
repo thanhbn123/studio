@@ -33,6 +33,7 @@ export const USAGE_OPERATIONS = Object.freeze([
 
 export const VERIFICATION_LEVELS = Object.freeze([
   'MOCK_VERIFIED',
+  'MANUAL_INPUT',
   'LIVE_VERIFIED',
   'AUTHENTICATED_LIVE_VERIFIED',
   'BLOCKED',

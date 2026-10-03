@@ -52,8 +52,13 @@ export function loadDotEnv({ cwd = process.cwd(), env = process.env, files } = {
     let parsed;
     try {
       parsed = parseEnv(fs.readFileSync(file, 'utf8'));
-    } catch {
-      continue;
+    } catch (err) {
+      // KHÔNG được `catch { continue; }` ở đây. Nuốt lỗi nghĩa là một `.env` hỏng
+      // (sai quyền, ký tự lạ) khiến ứng dụng chạy bằng giá trị MẶC ĐỊNH trong im lặng —
+      // người vận hành tưởng đã cấu hình mà thật ra chưa. Dừng ngay và nói rõ file nào.
+      const e = new Error(`Không đọc được file cấu hình "${file}": ${err.message}`);
+      e.code = 'ENV_FILE_UNREADABLE';
+      throw e;
     }
     for (const [k, v] of Object.entries(parsed)) {
       if (env[k] === undefined || env[k] === '') env[k] = v;
