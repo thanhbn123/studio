@@ -461,3 +461,31 @@ xác nhận).
 
 **Cách tự kiểm lại toàn bộ:** `npm test` · `npm run verify` · `npm run demo:imagelab` ·
 `cd /tmp/atk6 && node x26-n1-store-gap.mjs` (script của phản biện).
+
+### 12.2 CI trên GitHub — bằng chứng đo trên môi trường KHÁC (Linux)
+
+PR [#20](https://github.com/thanhbn123/studio/pull/20) chạy 5 job, **tất cả PASS**:
+
+| Job | Chứng minh được gì |
+|---|---|
+| Test (Node 24.x, SQLite) | Toàn bộ 428 test chạy trên Linux (khác macOS của Owner); gồm migration DB MVP-01 CŨ và `npm run demo:imagelab` |
+| **Test (PostgreSQL 16)** | `schema.sql` + migration cộng thêm chạy được trên **PostgreSQL 16 THẬT** (3 bảng `image_assets`/`ocr_regions`/`translation_lines` + cột `jobs.kind` được tạo), rồi chạy bộ test trên PG |
+| Smoke test (server khởi động thật) | Server boot thật, `/api/health` trả `imagelab.available = true`, trang chủ phục vụ được, SSRF vẫn bị chặn |
+| Build Docker image | Image dựng được; container chạy health OK; **luồng MVP-02 chạy trong chính image**: sinh ảnh mẫu bằng `tools/` rồi `tools/imagelab-demo.mjs` → `succeeded` + nhãn `MOCK_VERIFIED` (ảnh ghi vào `/data`) |
+| Quét secret | Không có `.env`/API key/cookie bị commit |
+
+**Hai lỗi thật đã lộ ra khi chạy trên Linux** (máy macOS xanh, CI đỏ — đây là giá trị của việc
+chạy trên môi trường khác):
+
+1. `test/imagelab-render.test.js` đòi `encodePng(decodePng(fixture))` giống **từng byte** của file
+   PNG có sẵn. Nén zlib là “tuỳ cài đặt”: cùng pixel nhưng macOS và Linux cho byte/độ dài khác
+   nhau ⇒ **test sai, không phải codec sai**. Đã sửa thành: pixel round-trip y hệt + `encodePng`
+   tất định với cùng input trong cùng tiến trình + không phình quá 4 lần.
+2. Bước CI trong Docker gọi demo với fixture `test/fixtures/…`, nhưng image runtime **cố ý không
+   chứa `test/`** ⇒ nay sinh ảnh mẫu bằng chính `tools/make-test-image.mjs` bên trong image.
+
+**Vẫn chưa đo (dù CI xanh):** provider thật (OCR/dịch/render trả tiền), trình duyệt thật (DOM),
+hai request render đồng thời, và **các method store của MVP-02 trên PostgreSQL** — bộ test
+imagelab luôn chạy SQLite in-memory (`testConfig` ép `DB_DRIVER=sqlite`), nên CI chỉ chứng minh
+**schema + migration** đúng trên PG; phần method store trên PG mới chỉ có tự kiểm thủ công của
+agent C4 (`PG-CHECK: PASS`), chưa thành test thường trực.
