@@ -484,8 +484,14 @@ chạy trên môi trường khác):
 2. Bước CI trong Docker gọi demo với fixture `test/fixtures/…`, nhưng image runtime **cố ý không
    chứa `test/`** ⇒ nay sinh ảnh mẫu bằng chính `tools/make-test-image.mjs` bên trong image.
 
-**Vẫn chưa đo (dù CI xanh):** provider thật (OCR/dịch/render trả tiền), trình duyệt thật (DOM),
-hai request render đồng thời, và **các method store của MVP-02 trên PostgreSQL** — bộ test
-imagelab luôn chạy SQLite in-memory (`testConfig` ép `DB_DRIVER=sqlite`), nên CI chỉ chứng minh
-**schema + migration** đúng trên PG; phần method store trên PG mới chỉ có tự kiểm thủ công của
-agent C4 (`PG-CHECK: PASS`), chưa thành test thường trực.
+**Vẫn chưa đo (dù CI xanh):** provider thật (OCR/dịch/render trả tiền) và trình duyệt thật (DOM).
+
+### 12.3 Hai mục “chưa đo” đã đóng — có test thường trực
+
+| Mục trước đây chỉ là tự kiểm | Nay là test trong repo | Kết quả đo |
+|---|---|---|
+| **Method store MVP-02 trên PostgreSQL** | `test/imagelab-store-postgres.test.js` (5 test, tự BỎ QUA khi không có `DATABASE_URL`): 3 bảng + `jobs.kind`, `init()` chạy LẦN HAI không lỗi, `createJob({kind})`/`getJob`/`listJobs`, **đủ 8 method** (image_assets, ocr_regions, translation_lines), tính **idempotent theo job**, mảng/JSON lồng nhau round-trip, `translatable`/`edited_by_user` giữ đúng boolean, `usage_event` `OCR_DETECT`+`IMAGE_RENDER`, job `awaiting_review` có `finished_at = null`. Mọi dữ liệu tạo ra đều được dọn theo `job_id` | Chạy thật trên **PostgreSQL 16.15** (máy Owner): 5/5 pass. Trên CI, job PostgreSQL 16 set `DATABASE_URL` nên file này cũng chạy ở đó |
+| **Hai request render ĐỒNG THỜI trên cùng một job** | `test/imagelab-concurrency.test.js` (2 test): bắn 2 `POST /render` song song, khẳng định không 5xx, ảnh gốc bất biến (sha256 trên đĩa), mỗi request được nhận để lại **đúng một** asset `rendered` có `parent_id` đúng và `sha256` khớp byte trên đĩa, không có asset rác, job không treo `running`, và số `usage_event IMAGE_RENDER` = số request được nhận | Đo được: **cả hai đều 202** ⇒ tạo **2 asset riêng** (mỗi ảnh một bản ghi có cha chung), **2 usage_event**, `parent_id` đúng cả hai, ảnh gốc không đổi một byte |
+
+Tổng sau khi thêm: `npm test` → **435 test · 434 pass · 0 fail · 1 skipped** (skip duy nhất là ca
+“thiếu `DATABASE_URL`” trong `test/store.test.js`, chỉ chạy khi KHÔNG có PostgreSQL).
