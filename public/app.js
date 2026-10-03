@@ -1425,6 +1425,9 @@ function renderIlNoLines(data) {
 
 /** Cảnh báo THẬT: mock, glyph thiếu, vùng bị bỏ kèm lý do, vi phạm guardrail, PARTIAL. */
 function renderIlWarnings(data) {
+  // Chịu được `data` rỗng/null: hàm này chạy trong luồng render, ném lỗi ở đây sẽ làm trắng
+  // cả trang kết quả. (Test UI bắt được: `renderIlWarnings(null)` từng ném TypeError.)
+  data = data || {};
   const blocks = [];
   const ocr = data.ocr || {};
   const summary = data.render_summary;
