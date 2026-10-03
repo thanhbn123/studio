@@ -33,6 +33,7 @@ npm start          # http://127.0.0.1:3000
 
 ```bash
 npm test                                   # toàn bộ test (không cần mạng, không cần API key)
+npm run verify                             # kiểm cú pháp src/public/tools/test + toàn bộ test
 DATABASE_URL=postgres://... npm test       # bật thêm test PostgreSQL thật
 ```
 
