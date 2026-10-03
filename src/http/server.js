@@ -67,7 +67,14 @@ export class Router {
       if (!m) continue;
       const params = {};
       r.keys.forEach((k, i) => {
-        params[k] = decodeURIComponent(m[i + 1]);
+        // decodeURIComponent ném URIError với mã hoá hỏng (vd /api/jobs/%E0%A4%A).
+        // Trước đây lỗi này thoát ra ngoài và trả HTTP 500 — lỗi của NGƯỜI GỌI mà báo
+        // thành lỗi hệ thống. Phải là 400.
+        try {
+          params[k] = decodeURIComponent(m[i + 1]);
+        } catch {
+          throw new HttpError(400, 'BAD_ENCODING', 'Đường dẫn chứa ký tự mã hoá không hợp lệ.');
+        }
       });
       return { handler: r.handler, params };
     }

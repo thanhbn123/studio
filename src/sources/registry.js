@@ -141,7 +141,11 @@ export class ConnectorRegistry {
     });
     master.extraction.connector = connectorName || source;
     master.extraction.method = 'none';
+    master.extraction.transport = 'none'; // không hề tải được gì
     master.extraction.blocked_reason = `${reason}: ${message}`;
+    // Phải ghi `error_code`: trước đây thiếu nên `determineVerificationLevel` không bao giờ
+    // nhận ra nhánh UNSUPPORTED và luôn trả BLOCKED — một nhánh chết.
+    master.extraction.error_code = reason === 'UNSUPPORTED' ? 'UNSUPPORTED_SOURCE' : reason;
     master.extraction.extracted_at = new Date().toISOString();
     master.title_original_status = st;
     master.description_original_status = st;

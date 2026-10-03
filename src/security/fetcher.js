@@ -106,6 +106,9 @@ async function requestOnce(urlStr, { method, headers, body, timeoutMs, maxBytes,
             headers: res.headers,
             body: buffer,
             finalUrl: url.toString(),
+            // `transport: 'http'` là BẰNG CHỨNG rằng dữ liệu này thật sự đi qua mạng.
+            // Không có nó thì không được phép gọi kết quả là LIVE_VERIFIED.
+            transport: 'http',
           }),
         )
         .catch((err) => done(reject, err));

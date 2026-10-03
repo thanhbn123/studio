@@ -170,6 +170,15 @@ export function isPrivateIPv6(ip) {
   if (allZero) return true;
   if (g.slice(0, 7).every((x) => x === 0) && g[7] === 1) return true; // loopback
 
+  // IPv4-compatible (đã bị deprecate): ::a.b.c.d hoặc dạng viết liền ::7f00:1.
+  // Chỉ xử lý `::ffff:` là KHÔNG đủ — verifier tìm ra `::127.0.0.1` và
+  // `0:0:0:0:0:0:7f00:1` đều lọt qua hàm này.
+  const first6Zero = g.slice(0, 6).every((x) => x === 0);
+  if (first6Zero && !allZero && !(g[7] === 1)) {
+    const v4 = `${(g[6] >> 8) & 0xff}.${g[6] & 0xff}.${(g[7] >> 8) & 0xff}.${g[7] & 0xff}`;
+    if (isPrivateIPv4(v4)) return true;
+  }
+
   if ((g[0] & 0xfe00) === 0xfc00) return true; // fc00::/7 unique local
   if ((g[0] & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
   if ((g[0] & 0xff00) === 0xff00) return true; // ff00::/8 multicast

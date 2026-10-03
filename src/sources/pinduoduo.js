@@ -171,7 +171,10 @@ export class PinduoduoConnector extends ProductSourceConnector {
       master.extraction.field_status = {
         ...(master.extraction.field_status || {}),
         images: STATUS.LOGIN_REQUIRED,
-        videos: STATUS.NOT_FOUND,
+        // KHÔNG được đặt NOT_FOUND ở đây. Trang này chỉ là shell JS rỗng — ta KHÔNG đọc
+        // được nội dung, nên "trang không có video" là khẳng định ta không có cơ sở.
+        // NOT_FOUND chỉ đúng khi ĐỌC ĐƯỢC trang và thật sự không thấy video.
+        videos: STATUS.LOGIN_REQUIRED,
         variants: STATUS.LOGIN_REQUIRED,
         attributes: STATUS.LOGIN_REQUIRED,
         price: STATUS.LOGIN_REQUIRED,

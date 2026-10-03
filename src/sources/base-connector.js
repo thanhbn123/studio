@@ -225,6 +225,9 @@ export class ProductSourceConnector {
       redirects: res.redirects,
       bytes: res.body.length,
       method: 'http-get',
+      // Chỉ `safeFetch` thật mới gắn 'http'. Fetcher giả trong test không gắn,
+      // nên tầng kiểm chứng phân biệt được dữ liệu THẬT với dữ liệu fixture.
+      transport: res.transport || 'unknown',
     };
   }
 
@@ -312,6 +315,7 @@ export class ProductSourceConnector {
       master.extraction.final_url = raw.finalUrl || target;
       master.extraction.bytes = raw.bytes ?? 0;
       master.extraction.method = raw.method || 'http-get';
+      master.extraction.transport = raw.transport || 'unknown';
       if (raw.redirects?.length) master.extraction.redirects = raw.redirects;
 
       const cls = classifyPage(raw.html, { url: raw.finalUrl || target });
@@ -329,8 +333,22 @@ export class ProductSourceConnector {
       master.description_original_status = st;
       master.price.status = st;
       master.store.status = st;
-      master.extraction.field_status = { ...(master.extraction.field_status || {}), ...{} };
       master.extraction.error_code = err.code || err.name;
+      master.extraction.transport = 'none';
+      // Trạng thái field phải NHẤT QUÁN: mọi field đều thất bại cùng một lý do.
+      // Trước đây chỉ 4/8 field được đặt, 4 field còn lại rơi về NOT_FOUND —
+      // trông như "trang không có field này" trong khi thật ra là bị chặn.
+      master.extraction.field_status = {
+        ...(master.extraction.field_status || {}),
+        images: st,
+        videos: st,
+        variants: st,
+        attributes: st,
+        title_original: st,
+        description_original: st,
+        price: st,
+        store: st,
+      };
       addWarning(master, `Trích xuất thất bại: ${err.message}`);
       this.logger?.warn('connector.extract_failed', {
         source: this.source,

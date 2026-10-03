@@ -146,7 +146,13 @@ describe('G05 — Pinduoduo connector', () => {
     assert.equal(m.images.length, 0);
     assert.equal(m.price.status, STATUS.LOGIN_REQUIRED);
     assert.equal(m.videos.length, 0);
-    assert.equal(m.extraction.field_status.videos, STATUS.NOT_FOUND, 'video phải NOT_FOUND, không được suy diễn');
+    // Trang chỉ là shell JS rỗng — ta KHÔNG đọc được nội dung, nên không được khẳng định
+    // "trang không có video". NOT_FOUND chỉ đúng khi đọc được trang mà thật sự không thấy video.
+    assert.equal(
+      m.extraction.field_status.videos,
+      STATUS.LOGIN_REQUIRED,
+      'trang không đọc được thì video phải là LOGIN_REQUIRED, không phải NOT_FOUND',
+    );
     assert.ok(m.extraction.login_required, 'phải báo cần session');
   });
 

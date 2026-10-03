@@ -110,10 +110,10 @@ describe('Guardrails chống bịa', () => {
     assert.ok(out.includes('Câu sạch thứ hai'));
   });
 
-  test('có đủ 9 nhóm luật chống bịa', () => {
-    assert.equal(CLAIM_RULES.length, 9);
+  test('có đủ 11 nhóm luật chống bịa', () => {
+    assert.equal(CLAIM_RULES.length, 11);
     const ids = CLAIM_RULES.map((r) => r.id);
-    for (const must of ['warranty', 'certification', 'waterproof', 'spec_unit', 'capacity', 'material', 'origin', 'price_claim', 'rating']) {
+    for (const must of ['warranty', 'certification', 'waterproof', 'spec_unit', 'capacity', 'material', 'origin', 'price_claim', 'price_value', 'rating', 'overclaim']) {
       assert.ok(ids.includes(must), `thiếu nhóm luật ${must}`);
     }
   });
@@ -128,30 +128,22 @@ describe('Guardrails chống bịa', () => {
    * có test thường trực. Thêm cách nói mới thì thêm dòng vào bảng dưới.
    */
   test('BẮT được các cách NÓI VÒNG phổ biến của tiếng Việt', () => {
+    // Bảng này là danh sách verifier ĐỘC LẬP tìm ra là lọt lưới ở các bản trước
+    // (lần đầu 13/23, sau khi siết vẫn còn 42/79). Mỗi câu ở đây từng là một lỗ thật.
     const paraphrases = [
-      'Sản phẩm được BH 12 tháng tại hãng.',
-      'Bảo đảm trong vòng 1 năm nếu lỗi.',
-      'Hỗ trợ đổi trả trong 12 tháng.',
-      'Ngâm nước thoải mái không hỏng.',
-      'Đi mưa không sao, kháng ẩm tốt.',
-      'Đạt chuẩn IP68.',
-      'Chứa được 5 lít nước.',
-      'Bình 500 ml tiện lợi.',
-      'Pin 5000 mAh dùng cả ngày.',
-      'Công suất 1200 W mạnh mẽ.',
-      'Làm bằng da bò thật 100%.',
-      'Vải cotton thoáng mát.',
-      'Chất liệu inox 304.',
-      'Hàng nội địa Trung, nhập khẩu chính hãng.',
-      'Sản xuất tại Đức.',
-      'Hơn 10 nghìn người mua tin dùng.',
-      'Được đánh giá 4.9 sao.',
-      '1000+ review 5 sao.',
-      'Sale 50% toàn bộ.',
-      'Tặng kèm túi đựng.',
-      'Miễn phí giao hàng toàn quốc.',
-      'Số lượng có hạn, nhanh tay!',
-      'Giảm 30% hôm nay.',
+      'chống thấm', 'chống bụi nước', 'IPX7', '5ATM', 'lặn sâu 50m', 'rửa trực tiếp dưới vòi nước',
+      'pin 5000 miliampe', 'công suất 2000 oát', 'nặng 2 ký', 'cao 1m8', 'dài 30 phân',
+      'dung tích 5 xị', 'pin dùng được 3 ngày',
+      'da PU cao cấp', 'gỗ sồi tự nhiên', 'hợp kim nhôm', 'thủy tinh cường lực', 'vàng 18K',
+      'bạc 925', 'da microfiber',
+      'hàng Quảng Châu', 'hàng xách tay', 'nguồn hàng tận xưởng',
+      'mua 1 tặng 1', 'tặng ngay 1 sản phẩm', 'free ship', 'giá chỉ 99k', 'voucher 50k',
+      'flash sale', 'đồng giá 199k',
+      '10.000+ đơn hàng', 'được yêu thích nhất',
+      'đạt chuẩn châu Âu', 'an toàn thực phẩm', 'không chứa BPA', 'đạt chuẩn xuất khẩu',
+      'tốt nhất thị trường', 'số 1 Việt Nam', 'độc quyền', 'an toàn tuyệt đối cho trẻ em',
+      'chữa khỏi bệnh', 'giảm cân thần tốc',
+      'Sản phẩm có giá 500.000đ', 'chỉ 199 nghìn đồng',
     ];
     const missed = [];
     for (const text of paraphrases) {
@@ -159,6 +151,62 @@ describe('Guardrails chống bịa', () => {
       if (r.passed) missed.push(text);
     }
     assert.deepEqual(missed, [], `các câu sau lọt lưới chống bịa:\n${missed.join('\n')}`);
+  });
+
+  test('REGRESSION: `\\b` của JS chỉ hiểu ASCII — không dùng quanh từ tiếng Việt', () => {
+    // `\b(?:…|đạt chuẩn|…)` KHÔNG BAO GIỜ khớp vì 'đ' không phải ký tự \w.
+    // Đây từng làm hai nhánh luật thành mã chết. Test này khoá lại đúng lớp lỗi đó.
+    const nonAsciiStarts = [];
+    const MARKER = '\\b(?:'; // ký tự thật trong rule.re.source: \ b ( ? :
+    for (const rule of CLAIM_RULES) {
+      const src = rule.re.source;
+      let idx = src.indexOf(MARKER);
+      while (idx !== -1) {
+        const firstAlt = src.slice(idx + MARKER.length).split('|')[0];
+        if (firstAlt && firstAlt.charCodeAt(0) > 127) nonAsciiStarts.push(`${rule.id} → ${firstAlt}`);
+        idx = src.indexOf(MARKER, idx + 1);
+      }
+    }
+    assert.deepEqual(nonAsciiStarts, [], `luật có \\b trước nhánh non-ASCII (nhánh chết): ${nonAsciiStarts}`);
+    // Và phải khẳng định bằng HÀNH VI, không chỉ bằng hình dạng regex.
+    for (const text of ['đạt chuẩn châu Âu', 'được đánh giá 4.9 sao']) {
+      const r = checkContent(baseContent({ detailed_description: text }), { evidenceText: '' });
+      assert.equal(r.passed, false, `"${text}" phải bị bắt`);
+    }
+  });
+
+  test('REGRESSION: bằng chứng VÒNG — không lấy văn bản do model sinh làm căn cứ', () => {
+    // Lỗ hổng tốn kém nhất: bản dịch do CHÍNH model sinh bị gắn nhãn inference nhưng vẫn
+    // được đưa vào bằng chứng, nên model chỉ cần "dịch" điều nó vừa bịa là lượt sau được miễn kiểm.
+    const emptyMaster = {
+      source: '1688', title_original: '', images: [], videos: [], variants: [], attributes: [],
+      price: { raw: '', currency: 'CNY', status: 'NOT_FOUND', kind: 'unknown', tiers: [] },
+      description_original: '', store: { name: '', id: '', url: '', status: 'NOT_FOUND' },
+      extraction: { warnings: [], field_status: {} },
+    };
+    const lie = 'Bảo hành 12 tháng, chống nước IP68';
+    const knowledge = mergeKnowledge(emptyMaster, null, {
+      translation: { title_vi: lie, description_vi: lie },
+    });
+    const evidence = buildEvidenceText(emptyMaster, knowledge, null);
+    assert.ok(!/bảo hành|chống nước/i.test(evidence), 'bằng chứng KHÔNG được chứa văn bản model tự sinh');
+
+    const r = checkContent(baseContent({ detailed_description: lie }), { evidenceText: evidence });
+    assert.equal(r.passed, false, 'nội dung bịa phải bị bắt dù model đã "dịch" nó trước');
+    assert.ok(r.violations.length > 0);
+  });
+
+  test('KHÔNG bắt oan câu TRÍCH DẪN TRUNG THỰC của sàn (có bằng chứng)', () => {
+    // Câu này từng bị bắt oan vì chứa chữ "khuyến mãi" — nhưng nó chỉ trích lại
+    // đúng ghi chú giá của chính Taobao. Bắt oan làm hỏng nội dung thật.
+    const evidence = 'Nơi xuất xứ (theo sàn) 浙江金華 Ghi chú giá (sàn) 價格可能因優惠活動發生變化 15.00'.toLowerCase();
+    for (const text of [
+      'Giá tham khảo trên sàn: 15.00 CNY (giá có thể thay đổi theo chương trình khuyến mãi của sàn)',
+      'Nơi xuất xứ theo sàn: Chiết Giang, Kim Hoa',
+    ]) {
+      const r = checkContent(baseContent({ detailed_description: text }), { evidenceText: evidence });
+      assert.equal(r.passed, true, `bắt oan: ${text} → ${JSON.stringify(r.violations.map((v) => v.matched))}`);
+    }
   });
 
   test('KHÔNG bắt nhầm nội dung sạch (không có dương tính giả)', () => {

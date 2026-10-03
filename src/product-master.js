@@ -160,7 +160,15 @@ export function recomputeEvidence(master) {
     else missing.push(field);
   };
 
-  mark('title_original', master.title_original ? master.title_original_status || STATUS.FOUND : STATUS.NOT_FOUND);
+  // Khi field RỖNG, phải tôn trọng status đã được đặt sẵn (BLOCKED/LOGIN_REQUIRED/UNSUPPORTED).
+  // Trước đây luôn ghi đè thành NOT_FOUND, tạo mâu thuẫn ngay trong CÙNG một object:
+  // field_status.title_original = NOT_FOUND trong khi evidenceTable báo UNSUPPORTED.
+  mark(
+    'title_original',
+    master.title_original
+      ? master.title_original_status || STATUS.FOUND
+      : master.title_original_status || STATUS.NOT_FOUND,
+  );
 
   const imgFound = master.images.filter((i) => i.status === STATUS.FOUND);
   mark('images', imgFound.length > 0 ? STATUS.FOUND : master.extraction.field_status?.images || STATUS.NOT_FOUND);
@@ -173,7 +181,9 @@ export function recomputeEvidence(master) {
   mark('price', master.price.status || STATUS.NOT_FOUND);
   mark(
     'description_original',
-    master.description_original ? master.description_original_status || STATUS.FOUND : STATUS.NOT_FOUND,
+    master.description_original
+      ? master.description_original_status || STATUS.FOUND
+      : master.description_original_status || STATUS.NOT_FOUND,
   );
   mark('store', master.store?.name ? master.store.status || STATUS.FOUND : master.store?.status || STATUS.NOT_FOUND);
 
@@ -278,22 +288,49 @@ export function evidenceTable(master) {
   // Trước đây chỉ mỗi dòng "Video" tra field_status, còn Ảnh/SKU/Thuộc tính hardcode
   // NOT_FOUND — che mất sự thật là trang bị chặn.
   const fs = master.extraction?.field_status || {};
-  const st = (key, count) => (count > 0 ? STATUS.FOUND : fs[key] || STATUS.NOT_FOUND);
+
+  /**
+   * Trạng thái của một dòng bằng chứng.
+   *
+   * Hai luật, cả hai đều sinh ra từ lỗi thật mà verifier độc lập tìm ra:
+   *  1. `count` phải là SỐ PHẦN TỬ CÓ status === FOUND, không phải độ dài mảng. Bản trước
+   *     lấy `master.images.length`, nên một ảnh mang status LOGIN_REQUIRED vẫn hiện
+   *     "Ảnh FOUND (1 FOUND)" trong khi `summary.images_found = 0`.
+   *  2. `field_status` phải THẮNG giá trị NOT_FOUND mặc định. Nếu nó nói LOGIN_REQUIRED /
+   *     BLOCKED / UNSUPPORTED thì đó mới là lý do thật; để NOT_FOUND hiện ra là che mất
+   *     sự thật "trang bị chặn" và biến nó thành "trang không có field này".
+   */
+  const resolveStatus = (explicit, key, arrived, arr = []) => {
+    if (arrived) return STATUS.FOUND;
+    const fromField = fs[key];
+    if (fromField && fromField !== STATUS.NOT_FOUND) return fromField;
+    // Lý do có thể nằm ngay trên CHÍNH các phần tử: một ảnh mang status LOGIN_REQUIRED
+    // tự nó đã nói "cần đăng nhập", không cần field_status nhắc lại.
+    const fromItem = arr.find((x) => x && x.status && x.status !== STATUS.FOUND)?.status;
+    if (fromItem) return fromItem;
+    return explicit || fromField || STATUS.NOT_FOUND;
+  };
+  const arrivedCount = (arr) => countStatus(arr, STATUS.FOUND);
 
   const rows = [
-    row('Ảnh', st('images', master.images.length), `${master.images.length} FOUND`),
-    row('Video', st('videos', master.videos.length), `${master.videos.length} FOUND`),
-    row('SKU / Biến thể', st('variants', master.variants.length), `${master.variants.length} FOUND`),
-    row('Thuộc tính', st('attributes', master.attributes.length), `${master.attributes.length} FOUND`),
-    row('Tiêu đề gốc', master.title_original ? STATUS.FOUND : master.title_original_status || fs.title_original || STATUS.NOT_FOUND, master.title_original ? 'FOUND' : 'NOT_FOUND'),
-    row('Giá hiển thị', master.price.status, master.price.raw ? `${master.price.kind}: ${master.price.raw}` : 'NOT_FOUND'),
+    row('Ảnh', resolveStatus(null, 'images', arrivedCount(master.images), master.images), `${arrivedCount(master.images)} FOUND`),
+    row('Video', resolveStatus(null, 'videos', arrivedCount(master.videos), master.videos), `${arrivedCount(master.videos)} FOUND`),
+    row('SKU / Biến thể', resolveStatus(null, 'variants', arrivedCount(master.variants), master.variants), `${arrivedCount(master.variants)} FOUND`),
+    row('Thuộc tính', resolveStatus(null, 'attributes', arrivedCount(master.attributes), master.attributes), `${arrivedCount(master.attributes)} FOUND`),
+    row(
+      'Tiêu đề gốc',
+      resolveStatus(master.title_original_status, 'title_original', Boolean(master.title_original)),
+      master.title_original ? 'FOUND' : 'NOT_FOUND',
+    ),
+    row('Giá hiển thị', resolveStatus(master.price?.status, 'price', Boolean(master.price?.raw)), master.price?.raw ? `${master.price.kind}: ${master.price.raw}` : 'NOT_FOUND'),
     row(
       'Mô tả',
-      master.description_original ? STATUS.FOUND : master.description_original_status || fs.description_original || STATUS.NOT_FOUND,
+      resolveStatus(master.description_original_status, 'description_original', Boolean(master.description_original)),
       master.description_original ? `${master.description_original.length} ký tự` : 'NOT_FOUND',
     ),
-    row('Cửa hàng', master.store?.name ? STATUS.FOUND : master.store?.status || fs.store || STATUS.NOT_FOUND, master.store?.name || '—'),
+    row('Cửa hàng', resolveStatus(master.store?.status, 'store', Boolean(master.store?.name)), master.store?.name || '—'),
   ];
+
 
   return {
     connector: master.extraction?.connector || master.source,
