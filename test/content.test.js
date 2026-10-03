@@ -110,8 +110,72 @@ describe('Guardrails chống bịa', () => {
     assert.ok(out.includes('Câu sạch thứ hai'));
   });
 
-  test('có đủ 8 nhóm luật chống bịa', () => {
-    assert.equal(CLAIM_RULES.length, 8);
+  test('có đủ 9 nhóm luật chống bịa', () => {
+    assert.equal(CLAIM_RULES.length, 9);
+    const ids = CLAIM_RULES.map((r) => r.id);
+    for (const must of ['warranty', 'certification', 'waterproof', 'spec_unit', 'capacity', 'material', 'origin', 'price_claim', 'rating']) {
+      assert.ok(ids.includes(must), `thiếu nhóm luật ${must}`);
+    }
+  });
+
+  /**
+   * REGRESSION — cách NÓI VÒNG của tiếng Việt.
+   *
+   * Bộ luật đầu tiên chỉ bắt cách nói thẳng ("bảo hành 24 tháng", "chống nước IP68").
+   * Khi tự thử 23 cách diễn đạt lại thường gặp, **13 cách lọt lưới** — ví dụ "BH 12 tháng",
+   * "đi mưa không sao", "Pin 5000 mAh", "Sale 50%", "Hơn 10 nghìn người mua".
+   * Đây là lỗ hổng thật của một sản phẩm mà lời hứa cốt lõi là chống bịa, nên nó phải
+   * có test thường trực. Thêm cách nói mới thì thêm dòng vào bảng dưới.
+   */
+  test('BẮT được các cách NÓI VÒNG phổ biến của tiếng Việt', () => {
+    const paraphrases = [
+      'Sản phẩm được BH 12 tháng tại hãng.',
+      'Bảo đảm trong vòng 1 năm nếu lỗi.',
+      'Hỗ trợ đổi trả trong 12 tháng.',
+      'Ngâm nước thoải mái không hỏng.',
+      'Đi mưa không sao, kháng ẩm tốt.',
+      'Đạt chuẩn IP68.',
+      'Chứa được 5 lít nước.',
+      'Bình 500 ml tiện lợi.',
+      'Pin 5000 mAh dùng cả ngày.',
+      'Công suất 1200 W mạnh mẽ.',
+      'Làm bằng da bò thật 100%.',
+      'Vải cotton thoáng mát.',
+      'Chất liệu inox 304.',
+      'Hàng nội địa Trung, nhập khẩu chính hãng.',
+      'Sản xuất tại Đức.',
+      'Hơn 10 nghìn người mua tin dùng.',
+      'Được đánh giá 4.9 sao.',
+      '1000+ review 5 sao.',
+      'Sale 50% toàn bộ.',
+      'Tặng kèm túi đựng.',
+      'Miễn phí giao hàng toàn quốc.',
+      'Số lượng có hạn, nhanh tay!',
+      'Giảm 30% hôm nay.',
+    ];
+    const missed = [];
+    for (const text of paraphrases) {
+      const r = checkContent(baseContent({ detailed_description: text }), { evidenceText: '' });
+      if (r.passed) missed.push(text);
+    }
+    assert.deepEqual(missed, [], `các câu sau lọt lưới chống bịa:\n${missed.join('\n')}`);
+  });
+
+  test('KHÔNG bắt nhầm nội dung sạch (không có dương tính giả)', () => {
+    const clean = baseContent({
+      product_name: 'Tai nghe chụp tai không dây',
+      headline: 'Êm ái cho học tập và làm việc',
+      short_description: 'Thiết kế ôm trọn vành tai, đeo lâu không mỏi.',
+      selling_points: ['Kết nối không dây tiện lợi', 'Kiểu dáng gọn gàng, dễ mang theo'],
+      detailed_description: 'Phù hợp cho học tập, làm việc và giải trí hàng ngày.',
+      facebook_caption: 'Một lựa chọn tiện lợi cho người cần đeo thoải mái cả ngày.',
+      tiktok_caption: 'Đeo êm, mang đi học đi làm đều tiện.',
+      marketplace_description: 'Thiết kế chụp tai, kết nối không dây.',
+      hashtags: ['#tainghe', '#hoconline'],
+      seo: { title: 'Tai nghe chụp tai không dây', meta_description: 'Thiết kế êm ái, tiện lợi.', keywords: ['tai nghe chụp tai'] },
+    });
+    const r = checkContent(clean, { evidenceText: '' });
+    assert.equal(r.passed, true, `bắt nhầm: ${JSON.stringify(r.violations.map((v) => v.matched))}`);
   });
 });
 

@@ -101,10 +101,18 @@ Mọi dữ kiện trong `knowledge.facts` đều mang `provenance`:
 ### 3.3 Chống bịa hai tầng
 
 1. **Prompt** bị chặn bằng *fact sheet* — danh sách ĐÓNG các dữ kiện được phép dùng.
-2. **Guardrails** chạy trên văn bản đã sinh (8 nhóm luật: bảo hành, chứng nhận, chống nước,
-   thông số kỹ thuật, chất liệu, nguồn gốc, khuyến mãi, số liệu xã hội). Nếu phát hiện khẳng
-   định không có bằng chứng, engine **tự gọi một lượt sửa**; nếu vẫn còn thì nội dung được trả
-   về kèm `guardrails_passed = false` và UI hiện cảnh báo — **không bao giờ im lặng**.
+2. **Guardrails** chạy trên văn bản đã sinh (9 nhóm luật: bảo hành, chứng nhận, chống nước,
+   đơn vị thông số, dung tích/công suất, chất liệu, nguồn gốc, khuyến mãi, số liệu xã hội).
+   Nếu phát hiện khẳng định không có bằng chứng, engine **tự gọi một lượt sửa**; nếu vẫn còn
+   thì nội dung được trả về kèm `guardrails_passed = false` và UI hiện cảnh báo —
+   **không bao giờ im lặng**.
+
+   > **Bài học đã trả giá.** Bộ luật đầu tiên chỉ bắt **cách nói thẳng**. Khi tự thử phá chính
+   > mình bằng 23 cách **diễn đạt lại** thường gặp của tiếng Việt, **13 cách lọt lưới** —
+   > "BH 12 tháng", "đi mưa không sao", "Pin 5000 mAh", "Sale 50%", "Hơn 10 nghìn người mua".
+   > Đã vá (10/23 → **23/23**) và **khoá lại bằng test thường trực**, kèm một test chống
+   > dương tính giả trên nội dung sạch. Regex bắt được cái đã biết, không bắt được cái chưa
+   > nghĩ tới — nên lỗ hổng này phải có test canh, không thể chỉ dựa vào việc "đã viết kỹ".
 
 ---
 
