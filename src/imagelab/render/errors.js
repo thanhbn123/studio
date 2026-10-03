@@ -67,6 +67,12 @@ export const RENDER_CODES = Object.freeze({
    * vùng bảo vệ nào — ảnh giao cho khách phải cùng khung hình với ảnh gốc).
    */
   RENDER_SIZE_MISMATCH: 'RENDER_SIZE_MISMATCH',
+  /**
+   * Vòng 6 (N-13): ảnh trả về CÓ ops nhưng repo KHÔNG giải mã được (PNG palette/1-bit/
+   * interlaced, hoặc định dạng khác PNG) ⇒ không đo được pixel nào. Vẫn lưu được nhưng
+   * KHÔNG được báo `OK` như thể đã kiểm: hạ `PARTIAL` + cảnh báo nói thẳng.
+   */
+  RENDER_OUTPUT_UNVERIFIED: 'RENDER_OUTPUT_UNVERIFIED',
 });
 
 /**

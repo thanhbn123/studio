@@ -314,3 +314,132 @@ describe('VÒNG 5 · N-11 — `only_region_ids` rỗng / rác phải fail-closed
     }
   });
 });
+
+/* ───────── N-12/N-13 (vòng 6 — phản biện chấm cuối): hậu kiểm đến từng vùng ───────── */
+
+const BOX_A = { x: 4, y: 4, w: 20, h: 10 };
+const BOX_B = { x: 40, y: 40, w: 20, h: 10 };
+const RED_FILL = [255, 0, 0, 255];
+
+/** Đổi một hộp thành trắng (RGB đổi thật) trong ảnh RGBA. */
+function whiten(rgba, box) {
+  const out = Buffer.from(rgba);
+  for (let y = box.y; y < box.y + box.h; y += 1) {
+    for (let x = box.x; x < box.x + box.w; x += 1) {
+      const i = (y * W + x) * 4;
+      out[i] = 255;
+      out[i + 1] = 255;
+      out[i + 2] = 255;
+      out[i + 3] = 255;
+    }
+  }
+  return out;
+}
+
+/** Đổi CHỈ kênh alpha trong một hộp — không có thay đổi RGB nhìn thấy được. */
+function alphaOnly(rgba, box, alpha = 128) {
+  const out = Buffer.from(rgba);
+  for (let y = box.y; y < box.y + box.h; y += 1) {
+    for (let x = box.x; x < box.x + box.w; x += 1) {
+      out[(y * W + x) * 4 + 3] = alpha;
+    }
+  }
+  return out;
+}
+
+/** Ép IHDR sang color type 3 (palette) + tính lại CRC ⇒ `probeImage` vẫn đọc được kích
+ *  thước, nhưng `decodePng` của repo KHÔNG giải mã được (đúng ca N-13). */
+function asPalettePng(png) {
+  const buf = Buffer.from(png);
+  buf[25] = 3;
+  buf.writeUInt32BE(crc32(buf.subarray(12, 29)) >>> 0, 29);
+  return buf;
+}
+
+describe('VÒNG 6 · N-12 — hậu kiểm phải ĐẾN TỪNG VÙNG, không chỉ "có hộp nào đó đổi"', () => {
+  test('remote vẽ 1/2 op mà khai cả 2 ⇒ PARTIAL + bỏ vùng KHÔNG được vẽ khỏi `applied`', async () => {
+    const image = tinyImage([
+      { box: BOX_A, rgba: RED_FILL },
+      { box: BOX_B, rgba: RED_FILL },
+    ]);
+    const provider = new FakeRemoteRenderProvider(({ image: img }) => {
+      const data = whiten(rgbaOf(img.buffer), BOX_A); // chỉ vẽ op đầu
+      const buf = pngFromRgba(data);
+      return {
+        status: 'OK',
+        output: { buffer: buf, mime: 'image/png', width: W, height: H },
+        applied: [{ region_id: 'r1', box: BOX_A }, { region_id: 'r2', box: BOX_B }], // khai khống r2
+        skipped: [],
+        warnings: ['server giả: chỉ vẽ 1/2 op'],
+      };
+    });
+
+    const res = await provider.render({
+      image: { buffer: image, mime: 'image/png' },
+      ops: [
+        { region_id: 'r1', box: BOX_A, action: 'erase' },
+        { region_id: 'r2', box: BOX_B, action: 'erase' },
+      ],
+    });
+
+    assert.equal(res.status, 'PARTIAL', 'vẽ thiếu vùng thì không được báo OK');
+    assert.equal(res.error_code, 'RENDER_APPLIED_MISMATCH');
+    assert.deepEqual(
+      res.applied.map((a) => a.region_id),
+      ['r1'],
+      'vùng r2 không đổi pixel RGB thì KHÔNG được coi là đã vẽ',
+    );
+    assert.match(res.warnings.join(' '), /r2/);
+  });
+
+  test('remote chỉ đổi kênh ALPHA ⇒ không tính là đã vẽ (PARTIAL + NO_OPS)', async () => {
+    const image = tinyImage();
+    const provider = new FakeRemoteRenderProvider(({ image: img }) => {
+      const buf = pngFromRgba(alphaOnly(rgbaOf(img.buffer), BOX_A));
+      return {
+        status: 'OK',
+        output: { buffer: buf, mime: 'image/png', width: W, height: H },
+        applied: [{ region_id: 'r1', box: BOX_A }],
+        skipped: [],
+        warnings: ['server giả: chỉ đổi alpha'],
+      };
+    });
+
+    const res = await provider.render({
+      image: { buffer: image, mime: 'image/png' },
+      ops: [{ region_id: 'r1', box: BOX_A, action: 'erase' }],
+    });
+
+    assert.notEqual(res.status, 'OK');
+    assert.equal(res.error_code, 'NO_OPS');
+    assert.deepEqual(res.applied, []);
+  });
+});
+
+describe('VÒNG 6 · N-13 — không giải mã được ảnh trả về thì KHÔNG được báo OK', () => {
+  test('PNG palette (repo không giải mã được), KHÔNG có vùng bảo vệ ⇒ PARTIAL + RENDER_OUTPUT_UNVERIFIED', async () => {
+    const image = tinyImage([{ box: BOX_A, rgba: RED_FILL }]);
+    const provider = new FakeRemoteRenderProvider(({ image: img }) => {
+      const data = whiten(rgbaOf(img.buffer), BOX_A);
+      const buf = asPalettePng(pngFromRgba(data));
+      return {
+        status: 'OK',
+        output: { buffer: buf, mime: 'image/png', width: W, height: H },
+        applied: [{ region_id: 'r1', box: BOX_A }],
+        skipped: [],
+        warnings: ['server giả: PNG palette'],
+      };
+    });
+
+    const res = await provider.render({
+      image: { buffer: image, mime: 'image/png' },
+      ops: [{ region_id: 'r1', box: BOX_A, action: 'erase' }],
+      options: { protected_boxes: [] }, // job KHÔNG có vùng bảo vệ — đúng ca N-13
+    });
+
+    assert.notEqual(res.status, 'OK', 'không đo được pixel nào thì không được báo OK');
+    assert.equal(res.status, 'PARTIAL');
+    assert.equal(res.error_code, 'RENDER_OUTPUT_UNVERIFIED');
+    assert.match(res.warnings.join(' '), /KHÔNG kiểm chứng được pixel/);
+  });
+});

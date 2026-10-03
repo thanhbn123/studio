@@ -31,15 +31,17 @@ export const PROTECTED_CHECK = Object.freeze({
   PROTECTED_PIXELS_CHANGED: 'PROTECTED_PIXELS_CHANGED',
 });
 
-/** Đếm pixel khác nhau trong một hộp giữa hai ảnh RGBA cùng kích thước. */
-function countChangedInBox(before, after, box, width) {
+/** Đếm pixel khác nhau trong một hộp giữa hai ảnh RGBA cùng kích thước.
+ *  `includeAlpha = false` ⇒ chỉ tính thay đổi RGB NHÌN THẤY ĐƯỢC (N-12: đổi mỗi kênh alpha
+ *  không phải là "đã vẽ chữ"). */
+function countChangedInBox(before, after, box, width, includeAlpha = true) {
   let changed = 0;
   for (let y = box.y; y < box.y + box.h; y += 1) {
     for (let x = box.x; x < box.x + box.w; x += 1) {
       const i = (y * width + x) * 4;
-      if (before[i] !== after[i] || before[i + 1] !== after[i + 1] || before[i + 2] !== after[i + 2] || before[i + 3] !== after[i + 3]) {
-        changed += 1;
-      }
+      const rgbDiff = before[i] !== after[i] || before[i + 1] !== after[i + 1] || before[i + 2] !== after[i + 2];
+      const alphaDiff = before[i + 3] !== after[i + 3];
+      if (rgbDiff || (includeAlpha && alphaDiff)) changed += 1;
     }
   }
   return changed;
@@ -52,20 +54,28 @@ function countChangedInBox(before, after, box, width) {
  *      decode-rồi-encode lại: ảnh khác byte nhưng y hệt pixel).
  *
  * @param {{originalBuffer: Buffer, outputBuffer: Buffer,
- *          protectedBoxes?: Array, opBoxes?: Array, maxPixels?: number}} params
+ *          protectedBoxes?: Array, opBoxes?: Array, opEntries?: Array, maxPixels?: number}} params
+ *   `opEntries`: `[{ region_id, box }]` — để hậu kiểm ĐẾN TỪNG VÙNG (N-12), không chỉ
+ *   "có ít nhất một hộp đổi".
  * @returns {{readable: boolean, reason: string, mime: string|null,
- *            protectedChanged: Array, opBoxesChanged: number, opBoxesTotal: number, detail?: string}}
+ *            protectedChanged: Array, opBoxesChanged: number, opBoxesTotal: number,
+ *            opEntries: Array<{region_id: string|null, box: object|null, changedRgb: number, drawn: boolean}>,
+ *            detail?: string}}
  */
-export function inspectRenderedPixels({ originalBuffer, outputBuffer, protectedBoxes = [], opBoxes = [], maxPixels } = {}) {
+export function inspectRenderedPixels({ originalBuffer, outputBuffer, protectedBoxes = [], opBoxes = [], opEntries, maxPixels } = {}) {
   const pBoxes = Array.isArray(protectedBoxes) ? protectedBoxes.filter(Boolean) : [];
-  const oBoxes = Array.isArray(opBoxes) ? opBoxes.filter(Boolean) : [];
+  // Nhận cả hai dạng: mảng hộp thuần (tương thích cũ) hoặc mảng `{ region_id, box }` (N-12).
+  const oEntries = (Array.isArray(opEntries) && opEntries.length > 0 ? opEntries : opBoxes)
+    .filter(Boolean)
+    .map((e) => (e && e.box ? { region_id: e.region_id ?? null, box: e.box } : { region_id: null, box: e }));
   const empty = {
     readable: false,
     reason: PROTECTED_CHECK.OUTPUT_UNREADABLE,
     mime: null,
     protectedChanged: [],
     opBoxesChanged: 0,
-    opBoxesTotal: oBoxes.length,
+    opBoxesTotal: oEntries.length,
+    opEntries: [],
   };
   if (!originalBuffer || !outputBuffer) return { ...empty, detail: 'thiếu buffer ảnh gốc hoặc ảnh trả về' };
 
@@ -110,10 +120,19 @@ export function inspectRenderedPixels({ originalBuffer, outputBuffer, protectedB
   }
 
   let opBoxesChanged = 0;
-  for (const raw of oBoxes) {
-    const box = clampBox(raw, dims);
-    if (!box) continue;
-    if (countChangedInBox(before, after, box, dims.width) > 0) opBoxesChanged += 1;
+  const opDetail = [];
+  for (const entry of oEntries) {
+    const box = clampBox(entry.box, dims);
+    if (!box) {
+      opDetail.push({ region_id: entry.region_id, box: null, changedRgb: 0, drawn: false });
+      continue;
+    }
+    // N-12: "đã vẽ" phải là thay đổi RGB NHÌN THẤY ĐƯỢC — đổi mỗi alpha không tính,
+    // nếu không thì remote chỉ cần sửa kênh alpha là qua mặt được hậu kiểm.
+    const changedRgb = countChangedInBox(before, after, box, dims.width, false);
+    const drawn = changedRgb > 0;
+    if (drawn) opBoxesChanged += 1;
+    opDetail.push({ region_id: entry.region_id, box, changedRgb, drawn });
   }
 
   return {
@@ -122,7 +141,8 @@ export function inspectRenderedPixels({ originalBuffer, outputBuffer, protectedB
     mime,
     protectedChanged,
     opBoxesChanged,
-    opBoxesTotal: oBoxes.length,
+    opBoxesTotal: oEntries.length,
+    opEntries: opDetail,
   };
 }
 

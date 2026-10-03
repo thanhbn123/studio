@@ -725,3 +725,27 @@ CRITICAL/MAJOR) với **một điều kiện còn lại** (N-1 ở tầng store)
 - Trường **vắng mặt** ⇒ render tất cả dòng đã duyệt (hành vi cũ).
 - Mảng **rỗng** `[]` ⇒ `400 EMPTY_REGION_IDS` (người dùng chưa chọn vùng nào ⇒ không render gì),
   KHÔNG được hiểu thành “không lọc” rồi âm thầm render tất cả.
+
+---
+
+## 10. SỬA ĐỔI SAU PHÁN QUYẾT CUỐI (vòng 6 — bổ sung, không đổi tên đã đóng băng)
+
+Nguồn: `docs/MVP-02-REVIEW.md` mục “VÒNG 4 — chấm cuối” — phán quyết **PASS**, còn 2 lỗ hổng
+MINOR (N-12/N-13). Đã vá nốt.
+
+**N-12 — hậu kiểm phải ĐẾN TỪNG VÙNG**
+
+- `inspectRenderedPixels()` nhận thêm `opEntries: [{ region_id, box }]` và trả `opEntries` chi
+  tiết: mỗi vùng có `changedRgb` + `drawn`.
+- “Đã vẽ” = **có pixel RGB đổi** (`countChangedInBox(..., includeAlpha = false)`); đổi **mỗi kênh
+  alpha** KHÔNG tính là đã vẽ (trước đây remote chỉ cần sửa alpha là qua mặt được hậu kiểm).
+- `RenderProvider.render()`: vùng nào không đổi RGB thì **bị bỏ khỏi `applied`**, hạ `PARTIAL`,
+  `error_code = RENDER_APPLIED_MISMATCH` + cảnh báo nêu id các vùng không được vẽ. Trước đây
+  hậu kiểm chỉ hỏi “có ít nhất một hộp đổi không”, nên remote vẽ 1/2 op vẫn được báo `OK`.
+
+**N-13 — không giải mã được ảnh trả về thì không được báo `OK`**
+
+- Khi job **không có vùng bảo vệ** mà ảnh trả về vẫn có op nhưng repo không giải mã được
+  (PNG palette/1-bit/interlaced, hoặc định dạng khác PNG) ⇒ mã lỗi mới
+  `RENDER_OUTPUT_UNVERIFIED`: giữ `PARTIAL` + cảnh báo “KHÔNG kiểm chứng được pixel…” thay vì
+  `OK`. Trường hợp CÓ vùng bảo vệ vẫn giữ nguyên `PROTECTED_PIXELS_UNVERIFIED` như §8.

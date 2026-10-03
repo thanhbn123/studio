@@ -498,3 +498,82 @@ Giống hệt với `x='\t'`, `x='\n'`, `x='0x10'`. Đối chứng `x=NULL` / `x
 6. **DOM/trình duyệt thật**: các hàm UI (`renderIlWarnings`, `historyItemHtml`) được trích và **chạy thật** trong Node; chưa mở DOM/CSS thật, chưa bấm nút trong trình duyệt. `protected_pixels_verified` có trong `render_summary`/meta nhưng **UI chưa hiện badge riêng** (chỉ hiện qua câu cảnh báo).
 7. **`data/studio.db` thật**: vẫn chỉ chạy migration trên bản sao trong `/tmp`.
 8. **Đánh đổi của guardrail**: không có ngưỡng nào chặn được `xii`/homoglyph/`tốt nhứt` mà không tăng dương tính giả (N-10 là ví dụ vừa xảy ra); cần Owner quyết định mức đánh đổi, tôi không tự chọn.
+
+---
+---
+
+# VÒNG 4 — chấm cuối tại commit `9db4090`
+
+PHÁN QUYẾT CUỐI CÙNG: **PASS** *(phạm vi: những gì đã đo được trong repo này; xem “PASS nghĩa là gì / KHÔNG nghĩa là gì” ngay dưới)*
+
+- Commit chấm: `9db4090c1b53e8cc25415974393696c046d77d88` (03/10/2026 ~14:4x–15:2x UTC). `git status --short` sau khi làm việc: **` M docs/MVP-02-REVIEW.md`** (báo cáo này — file duy nhất tôi ghi; **không** sửa mã nguồn, **không** sửa `test/**`) và **` M README.md`** — README.md do **một agent khác** sửa lúc 21:50:42 (nội dung về volume Docker của ImageLab), **không phải tôi**; tôi không đụng tới file đó.
+- Ba lượt trước (VÒNG 1 FAIL, VÒNG 2 và VÒNG 3 PASS CÓ ĐIỀU KIỆN) được **giữ nguyên**. Script vòng 4 ở **`/tmp/atk6/`** (bản sao đòn vòng 3 + `x30`, `x31`); bằng chứng gộp `/tmp/atk6/out-rerun.txt`, `out-x20.txt`, `out-x25.txt`, `out-tests.txt`.
+- Tự đo tại commit này: `npm test` → **tests 425 · suites 77 · pass 424 · fail 0 · cancelled 0 · skipped 1 · todo 0** (skip duy nhất: PostgreSQL `test/store.test.js:162`); `node tools/verify.mjs` → **EXIT=0**.
+- **Điều kiện duy nhất của vòng 3 (N-1 ở tầng `store`) ĐÃ ĐƯỢC VÁ THẬT**; cả 4 phát hiện MINOR còn lại (N-8/N-9/N-10/N-11) cũng đã vá thật. Tôi chấm lại bằng **chính script của mình** và tấn công thêm 30+ biến thể mới. Không còn CRITICAL/MAJOR; các phát hiện mới chỉ ở mức MINOR và **không** làm mất hiệu lực của bất kỳ bản vá nào.
+
+## V4.1 — Bảng chấm 5 mục
+
+| # | Nội dung vòng 3 | Kết luận vòng 4 | Bằng chứng (output thật) |
+|---|---|---|---|
+| **N-1 (store)** | `store.toNum` biến chuỗi rác thành 0 | **ĐÃ VÁ THẬT** | `node x26-n1-store-gap.mjs`: `x='  '` → `STORE trả về box … {"x":null,…}` + `PIXEL VÙNG NHÃN HIỆU THẬT … 0/4000` (vòng 3: `{"x":0,…}` + `2800/4000`); giống hệt với `'\t'`, `'\n'`, `'0x10'`. `node x30-round5-attack.mjs` phần A, thêm 8 dạng rác **đều → `null`**: `' 0x10 '`, `'0b11'`, `'[12]'`, `'{"valueOf":12}'`, `'12,5'`, `'1_000'`, `'１２'` |
+| **N-8** | Hậu kiểm `http` chỉ dựa hash, một chiều | **ĐÃ VÁ THẬT** (a/b/c/d) | `node x21-n5-blindspot.mjs`: (a) `reencode-chunk` → `status="PARTIAL"`, `rsErr="NO_OPS"`, `applied=0`, cảnh báo “KHÔNG có pixel nào thay đổi trong hộp của 1 op”; (b) `stray-pixel` → y hệt; (c) `nobrand-small` → `job=failed`, `jobErr="RENDER_SIZE_MISMATCH"`, `ảnhMới=0`. `node x20-http-hardening.mjs` (14 chế độ): `garbage` → `job=failed "RENDER_BAD_RESPONSE"`, `ảnhMới=0`; `bigger`/`smaller` → `RENDER_SIZE_MISMATCH`; `onepixel`/`alphaonly`/`evil`/`white` → `PROTECTED_PIXELS_CHANGED`, `ảnhMới=0`; `liar` → `RENDER_NO_OPS`, `applied=0` |
+| **N-9** | `500克 → "500 tấn"` lọt | **ĐÃ VÁ THẬT** | `node x24-old-vs-new.mjs`: dòng `(N-9) 500克 → "500 tấn"` **`lọt → BẮT`**; `node x23-unit-substitution.mjs`: `unitsIn(vi)=["tấn"]` + vi phạm “Đơn vị ‘tấn’ không có trong chữ gốc”, trong khi đối chứng `500克 → "500 gram"` và `12个月 → "12 tháng"` vẫn `TRANSLATED` (không tố oan) |
+| **N-10** | Dương tính giả do bỏ dấu | **ĐÃ VÁ THẬT** | `node x24-old-vs-new.mjs`: `"Chỉnh hàng"`, `"Đất chuẩn bị trồng"`, `"Tột nhất"` đều **`BẮT → lọt`** (hết tố oan); `node x22-guardrail-regression.mjs`: 7/7 ca không-dấu vẫn **BẮT** (`bao hanh mot nam`, `muoi hai thang`, …) và **hồi quy MẤT 0/21**; bộ 20 câu sạch chỉ còn 1 ca bị bắt (`"Sờ 1 lần là thích"` — bắt vì chữ số “1” không có trong chữ gốc, **đúng**, không phải do bỏ dấu) |
+| **N-11** | `only_region_ids: []` render tất cả | **ĐÃ VÁ THẬT** | `node x27-n2-n3-n4.mjs`: `[] (mảng RỖNG) → HTTP 400 "EMPTY_REGION_IDS"` + thông điệp hướng dẫn (“Bỏ hẳn trường này nếu muốn render tất cả”); `node x30` phần D: `[[]]` → `409 UNKNOWN_REGION_IDS`, `['']` → `409`, `VẮNG trường` → `202` + render tất cả (đúng hợp đồng) |
+
+## V4.2 — Tấn công lại bản vá mới (các biến thể tôi tự nghĩ thêm)
+
+**(1) Toạ độ "số kiểu khác" ở tầng store** (`node x30` phần A, 12 dạng): 8 dạng rác → `null` (an toàn). Bốn dạng còn lại — `'+12'` → 12, `'.5'` → 0.5, `'-0'` → 0, `' 12 '` → 12 — bị **đọc thành SỐ** và hộp bảo vệ "ảo" xuất hiện ⇒ `PIXEL NHÃN HIỆU=2800/4000`. **Tôi KHÔNG xếp đây là lỗ hổng mới**: đó là các **số hợp lệ viết dạng chuỗi** (`+12`, `.5`, `-0` là literal thập phân hợp lệ), không phải rác bị hoá thành số — kẻ ghi được `'+12'` vào DB thì cũng ghi được `12` hoặc `999`. Phân biệt này là mấu chốt: bản vá vòng 3/4 chặn **rác**, không (và không thể) chặn **dữ liệu số sai**. Ghi ra đây để người đọc biết chính xác mức bảo vệ thực tế: *toạ độ trong DB là nguồn sự thật; ai ghi được số sai thì vẫn xoá được nhãn hiệu.*
+
+**(2) PNG lạ ĐÚNG kích thước** (`node x30` phần B + `node x31` phần 1):
+- Job **CÓ** vùng bảo vệ: `palette` / `gray1bit` / `interlaced` → `job=failed "PNG_CORRUPT"`, `ảnhMới=0` (fail-closed). *(Mã lỗi hơi gây nhầm — định dạng không hỗ trợ bị gọi là “corrupt” — nhưng thông điệp nói rõ “không giải mã được … TỪ CHỐI lưu”.)*
+- Job **KHÔNG** có vùng bảo vệ: cả 3 ca được **LƯU** với `rs.status="OK"`, `applied=2`, `job=succeeded`, và `node x31` xác nhận chính **`decodePng` của repo NÉM `PNG_UNSUPPORTED`** trên asset đó (`repoDecode(ảnh vá interlace=1) → NÉM "PNG_UNSUPPORTED" "Không hỗ trợ PNG interlaced (Adam7)."`) ⇒ **ảnh giao cho khách mà chính app không giải mã được**, vẫn báo `OK`. → **N-13 (MINOR, mới).**
+
+**(3) Remote vẽ MỘT PHẦN op / chỉ đổi alpha** (`node x31` phần 2–3, nền có màu để pixel thật sự đổi):
+```
+op gửi đi: [["r1",{"x":40,"y":60,"w":200,"h":40}],["r2",{"x":30,"y":200,"w":200,"h":30}]]
+render=202 | job=succeeded | jobErr=null | rs="OK"/null | applied=["r1","r2"] || warnings: []
+  hộp op {"x":40,"y":60,…}: pixel RGB đổi=8000 | hộp op {"x":30,"y":200,…}: pixel RGB đổi=0
+  ➜ số hộp op có RGB đổi: 1/2
+(chế độ alpha) ➜ số hộp op có RGB đổi: 0/2 | số hộp CHỈ alpha đổi: 1/2  → vẫn rs="OK", applied=["r1","r2"]
+```
+⇒ Hậu kiểm N-8 mới chỉ ở mức **“có ÍT NHẤT MỘT hộp op đổi pixel”**, không phải “từng op”: remote vẽ 1/2 vùng (hoặc chỉ đổi kênh alpha) vẫn được `OK` + `applied=<tất cả>` + **không cảnh báo**, trong khi vùng còn lại vẫn nguyên chữ Trung. → **N-12 (MINOR, mới).** *(Hợp đồng §N-8 ghi đúng như cài đặt — “**không hộp nào** đổi ⇒ bỏ `applied`” — nên đây là **giới hạn còn lại**, không phải sai lệch hợp đồng.)*
+
+**(4) `only_region_ids` biên khác** (`node x30` phần D): `null` (JSON null) vẫn được coi như **vắng mặt** ⇒ render tất cả. Chấp nhận được (`null` = “không có giá trị”), nhưng nên ghi vào hợp đồng cho rõ, vì `[]` thì nay đã bị 400.
+
+## V4.3 — LỖ HỔNG MỚI (vòng 4) — cả hai đều MINOR
+
+| # | Mức | Phát hiện | Bằng chứng thật | Vì sao quan trọng |
+|---|---|---|---|---|
+| N-12 | MINOR | **Hậu kiểm op ở mức “ít nhất một hộp đổi”, không phải từng hộp**: remote vẽ 1 phần (hoặc chỉ đổi alpha) ⇒ `OK` + `applied=<tất cả>` + không cảnh báo | `node x31-interlace-and-partial.mjs`: `rs="OK"/null`, `applied=["r1","r2"]`, `warnings: []`, nhưng `hộp op r2: pixel RGB đổi=0` (`➜ 1/2`); chế độ alpha: `➜ RGB đổi 0/2, chỉ alpha đổi 1/2` mà vẫn `OK` | Người dùng nhận ảnh **dịch một nửa** nhưng hệ thống báo đã áp dụng đủ 2 vùng; cùng lớp “báo cáo sai” với N-2/N-8 cũ, chỉ hẹp hơn. Sửa: kiểm **từng** hộp op (`opBoxesChanged === opBoxes.length` mới cho `OK`) và **không tính thay đổi chỉ ở kênh alpha** là “đã vẽ” |
+| N-13 | MINOR | **PNG mà repo không giải mã được vẫn được LƯU khi job không có vùng bảo vệ** (`palette` / `1-bit` / `16-bit` / `interlaced`) ⇒ `rs.status="OK"`, `job=succeeded`, nhưng asset không mở được bằng chính repo | `node x30` phần B2: `palette + KHÔNG brand → job=succeeded, rs="OK"/null, applied=2, ảnhMới=1`; `node x31` phần 1: `repoDecode(ảnh vá interlace=1) → NÉM "PNG_UNSUPPORTED"` | Ảnh giao cho khách là định dạng app của mình không đọc được, vẫn báo thành công; nhánh từ chối hiện chỉ chạy khi có vùng bảo vệ. Sửa: chạy `decodePng` (hoặc `probeImage` + kiểm `bitDepth/colorType/interlace`) cho **mọi** ảnh trả về, bất kể có vùng bảo vệ hay không |
+
+## V4.4 — Nhận xét về bộ test mới của nhóm gộp (`test/imagelab-round5-hardening.test.js`, 17 test)
+
+Tôi đọc hết 316 dòng và **không tìm thấy test vô nghĩa nào**: không có `assert.ok(true)`, không `skip`, không test chỉ khẳng định “hàm tồn tại”.
+- 17 ca = 11 khối `test(` (một khối chạy trong vòng lặp 7 câu sạch). Mỗi ca khẳng định **giá trị cụ thể**: `assert.equal(res.status, 'FAILED')`, `assert.equal(res.error_code, 'RENDER_SIZE_MISMATCH')`, `assert.equal(res.output, null)`, `assert.deepEqual(res.applied, [])`, `assert.equal(r.box.x, null)` + `assert.notEqual(r.box.x, 0)`.
+- Có **tiền đề được khẳng định trước** (rất đáng khen): `assert.notEqual(reencoded.equals(img.buffer), true, 'tiền đề của test: byte phải KHÁC ảnh gốc (thêm chunk tEXt)')` — tức test tự chứng minh dữ liệu thử đúng là ca “cùng pixel khác byte”, không phải test giả.
+- Ca N-11 dùng **HTTP thật** (`startImagelabApp` + `postJson`) và còn kiểm hệ quả `assert.equal(detail.rendered.length, 0, 'không được sinh ảnh nào khi yêu cầu rỗng')`.
+- **Giới hạn của bộ test (đã được nhóm ghi ở `docs/VERIFICATION.md §11.1`):** các ca N-8 dùng lớp `FakeRemoteRenderProvider` kế thừa `RenderProvider` (không đi qua `HttpRenderProvider`/socket thật) — tức kiểm logic hậu kiểm ở lớp cha, **không** kiểm đường truyền http. Chính vì vậy các ca như N-12/N-13 (chỉ lộ ra khi đi qua provider http thật + server giả) không bị bộ test bắt.
+
+## V4.5 — PASS nghĩa là gì, và KHÔNG nghĩa là gì
+
+**PASS nghĩa là:** tại commit `9db4090`, trên cây mã này, với các đòn tấn công tôi đã dựng (≈ 30 script, hơn 150 ca), **tôi không còn phá được** bất kỳ luật bất khả xâm phạm nào: nhãn hiệu/chứng nhận/giá không bị xoá pixel (kể cả khi OCR trả hộp chồng lấn, khi toạ độ DB bị đầu độc bằng rác, khi provider `http` trả ảnh lem/ảnh trắng/ảnh sai kích thước/ảnh rác); ảnh gốc bất biến; mọi tình huống “không vẽ được gì” đều được báo thật (`NO_OPS`/`RENDER_NO_OPS`/`FAILED` + cảnh báo); guardrail không bị nới lỏng (hồi quy 0/21). 12/12 phát hiện của 3 vòng trước (F-01…F-08, H-1, H-2, N-1…N-11) đã được vá và **kiểm lại độc lập**.
+
+**PASS KHÔNG có nghĩa là:**
+1. **Không** có nghĩa OCR/dịch/render THẬT đã được đo. Mọi bằng chứng dùng `mock` cho OCR/dịch, `purejs` cho render, và một **server render giả ở `127.0.0.1`** cho đường `http`. Chất lượng model thật, hành vi service inpainting thật (kể cả việc nó có re-encode hay vẽ một phần — N-12) **chưa đo**. Đây là mục chưa kiểm được lớn nhất.
+2. **Không** có nghĩa là chống được kẻ ghi trực tiếp vào DB: toạ độ/hộp là nguồn sự thật, ghi số sai (kể cả `'+12'`) vẫn xoá được nhãn hiệu (V4.2 mục 1); vết override trong DB vẫn được tin (CA F của vòng 2).
+3. **Không** có nghĩa `session_id` là xác thực — nó chỉ **phân vùng** lịch sử (giới hạn kế thừa MVP-01; đóng giả cookie `sid` vẫn đọc/ghi được job của người khác: `node d1-security.mjs` D1b).
+4. **Không** có nghĩa guardrail chặn mọi câu bịa: còn `xii`, homoglyph Kirin/Greek, “tốt nhứt”, và `3件装 → "3 bộ"` (nhóm **đã tự ghi** ở `docs/VERIFICATION.md §11.1` — tôi xác nhận các ca này vẫn lọt).
+5. **Không** có nghĩa ảnh JPEG/WebP được bảo vệ ở tầng pixel: với định dạng không phải PNG, hệ thống **nói thật là không kiểm được** (`PROTECTED_PIXELS_UNVERIFIED`, `verified=false`, có cảnh báo) — đó là trung thực, **không** phải bảo vệ.
+6. **Không** có nghĩa đã hết lỗi: còn N-12 và N-13 (MINOR, ở V4.3) và các mục chưa kiểm được ở V4.6.
+
+## V4.6 — CHƯA KIỂM ĐƯỢC (vòng 4, giữ nguyên các mục trước)
+
+1. **Provider THẬT trả tiền** (OCR Trung, model dịch, service render/inpainting): chưa đo — xem V4.5 mục 1.
+2. **PostgreSQL**: vẫn chỉ chạy SQLite; test PostgreSQL vẫn là test **skip** duy nhất.
+3. **Trình duyệt thật / DOM / CSS / bấm nút**: các hàm UI được **chạy thật** trong Node nhưng chưa mở trình duyệt.
+4. **Hai request `render` đồng thời** trên cùng job và nhiều instance chia sẻ `IMAGELAB_DIR`: chưa kiểm.
+5. **`data/studio.db` thật**: chỉ chạy migration trên bản sao trong `/tmp`.
+6. **PNG 16-bit thật**: `decodePng` từ chối theo `bitDepth`; tôi mới kiểm `1-bit`/`palette`/`interlaced`, chưa dựng ảnh 16-bit thật.
+7. **Nguồn sinh toạ độ rác ngoài đời**: mọi ca “đầu độc DB” do tôi ghi bằng `node:sqlite`; chưa xác minh vận hành thật có tạo được giá trị TEXT trong cột số hay không.

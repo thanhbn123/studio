@@ -59,6 +59,17 @@ Nó **không** chứng minh OCR thật — output tự ghi nhãn `MOCK_VERIFIED`
 docker compose up --build     # app + PostgreSQL 16, mở http://localhost:3000
 ```
 
+Ảnh của MVP-02 (ảnh gốc + ảnh đã render) nằm trong **volume `appdata`** mount tại `/data`
+(`IMAGELAB_DIR=/data/imagelab`), nên **không mất khi dựng lại container**. Mặc định trong
+container là OCR `mock` + render `purejs` (miễn phí, chỉ PNG); muốn cắm dịch vụ thật thì đặt
+`OCR_PROVIDER` / `RENDER_PROVIDER` / `TRANSLATE_PROVIDER` + key trong `.env` — compose đã truyền sẵn.
+
+Kiểm nhanh luồng dịch ảnh **bên trong chính image** (offline):
+
+```bash
+docker run --rm vip-product-studio:local node tools/imagelab-demo.mjs
+```
+
 ---
 
 ## 2. Luồng xử lý

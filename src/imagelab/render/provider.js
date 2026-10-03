@@ -243,13 +243,15 @@ export class RenderProvider {
       }
 
       // (N-8a) soi PIXEL: hộp của từng op gửi đi có THỰC SỰ đổi không?
+      // (N-12) kiểm ĐẾN TỪNG VÙNG: remote vẽ 1/2 op mà khai cả 2 ⇒ phải phát hiện.
+      const opEntries = normalized.ops.map((op) => ({ region_id: op.region_id ?? null, box: op.box }));
       const pixelScan = skipInspection || outputMime !== 'image/png'
         ? null
         : inspectRenderedPixels({
             originalBuffer: img.buffer,
             outputBuffer,
             protectedBoxes: guardBoxes.map((b) => b.box),
-            opBoxes,
+            opEntries,
             maxPixels: this.limits.maxPixels,
           });
       const nothingDrawnByPixels = Boolean(
@@ -264,6 +266,47 @@ export class RenderProvider {
         partialWarnings.push(
           `Provider "${this.name}" trả về ảnh CÙNG KÍCH THƯỚC nhưng KHÔNG có pixel nào thay đổi trong hộp của ${opBoxes.length} op đã gửi — ảnh chỉ được giải mã/mã hoá lại (hoặc trả nguyên ảnh gốc). KHÔNG tính là đã vẽ.`,
         );
+      }
+
+      // (N-13) Có op nhưng KHÔNG giải mã được ảnh trả về ⇒ không đo được pixel nào.
+      // Không được để `status = OK` như thể đã kiểm (trước đây chỉ hạ khi CÓ vùng bảo vệ).
+      // Lưu ý: khi CÓ vùng bảo vệ, nhánh hậu kiểm bên dưới đã báo `PROTECTED_PIXELS_UNVERIFIED`
+      // (giữ nguyên hợp đồng §8) — ở đây chỉ lo ca KHÔNG có vùng bảo vệ nào.
+      const outputUnverified = Boolean(
+        !skipInspection
+        && outputBuffer
+        && ops.length > 0
+        && guardBoxes.length === 0
+        && (!pixelScan || !pixelScan.readable),
+      );
+      if (outputUnverified) {
+        partialWarnings.push(
+          `KHÔNG kiểm chứng được pixel của ảnh do provider "${this.name}" trả về ` +
+          `(${pixelScan?.reason ?? 'không soi được pixel'}) — ảnh vẫn được lưu nhưng KHÔNG có bằng chứng là đã vẽ đúng.`,
+        );
+        status = RENDER_STATUS.PARTIAL;
+        errorCode = errorCode ?? RENDER_CODES.RENDER_OUTPUT_UNVERIFIED;
+      }
+
+      // (N-12) Op nào KHÔNG đổi pixel RGB thì không được coi là đã vẽ — bỏ khỏi `applied`.
+      const undrawn = pixelScan?.readable
+        ? (pixelScan.opEntries ?? []).filter((e) => !e.drawn)
+        : [];
+      const partiallyDrawn = Boolean(
+        pixelScan?.readable
+        && pixelScan.reason === PROTECTED_CHECK.OK
+        && undrawn.length > 0
+        && undrawn.length < (pixelScan.opEntries ?? []).length,
+      );
+      if (partiallyDrawn) {
+        const ids = undrawn.map((e) => String(e.region_id ?? '?'));
+        partialWarnings.push(
+          `Provider "${this.name}" khai đã vẽ nhưng ${undrawn.length}/${(pixelScan.opEntries ?? []).length} vùng ` +
+          `KHÔNG có pixel RGB nào thay đổi (${ids.slice(0, 5).join(', ')}${ids.length > 5 ? '…' : ''}) — bỏ các vùng đó khỏi \`applied\`.`,
+        );
+        applied = applied.filter((a) => !ids.includes(String(a?.region_id ?? '?')));
+        status = status === RENDER_STATUS.OK ? RENDER_STATUS.PARTIAL : status;
+        errorCode = errorCode ?? RENDER_CODES.RENDER_APPLIED_MISMATCH;
       }
 
       // ── N-5 (vòng 4): KHÔNG TIN provider, nhất là `http` ─────────────────────
