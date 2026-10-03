@@ -15,42 +15,51 @@ export const CLAIM_RULES = [
   {
     id: 'warranty',
     label: 'bảo hành',
-    re: /bảo hành\s*(?:\d+|\d+\s*(?:năm|tháng|ngày))|cam kết bảo hành|\b\d+\s*năm bảo hành/gi,
+    // Gồm cả cách viết tắt và cách nói vòng: "BH 12 tháng", "bảo đảm 1 năm", "đổi trả 12 tháng".
+    re: /(?:\bbh\b|bảo hành|bảo đảm|bảo trì|đổi trả|hoàn tiền|1\s*đổi\s*1)\s*(?:trong\s*)?(?:\d+|\d+\s*(?:năm|tháng|ngày))?|cam kết bảo hành|\b\d+\s*(?:năm|tháng)\s*bảo hành/gi,
   },
   {
     id: 'certification',
     label: 'chứng nhận',
-    re: /\b(?:chứng nhận|đạt chuẩn|tiêu chuẩn)\s*(?:ISO|CE|FDA|RoHS|FCC|GMP|HACCP)\b|\b(?:ISO|CE|FDA|RoHS|FCC)\s*\d*/gi,
+    re: /\b(?:chứng nhận|đạt chuẩn|tiêu chuẩn|kiểm định|công bố)\s*(?:ISO|CE|FDA|RoHS|FCC|GMP|HACCP|IEC|TUV)?\b|\b(?:ISO|CE|FDA|RoHS|FCC|GMP|HACCP)\s*\d*/gi,
   },
   {
     id: 'waterproof',
     label: 'chống nước',
-    re: /chống nước|kháng nước|ngâm nước|waterproof|\bIP\d{2}\b/gi,
+    // "ngâm nước", "đi mưa", "kháng ẩm" là những cách nói vòng phổ biến của tiếng Việt.
+    re: /chống nước|kháng nước|ngâm nước|không thấm nước|waterproof|đi mưa|kháng ẩm|chống ẩm|\bIP\d{2}\b/gi,
+  },
+  {
+    id: 'spec_unit',
+    label: 'đơn vị thông số',
+    // Đơn vị kỹ thuật gần như không xuất hiện trong văn bản bán hàng thường — thấy là nghi ngay.
+    re: /\b\d+(?:[.,]\d+)?\s*(?:mAh|kWh|kW|W|V|Hz|inch|ml|kg|mm|cm|lít|L)\b|\b(?:mAh|kWh|IP\d{2}|Hz)\b/gi,
   },
   {
     id: 'capacity',
     label: 'dung tích/công suất',
-    re: /\b\d+(?:[.,]\d+)?\s*(?:ml|l|L|mAh|W|kW|V|Hz|inch|cm|mm|kg|g)\b/g,
+    re: /\b\d+(?:[.,]\d+)?\s*(?:ml|l|L|mAh|W|kW|V|Hz|inch|cm|mm|kg|g|lít)\b/gi,
   },
   {
     id: 'material',
     label: 'chất liệu',
-    re: /da thật|da bò|100%\s*cotton|nhôm nguyên khối|thép không gỉ|inox|titan|gốm sứ cao cấp/gi,
+    re: /da thật|da bò|da cá sấu|cotton|nhôm nguyên khối|thép không gỉ|inox|titan|gốm sứ|cao su|silicon|nhựa ABS|gỗ tự nhiên|carbon/gi,
   },
   {
     id: 'origin',
     label: 'nguồn gốc',
-    re: /xuất xứ|nguồn gốc|made in|sản xuất tại|nhập khẩu (?:từ|nguyên chiếc)/gi,
+    re: /xuất xứ|nguồn gốc|made in|sản xuất tại|nhập khẩu|nội địa|chính hãng|hàng chính hãng/gi,
   },
   {
     id: 'price_claim',
     label: 'giá/khuyến mãi',
-    re: /giảm giá\s*\d+%|giảm\s*\d+%|freeship|miễn phí vận chuyển|tặng kèm|quà tặng|số lượng có hạn|chỉ còn\s*\d+/gi,
+    re: /\b(?:sale|giảm giá|giảm|ưu đãi|khuyến mãi|voucher|mã giảm)\s*(?:đến\s*)?\d+\s*%|\b\d+\s*%\s*(?:off|giảm)?|freeship|miễn phí (?:vận chuyển|giao hàng|ship)|tặng kèm|quà tặng|số lượng có hạn|chỉ còn\s*\d+|nhanh tay/gi,
   },
   {
     id: 'rating',
     label: 'số liệu xã hội',
-    re: /\b\d{2,}(?:[.,]\d+)?\s*(?:khách hàng|người mua|đánh giá|review|sao)\b|\b\d+(?:[.,]\d+)?\/5\b/gi,
+    // "nghìn người mua", "4.9 sao", "1000+ review" — kể cả khi không ghi chữ "đánh giá".
+    re: /\b\d+(?:[.,]\d+)?\s*(?:k|nghìn|ngàn|trăm|triệu)?\+?\s*(?:khách hàng|người mua|người dùng|đánh giá|review|sao|lượt mua|lượt bán)\b|\b\d+(?:[.,]\d+)?\s*\/\s*5\b|\bđược đánh giá\b|\btin dùng\b|\bbán chạy\b/gi,
   },
 ];
 
