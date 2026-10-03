@@ -304,6 +304,51 @@ describe('MVP-02 OCR — khử trùng theo HỘP + cảnh báo hộp giao nhau (
     assert.equal(regions.length, 2);
     assert.equal(warnings.some((w) => /giao nhau/.test(w)), false);
   });
+
+  /* ─────────────────────────────────────────────────────────────────────────
+   * SIẾT LẠI Ý ĐỊNH CỦA TEST "kind do provider khai chỉ được LEO THANG"
+   * (test phía trên đã phải đổi 3 vùng sang 3 hộp KHÁC nhau vì luật khử trùng mới).
+   *
+   * Hai test dưới chứng minh việc đổi hộp là do HỢP ĐỒNG MỚI, không phải để test dễ
+   * xanh: (1) kịch bản CŨ (3 vùng cùng hộp) giờ bị khử trùng — và bị khử trùng ĐÚNG
+   * theo mức bảo vệ; (2) luật leo thang kind vẫn đúng khi các hộp chỉ giao MỘT PHẦN.
+   * ───────────────────────────────────────────────────────────────────────── */
+  test('kịch bản CŨ (3 vùng CÙNG hộp): luật khử trùng mới giữ vùng bảo vệ cao nhất, có vết trong dropped', () => {
+    const sameBox = { x: 10, y: 20, w: 100, h: 30 };
+    const { regions, dropped, warnings } = normalizeRegions(
+      [
+        raw({ text: '纯棉短袖', kind: 'brand', kind_reason: 'provider nói nhãn hiệu', box: sameBox }),
+        raw({ text: '品牌旗舰店', kind: 'descriptive', kind_reason: 'provider nói dịch được', box: sameBox }),
+        raw({ text: 'Chữ mô tả', kind: 'unknown', box: sameBox }),
+      ],
+      dims,
+    );
+    assert.equal(regions.length, 1, 'một hộp chỉ được giữ MỘT vùng');
+    assert.equal(regions[0].text, '纯棉短袖');
+    assert.equal(regions[0].kind, 'brand', 'kind do provider khai vẫn KHÔNG bị hạ cấp');
+    assert.equal(regions[0].translatable, false);
+    assert.equal(dropped.length, 2, 'hai vùng bị khử trùng phải có vết, không mất im lặng');
+    for (const d of dropped) assert.match(d.reason, /trùng hộp nhưng khác chữ/);
+    assert.deepEqual(dropped.map((d) => d.text).sort(), ['Chữ mô tả', '品牌旗舰店'].sort());
+    assert.ok(warnings.some((w) => /Đã bỏ 2 vùng/.test(w)));
+  });
+
+  test('hộp chỉ GIAO MỘT PHẦN (khác hộp): luật leo thang kind vẫn nguyên cho mọi vùng', () => {
+    const { regions } = normalizeRegions(
+      [
+        raw({ text: '纯棉短袖', kind: 'brand', box: { x: 10, y: 20, w: 100, h: 30 } }),
+        raw({ text: '品牌旗舰店', kind: 'descriptive', box: { x: 20, y: 25, w: 100, h: 30 } }),
+        raw({ text: 'Chữ mô tả', kind: 'unknown', box: { x: 10, y: 100, w: 100, h: 30 } }),
+      ],
+      dims,
+    );
+    assert.equal(regions.length, 3, 'hộp giao một phần KHÔNG bị khử trùng');
+    const byText = Object.fromEntries(regions.map((r) => [r.text, r]));
+    assert.equal(byText['纯棉短袖'].kind, 'brand', 'provider khai bảo vệ cao hơn thì giữ');
+    assert.equal(byText['品牌旗舰店'].kind, 'brand', 'provider KHÔNG được hạ cấp vùng nhãn hiệu (auto đã là brand)');
+    assert.equal(byText['品牌旗舰店'].translatable, false);
+    assert.equal(byText['Chữ mô tả'].kind, 'unknown');
+  });
 });
 
 describe('MVP-02 OCR — provider (none / mock / fixture hỏng)', () => {

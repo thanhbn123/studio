@@ -21,6 +21,7 @@ import {
   createTranslator,
   enforceTranslationGuardrails,
 } from '../src/imagelab/translate/index.js';
+import { RENDERABLE_STATUSES, pendingReviewLines } from '../src/imagelab/pipeline.js';
 import { testConfig, silent } from './helpers.js';
 import { fakeAiProvider } from './imagelab-helpers.js';
 
@@ -265,7 +266,11 @@ describe('MVP-02 dịch — applyReviewEdits (duyệt từng dòng)', () => {
   // SỬA THEO F-06: `skip` là quyết định CỦA NGƯỜI DÙNG nên phải là `SKIPPED_BY_USER`
   // (không còn là `NEEDS_REVIEW`, vốn là trạng thái do guardrail chặn). Nhờ vậy dòng bị
   // bỏ qua không chặn cổng 409 nhưng vẫn được kể ra trong `skipped` khi render.
-  test('action = skip → SKIPPED_BY_USER (không chặn render) và vẫn để vết người dùng', () => {
+  //
+  // SIẾT THÊM (agent test, sau bản vá): đổi kỳ vọng sang `SKIPPED_BY_USER` chỉ hợp lý nếu
+  // trạng thái mới THẬT SỰ không bao giờ được vẽ và THẬT SỰ không chặn cổng 409 — hai hệ
+  // quả đó phải được khẳng định tường minh, nếu không test sẽ yếu hơn bản cũ.
+  test('action = skip → SKIPPED_BY_USER (không vẽ được, không chặn render) và vẫn để vết người dùng', () => {
     const lines = [descriptive()];
     const { lines: out } = applyReviewEdits(lines, [{ region_id: 'r2', action: 'skip' }]);
     assert.equal(out[0].text_vi, '');
@@ -276,6 +281,27 @@ describe('MVP-02 dịch — applyReviewEdits (duyệt từng dòng)', () => {
     assert.ok(out[0].edited_at, 'phải có vết thời điểm');
     assert.match(out[0].notes, /bỏ qua/i);
     assert.deepEqual(out[0].violations, [], 'bỏ qua theo ý người dùng không phải vi phạm guardrail');
+
+    // Hệ quả 1: dòng bỏ qua KHÔNG BAO GIỜ được dựng op render (dù có vết người dùng).
+    assert.equal(RENDERABLE_STATUSES.includes(TRANSLATE_STATUS.SKIPPED_BY_USER), false, 'SKIPPED_BY_USER không được nằm trong danh sách vẽ được');
+    // Hệ quả 2: dòng bỏ qua KHÔNG chặn cổng 409 của hợp đồng 4.4.
+    assert.deepEqual(pendingReviewLines(out), [], 'bỏ qua theo ý người dùng không phải "cần duyệt"');
+  });
+
+  test('skip trên vùng NHÃN HIỆU: chỉ nhận khi có allowBrandOverride, và cũng ra SKIPPED_BY_USER', () => {
+    const rejectedRun = applyReviewEdits([brand()], [{ region_id: 'r1', action: 'skip' }]);
+    assert.equal(rejectedRun.rejected.length, 1, 'chưa bật override thì skip vùng nhãn hiệu bị từ chối');
+    assert.equal(rejectedRun.lines[0].status, TRANSLATE_STATUS.SKIPPED_BRAND, 'không được đổi trạng thái gốc');
+
+    const { lines: out, rejected } = applyReviewEdits(
+      [brand()],
+      [{ region_id: 'r1', action: 'skip' }],
+      { allowBrandOverride: true },
+    );
+    assert.deepEqual(rejected, []);
+    assert.equal(out[0].status, TRANSLATE_STATUS.SKIPPED_BY_USER);
+    assert.equal(out[0].edited_by_user, true);
+    assert.deepEqual(pendingReviewLines(out), [], 'skip vùng nhãn hiệu cũng không được chặn render');
   });
 
   test('accept không đổi nội dung; accept kèm text_vi khác bị bỏ qua (chỉ edit mới sửa)', () => {

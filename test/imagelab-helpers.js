@@ -21,7 +21,7 @@ import { STATUS } from '../src/product-master.js';
 import { createImageStorage } from '../src/imagelab/storage.js';
 import { createOcrProvider } from '../src/imagelab/ocr/index.js';
 import { createTranslator } from '../src/imagelab/translate/index.js';
-import { createRenderProvider } from '../src/imagelab/render/index.js';
+import { createRenderProvider, decodePng, encodePng, toRgba } from '../src/imagelab/render/index.js';
 import { ImageTranslationPipeline } from '../src/imagelab/pipeline.js';
 import { testConfig, silent, fakeContentEngine, fakeVisionProvider, fixtureBuffer } from './helpers.js';
 
@@ -274,6 +274,70 @@ export function fakeRenderProvider({ result = null, fail = null, name = 'fake-re
     },
     lastParams: null,
   };
+}
+
+/* ───────────────────── pixel: ảnh tổng hợp + đếm pixel đổi ─────────────────────
+ *
+ * Dùng cho test hồi quy F-01/F-02: phải ĐẾM PIXEL THẬT trong buffer PNG, không chỉ
+ * tin vào danh sách `applied`/`skipped` mà hệ thống tự báo (luật #1: không bịa).
+ */
+
+/**
+ * Ảnh PNG tổng hợp: nền `background` (mặc định trắng đục), tô đặc các hộp trong `fills`.
+ */
+export function makeTestImage({ width = 320, height = 320, background = [255, 255, 255, 255], fills = [] } = {}) {
+  const data = Buffer.alloc(width * height * 4);
+  for (let i = 0; i < width * height; i += 1) {
+    data[i * 4] = background[0];
+    data[i * 4 + 1] = background[1];
+    data[i * 4 + 2] = background[2];
+    data[i * 4 + 3] = background[3] ?? 255;
+  }
+  for (const { box, rgba } of fills) {
+    for (let y = Math.max(0, box.y); y < Math.min(height, box.y + box.h); y += 1) {
+      for (let x = Math.max(0, box.x); x < Math.min(width, box.x + box.w); x += 1) {
+        const i = (y * width + x) * 4;
+        data[i] = rgba[0];
+        data[i + 1] = rgba[1];
+        data[i + 2] = rgba[2];
+        data[i + 3] = rgba[3] ?? 255;
+      }
+    }
+  }
+  return encodePng({ width, height, data, channels: 4 });
+}
+
+/**
+ * Đếm số pixel BỊ ĐỔI trong `box` giữa hai ảnh PNG (RGBA, so cả alpha).
+ * @returns {{changed:number, total:number, first:{x:number,y:number,before:number[],after:number[]}|null}}
+ */
+export function countChangedPixels(pngBefore, pngAfter, box) {
+  const before = decodePng(pngBefore);
+  const after = decodePng(pngAfter);
+  if (before.width !== after.width || before.height !== after.height) {
+    throw new Error(`hai ảnh khác kích thước: ${before.width}×${before.height} vs ${after.width}×${after.height}`);
+  }
+  const a = toRgba(before);
+  const b = toRgba(after);
+  const x0 = Math.max(0, Math.round(box.x));
+  const y0 = Math.max(0, Math.round(box.y));
+  const x1 = Math.min(before.width, Math.round(box.x + box.w));
+  const y1 = Math.min(before.height, Math.round(box.y + box.h));
+  let changed = 0;
+  let first = null;
+  for (let y = y0; y < y1; y += 1) {
+    for (let x = x0; x < x1; x += 1) {
+      const i = (y * before.width + x) * 4;
+      if (a[i] !== b[i] || a[i + 1] !== b[i + 1] || a[i + 2] !== b[i + 2] || a[i + 3] !== b[i + 3]) {
+        changed += 1;
+        if (!first) {
+          first = { x, y, before: [a[i], a[i + 1], a[i + 2], a[i + 3]], after: [b[i], b[i + 1], b[i + 2], b[i + 3]] };
+        }
+      }
+    }
+  }
+  const total = Math.max(0, x1 - x0) * Math.max(0, y1 - y0);
+  return { changed, total, first };
 }
 
 /** Vùng OCR đúng hợp đồng 3.2 (để test pipeline mà không phụ thuộc fixture). */
