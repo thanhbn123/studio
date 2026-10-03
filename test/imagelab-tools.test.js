@@ -29,10 +29,11 @@ describe('MVP-02 tools — imagelab-demo.mjs chạy thật, ảnh gốc bất bi
 
     const dir = tmpDir('vps-imagelab-demo-');
     const outPath = path.join(dir, 'rendered.png');
+    const sidePath = path.join(dir, 'truoc-sau.png');
 
     const run = spawnSync(
       process.execPath,
-      ['tools/imagelab-demo.mjs', '--image', FIXTURE_REL, '--out', outPath, '--db', ':memory:'],
+      ['tools/imagelab-demo.mjs', '--image', FIXTURE_REL, '--out', outPath, '--side-by-side', sidePath, '--db', ':memory:'],
       {
         cwd: ROOT,
         encoding: 'utf8',
@@ -60,7 +61,8 @@ describe('MVP-02 tools — imagelab-demo.mjs chạy thật, ảnh gốc bất bi
     assert.match(stdout, /succeeded/, 'output phải có trạng thái job succeeded');
     assert.match(stdout, /MOCK_VERIFIED/, 'phải có nhãn MOCK_VERIFIED (provider giả tự khai)');
     assert.ok(!stdout.includes('LIVE_VERIFIED'), 'MVP-02 KHÔNG BAO GIỜ được gắn nhãn LIVE_VERIFIED');
-    assert.match(stdout, /Ảnh gốc trên đĩa không đổi/, 'demo phải tự chứng minh ảnh gốc không đổi');
+    assert.match(stdout, /Ảnh gốc không đổi sau toàn bộ luồng/, 'demo phải tự chứng minh ảnh gốc không đổi');
+    assert.match(stdout, /Ảnh TRƯỚC\|SAU/, 'demo phải nói rõ file ảnh trước/sau để mở bằng mắt');
 
     // ẢNH FIXTURE GỐC: cùng hash, cùng kích thước, cùng thời điểm sửa.
     const afterHash = sha256(fs.readFileSync(fixturePath));
@@ -74,6 +76,13 @@ describe('MVP-02 tools — imagelab-demo.mjs chạy thật, ảnh gốc bất bi
     const outBuf = fs.readFileSync(outPath);
     assert.deepEqual([...outBuf.subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47], 'ảnh kết quả phải là PNG');
     assert.notEqual(sha256(outBuf), beforeHash, 'ảnh kết quả phải là bản mới, không phải ảnh gốc');
+
+    // Ảnh TRƯỚC|SAU: PNG riêng, rộng gấp đôi ảnh gốc (để mở MỘT file là nhìn được cả hai).
+    assert.ok(fs.existsSync(sidePath), 'demo phải ghép được ảnh trước/sau');
+    const sideBuf = fs.readFileSync(sidePath);
+    assert.deepEqual([...sideBuf.subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47], 'ảnh trước/sau phải là PNG');
+    // IHDR nằm ngay sau signature: width/height ở byte 16..23.
+    assert.ok(sideBuf.readUInt32BE(16) > 320, 'ảnh trước/sau phải rộng hơn ảnh gốc (ghép 2 ảnh)');
 
     // Mọi thứ ghi ra đều nằm trong thư mục tạm: có BẢN LƯU ảnh gốc đúng byte fixture
     // và ảnh render mới (chứng minh luồng lưu trữ thật đã chạy, không phải chỉ in chữ).

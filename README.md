@@ -49,9 +49,14 @@ npm run demo:imagelab                      # MVP-02: chạy trọn luồng dịc
 DATABASE_URL=postgres://... npm test       # bật thêm test PostgreSQL thật
 ```
 
-`npm run demo:imagelab` chạy trên ảnh PNG thật và in ra **sha256 ảnh gốc trước/sau** (chứng minh
-ảnh gốc không đổi), danh sách vùng chữ theo loại, số dòng bị khoá, và `usage_event` đọc lại từ DB.
+`npm run demo:imagelab` tự dựng **ảnh mẫu 800×800** (không cần ảnh của anh) rồi in ra **sha256 ảnh
+gốc trước/sau** (chứng minh ảnh gốc không đổi), danh sách vùng chữ theo loại, số dòng bị khoá,
+`usage_event` đọc lại từ DB — và ghi **ảnh TRƯỚC | SAU** vào `data/imagelab-demo/truoc-sau.png`
+để mở bằng mắt. Muốn dùng ảnh thật: `node tools/imagelab-demo.mjs --image <ảnh.png>`.
 Nó **không** chứng minh OCR thật — output tự ghi nhãn `MOCK_VERIFIED` khi có bước dùng provider giả.
+
+> **Owner nghiệm thu MVP-02:** xem hồ sơ từng bước tại
+> [`docs/MVP-02-ACCEPTANCE.md`](docs/MVP-02-ACCEPTANCE.md) (4 lệnh chạy + checklist + ảnh minh chứng).
 
 ### Docker
 
