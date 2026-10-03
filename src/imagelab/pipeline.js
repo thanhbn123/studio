@@ -22,6 +22,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { JOB_STATUS, VERIFICATION_LEVELS } from '../store/index.js';
 import { sniffImageMime } from '../security/sanitize.js';
+import { boxesIntersect, intersectBoxWithImage } from './geometry.js';
 
 /** Các bước của một job ImageLab — C5 hiện tiến trình theo `stage` này. */
 export const IMAGELAB_STAGES = Object.freeze([
@@ -188,28 +189,22 @@ function decodeImageInput(image, { maxBytes = 0 } = {}) {
   return { buffer, declaredMime, filename };
 }
 
-/** Cắt hộp bao vào biên ảnh — không bao giờ để RenderOp tràn ra ngoài ảnh. */
-function clampBox(box, width, height) {
-  let { x, y, w, h } = box;
-  if (Number.isFinite(width) && width > 0) {
-    x = Math.min(Math.max(x, 0), width - 1);
-    w = Math.min(w, width - x);
-  }
-  if (Number.isFinite(height) && height > 0) {
-    y = Math.min(Math.max(y, 0), height - 1);
-    h = Math.min(h, height - y);
-  }
-  if (!(w > 0) || !(h > 0)) return null;
-  return { x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) };
-}
-
 /**
- * Hai hộp pixel có GIAO nhau (diện tích chung > 0) hay không — bổ sung sau phản biện F-01.
- * Chạm cạnh không tính là giao: hai vùng chữ xếp sát nhau vẫn được vẽ bình thường.
+ * Cắt hộp bao vào biên ảnh — không bao giờ để RenderOp tràn ra ngoài ảnh.
+ *
+ * H-1: đây là GIAO của hộp với khung ảnh (hàm dùng chung `src/imagelab/geometry.js`),
+ * KHÔNG phải "dời gốc rồi giữ nguyên w/h" — bản cũ làm hộp có toạ độ âm bị NỚI RỘNG,
+ * khiến vùng mô tả hợp lệ bị `BOX_OVERLAPS_PROTECTED` chặn oan.
  */
-function boxesIntersect(a, b) {
-  if (!a || !b) return false;
-  return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+function clampBox(box, width, height) {
+  if (!box || typeof box !== 'object') return null;
+  const rounded = {
+    x: Math.round(Number(box.x)),
+    y: Math.round(Number(box.y)),
+    w: Math.round(Number(box.w ?? box.width)),
+    h: Math.round(Number(box.h ?? box.height)),
+  };
+  return intersectBoxWithImage(rounded, width, height);
 }
 
 export class ImageTranslationPipeline {
@@ -1063,6 +1058,14 @@ export class ImageTranslationPipeline {
       overrideIds.has(String(a?.region_id)) ? { ...a, override: true } : a,
     );
     const mergedSkipped = [...skipped, ...providerSkipped];
+    // H-2 (vòng 3): provider báo đã chạy xong mà KHÔNG vẽ được vùng nào ⇒ job vẫn có thể
+    // `succeeded` (ảnh là bản ghi mới, hợp lệ) nhưng TUYỆT ĐỐI không được im lặng: thêm
+    // cảnh báo nổi bật + giữ `error_code` của engine (NO_OPS) trong meta để UI nói thật.
+    if (applied.length === 0) {
+      warnings.push(
+        `⚠️ Không vùng nào được vẽ (0/${ops.length} op áp dụng được) — ảnh kết quả y hệt ảnh gốc. Xem danh sách "vùng không được vẽ" để biết lý do.`,
+      );
+    }
     const mergedWarnings = [...warnings, ...providerWarnings, ...extraWarnings];
     const providerName = String(render?.provider || this.renderProvider.name || '');
     const providerModel = String(render?.model || this.renderProvider.model || '');
@@ -1073,6 +1076,8 @@ export class ImageTranslationPipeline {
     const meta = {
       // `status` để C5 đọc thẳng `render_summary.status` từ meta ảnh đã render.
       status: renderStatus,
+      // H-2: mã lỗi của engine (vd `NO_OPS` khi không vẽ được vùng nào) — không im lặng.
+      error_code: render?.error_code ?? null,
       applied,
       applied_count: applied.length,
       skipped: mergedSkipped,

@@ -42,6 +42,11 @@ export const RENDER_CODES = Object.freeze({
   // Lỗi khác
   NOT_IMPLEMENTED: 'NOT_IMPLEMENTED',
   RENDER_FAILED: 'RENDER_FAILED',
+  /**
+   * Vòng 3 (H-2): render chạy xong nhưng KHÔNG vẽ được vùng nào (`applied` rỗng) —
+   * kết quả KHÔNG phải "OK", ảnh trả về y hệt ảnh gốc và phải kèm cảnh báo tiếng Việt.
+   */
+  NO_OPS: 'NO_OPS',
 });
 
 /**

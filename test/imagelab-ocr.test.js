@@ -137,7 +137,11 @@ describe('MVP-02 OCR — normalizeRegions (chuẩn hoá + vết dropped)', () =>
     const byText = Object.fromEntries(regions.map((r) => [r.text, r.box]));
     assert.deepEqual(byText['Lẻ'], { x: 10, y: 20, w: 30, h: 40 });
     assert.deepEqual(byText['Tràn'], { x: 950, y: 80, w: 50, h: 20 });
-    assert.deepEqual(byText['Âm'], { x: 0, y: 0, w: 100, h: 60 });
+    // SỬA THEO H-1 (vòng 3): kỳ vọng cũ { x: 0, y: 0, w: 100, h: 60 } mã hoá đúng LỖI —
+    // hộp { x: -50, w: 100 } phủ x ∈ [-50, 50) nên phần nằm TRONG ảnh chỉ còn w = 50
+    // (tương tự y: h = 30). Giữ nguyên w/h sau khi dời gốc là NỚI RỘNG hộp, đúng thứ
+    // đã làm vùng mô tả hợp lệ bị BOX_OVERLAPS_PROTECTED chặn oan.
+    assert.deepEqual(byText['Âm'], { x: 0, y: 0, w: 50, h: 30 });
     for (const r of regions) {
       assert.ok(r.box.x >= 0 && r.box.y >= 0);
       assert.ok(r.box.x + r.box.w <= 1000 && r.box.y + r.box.h <= 100);

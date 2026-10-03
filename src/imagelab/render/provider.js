@@ -162,21 +162,39 @@ export class RenderProvider {
         protectedBoxes,
         originalSha256: originalSha,
       })) ?? {};
+      const applied = Array.isArray(partial.applied) ? partial.applied : [];
+      const rawStatus = partial.status ?? RENDER_STATUS.OK;
+      const skippedAll = [...normalized.skipped, ...(Array.isArray(partial.skipped) ? partial.skipped : [])];
+      const partialWarnings = Array.isArray(partial.warnings) ? partial.warnings : [];
+      const output = partial.output ?? null;
+
+      // H-2 (vòng 3): KHÔNG vẽ được vùng nào thì TUYỆT ĐỐI không được báo "OK" im lặng.
+      // Giữ nguyên ảnh (bản sao y hệt gốc) nhưng hạ trạng thái xuống PARTIAL, gắn
+      // `error_code = NO_OPS` và kèm cảnh báo tiếng Việt nói thẳng sự thật.
+      const nothingDrawn = applied.length === 0 && (rawStatus === RENDER_STATUS.OK || rawStatus === RENDER_STATUS.PARTIAL);
+      if (nothingDrawn) {
+        partialWarnings.push(
+          ops.length === 0
+            ? 'Không có op nào để vẽ (ops rỗng) — ảnh trả về y hệt ảnh gốc, KHÔNG phải kết quả đã render.'
+            : `Không vẽ được vùng nào trong ${ops.length} op — ảnh trả về y hệt ảnh gốc (xem \`skipped\` để biết lý do).`,
+        );
+      }
+
       return finish({
         ...base,
         ...partial,
         // Các field nhận dạng KHÔNG cho provider con ghi đè.
-        status: partial.status ?? RENDER_STATUS.OK,
+        status: nothingDrawn ? RENDER_STATUS.PARTIAL : rawStatus,
         provider: this.name,
         model: this.model,
         is_mock: this.isMock,
         original_sha256: originalSha,
-        output: partial.output ?? null,
-        applied: Array.isArray(partial.applied) ? partial.applied : [],
-        skipped: [...normalized.skipped, ...(Array.isArray(partial.skipped) ? partial.skipped : [])],
+        output,
+        applied,
+        skipped: skippedAll,
         unsupported_glyphs: Array.isArray(partial.unsupported_glyphs) ? partial.unsupported_glyphs : [],
-        warnings: [...warnings, ...(Array.isArray(partial.warnings) ? partial.warnings : [])],
-        error_code: partial.error_code ?? null,
+        warnings: [...warnings, ...partialWarnings],
+        error_code: partial.error_code ?? (nothingDrawn ? RENDER_CODES.NO_OPS : null),
         error_message: partial.error_message ?? null,
       });
     } catch (err) {

@@ -11,6 +11,7 @@
  */
 
 import { Buffer } from 'node:buffer';
+import { boxesIntersect, intersectBoxWithImage } from '../geometry.js';
 import { readPngHeader } from './png.js';
 
 /** Magic bytes — khớp với `sniffImageMime` của src/security/sanitize.js (chỉ đọc, không sửa). */
@@ -185,6 +186,11 @@ export function toRgba(image) {
 
 /**
  * Kẹp hộp vào biên ảnh và làm tròn về số nguyên.
+ *
+ * Vòng 3 (H-1): thân hàm nay gọi `intersectBoxWithImage` của `src/imagelab/geometry.js`
+ * — MỘT bản logic dùng chung với `ocr/normalize.js` và `pipeline.js`, để ba nơi không
+ * còn lệch nhau (bản ở đây vốn đã đúng hình học; hai bản kia thì chưa).
+ *
  * @returns {{x:number,y:number,w:number,h:number}|null} null nếu hộp rỗng/không hợp lệ
  */
 export function clampBox(box, { width, height } = {}) {
@@ -198,12 +204,7 @@ export function clampBox(box, { width, height } = {}) {
   w = Math.round(w);
   h = Math.round(h);
   if (w <= 0 || h <= 0) return null;
-  const x0 = Math.max(0, x);
-  const y0 = Math.max(0, y);
-  const x1 = Math.min(width, x + w);
-  const y1 = Math.min(height, y + h);
-  if (x1 <= x0 || y1 <= y0) return null;
-  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+  return intersectBoxWithImage({ x, y, w, h }, width, height);
 }
 
 /** Đọc pixel (RGBA) tại (x, y) — trả mảng 4 số, hoặc null nếu ngoài biên. */
@@ -337,10 +338,12 @@ export function normalizeProtectedBoxes(raw) {
   return out;
 }
 
-/** Hai hộp có giao nhau (diện tích chung > 0) hay không. */
+/**
+ * Hai hộp có giao nhau (diện tích chung > 0) hay không.
+ * Vòng 3 (H-1): dùng chung `boxesIntersect` của `src/imagelab/geometry.js`.
+ */
 export function boxesOverlap(a, b) {
-  if (!a || !b) return false;
-  return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+  return boxesIntersect(a, b);
 }
 
 /**

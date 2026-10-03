@@ -4,9 +4,9 @@
  * Phần XANH: những chỗ bản vá được cho là dễ "chặn oan" / tính sai hộp — kiểm để
  * chứng minh nó KHÔNG sai.
  *
- * Phần ĐỎ (đang `skip`): lỗ hổng thật tìm được khi săn. Bỏ `skip` là test đỏ ngay;
- * lý do nằm trong chính tên test và trong báo cáo của agent test. TUYỆT ĐỐI không
- * sửa `src/**` — đây là bằng chứng, không phải bản vá.
+ * Phần ĐỎ (từng `skip`): lỗ hổng thật tìm được khi săn. **Vòng 3 đã vá H-1 (kẹp hộp =
+ * giao với khung ảnh, hàm dùng chung `src/imagelab/geometry.js`) và H-2 (render 0 op
+ * không còn báo `OK` im lặng), rồi GỠ `skip`** — nội dung khẳng định giữ nguyên.
  *
  *   H-1  `normalizeRegions` kẹp hộp có toạ độ ÂM bằng cách DỜI gốc nhưng GIỮ w/h
  *        ⇒ hộp lưu DB phủ rộng hơn vùng chữ thật (và `box_normalized` cũng sai).
@@ -130,8 +130,9 @@ describe('MVP-02 · săn lỗ hổng: KHÔNG chặn oan vùng hợp lệ (phần
   });
 });
 
-describe('MVP-02 · săn lỗ hổng: phát hiện được (test ĐỎ nếu bỏ skip)', () => {
-  test('H-1a: kẹp hộp có toạ độ ÂM phải giữ đúng vùng chữ thật (không nới rộng)', { skip: 'H-1: normalizeRegions dời gốc nhưng giữ w/h — test này ĐỎ với mã hiện tại' }, () => {
+describe('MVP-02 · săn lỗ hổng: H-1/H-2 đã vá — hồi quy thường trực (không còn skip)', () => {
+  // H-1 — ĐÃ VÁ (vòng 3): kẹp hộp = GIAO với khung ảnh (src/imagelab/geometry.js). Đã gỡ `skip`.
+  test('H-1a: kẹp hộp có toạ độ ÂM phải giữ đúng vùng chữ thật (không nới rộng)', () => {
     const { regions } = normalizeRegions(
       [{ text: '纯棉短袖T恤', box: { x: -30, y: 150, w: 240, h: 40 }, confidence: 0.95, lang: 'zh-Hans' }],
       { width: 320, height: 320, minConfidence: 0.5, maxRegions: 40 },
@@ -142,7 +143,7 @@ describe('MVP-02 · săn lỗ hổng: phát hiện được (test ĐỎ nếu b�
     assert.equal(regions[0].box_normalized.w, Math.round((210 / 320) * 1e6) / 1e6);
   });
 
-  test('H-1b: vùng mô tả KHÔNG giao nhãn hiệu (chỉ do hộp bị nới) phải vẫn được dịch', { skip: 'H-1: hệ quả của lỗi kẹp hộp — vùng hợp lệ bị BOX_OVERLAPS_PROTECTED chặn oan; test này ĐỎ với mã hiện tại' }, async () => {
+  test('H-1b: vùng mô tả KHÔNG giao nhãn hiệu (chỉ do hộp bị nới) phải vẫn được dịch', async () => {
     const BRAND = { x: 215, y: 150, w: 60, h: 40 };
     const WIDE = { x: -30, y: 150, w: 240, h: 40 }; // thật: [0,210) — KHÔNG chạm brand [215,275)
     const image = makeTestImage({ width: 320, height: 320, fills: [{ box: BRAND, rgba: RED }] });
@@ -161,7 +162,7 @@ describe('MVP-02 · săn lỗ hổng: phát hiện được (test ĐỎ nếu b�
     assert.equal(countChangedPixels(image, result.render.output.buffer, BRAND).changed, 0, 'nhãn hiệu vẫn phải nguyên');
   });
 
-  test('H-1c: hộp âm ghi THẲNG vào DB cũng bị tầng pipeline nới rộng (clampBox thứ hai)', { skip: 'H-1: pipeline.js#clampBox cũng dời gốc mà giữ w/h — test này ĐỎ với mã hiện tại' }, async () => {
+  test('H-1c: hộp âm ghi THẲNG vào DB cũng bị tầng pipeline nới rộng (clampBox thứ hai)', async () => {
     const config = imagelabConfig();
     const store = await createStore(config, silent);
     const storage = createImageStorage(config, { logger: silent });
@@ -190,7 +191,8 @@ describe('MVP-02 · săn lỗ hổng: phát hiện được (test ĐỎ nếu b�
     await store.close();
   });
 
-  test('H-2: render với 0 op không được báo OK im lặng', { skip: 'H-2: engine trả OK + ảnh y hệt gốc, warnings rỗng — test này ĐỎ với mã hiện tại' }, async () => {
+  // H-2 — ĐÃ VÁ (vòng 3): engine trả PARTIAL + error_code NO_OPS + cảnh báo. Đã gỡ `skip`.
+  test('H-2: render với 0 op không được báo OK im lặng', async () => {
     const provider = createRenderProvider(imagelabConfig(), { logger: silent });
     const image = makeTestImage({ width: 64, height: 64 });
     const res = await provider.render({ image, ops: [], options: {} });

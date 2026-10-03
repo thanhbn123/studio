@@ -852,6 +852,8 @@ function buildRenderSummary(rendered) {
   return {
     asset_id: rendered.id,
     status: meta.status ?? null,
+    // H-2: mã lỗi của engine (`NO_OPS` khi không vẽ được vùng nào) — UI nói thẳng.
+    error_code: meta.error_code ?? null,
     provider: meta.provider ?? null,
     is_mock: meta.is_mock ?? null,
     applied: asArray(meta.applied),

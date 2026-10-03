@@ -569,3 +569,49 @@ Mọi tên hàm / tên field / mã lỗi ở các mục 1–5 **giữ nguyên**;
   `tháng, năm, ngày, giờ, phút, lần, %, kg, g, ml, l, cm, mm, m, W, V, mAh, chiếc, cái, bộ, hộp, gói`).
 - Chữ chưa dịch: kana (`\p{Script=Hiragana}`, `\p{Script=Katakana}`) và Hangul (`\p{Script=Hangul}`)
   vào **cùng nhóm** "CHƯA DỊCH" với CJK.
+
+---
+
+## 7. SỬA ĐỔI SAU VÒNG SĂN LỖ HỔNG (vòng 3 — vẫn chỉ BỔ SUNG, không đổi tên đã đóng băng)
+
+Nguồn: 7 test bị `skip` có chủ đích trong `test/imagelab-f08-guardrails.test.js` và
+`test/imagelab-patch-holes.test.js` (agent test độc lập tìm ra sau bản vá F-01…F-08).
+Cả 7 đã được vá và **gỡ `skip`**; nội dung khẳng định của agent test giữ nguyên.
+
+**H-1 — kẹp hộp = GIAO với khung ảnh (module dùng chung)**
+
+- Thêm `src/imagelab/geometry.js`: `intersectBoxWithImage(box, width, height)` và
+  `boxesIntersect(a, b)` — **một chỗ duy nhất** cho hình học hộp pixel.
+- `ocr/normalize.js`, `pipeline.js#clampBox`, `render/image.js#clampBox` đều dùng hàm này.
+  Kẹp hộp phải **cắt bớt `w`/`h`** theo phần giao; giao rỗng ⇒ trả `null` (vùng bị bỏ kèm
+  lý do). Bản cũ ở `normalize.js`/`pipeline.js` dời gốc mà giữ `w`/`h` ⇒ hộp bị NỚI RỘNG,
+  làm vùng mô tả hợp lệ bị `BOX_OVERLAPS_PROTECTED` chặn oan và `box_normalized` sai.
+- Ví dụ chuẩn: hộp `{ x: -30, w: 240 }` trên ảnh rộng 320 → `{ x: 0, w: 210 }`.
+
+**H-2 — render 0 op KHÔNG được báo `OK`**
+
+- `RENDER_CODES.NO_OPS` (mới). `RenderProvider.render()` (C3): khi `applied.length === 0`
+  và trạng thái provider con là `OK`/`PARTIAL` ⇒ hạ xuống **`PARTIAL`**, gắn
+  `error_code = 'NO_OPS'` và thêm cảnh báo tiếng Việt ("không vẽ được vùng nào…").
+  Ảnh trả về vẫn là bản sao y hệt ảnh gốc (`output.sha256` không đổi) — không tạo ảnh giả.
+- Pipeline (C4): khi `applied.length === 0` phải thêm cảnh báo nổi bật và ghi
+  `asset.meta.error_code`; `render_summary.error_code` được trả thêm cho UI.
+  Giữ nguyên luật cũ: **không có op nào đủ điều kiện ⇒ job `FAILED IMAGELAB_NO_LINES`,
+  không lưu ảnh rỗng**.
+
+**F-08a — đơn vị tiền tệ trong luật "số viết bằng chữ"**
+
+- `COUNTED_UNITS` (C2) bổ sung: `đồng`, `vnđ`, `vnd`, `đ`, `nghìn`, `nghàn`, `ngàn`,
+  `triệu`, `tỷ`, `tỉ` ⇒ "…một trăm hai mươi nghìn đồng" bị bắt là số liệu bịa.
+
+**F-08b — ký hiệu số ngoài `\p{Nd}`**
+
+- `checkSpecialNumerals()` (C2): ký tự `\p{No}` (①, ½, ², ৴…) và `\p{Nl}` (số La Mã Ⅻ)
+  có trong `text_vi` mà chữ gốc không có ⇒ vi phạm "số liệu không có trong chữ gốc".
+  Ký hiệu nào NFKC đã quy về chữ số ASCII thì luật chữ số lo (không báo trùng).
+
+**F-08c — chuẩn hoá NFKC**
+
+- `normalizeForMatch()` (C2) đổi `NFC` → **`NFKC`**: gộp cả biến thể tương thích
+  (chữ FULL-WIDTH Latin "ｂảo hành" → "bảo hành", "①" → "1", "㎖" → "ml").
+  Văn bản trong `line` vẫn KHÔNG bị sửa — chỉ dùng để so khớp.

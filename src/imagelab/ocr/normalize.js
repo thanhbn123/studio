@@ -10,6 +10,7 @@
  */
 
 import { sanitizeText } from '../../security/sanitize.js';
+import { boxesIntersect, intersectBoxWithImage } from '../geometry.js';
 import {
   REGION_KINDS,
   PROTECTION_RANK,
@@ -104,16 +105,6 @@ function dropEntry(reason, text) {
 }
 
 /**
- * Hai hộp pixel có GIAO nhau (diện tích chung > 0) hay không.
- * Chạm cạnh (không có diện tích chung) KHÔNG tính là giao — nếu tính, hai vùng chữ
- * xếp sát nhau sẽ bị chặn oan.
- */
-function boxesIntersect(a, b) {
-  if (!a || !b) return false;
-  return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
-}
-
-/**
  * Chuẩn hoá danh sách vùng thô.
  *
  * @param {Array<object>} rawRegions vùng do provider trả về (có thể bẩn/không phải mảng)
@@ -186,15 +177,24 @@ export function normalizeRegions(rawRegions, { width, height, maxRegions, minCon
       return;
     }
 
-    // Clamp vào biên ảnh, toạ độ là số nguyên.
-    const x = clamp(Math.trunc(box.x), 0, W);
-    const y = clamp(Math.trunc(box.y), 0, H);
-    const w = Math.min(Math.trunc(box.w), W - x);
-    const h = Math.min(Math.trunc(box.h), H - y);
-    if (w <= 0 || h <= 0) {
+    // Kẹp vào biên ảnh = GIAO của hộp với khung ảnh (H-1: phải cắt bớt w/h, KHÔNG được
+    // dời gốc rồi giữ nguyên kích thước — làm vậy hộp bị nới rộng và chặn oan vùng khác).
+    // Toạ độ là số nguyên (trunc) như trước; hàm dùng chung với pipeline/render.
+    const box_ = intersectBoxWithImage(
+      {
+        x: Math.trunc(box.x),
+        y: Math.trunc(box.y),
+        w: Math.trunc(box.w),
+        h: Math.trunc(box.h),
+      },
+      W,
+      H,
+    );
+    if (!box_) {
       dropped.push(dropEntry('hộp nằm ngoài biên ảnh sau khi cắt (không còn diện tích)', text));
       return;
     }
+    const { x, y, w, h } = box_;
 
     // Độ tin cậy: chỉ nhận 0..1. Giá trị ngoài khoảng bị kẹp (KHÔNG đoán thang 0-100).
     const confRaw = num(r.confidence);

@@ -104,24 +104,27 @@ describe('MVP-02 F-08 · guardrail bắt biến thể từng lọt', () => {
     }
   });
 
-  /* ─────────── LỖ HỔNG CÒN LẠI của F-08: test ĐỎ nếu bỏ `skip` ───────────
+  /* ─────────── BA LỖ HỔNG F-08 ĐÃ ĐƯỢC VÁ (vòng 3) ───────────
    *
-   * Ba biến thể dưới đây vẫn lọt guardrail (đã kiểm bằng script độc lập). Đây là
-   * GIỚI HẠN PHƯƠNG PHÁP còn lại sau bản vá, không phải hồi quy — nhưng phải được
-   * ghi lại bằng test thay vì chỉ nằm trong báo cáo. Bỏ `skip` là test đỏ ngay.
+   * Ba test dưới đây từng bị `skip` vì mã cũ để lọt; agent gộp vòng 3 đã vá
+   * (F-08a đơn vị tiền tệ · F-08b `\p{No}`/`\p{Nl}` · F-08c NFKC) và GỠ `skip`.
+   * Nội dung khẳng định giữ nguyên — chỉ bỏ cờ skip và đổi tên cho khỏi nói sai.
    */
-  test('LỖ HỔNG: giá bịa bằng CHỮ + đơn vị tiền tệ ("…nghìn đồng") phải bị bắt', { skip: 'F-08 còn lọt: COUNTED_UNITS thiếu đơn vị tiền tệ (đồng/vnđ) — test này ĐỎ với mã hiện tại' }, () => {
+  // F-08a — ĐÃ VÁ (vòng 3): thêm đơn vị tiền tệ vào COUNTED_UNITS. Cờ `skip` đã được gỡ.
+  test('giá bịa bằng CHỮ + đơn vị tiền tệ ("…nghìn đồng") phải bị bắt', () => {
     const out = check('纯棉T恤', 'Áo thun cotton một trăm hai mươi nghìn đồng');
     assert.equal(out.line.status, TRANSLATE_STATUS.NEEDS_REVIEW);
     assert.match(out.violations.join(' | '), /Số liệu/);
   });
 
-  test('LỖ HỔNG: chữ số khoanh tròn ①② phải bị bắt', { skip: 'F-08 còn lọt: ① là \\p{No} chứ không phải \\p{Nd} — test này ĐỎ với mã hiện tại' }, () => {
+  // F-08b — ĐÃ VÁ (vòng 3): NFKC + luật riêng cho `\p{No}`/`\p{Nl}`. Cờ `skip` đã được gỡ.
+  test('chữ số khoanh tròn ①② phải bị bắt', () => {
     const out = check('纯棉T恤', 'Áo thun cotton ①② tháng');
     assert.equal(out.line.status, TRANSLATE_STATUS.NEEDS_REVIEW);
   });
 
-  test('LỖ HỔNG: từ khoá viết bằng chữ FULL-WIDTH Latin ("ｂảo hành") phải bị bắt', { skip: 'F-08 còn lọt: normalizeForMatch chỉ NFC, chưa NFKC — test này ĐỎ với mã hiện tại' }, () => {
+  // F-08c — ĐÃ VÁ (vòng 3): `normalizeForMatch` dùng NFKC. Cờ `skip` đã được gỡ.
+  test('từ khoá viết bằng chữ FULL-WIDTH Latin ("ｂảo hành") phải bị bắt', () => {
     const out = check('纯棉T恤', 'Áo thun cotton ｂảo hành');
     assert.equal(out.line.status, TRANSLATE_STATUS.NEEDS_REVIEW);
     assert.match(out.violations.join(' | '), /bảo hành/i);

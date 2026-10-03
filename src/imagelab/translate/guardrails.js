@@ -32,7 +32,11 @@ import { TRANSLATE_STATUS } from './lines.js';
  * Kẻ bịa có thể chèn ký tự VÔ HÌNH vào giữa từ khoá ("bảo\u200bhành") để regex
  * không khớp. Mọi luật vì vậy phải chạy trên văn bản đã BỎ ký tự vô hình (thay bằng
  * khoảng trắng để "bảo\u200bhành" vẫn tách thành "bảo hành") và đã chuẩn hoá Unicode
- * (NFC) — nhưng KHÔNG được sửa văn bản gốc của người dùng.
+ * **NFKC** (vòng 3 — F-08c) — nhưng KHÔNG được sửa văn bản gốc của người dùng.
+ *
+ * Vì sao NFKC chứ không chỉ NFC: NFKC gộp thêm các biến thể TƯƠNG THÍCH — chữ
+ * FULL-WIDTH Latin ("ｂảo hành" → "bảo hành"), chỉ số trên ("²" → "2"), số khoanh tròn
+ * ("①" → "1"), ký hiệu đơn vị ghép ("㎖" → "ml") — đúng những đường lách của F-08b/c.
  */
 
 /** Ký tự vô hình: zero-width space/non-joiner/joiner, BOM, word-joiner. */
@@ -44,7 +48,7 @@ export function stripInvisible(text) {
 }
 
 /**
- * Chuẩn hoá văn bản để so khớp: ký tự vô hình → khoảng trắng, gộp khoảng trắng, NFC.
+ * Chuẩn hoá văn bản để so khớp: ký tự vô hình → khoảng trắng, gộp khoảng trắng, NFKC.
  * Thay bằng khoảng trắng (không xoá hẳn) để từ khoá bị cắt vẫn khớp lại được.
  */
 export function normalizeForMatch(text) {
@@ -52,7 +56,7 @@ export function normalizeForMatch(text) {
     .replace(INVISIBLE_RE, ' ')
     .replace(/\s+/g, ' ')
     .trim()
-    .normalize('NFC');
+    .normalize('NFKC');
 }
 
 /* ─────────────────────── 1. Phát hiện ký tự CHƯA DỊCH ─────────────────────── */
@@ -265,10 +269,18 @@ const VI_NUM_WORD_ALT =
 
 const VI_NUM_WORD_RUN = `(?:${VI_NUM_WORD_ALT})(?:\\s+(?:${VI_NUM_WORD_ALT})){0,4}`;
 
-/** Đơn vị / mốc thời gian phải đi kèm thì cụm số-bằng-chữ mới bị coi là "số liệu". */
+/**
+ * Đơn vị / mốc thời gian phải đi kèm thì cụm số-bằng-chữ mới bị coi là "số liệu".
+ *
+ * Vòng 3 (F-08a): bổ sung ĐƠN VỊ TIỀN TỆ Việt — "một trăm hai mươi nghìn đồng" từng lọt
+ * vì `đồng`/`vnđ`/`đ` không có trong danh sách, còn `nghìn`/`triệu`/`tỷ` chỉ được coi là
+ * hư từ ghép số nên cụm "…nghìn" trơ trọi không kích hoạt luật nào.
+ */
 const COUNTED_UNITS = Object.freeze([
   'tháng', 'năm', 'ngày', 'giờ', 'phút', 'lần', '%', 'kg', 'g', 'ml', 'l', 'cm', 'mm', 'm',
   'W', 'V', 'mAh', 'chiếc', 'cái', 'bộ', 'hộp', 'gói',
+  // Tiền tệ / mốc giá (F-08a)
+  'đồng', 'vnđ', 'vnd', 'đ', 'nghìn', 'nghàn', 'ngàn', 'triệu', 'tỷ', 'tỉ',
 ]);
 
 const COUNTED_UNIT_ALT = COUNTED_UNITS
@@ -323,6 +335,39 @@ export function wordNumberUnitsIn(text) {
   for (const m of s.matchAll(VI_WORD_NUMBER_UNIT_RE)) {
     const phrase = `${m[1]} ${m[2]}`.replace(/\s+/g, ' ').trim();
     out.push({ phrase, unit: String(m[2]), value: vietnameseWordsToNumber(m[1]) });
+  }
+  return out;
+}
+
+/* ─── Ký hiệu số KHÔNG thuộc \p{Nd} (F-08b — vòng 3) ───
+ *
+ * `\p{Nd}` chỉ phủ chữ số thập phân. Còn hai nhóm "số" khác lọt qua:
+ *   - `\p{No}` (Number, other): số khoanh tròn ①②, phân số ½, chỉ số trên ², số Ả Rập - Ấn
+ *     dạng ký hiệu (৴)… NFKC chỉ gỡ được MỘT PHẦN (① → "1", nhưng 773/915 ký tự No KHÔNG
+ *     cho ra chữ số ASCII nào).
+ *   - `\p{Nl}` (Number, letter): số La Mã Ⅰ Ⅱ Ⅻ — NFKC biến thành CHỮ ("XII") nên luật
+ *     chữ số không bắt được.
+ *
+ * Luật: ký hiệu số có trong `text_vi` mà chữ gốc KHÔNG có ⇒ vi phạm "số liệu không có
+ * trong chữ gốc". Ký hiệu nào NFKC đã quy về chữ số ASCII thì luật chữ số lo (không báo
+ * trùng hai lần).
+ */
+const SPECIAL_NUMERAL_RE = /[\p{No}\p{Nl}]/gu;
+
+/**
+ * @param {string} textOriginal chữ gốc (nguyên văn, chưa NFKC)
+ * @param {string} textVi chữ Việt (nguyên văn, chưa NFKC)
+ * @returns {string[]} câu tiếng Việt
+ */
+export function checkSpecialNumerals(textOriginal, textVi) {
+  const original = stripInvisible(textOriginal);
+  const vi = stripInvisible(textVi);
+  const out = [];
+  for (const ch of [...new Set(vi.match(SPECIAL_NUMERAL_RE) || [])]) {
+    if (original.includes(ch)) continue; // chữ gốc có đúng ký hiệu đó ⇒ trung thực
+    if (/[0-9]/.test(ch.normalize('NFKC'))) continue; // đã quy về chữ số ASCII ⇒ luật (a) lo
+    const label = /\p{Nl}/u.test(ch) ? 'số La Mã' : 'ký hiệu số đặc biệt';
+    out.push(`Số liệu “${ch}” (${label}) không có trong chữ gốc — không được tự thêm số.`);
   }
   return out;
 }
@@ -553,16 +598,21 @@ export function resolveTranslatable(line, region) {
  */
 export function enforceTranslationGuardrails(line, { region } = {}) {
   const base = { ...(line || {}) };
-  // F-08: mọi phép so khớp chạy trên văn bản đã bỏ ký tự vô hình + NFC; văn bản trong
-  // `line` KHÔNG bị sửa (giữ nguyên thứ người dùng gõ).
-  const textOriginal = normalizeForMatch(base.text_original ?? region?.text ?? '');
-  const textVi = normalizeForMatch(base.text_vi ?? '');
+  // F-08: mọi phép so khớp chạy trên văn bản đã bỏ ký tự vô hình + NFKC (vòng 3); văn bản
+  // trong `line` KHÔNG bị sửa (giữ nguyên thứ người dùng gõ).
+  const rawOriginal = String(base.text_original ?? region?.text ?? '');
+  const rawVi = String(base.text_vi ?? '');
+  const textOriginal = normalizeForMatch(rawOriginal);
+  const textVi = normalizeForMatch(rawVi);
   const translatable = resolveTranslatable(base, region);
 
   const violations = [...(Array.isArray(base.violations) ? base.violations : [])];
 
   // (a) số liệu / đơn vị không có trong chữ gốc
   violations.push(...checkNumericClaims(textOriginal, textVi));
+  // (a2) ký hiệu số ngoài `\p{Nd}` (khoanh tròn ①, số La Mã Ⅻ…) — phải soi trên văn bản
+  // GỐC vì NFKC đã biến đổi chúng trước khi tới `checkNumericClaims` (F-08b).
+  violations.push(...checkSpecialNumerals(rawOriginal, rawVi));
 
   // (b) còn ký tự CHƯA DỊCH (Hán, kana, Hangul) → CHƯA DỊCH
   if (hasUntranslatedScript(textVi)) {
