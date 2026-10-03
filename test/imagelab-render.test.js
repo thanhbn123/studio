@@ -2,7 +2,8 @@
  * TEST MVP-02 · RENDER & PIXEL (C3) — `src/imagelab/render/**`.
  *
  * Đây là tầng dễ sai nhất, nên test khẳng định bằng PIXEL và HÌNH HỌC thật:
- *  - PNG round-trip (byte-identical với fixture 320×320 RGB và với ảnh RGBA tự sinh);
+ *  - PNG round-trip PIXEL-identical (fixture 320×320 RGB và ảnh RGBA tự sinh). Lưu ý: KHÔNG
+ *    đòi giống từng BYTE với file PNG ngoài — nén zlib khác phiên bản cho byte khác nhau;
  *  - PNG lạ (interlaced / palette / bit-depth ≠ 8) → PNG_UNSUPPORTED;
  *  - PNG hỏng (CRC sai / cắt ngắn / rác) → PNG_CORRUPT, không crash, không treo;
  *  - ảnh gốc BẤT BIẾN: buffer vào không bị sửa, pixel NGOÀI mọi hộp không đổi;
@@ -56,7 +57,7 @@ const pixelAt = (rgba, width, x, y) => {
 const inAnyBox = (boxes, x, y) => boxes.some((b) => x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h);
 
 describe('MVP-02 render — PNG codec (round-trip + ảnh không hỗ trợ + ảnh hỏng)', () => {
-  test('round-trip BYTE-IDENTICAL với fixture headphones.png (320×320, RGB color type 2)', () => {
+  test('round-trip PIXEL-IDENTICAL với fixture headphones.png (320×320, RGB color type 2)', () => {
     const original = headphones();
     const header = decodePng(original);
     assert.equal(header.width, 320);
@@ -71,11 +72,25 @@ describe('MVP-02 render — PNG codec (round-trip + ảnh không hỗ trợ + �
       data: header.data,
       channels: header.channels,
     });
-    assert.equal(reencoded.length, original.length);
-    assert.ok(reencoded.equals(original), 'encodePng(decodePng(x)) phải cho lại đúng byte của x');
+    // CỐ Ý KHÔNG khẳng định `reencoded.equals(original)`: nén zlib là "tuỳ cài đặt" — cùng
+    // pixel nhưng macOS và Linux (CI) cho ra chuỗi byte KHÁC nhau, nên đòi giống byte là
+    // test SAI (đã từng đỏ trên CI). Điều thật sự phải đúng:
+    //   1. giải nén lại cho ĐÚNG TỪNG PIXEL;
+    //   2. mã hoá lại CÙNG một input trong cùng tiến trình phải TẤT ĐỊNH;
+    //   3. kích thước không phình bất thường.
+    assert.ok(reencoded.length > 0);
+    assert.ok(reencoded.length < original.length * 4, 'không được phình quá 4 lần');
 
     const again = decodePng(reencoded);
     assert.ok(again.data.equals(header.data), 'pixel sau round-trip phải y hệt');
+
+    const reencoded2 = encodePng({
+      width: header.width,
+      height: header.height,
+      data: header.data,
+      channels: header.channels,
+    });
+    assert.ok(reencoded.equals(reencoded2), 'encodePng phải tất định với cùng input trong cùng tiến trình');
   });
 
   test('round-trip ảnh RGBA tự sinh: giữ đúng alpha và byte-identical khi mã hoá lại', () => {

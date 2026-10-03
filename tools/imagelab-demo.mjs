@@ -59,6 +59,8 @@ async function main() {
 
   if (!fs.existsSync(imagePath)) {
     console.error(`Không thấy ảnh: ${imagePath}`);
+    console.error('Gợi ý: sinh ảnh mẫu bằng  node tools/make-test-image.mjs <đường-dẫn.png>  rồi truyền --image.');
+    console.error('(Image Docker runtime cố ý không chứa test/, nên ảnh mẫu phải sinh tại chỗ.)');
     process.exit(2);
   }
 

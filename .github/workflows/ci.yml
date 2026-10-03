@@ -225,6 +225,9 @@ jobs:
 
       - name: Chạy luồng MVP-02 trong image (offline, ghi vào /data)
         run: |
-          docker run --rm vip-product-studio:ci node tools/imagelab-demo.mjs | tee /tmp/demo.log | tail -8
+          # Image runtime CỐ Ý không chứa `test/`, nên sinh ảnh mẫu bằng chính `tools/` trong image.
+          docker run --rm vip-product-studio:ci sh -c \
+            "node tools/make-test-image.mjs /data/anh-mau.png && node tools/imagelab-demo.mjs --image /data/anh-mau.png" \
+            | tee /tmp/demo.log | tail -8
           grep -q "MOCK_VERIFIED" /tmp/demo.log
           grep -q "Trạng thái job: succeeded" /tmp/demo.log
