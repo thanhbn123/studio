@@ -22,7 +22,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { JOB_STATUS, VERIFICATION_LEVELS } from '../store/index.js';
 import { sniffImageMime } from '../security/sanitize.js';
-import { boxesIntersect, intersectBoxWithImage } from './geometry.js';
+import { boxesIntersect, intersectBoxWithImage, strictCoordinate } from './geometry.js';
 
 /** Các bước của một job ImageLab — C5 hiện tiến trình theo `stage` này. */
 export const IMAGELAB_STAGES = Object.freeze([
@@ -100,6 +100,12 @@ const KIND_SKIP_REASON = Object.freeze({
 });
 
 const NEVER_LIVE = Object.freeze(new Set(['LIVE_VERIFIED', 'AUTHENTICATED_LIVE_VERIFIED']));
+
+/**
+ * Mã lỗi MỨC JOB khi render không vẽ được vùng nào (N-2, vòng 4). Ảnh mới vẫn được lưu
+ * nên `status = succeeded`, nhưng `error_code` phải nói thật để client không hiểu nhầm.
+ */
+export const RENDER_NO_OPS = 'RENDER_NO_OPS';
 
 /** Lỗi có `code` rõ ràng — C5 map sang HTTP (REVIEW_REQUIRED → 409). */
 export class ImageLabError extends Error {
@@ -198,13 +204,17 @@ function decodeImageInput(image, { maxBytes = 0 } = {}) {
  */
 function clampBox(box, width, height) {
   if (!box || typeof box !== 'object') return null;
-  const rounded = {
-    x: Math.round(Number(box.x)),
-    y: Math.round(Number(box.y)),
-    w: Math.round(Number(box.w ?? box.width)),
-    h: Math.round(Number(box.h ?? box.height)),
-  };
-  return intersectBoxWithImage(rounded, width, height);
+  // N-1 (vòng 4): đọc toạ độ NGHIÊM NGẶT — NULL/rác KHÔNG được coi là 0.
+  const x = strictCoordinate(box.x);
+  const y = strictCoordinate(box.y);
+  const w = strictCoordinate(box.w ?? box.width);
+  const h = strictCoordinate(box.h ?? box.height);
+  if (x === null || y === null || w === null || h === null) return null;
+  return intersectBoxWithImage(
+    { x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) },
+    strictCoordinate(width),
+    strictCoordinate(height),
+  );
 }
 
 export class ImageTranslationPipeline {
@@ -305,33 +315,43 @@ export class ImageTranslationPipeline {
     return Array.isArray(configured) && configured.length > 0 ? configured : ALLOWED_IMAGE_MIME;
   }
 
-  /** Hộp bao pixel của vùng trên ảnh gốc; suy từ `box_normalized` nếu thiếu `box`. */
+  /**
+   * Hộp bao pixel của vùng trên ảnh gốc; suy từ `box_normalized` nếu `box` thiếu/hỏng.
+   *
+   * N-1 (vòng 4): toạ độ đọc NGHIÊM NGẶT — `null`/`undefined`/`''`/`NaN`/`Infinity`/chuỗi
+   * không phải số/boolean/mảng KHÔNG được coi là 0 (trước đây `Number(null) === 0` khiến
+   * hộp bảo vệ "ảo" mọc ở gốc toạ độ và pixel nhãn hiệu bị xoá thật).
+   *
+   * Nếu `box` hỏng nhưng `box_normalized` của CHÍNH vùng đó còn dùng được thì lấy theo nó
+   * (không đoán: đây là số liệu chuẩn hoá đã lưu cùng vùng). Cả hai đều hỏng ⇒ `null`,
+   * và tầng gọi phải fail-closed.
+   */
   #boxOf(region, asset) {
     const width = Number(asset?.width);
     const height = Number(asset?.height);
     const b = region?.box;
-    if (b && [b.x, b.y, b.w, b.h].every((v) => Number.isFinite(Number(v))) && Number(b.w) > 0 && Number(b.h) > 0) {
-      return clampBox(
-        { x: Number(b.x), y: Number(b.y), w: Number(b.w), h: Number(b.h) },
-        width,
-        height,
-      );
+    if (b && typeof b === 'object') {
+      const bx = strictCoordinate(b.x);
+      const by = strictCoordinate(b.y);
+      const bw = strictCoordinate(b.w ?? b.width);
+      const bh = strictCoordinate(b.h ?? b.height);
+      if (bx !== null && by !== null && bw !== null && bh !== null && bw > 0 && bh > 0) {
+        return clampBox({ x: bx, y: by, w: bw, h: bh }, width, height);
+      }
     }
     const n = region?.box_normalized;
-    if (
-      n && Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0 &&
-      Number(n.w) > 0 && Number(n.h) > 0
-    ) {
-      return clampBox(
-        {
-          x: Number(n.x || 0) * width,
-          y: Number(n.y || 0) * height,
-          w: Number(n.w) * width,
-          h: Number(n.h) * height,
-        },
-        width,
-        height,
-      );
+    if (n && typeof n === 'object' && Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0) {
+      const nx = strictCoordinate(n.x);
+      const ny = strictCoordinate(n.y);
+      const nw = strictCoordinate(n.w);
+      const nh = strictCoordinate(n.h);
+      if (nx !== null && ny !== null && nw !== null && nh !== null && nw > 0 && nh > 0) {
+        return clampBox(
+          { x: nx * width, y: ny * height, w: nw * width, h: nh * height },
+          width,
+          height,
+        );
+      }
     }
     return null;
   }
@@ -766,7 +786,7 @@ export class ImageTranslationPipeline {
    * Dựng RenderOp từ các dòng ĐÃ DUYỆT rồi render ra ảnh mới (role `rendered`,
    * `parent_id` = ảnh gốc). Ảnh gốc chỉ được đọc.
    */
-  async renderApproved(jobId, { sessionId, onlyRegionIds, force = false } = {}) {
+  async renderApproved(jobId, { sessionId, onlyRegionIds, force = false, unknownRegionIds = [] } = {}) {
     const started = Date.now();
     const log = this.#log(jobId);
     const cfg = this.imagelabConfig;
@@ -804,6 +824,12 @@ export class ImageTranslationPipeline {
     }
 
     const warnings = [];
+    // N-4 (vòng 4): id trong `only_region_ids` không khớp vùng nào ⇒ CẢNH BÁO (không im lặng).
+    if (Array.isArray(unknownRegionIds) && unknownRegionIds.length > 0) {
+      warnings.push(
+        `⚠️ ${unknownRegionIds.length} id trong \`only_region_ids\` không khớp vùng nào của job (${unknownRegionIds.slice(0, 5).join(', ')}) — chỉ render các vùng khớp.`,
+      );
+    }
     let forcedReason = null;
     if (force === true) {
       forcedReason = pending.length > 0
@@ -831,6 +857,7 @@ export class ImageTranslationPipeline {
     const lineByRegion = new Map();
     for (const line of allLines) lineByRegion.set(String(line?.region_id ?? ''), line);
     const protectedBoxes = [];
+    const unusableProtected = []; // vùng bảo vệ có toạ độ KHÔNG dùng được (N-1)
     for (const region of persistedRegions) {
       const rid = String(region?.id ?? '');
       const kind = String(region?.kind ?? '');
@@ -840,7 +867,15 @@ export class ImageTranslationPipeline {
       if (!protectedByKind && !protectedByStatus) continue;
       const pbox = this.#boxOf(region, original);
       if (pbox) protectedBoxes.push({ region_id: rid, kind, box: pbox });
+      else unusableProtected.push({ region_id: rid, kind });
     }
+    // N-1 (vòng 4): KHÔNG biết hộp bảo vệ nằm ở đâu thì mọi op đều CÓ THỂ chồng lên nó ⇒
+    // fail-closed: không dựng op nào. Nếu vì thế mà không còn op ⇒ `IMAGELAB_NO_LINES`
+    // (job failed, KHÔNG lưu ảnh) — thà không render còn hơn xoá mất nhãn hiệu.
+    const unusableReason = unusableProtected.length
+      ? `BOX_OVERLAPS_PROTECTED: ${unusableProtected[0].region_id} (${unusableProtected[0].kind}, hộp không hợp lệ — fail-closed) — không xác định được vị trí vùng được bảo vệ nên KHÔNG xoá/vẽ bất kỳ vùng nào.`
+      : null;
+    if (unusableReason) warnings.push(unusableReason);
 
     for (const line of allLines) {
       const rid = String(line?.region_id ?? '');
@@ -887,7 +922,16 @@ export class ImageTranslationPipeline {
       // "đã duyệt" mà không bao giờ được render — đúng kiểu thất bại im lặng mà luật #4 cấm.
       const box = this.#boxOf(region, original);
       if (!box) {
-        skipped.push({ region_id: rid, reason: 'Hộp bao không hợp lệ (BAD_BOX) — không vẽ để tránh tràn ra ngoài vùng.' });
+        skipped.push({
+          region_id: rid,
+          reason:
+            'BAD_BOX_COORDINATE: hộp bao thiếu hoặc toạ độ không hợp lệ (NULL, rỗng, NaN, Infinity, chuỗi không phải số) — KHÔNG vẽ để tránh tràn ra ngoài vùng.',
+        });
+        continue;
+      }
+      // N-1: có vùng bảo vệ với toạ độ hỏng ⇒ chặn MỌI op (không đoán vị trí hộp bảo vệ).
+      if (unusableReason) {
+        skipped.push({ region_id: rid, reason: unusableReason });
         continue;
       }
       // F-01 lớp 1: op KHÔNG được GIAO với hộp của vùng được bảo vệ KHÁC (chồng một phần,
@@ -1009,6 +1053,29 @@ export class ImageTranslationPipeline {
       const code = String(render?.error_code || (renderStatus === 'NOT_CONFIGURED' ? 'NOT_CONFIGURED' : 'RENDER_FAILED'));
       const message = String(render?.error_message || `Render không thành công (status = ${renderStatus}).`).slice(0, 500);
       await this.#failJob(jobId, { code, message });
+      // N-5: giữ lại CHÍNH warnings/skipped của provider vào content_meta để UI/lịch sử
+      // đọc được lý do thật (với `PROTECTED_PIXELS_CHANGED` thì câu giải thích nằm ở đây).
+      await this.#setJob(jobId, {
+        content_meta: {
+          ...(job.content_meta || {}),
+          imagelab: {
+            ...(job.content_meta?.imagelab || {}),
+            render: {
+              provider: String(render?.provider || ''),
+              model: String(render?.model || ''),
+              is_mock: Boolean(render?.is_mock),
+              status: renderStatus,
+              applied: 0,
+              skipped: Array.isArray(render?.skipped) ? render.skipped.length : 0,
+              error_code: code,
+              protected_pixels_verified: render?.protected_pixels_verified ?? null,
+              warnings: Array.isArray(render?.warnings) ? render.warnings.map(String).slice(0, 50) : [],
+            },
+            warnings: Array.isArray(render?.warnings) ? render.warnings.map(String).slice(0, 50) : [],
+            updated_at: new Date().toISOString(),
+          },
+        },
+      }).catch(() => {});
       return failedResult(code, message, { render });
     }
 
@@ -1078,6 +1145,9 @@ export class ImageTranslationPipeline {
       status: renderStatus,
       // H-2: mã lỗi của engine (vd `NO_OPS` khi không vẽ được vùng nào) — không im lặng.
       error_code: render?.error_code ?? null,
+      // N-5: `true` = đã đo pixel vùng bảo vệ trên ảnh trả về; `false` = KHÔNG kiểm được
+      // (định dạng khác PNG); `null` = không có hộp bảo vệ nào để kiểm.
+      protected_pixels_verified: render?.protected_pixels_verified ?? null,
       applied,
       applied_count: applied.length,
       skipped: mergedSkipped,
@@ -1154,8 +1224,14 @@ export class ImageTranslationPipeline {
       status: JOB_STATUS.SUCCEEDED,
       stage: 'done',
       finished_at: new Date().toISOString(),
-      error_code: null,
-      error_message: null,
+      // N-2 (vòng 4): job phải PHẢN ÁNH sự thật — không vẽ được vùng nào thì `error_code`
+      // của job KHÔNG được để `null` (client chỉ đọc `job.status`/`error_code` sẽ tưởng
+      // đã render xong). Ảnh mới vẫn được lưu (bản ghi hợp lệ, y hệt ảnh gốc) nên
+      // `status` giữ `succeeded`; nếu KHÔNG lưu được ảnh thì đường lỗi phía trên đã `failed`.
+      error_code: applied.length === 0 ? RENDER_NO_OPS : null,
+      error_message: applied.length === 0
+        ? 'Render chạy xong nhưng KHÔNG vẽ được vùng nào (0 op áp dụng được) — ảnh kết quả y hệt ảnh gốc; xem `render_summary.skipped` để biết lý do.'
+        : null,
       content_meta: {
         ...(job.content_meta || {}),
         imagelab: {

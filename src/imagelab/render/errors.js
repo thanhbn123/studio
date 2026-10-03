@@ -47,6 +47,21 @@ export const RENDER_CODES = Object.freeze({
    * kết quả KHÔNG phải "OK", ảnh trả về y hệt ảnh gốc và phải kèm cảnh báo tiếng Việt.
    */
   NO_OPS: 'NO_OPS',
+  /**
+   * Vòng 4 (N-5b): provider khai `applied` nhiều hơn số op đã gửi — không tin phần khai thêm.
+   */
+  RENDER_APPLIED_MISMATCH: 'RENDER_APPLIED_MISMATCH',
+  /**
+   * Vòng 4 (N-5): ảnh do provider trả về ĐÃ ĐỔI pixel trong hộp bảo vệ (hoặc khác kích
+   * thước ảnh gốc ⇒ không thể chứng minh còn nguyên) ⇒ TỪ CHỐI lưu, job `failed`.
+   */
+  PROTECTED_PIXELS_CHANGED: 'PROTECTED_PIXELS_CHANGED',
+  /**
+   * Vòng 4 (N-5c): ảnh trả về không phải PNG nên KHÔNG kiểm chứng được pixel vùng bảo vệ —
+   * vẫn lưu được nhưng phải nói thẳng `protected_pixels_verified = false`, không được coi
+   * như đã kiểm.
+   */
+  PROTECTED_PIXELS_UNVERIFIED: 'PROTECTED_PIXELS_UNVERIFIED',
 });
 
 /**

@@ -366,13 +366,21 @@ async function loadMiniHistory() {
 function historyItemHtml(item) {
   const st = item.status || 'queued';
   const cls = st === 'succeeded' ? 'ok' : st === 'failed' ? 'bad' : st === 'needs_manual' ? 'warn' : '';
+  // N-3 (vòng 4): phân biệt job DỊCH ẢNH và dán nhãn MOCK theo dấu vết ĐÃ LƯU của chính
+  // job đó (cùng luật với màn hình duyệt — không theo cấu hình máy chủ đang chạy).
+  const isImagelab = item.kind === 'image_translation';
+  const mockSteps = Array.isArray(item.mock_steps) ? item.mock_steps : [];
+  const mockBadge = (item.mock || mockSteps.length)
+    ? `<span class="badge warn" title="${esc(`Bước chạy provider MOCK: ${mockSteps.join(', ') || 'có'}`)}">MOCK</span>`
+    : '';
+  const kindBadge = isImagelab ? '<span class="badge">Dịch ảnh</span>' : '';
   return `
     <button class="hist-item" data-action="openjob" data-id="${esc(item.id)}">
       <span style="min-width:0">
         <span class="hist-name">${esc(item.product_name || item.source_url || '(chưa có tên)')}</span>
         <span class="hist-sub">${esc(SOURCE_LABEL[item.source] || item.source || '—')} · ${esc(new Date(item.created_at).toLocaleString('vi-VN'))}</span>
       </span>
-      <span class="badge ${cls}">${esc(STATUS_LABEL[st] || st)}</span>
+      <span class="row" style="gap:6px;align-items:center">${kindBadge}${mockBadge}<span class="badge ${cls}">${esc(STATUS_LABEL[st] || st)}</span></span>
     </button>`;
 }
 

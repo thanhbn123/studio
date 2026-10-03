@@ -17,6 +17,29 @@
  */
 
 /**
+ * Đọc một TOẠ ĐỘ pixel một cách NGHIÊM NGẶT (N-1, vòng 4).
+ *
+ * Vì sao không dùng `Number(v)`: `Number(null) === 0`, `Number('') === 0`, `Number([]) === 0`,
+ * `Number(false) === 0` — nên toạ độ NULL/rác bị **âm thầm** biến thành 0 (fail-OPEN), hộp
+ * bảo vệ "ảo" xuất hiện ở gốc toạ độ và luật #3 bị vi phạm trở lại.
+ *
+ * Luật: chỉ nhận số hữu hạn thật, hoặc CHUỖI có nội dung số. Mọi thứ khác (null, undefined,
+ * '', khoảng trắng, boolean, mảng, object, NaN, ±Infinity) ⇒ `null` = "không có toạ độ".
+ *
+ * @returns {number|null}
+ */
+export function strictCoordinate(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const n = Number(trimmed);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+/**
  * Giao của một hộp với khung ảnh.
  *
  * @param {{x:number,y:number,w:number,h:number}} box hộp đã làm tròn về số nguyên
@@ -26,20 +49,22 @@
  */
 export function intersectBoxWithImage(box, width, height) {
   if (!box || typeof box !== 'object') return null;
-  const x = Number(box.x);
-  const y = Number(box.y);
-  const w = Number(box.w ?? box.width);
-  const h = Number(box.h ?? box.height);
-  if (![x, y, w, h].every((v) => Number.isFinite(v))) return null;
+  const x = strictCoordinate(box.x);
+  const y = strictCoordinate(box.y);
+  const w = strictCoordinate(box.w ?? box.width);
+  const h = strictCoordinate(box.h ?? box.height);
+  if (x === null || y === null || w === null || h === null) return null;
   if (!(w > 0) || !(h > 0)) return null;
 
-  const clampX = Number.isFinite(width) && width > 0;
-  const clampY = Number.isFinite(height) && height > 0;
+  const wNum = strictCoordinate(width);
+  const hNum = strictCoordinate(height);
+  const clampX = wNum !== null && wNum > 0;
+  const clampY = hNum !== null && hNum > 0;
 
-  const x0 = clampX ? Math.max(0, Math.min(x, width)) : x;
-  const x1 = clampX ? Math.max(0, Math.min(x + w, width)) : x + w;
-  const y0 = clampY ? Math.max(0, Math.min(y, height)) : y;
-  const y1 = clampY ? Math.max(0, Math.min(y + h, height)) : y + h;
+  const x0 = clampX ? Math.max(0, Math.min(x, wNum)) : x;
+  const x1 = clampX ? Math.max(0, Math.min(x + w, wNum)) : x + w;
+  const y0 = clampY ? Math.max(0, Math.min(y, hNum)) : y;
+  const y1 = clampY ? Math.max(0, Math.min(y + h, hNum)) : y + h;
 
   if (!(x1 > x0) || !(y1 > y0)) return null; // giao rỗng ⇒ không còn diện tích
   return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };

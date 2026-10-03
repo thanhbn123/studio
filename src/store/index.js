@@ -242,12 +242,12 @@ export class Store {
     const off = Math.max(Number(offset) || 0, 0);
     const rows = sessionId
       ? await this.driver.all(
-          `SELECT id, session_id, source, source_url, product_name, status, stage, style, length, created_at, updated_at
+          `SELECT id, session_id, kind, source, source_url, product_name, status, stage, style, length, content_meta, created_at, updated_at
            FROM jobs WHERE session_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`,
           [sessionId, lim, off],
         )
       : await this.driver.all(
-          `SELECT id, session_id, source, source_url, product_name, status, stage, style, length, created_at, updated_at
+          `SELECT id, session_id, kind, source, source_url, product_name, status, stage, style, length, content_meta, created_at, updated_at
            FROM jobs ORDER BY created_at DESC LIMIT ? OFFSET ?`,
           [lim, off],
         );

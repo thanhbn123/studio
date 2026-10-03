@@ -11,7 +11,7 @@
  */
 
 import { Buffer } from 'node:buffer';
-import { boxesIntersect, intersectBoxWithImage } from '../geometry.js';
+import { boxesIntersect, intersectBoxWithImage, strictCoordinate } from '../geometry.js';
 import { readPngHeader } from './png.js';
 
 /** Magic bytes — khớp với `sniffImageMime` của src/security/sanitize.js (chỉ đọc, không sửa). */
@@ -195,16 +195,17 @@ export function toRgba(image) {
  */
 export function clampBox(box, { width, height } = {}) {
   if (!box || typeof box !== 'object') return null;
-  const values = [box.x, box.y, box.w, box.h].map((v) => Number(v));
-  if (values.some((v) => !Number.isFinite(v))) return null;
-  let [x, y, w, h] = values;
+  // N-1 (vòng 4): đọc toạ độ NGHIÊM NGẶT — `null`/`''`/`[]`/`false` KHÔNG được coi là 0.
+  const x = strictCoordinate(box.x);
+  const y = strictCoordinate(box.y);
+  let w = strictCoordinate(box.w);
+  let h = strictCoordinate(box.h);
+  if (x === null || y === null || w === null || h === null) return null;
   if (w <= 0 || h <= 0) return null;
-  x = Math.round(x);
-  y = Math.round(y);
   w = Math.round(w);
   h = Math.round(h);
   if (w <= 0 || h <= 0) return null;
-  return intersectBoxWithImage({ x, y, w, h }, width, height);
+  return intersectBoxWithImage({ x: Math.round(x), y: Math.round(y), w, h }, width, height);
 }
 
 /** Đọc pixel (RGBA) tại (x, y) — trả mảng 4 số, hoặc null nếu ngoài biên. */

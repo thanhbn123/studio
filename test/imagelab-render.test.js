@@ -398,13 +398,21 @@ describe('MVP-02 render — provider mock & factory', () => {
       image: { buffer: input, mime: 'image/png' },
       ops: [{ region_id: 'r1', box: { x: 0, y: 0, w: 10, h: 10 }, action: 'erase_and_draw', text: 'Áo' }],
     });
-    assert.equal(res.status, 'OK');
+    assert.equal(res.status, 'PARTIAL');
+    // SỬA THEO N-5 (vòng 4): provider mock KHÔNG đổi pixel nào ⇒ ảnh trả về y hệt ảnh gốc
+    // ⇒ engine KHÔNG được báo `OK` (báo OK khi không vẽ gì là nói dối). Kết quả đúng là
+    // PARTIAL + `NO_OPS` + cảnh báo nói thẳng; các khẳng định còn lại giữ nguyên.
+    assert.equal(res.error_code, 'NO_OPS');
+    assert.match(res.warnings.join(' '), /y hệt ảnh gốc|KHÔNG phải kết quả đã render/i);
     assert.equal(res.is_mock, true);
     assert.equal(res.output.sha256, sha256(input));
     assert.ok(res.output.buffer.equals(input), 'mock phải trả bản sao y nguyên byte');
     assert.ok(input.equals(before));
-    assert.equal(res.applied.length, 1);
+    // ...và vì ảnh KHÔNG đổi một pixel nào nên danh sách `applied` do mock tự khai bị BỎ
+    // (N-5d: không tin lời khai khi sha256 ảnh trả về trùng ảnh gốc).
+    assert.equal(res.applied.length, 0);
     assert.match(res.warnings.join(' '), /mock/i);
+    assert.match(res.warnings.join(' '), /KHÔNG tính là đã vẽ/i);
   });
 
   test('factory: tên provider lạ → ném RenderError UNKNOWN_PROVIDER', () => {

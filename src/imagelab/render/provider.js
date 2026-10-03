@@ -13,6 +13,7 @@
 import { Buffer } from 'node:buffer';
 import { RenderError, RENDER_CODES, UNSUPPORTED_IMAGE_CODES } from './errors.js';
 import { probeImage, normalizeProtectedBoxes } from './image.js';
+import { verifyProtectedPixels, PROTECTED_CHECK } from './verify.js';
 import { sha256 } from './png.js';
 import { normalizeOps } from './ops.js';
 
@@ -141,6 +142,9 @@ export class RenderProvider {
       elapsed_ms: 0,
       error_code: null,
       error_message: null,
+      // N-5: `true` = đã đo pixel vùng bảo vệ trên ảnh trả về; `false` = KHÔNG kiểm được
+      // (định dạng khác PNG); `null` = không có hộp bảo vệ nào để kiểm.
+      protected_pixels_verified: null,
     };
     const finish = (result) => ({ ...result, elapsed_ms: Date.now() - started });
 
@@ -162,29 +166,138 @@ export class RenderProvider {
         protectedBoxes,
         originalSha256: originalSha,
       })) ?? {};
-      const applied = Array.isArray(partial.applied) ? partial.applied : [];
       const rawStatus = partial.status ?? RENDER_STATUS.OK;
       const skippedAll = [...normalized.skipped, ...(Array.isArray(partial.skipped) ? partial.skipped : [])];
       const partialWarnings = Array.isArray(partial.warnings) ? partial.warnings : [];
       const output = partial.output ?? null;
+      const outputBuffer = output && Buffer.isBuffer(output.buffer)
+        ? output.buffer
+        : output && output.buffer
+          ? Buffer.from(output.buffer)
+          : null;
+
+      let applied = Array.isArray(partial.applied) ? partial.applied : [];
+      let status = rawStatus;
+      let errorCode = partial.error_code ?? null;
+      let errorMessage = partial.error_message ?? null;
+      let protectedVerified = null;
+      // Hộp bảo vệ KHÔNG thuộc vùng nào đang được vẽ: op của chính vùng đó là override CÓ VẾT
+      // (F-02) nên được phép đổi pixel của nó; mọi hộp khác phải đóng băng.
+      const guardBoxes = protectedBoxes.filter(
+        (p) => p.region_id === null || !normalized.ops.some((op) => String(op.region_id) === String(p.region_id)),
+      );
+
+      // ── N-5 (vòng 4): KHÔNG TIN provider, nhất là `http` ─────────────────────
+      const outputSha = outputBuffer ? sha256(outputBuffer) : null;
+      const unchangedOutput = Boolean(outputSha && originalSha && outputSha === originalSha && ops.length > 0);
+
+      if (unchangedOutput) {
+        if (applied.length > 0) {
+          partialWarnings.push(
+            `Provider "${this.name}" khai đã áp dụng ${applied.length}/${ops.length} op nhưng ảnh trả về Y HỆT ảnh gốc (sha256 không đổi) — KHÔNG tính là đã vẽ; danh sách \`applied\` tự khai bị bỏ.`,
+          );
+        }
+        applied = [];
+        status = RENDER_STATUS.PARTIAL;
+        errorCode = errorCode ?? RENDER_CODES.NO_OPS;
+        partialWarnings.push('Ảnh trả về giống hệt ảnh gốc (0 pixel thay đổi) — đây KHÔNG phải kết quả đã render; cần kiểm tra provider.');
+      } else if (applied.length > ops.length) {
+        partialWarnings.push(
+          `Provider khai áp dụng ${applied.length} op trong khi chỉ nhận ${ops.length} op — không tin phần khai thêm (giữ ${ops.length}).`,
+        );
+        applied = applied.slice(0, ops.length);
+        status = RENDER_STATUS.PARTIAL;
+        errorCode = errorCode ?? RENDER_CODES.RENDER_APPLIED_MISMATCH;
+      }
+
+      // Hậu kiểm PIXEL vùng bảo vệ trên chính ảnh trả về (chỉ khi có hộp cần bảo vệ).
+      if (guardBoxes.length > 0 && outputBuffer && rawStatus !== RENDER_STATUS.FAILED) {
+        const check = verifyProtectedPixels({
+          originalBuffer: img.buffer,
+          outputBuffer,
+          protectedBoxes: guardBoxes.map((b) => b.box),
+          maxPixels: this.limits.maxPixels,
+        });
+
+        if (check.reason === PROTECTED_CHECK.PROTECTED_PIXELS_CHANGED || check.reason === PROTECTED_CHECK.SIZE_MISMATCH) {
+          const detail = check.reason === PROTECTED_CHECK.SIZE_MISMATCH
+            ? check.detail
+            : check.changed.map((c) => `${c.changed}/${c.total} pixel tại hộp ${JSON.stringify(c.box)}`).join('; ');
+          const message =
+            `Ảnh do provider "${this.name}" trả về KHÔNG giữ nguyên vùng bảo vệ (nhãn hiệu/chứng nhận/giá): ${detail}. ` +
+            'TỪ CHỐI lưu ảnh này — ảnh gốc được giữ nguyên và không có ảnh render mới (luật bất khả xâm phạm #3).';
+          partialWarnings.push(message);
+          this.#logger?.warn?.('imagelab.render.protected_pixels_changed', { provider: this.name, reason: check.reason, detail });
+          return finish({
+            ...base,
+            ...partial,
+            status: RENDER_STATUS.FAILED,
+            provider: this.name,
+            model: this.model,
+            is_mock: this.isMock,
+            original_sha256: originalSha,
+            output: null, // KHÔNG bao giờ trả ảnh đã làm hỏng vùng bảo vệ
+            applied: [],
+            skipped: skippedAll,
+            warnings: [...warnings, ...partialWarnings],
+            protected_pixels_verified: false,
+            error_code: RENDER_CODES.PROTECTED_PIXELS_CHANGED,
+            error_message: message,
+          });
+        }
+
+        if (check.reason === PROTECTED_CHECK.OUTPUT_UNREADABLE) {
+          const message = `Ảnh do provider "${this.name}" trả về không giải mã được (${check.detail}) — TỪ CHỐI lưu để không tạo ảnh hỏng.`;
+          partialWarnings.push(message);
+          return finish({
+            ...base,
+            ...partial,
+            status: RENDER_STATUS.FAILED,
+            provider: this.name,
+            model: this.model,
+            is_mock: this.isMock,
+            original_sha256: originalSha,
+            output: null,
+            applied: [],
+            skipped: skippedAll,
+            warnings: [...warnings, ...partialWarnings],
+            protected_pixels_verified: false,
+            error_code: RENDER_CODES.PNG_CORRUPT,
+            error_message: message,
+          });
+        }
+
+        protectedVerified = check.verified;
+        if (check.reason === PROTECTED_CHECK.OUTPUT_NOT_PNG) {
+          // (N-5c) Không kiểm chứng được pixel trên định dạng này ⇒ vẫn lưu nhưng KHÔNG
+          // được coi như đã kiểm: hạ xuống PARTIAL + nói thẳng bằng cảnh báo nổi bật.
+          status = status === RENDER_STATUS.OK || status === RENDER_STATUS.PARTIAL ? RENDER_STATUS.PARTIAL : status;
+          errorCode = errorCode ?? RENDER_CODES.PROTECTED_PIXELS_UNVERIFIED;
+          partialWarnings.push(
+            `⚠️ KHÔNG kiểm chứng được pixel vùng bảo vệ (nhãn hiệu/chứng nhận/giá) trên định dạng ${check.mime ?? 'không rõ'} do provider "${this.name}" trả về — chỉ kiểm được với PNG. Ảnh vẫn được lưu nhưng KHÔNG có bảo đảm nào ở tầng pixel.`,
+          );
+        }
+      }
 
       // H-2 (vòng 3): KHÔNG vẽ được vùng nào thì TUYỆT ĐỐI không được báo "OK" im lặng.
       // Giữ nguyên ảnh (bản sao y hệt gốc) nhưng hạ trạng thái xuống PARTIAL, gắn
       // `error_code = NO_OPS` và kèm cảnh báo tiếng Việt nói thẳng sự thật.
-      const nothingDrawn = applied.length === 0 && (rawStatus === RENDER_STATUS.OK || rawStatus === RENDER_STATUS.PARTIAL);
+      const nothingDrawn = applied.length === 0 && (status === RENDER_STATUS.OK || status === RENDER_STATUS.PARTIAL);
       if (nothingDrawn) {
         partialWarnings.push(
           ops.length === 0
             ? 'Không có op nào để vẽ (ops rỗng) — ảnh trả về y hệt ảnh gốc, KHÔNG phải kết quả đã render.'
             : `Không vẽ được vùng nào trong ${ops.length} op — ảnh trả về y hệt ảnh gốc (xem \`skipped\` để biết lý do).`,
         );
+        status = RENDER_STATUS.PARTIAL;
+        errorCode = errorCode ?? RENDER_CODES.NO_OPS;
       }
 
       return finish({
         ...base,
         ...partial,
         // Các field nhận dạng KHÔNG cho provider con ghi đè.
-        status: nothingDrawn ? RENDER_STATUS.PARTIAL : rawStatus,
+        status,
         provider: this.name,
         model: this.model,
         is_mock: this.isMock,
@@ -194,8 +307,9 @@ export class RenderProvider {
         skipped: skippedAll,
         unsupported_glyphs: Array.isArray(partial.unsupported_glyphs) ? partial.unsupported_glyphs : [],
         warnings: [...warnings, ...partialWarnings],
-        error_code: partial.error_code ?? (nothingDrawn ? RENDER_CODES.NO_OPS : null),
-        error_message: partial.error_message ?? null,
+        error_code: errorCode,
+        error_message: errorMessage,
+        protected_pixels_verified: protectedVerified,
       });
     } catch (err) {
       const code = err instanceof RenderError ? err.code : (err && err.code) || RENDER_CODES.RENDER_FAILED;

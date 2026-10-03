@@ -318,10 +318,34 @@ export function buildRouter(app) {
     const offset = req.query.get('offset');
     const scope = req.query.get('scope');
     const sessionIdFilter = scope === 'all' ? null : sid;
-    const [items, total] = await Promise.all([
+    const [rows, total] = await Promise.all([
       store.listJobs({ sessionId: sessionIdFilter, limit, offset }),
       store.countJobs({ sessionId: sessionIdFilter }),
     ]);
+    // N-3 (vòng 4): mỗi dòng lịch sử phải phân biệt được job ImageLab và mang nhãn MOCK
+    // theo DẤU VẾT ĐÃ LƯU của chính job đó (không theo cấu hình máy chủ đang chạy).
+    // KHÔNG trả `session_id`/`content_meta` thô (dữ liệu nội bộ).
+    const items = (Array.isArray(rows) ? rows : []).map((row) => {
+      // `listJobs` trả cột TEXT thô (SQLite) nên `content_meta` có thể là CHUỖI JSON —
+      // phải parse trước khi đọc dấu vết MOCK, nếu không nhãn MOCK sẽ im lặng biến mất.
+      const contentMeta = parseJsonObject(row?.content_meta);
+      const mockSteps = collectMockSteps({ ...row, content_meta: contentMeta }, []);
+      return {
+        id: row.id,
+        kind: row.kind ?? 'content',
+        source: row.source,
+        source_url: row.source_url,
+        product_name: row.product_name,
+        status: row.status,
+        stage: row.stage,
+        style: row.style,
+        length: row.length,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        mock: mockSteps.length > 0,
+        mock_steps: mockSteps,
+      };
+    });
     sendJson(res, 200, { items, total, limit: Number(limit) || 50, offset: Number(offset) || 0 });
   });
 
@@ -639,7 +663,9 @@ export function buildRouter(app) {
     const job = await requireImagelabJob(params.id, sid);
 
     const body = await readJson(req, { maxBytes: 256 * 1024 });
-    const onlyRegionIds = sanitizeRegionIds(body.only_region_ids);
+    const requestedRegionIds = Array.isArray(body.only_region_ids) ? body.only_region_ids : null;
+    let onlyRegionIds = sanitizeRegionIds(body.only_region_ids);
+    let unknownRegionIds = [];
     const force = body.force === true;
 
     if (isUnconfigured(app.renderProvider)) {
@@ -649,6 +675,26 @@ export function buildRouter(app) {
     const lines = ((await store.listTranslationLines(job.id)) || []).map(lineJson);
     if (lines.length === 0) {
       throw HttpError.safe(409, 'IMAGELAB_NO_LINES', 'Job chưa có dòng chữ nào để render.');
+    }
+
+    // N-4 (vòng 4): `only_region_ids` phải FAIL-CLOSED — trước đây id rác bị lọc sạch
+    // thành `[]` và pipeline hiểu là "không lọc" ⇒ ÂM THẦM render TẤT CẢ (nhiều hơn yêu cầu).
+    if (requestedRegionIds && requestedRegionIds.length > 0) {
+      const known = new Set(lines.map((l) => String(l.region_id)));
+      const matched = onlyRegionIds.filter((id) => known.has(id));
+      const rawIds = requestedRegionIds
+        .map((v) => sanitizeText(v, { maxLength: 64 }))
+        .filter(Boolean);
+      unknownRegionIds = [...new Set([...rawIds, ...onlyRegionIds].filter((id) => !known.has(id)))].slice(0, 100);
+      if (matched.length === 0) {
+        throw HttpError.safe(
+          409,
+          'UNKNOWN_REGION_IDS',
+          `Không có vùng nào khớp \`only_region_ids\` (${unknownRegionIds.length} id không tồn tại hoặc không hợp lệ) — không render gì cả để tránh vẽ nhiều hơn yêu cầu.`,
+          { unknown_region_ids: unknownRegionIds },
+        );
+      }
+      onlyRegionIds = matched;
     }
     // Cùng MỘT hàm luật với `renderApproved` của pipeline (hợp đồng 4.4): dòng
     // `NEEDS_REVIEW` mà `edited_by_user === true` coi như đã được người dùng xử lý.
@@ -673,7 +719,7 @@ export function buildRouter(app) {
     });
 
     queue.enqueue(job.id, () =>
-      app.imagelabPipeline.renderApproved(job.id, { sessionId: sid, onlyRegionIds, force }),
+      app.imagelabPipeline.renderApproved(job.id, { sessionId: sid, onlyRegionIds, force, unknownRegionIds }),
     );
 
     sendJson(res, 202, { job_id: job.id, status: JOB_STATUS.QUEUED, force });
@@ -756,6 +802,18 @@ const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 export const IMAGELAB_KINDS = Object.freeze(['descriptive', 'brand', 'certification', 'price', 'unknown']);
 
 const asArray = (v) => (Array.isArray(v) ? v : []);
+
+/** Parse một cột JSON dạng object (SQLite trả TEXT); trả {} nếu không đọc được. */
+function parseJsonObject(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value !== 'string' || !value.trim()) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
 
 function parseJsonArray(value) {
   if (Array.isArray(value)) return value;
@@ -854,6 +912,8 @@ function buildRenderSummary(rendered) {
     status: meta.status ?? null,
     // H-2: mã lỗi của engine (`NO_OPS` khi không vẽ được vùng nào) — UI nói thẳng.
     error_code: meta.error_code ?? null,
+    // N-5: đã kiểm pixel vùng bảo vệ trên ảnh trả về chưa? (null = không có gì để kiểm)
+    protected_pixels_verified: meta.protected_pixels_verified ?? null,
     provider: meta.provider ?? null,
     is_mock: meta.is_mock ?? null,
     applied: asArray(meta.applied),

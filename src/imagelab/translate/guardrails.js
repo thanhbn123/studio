@@ -39,6 +39,21 @@ import { TRANSLATE_STATUS } from './lines.js';
  * ("①" → "1"), ký hiệu đơn vị ghép ("㎖" → "ml") — đúng những đường lách của F-08b/c.
  */
 
+/**
+ * Bỏ dấu tiếng Việt (N-6, vòng 4) để bắt được câu bịa viết KHÔNG DẤU
+ * ("Ao thun cotton bao hanh mot nam") — cùng nội dung với câu có dấu đã bị chặn.
+ *
+ * `đ` không phải dấu tổ hợp nên phải thay riêng. Giữ nguyên chữ Hán/kana/Hangul.
+ */
+export function deaccent(text) {
+  return String(text ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D')
+    .normalize('NFC');
+}
+
 /** Ký tự vô hình: zero-width space/non-joiner/joiner, BOM, word-joiner. */
 const INVISIBLE_RE = /[\u200B-\u200D\uFEFF\u2060]/g;
 
@@ -267,6 +282,14 @@ const VI_MULTIPLIERS = Object.freeze({
 const VI_NUM_WORD_ALT =
   'không|linh|lẻ|một|mốt|hai|ba|bốn|tư|năm|lăm|sáu|bảy|tám|chín|chục|mươi|mười|trăm|nghìn|nghàn|ngàn|triệu|tỷ|tỉ';
 
+/** Bảng tra KHÔNG DẤU của hai bảng trên (N-6): "mot nam" ≈ "một năm". */
+const VI_NUMBER_WORDS_PLAIN = Object.freeze(
+  Object.fromEntries(Object.entries(VI_NUMBER_WORDS).map(([k, v]) => [deaccent(k), v])),
+);
+const VI_MULTIPLIERS_PLAIN = Object.freeze(
+  Object.fromEntries(Object.entries(VI_MULTIPLIERS).map(([k, v]) => [deaccent(k), v])),
+);
+
 const VI_NUM_WORD_RUN = `(?:${VI_NUM_WORD_ALT})(?:\\s+(?:${VI_NUM_WORD_ALT})){0,4}`;
 
 /**
@@ -278,9 +301,12 @@ const VI_NUM_WORD_RUN = `(?:${VI_NUM_WORD_ALT})(?:\\s+(?:${VI_NUM_WORD_ALT})){0,
  */
 const COUNTED_UNITS = Object.freeze([
   'tháng', 'năm', 'ngày', 'giờ', 'phút', 'lần', '%', 'kg', 'g', 'ml', 'l', 'cm', 'mm', 'm',
-  'W', 'V', 'mAh', 'chiếc', 'cái', 'bộ', 'hộp', 'gói',
+  'W', 'V', 'mAh',
   // Tiền tệ / mốc giá (F-08a)
   'đồng', 'vnđ', 'vnd', 'đ', 'nghìn', 'nghàn', 'ngàn', 'triệu', 'tỷ', 'tỉ',
+  // N-7b (vòng 4): ĐÃ BỎ các DANH TỪ ĐẾM (chiếc, cái, bộ, hộp, gói) — "Một chiếc áo thun
+  // cotton" là MẠO TỪ bất định, không phải số liệu; bắt nó là dương tính giả làm hỏng
+  // trải nghiệm thật. Chỉ giữ đơn vị ĐO LƯỜNG / THỜI GIAN / TIỀN TỆ.
 ]);
 
 const COUNTED_UNIT_ALT = COUNTED_UNITS
@@ -291,6 +317,20 @@ const COUNTED_UNIT_ALT = COUNTED_UNITS
 
 const VI_WORD_NUMBER_UNIT_RE = new RegExp(
   `(?<![\\p{L}\\p{N}])(${VI_NUM_WORD_RUN})\\s*(${COUNTED_UNIT_ALT})(?![\\p{L}\\p{N}])`,
+  'giu',
+);
+
+/* Bản KHÔNG DẤU của cùng bộ luật (N-6, vòng 4): câu bịa viết không dấu
+ * ("Ao thun cotton bao hanh mot nam") phải bị bắt như bản có dấu. */
+const VI_NUM_WORD_ALT_PLAIN = VI_NUM_WORD_ALT.split('|').map(deaccent).join('|');
+const VI_NUM_WORD_RUN_PLAIN = `(?:${VI_NUM_WORD_ALT_PLAIN})(?:\\s+(?:${VI_NUM_WORD_ALT_PLAIN})){0,4}`;
+const COUNTED_UNIT_ALT_PLAIN = COUNTED_UNITS
+  .map(deaccent)
+  .sort((a, b) => b.length - a.length)
+  .map((u) => u.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  .join('|');
+const VI_WORD_NUMBER_UNIT_RE_PLAIN = new RegExp(
+  `(?<![\\p{L}\\p{N}])(${VI_NUM_WORD_RUN_PLAIN})\\s*(${COUNTED_UNIT_ALT_PLAIN})(?![\\p{L}\\p{N}])`,
   'giu',
 );
 
@@ -305,18 +345,20 @@ export function vietnameseWordsToNumber(run) {
   let digit = 0;
   let seen = false;
   for (const word of words) {
-    if (VI_NUMBER_WORDS[word] !== undefined) {
-      digit = VI_NUMBER_WORDS[word];
+    // N-6 (vòng 4): tra được cả bản CÓ DẤU lẫn bản KHÔNG DẤU ("một" / "mot").
+    const digitValue = VI_NUMBER_WORDS[word] ?? VI_NUMBER_WORDS_PLAIN[word];
+    const multiplier = VI_MULTIPLIERS[word] ?? VI_MULTIPLIERS_PLAIN[word];
+    if (digitValue !== undefined) {
+      digit = digitValue;
       seen = true;
-    } else if (VI_MULTIPLIERS[word] !== undefined) {
-      const unit = VI_MULTIPLIERS[word];
+    } else if (multiplier !== undefined) {
       seen = true;
-      if (unit >= 1000) {
-        section = (section + digit) * unit;
+      if (multiplier >= 1000) {
+        section = (section + digit) * multiplier;
         total += section;
         section = 0;
       } else {
-        section += (digit || 1) * unit;
+        section += (digit || 1) * multiplier;
       }
       digit = 0;
     }
@@ -332,10 +374,18 @@ export function vietnameseWordsToNumber(run) {
 export function wordNumberUnitsIn(text) {
   const s = normalizeForMatch(text);
   const out = [];
-  for (const m of s.matchAll(VI_WORD_NUMBER_UNIT_RE)) {
-    const phrase = `${m[1]} ${m[2]}`.replace(/\s+/g, ' ').trim();
-    out.push({ phrase, unit: String(m[2]), value: vietnameseWordsToNumber(m[1]) });
-  }
+  const seen = new Set();
+  const push = (rawPhrase, rawRun, rawUnit) => {
+    const phrase = String(rawPhrase).replace(/\s+/g, ' ').trim();
+    const key = deaccent(phrase).toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ phrase, unit: String(rawUnit), value: vietnameseWordsToNumber(rawRun) });
+  };
+  for (const m of s.matchAll(VI_WORD_NUMBER_UNIT_RE)) push(`${m[1]} ${m[2]}`, m[1], m[2]);
+  // N-6: bản KHÔNG DẤU — "mot nam", "hai thang", "mot tram hai muoi nghin dong"…
+  const plain = deaccent(s);
+  for (const m of plain.matchAll(VI_WORD_NUMBER_UNIT_RE_PLAIN)) push(`${m[1]} ${m[2]}`, m[1], m[2]);
   return out;
 }
 
@@ -355,6 +405,12 @@ export function wordNumberUnitsIn(text) {
 const SPECIAL_NUMERAL_RE = /[\p{No}\p{Nl}]/gu;
 
 /**
+ * Ký hiệu "số" không thuộc `\p{No}`/`\p{Nl}` nhưng vẫn là số liệu khi xuất hiện:
+ * `№` (numero sign) — N-6 (vòng 4). NFKC biến nó thành chữ "No" nên luật chữ số không thấy.
+ */
+const NUMERO_SIGN = '№';
+
+/**
  * @param {string} textOriginal chữ gốc (nguyên văn, chưa NFKC)
  * @param {string} textVi chữ Việt (nguyên văn, chưa NFKC)
  * @returns {string[]} câu tiếng Việt
@@ -363,6 +419,9 @@ export function checkSpecialNumerals(textOriginal, textVi) {
   const original = stripInvisible(textOriginal);
   const vi = stripInvisible(textVi);
   const out = [];
+  if (vi.includes(NUMERO_SIGN) && !original.includes(NUMERO_SIGN)) {
+    out.push(`Số liệu “${NUMERO_SIGN}” (ký hiệu số) không có trong chữ gốc — không được tự thêm số.`);
+  }
   for (const ch of [...new Set(vi.match(SPECIAL_NUMERAL_RE) || [])]) {
     if (original.includes(ch)) continue; // chữ gốc có đúng ký hiệu đó ⇒ trung thực
     if (/[0-9]/.test(ch.normalize('NFKC'))) continue; // đã quy về chữ số ASCII ⇒ luật (a) lo
@@ -395,10 +454,18 @@ const CN_UNIT_ALIASES = Object.freeze([
 
 /**
  * Mẫu "số + đơn vị" phía tiếng Việt.
- * Lookahead `(?![a-zà-ỹ0-9])` để "12 lần" KHÔNG bị hiểu thành "12 l".
+ * Lookahead `(?![\p{L}\p{N}])` (Unicode) để "12 lần" KHÔNG bị hiểu thành "12 l".
+ *
+ * N-7a (vòng 4): bản cũ dùng `(?![a-zà-ỹ0-9])` — với cờ `/i`, lớp này khớp cả CHỮ HOA,
+ * nên `纯棉100%T恤` (chữ Trung viết liền số) bị coi là KHÔNG có đơn vị `%` ⇒ bản dịch
+ * trung thành "Áo thun cotton 100%" bị tố oan. Ký hiệu `%` không phải chữ cái nên còn
+ * được kiểm thêm bằng `SYMBOL_UNITS` bên dưới (không phụ thuộc biên từ).
  */
 const VI_NUM_UNIT_SOURCE =
-  '(\\d+(?:[.,]\\d+)?)\\s*(mAh|kWh|kW|Hz|ml|kg|mg|mm|cm|km|inch|W|V|L|l|g|m|%|giờ|ngày|tuần|tháng|năm|phút|giây|độ|đ|vnđ)(?![a-zà-ỹ0-9])';
+  '(\\d+(?:[.,]\\d+)?)\\s*(mAh|kWh|kW|Hz|ml|kg|mg|mm|cm|km|inch|W|V|L|l|g|m|giờ|ngày|tuần|tháng|năm|phút|giây|độ|đ|vnđ)(?![\\p{L}\\p{N}])';
+
+/** Ký hiệu đơn vị KHÔNG phải chữ cái ⇒ không cần biên từ, chỉ cần đứng sau một con số. */
+const SYMBOL_UNITS = Object.freeze([['%', '%']]);
 
 const UNIT_CANON = Object.freeze({
   mah: 'mah',
@@ -438,14 +505,40 @@ function canonicalUnit(raw) {
 export function unitsIn(text) {
   const s = normalizeForMatch(text);
   const set = new Set();
-  for (const m of s.matchAll(new RegExp(VI_NUM_UNIT_SOURCE, 'gi'))) {
+  // Cờ `u` là BẮT BUỘC: thiếu nó thì `\p{L}` trong lookahead bị hiểu thành lớp ký tự
+  // thường ⇒ "12 lần" lại bị nhận nhầm thành "12 l".
+  for (const m of s.matchAll(new RegExp(VI_NUM_UNIT_SOURCE, 'giu'))) {
     const u = canonicalUnit(m[2]);
     if (u) set.add(u);
+  }
+  for (const [symbol, canon] of SYMBOL_UNITS) {
+    if (new RegExp(`\\d\\s*${symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`).test(s)) set.add(canon);
   }
   for (const [re, canon] of CN_UNIT_ALIASES) {
     if (re.test(s)) set.add(canon);
   }
   return set;
+}
+
+/**
+ * Ký hiệu đơn vị có XUẤT HIỆN NGUYÊN VĂN trong chữ gốc hay không (N-7a, vòng 4).
+ *
+ * Đây là "lần kiểm thứ hai" độc lập với việc trích số: chữ Trung hay viết liền
+ * (`纯棉100%`, `含棉95%`) nên chỉ dựa vào danh sách số trích ra là chưa đủ.
+ */
+const UNIT_LITERALS = Object.freeze({
+  '%': ['%', '％', '百分比', '含量'],
+  'độ': ['°', 'độ', '度'],
+  'đ': ['đ', 'đồng'],
+  'vnđ': ['vnđ', 'VND', 'đồng', '元', '￥', '¥'],
+});
+
+/** @returns {boolean} */
+export function unitAppearsInText(text, unit) {
+  const literals = UNIT_LITERALS[unit];
+  if (!literals) return false;
+  const s = normalizeForMatch(text);
+  return literals.some((lit) => s.includes(lit));
 }
 
 /**
@@ -560,14 +653,25 @@ export function checkClaimWords(textOriginal, textVi) {
   // F-08: bỏ ký tự vô hình trước khi so khớp ("bảo\u200bhành" vẫn là "bảo hành").
   const original = normalizeForMatch(textOriginal);
   const viText = normalizeForMatch(textVi);
+  // N-6 (vòng 4): soi thêm bản KHÔNG DẤU của cùng câu ("bao hanh mot nam").
+  const originalPlain = deaccent(original);
+  const viPlain = deaccent(viText);
   for (const group of CLAIM_GROUPS) {
-    const re = new RegExp(group.vi.source, group.vi.flags.includes('g') ? group.vi.flags : `${group.vi.flags}g`);
-    const hits = [...new Set([...viText.matchAll(re)].map((m) => m[0]))];
-    if (hits.length === 0) continue;
+    const flags = group.vi.flags.includes('g') ? group.vi.flags : `${group.vi.flags}g`;
+    // Gộp hai dạng về MỘT mục cho mỗi khẳng định (ưu tiên hiển thị bản CÓ DẤU) để không
+    // báo trùng hai lần cùng một lỗi ("bảo hành" + "bao hanh").
+    const hits = new Map();
+    for (const m of viText.matchAll(new RegExp(group.vi.source, flags))) hits.set(deaccent(m[0]).toLowerCase(), m[0]);
+    for (const m of viPlain.matchAll(new RegExp(deaccent(group.vi.source), flags))) {
+      const key = deaccent(m[0]).toLowerCase();
+      if (!hits.has(key)) hits.set(key, m[0]);
+    }
+    if (hits.size === 0) continue;
     // Chữ gốc đã có khẳng định tương đương (tiếng Trung) ⇒ bản dịch trung thực, không bịa.
     if (new RegExp(group.zh.source, group.zh.flags.replace('g', '')).test(original)) continue;
-    for (const hit of hits) {
+    for (const hit of hits.values()) {
       if (original.toLowerCase().includes(hit.toLowerCase())) continue;
+      if (originalPlain.toLowerCase().includes(deaccent(hit).toLowerCase())) continue;
       out.push(`Khẳng định “${hit}” (nhóm ${group.label}) không có trong chữ gốc — cần người duyệt.`);
     }
   }

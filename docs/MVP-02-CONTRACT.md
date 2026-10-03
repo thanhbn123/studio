@@ -615,3 +615,71 @@ Cả 7 đã được vá và **gỡ `skip`**; nội dung khẳng định của a
 - `normalizeForMatch()` (C2) đổi `NFC` → **`NFKC`**: gộp cả biến thể tương thích
   (chữ FULL-WIDTH Latin "ｂảo hành" → "bảo hành", "①" → "1", "㎖" → "ml").
   Văn bản trong `line` vẫn KHÔNG bị sửa — chỉ dùng để so khớp.
+
+---
+
+## 8. SỬA ĐỔI SAU PHẢN BIỆN VÒNG 2 (vòng 4 — bổ sung, không đổi tên đã đóng băng)
+
+Nguồn: `docs/MVP-02-REVIEW.md` mục “VÒNG 2 — chấm lại” (PASS CÓ ĐIỀU KIỆN) với 3 điều kiện
+bắt buộc (N-5/N-1/N-2) và 4 phát hiện phụ (N-3/N-4/N-6/N-7). Tất cả đã được xử lý.
+
+**N-5 — không tin provider render (nhất là `RENDER_PROVIDER=http`)**
+
+- Thêm `src/imagelab/render/verify.js`: `verifyProtectedPixels({ originalBuffer, outputBuffer,
+  protectedBoxes, maxPixels })` — đo PIXEL trong hộp bảo vệ giữa ảnh gốc và ảnh trả về.
+- `RenderProvider.render()` (C3) hậu kiểm sau khi provider con trả kết quả:
+  - `sha256(output) === sha256(ảnh gốc)` mà vẫn khai `applied` ⇒ **bỏ lời khai**, hạ `PARTIAL`,
+    `error_code = NO_OPS` + cảnh báo (bắt ca remote “liar” với MỌI định dạng ảnh).
+  - `applied` khai nhiều hơn số op đã gửi ⇒ giữ đúng số op, `PARTIAL`,
+    `error_code = RENDER_APPLIED_MISMATCH` + cảnh báo.
+  - PNG giải mã được mà **pixel hộp bảo vệ bị đổi** (hoặc ảnh khác kích thước) ⇒ **TỪ CHỐI LƯU**:
+    `status = FAILED`, `error_code = PROTECTED_PIXELS_CHANGED`, `output = null`, `applied = []`,
+    job `failed` + `content_meta.imagelab.render.warnings` giữ nguyên lời giải thích.
+  - PNG hỏng/không giải mã được ⇒ `FAILED` + `PNG_CORRUPT`, không lưu ảnh hỏng.
+  - Không phải PNG (JPEG/WebP…) ⇒ **vẫn lưu** nhưng `protected_pixels_verified = false`,
+    `status = PARTIAL`, `error_code = PROTECTED_PIXELS_UNVERIFIED` + cảnh báo nổi bật
+    “KHÔNG kiểm chứng được pixel vùng bảo vệ trên định dạng này”.
+- `RenderResult` thêm field `protected_pixels_verified: true|false|null`; `asset.meta` và
+  `render_summary` trả lại field này cho UI.
+- Hộp bảo vệ của CHÍNH vùng đang được vẽ (override có vết — F-02) không nằm trong diện hậu kiểm.
+
+**N-1 — toạ độ NULL/rác là fail-closed**
+
+- `src/imagelab/geometry.js` thêm `strictCoordinate(value)`: chỉ nhận số hữu hạn hoặc CHUỖI có
+  nội dung số; `null`/`undefined`/`''`/`false`/`true`/mảng/object/`NaN`/`±Infinity` ⇒ `null`.
+  `intersectBoxWithImage` dùng hàm này ⇒ hộp có toạ độ rác trả `null` (KHÔNG còn bị coi là 0).
+- `pipeline.#boxOf`: `box` hỏng thì lấy `box_normalized` của CHÍNH vùng đó (nếu còn dùng được);
+  cả hai hỏng ⇒ `null` → vùng vào `skipped` với `BAD_BOX_COORDINATE`.
+- Nếu một vùng ĐƯỢC BẢO VỆ có hộp không dùng được ⇒ **chặn MỌI op** (không đoán vị trí), lý do
+  `BOX_OVERLAPS_PROTECTED: <id> (<kind>, hộp không hợp lệ — fail-closed)`; không còn op ⇒
+  job `FAILED IMAGELAB_NO_LINES`, không lưu ảnh.
+
+**N-2 — job phải nói thật khi không vẽ được vùng nào**
+
+- Hằng số mới `RENDER_NO_OPS` (export từ `pipeline.js`). Khi `applied.length === 0` mà ảnh mới
+  vẫn được lưu: `job.status` giữ `succeeded` nhưng `job.error_code = 'RENDER_NO_OPS'` +
+  `error_message` giải thích; `render_summary` vẫn `PARTIAL`/`NO_OPS`. Không có ảnh ⇒ `failed`.
+
+**N-3 — lịch sử job phân biệt được job dịch ảnh và job MOCK**
+
+- `Store.listJobs` `SELECT` thêm `kind` + `content_meta`; `GET /api/jobs` trả mỗi dòng thêm
+  `kind`, `mock: boolean`, `mock_steps: string[]` (đọc từ dấu vết ĐÃ LƯU của chính job) và
+  **không** trả `session_id`/`content_meta` thô. UI lịch sử hiện badge “Dịch ảnh” + “MOCK”.
+
+**N-4 — `only_region_ids` fail-closed**
+
+- `POST /api/imagelab/jobs/:id/render`: nếu client CÓ gửi `only_region_ids` mà **không id nào
+  khớp** vùng của job ⇒ `409 UNKNOWN_REGION_IDS` kèm `details.unknown_region_ids`
+  (trước đây lọc sạch thành `[]` ⇒ âm thầm render TẤT CẢ). Khớp một phần ⇒ chỉ render phần khớp
+  và ghi cảnh báo vào `warnings`/`render_summary`.
+
+**N-6/N-7 — guardrail (C2)**
+
+- N-7a: lookahead của `VI_NUM_UNIT_SOURCE` đổi sang `(?![\p{L}\p{N}])` + cờ `u`; thêm nhánh
+  `SYMBOL_UNITS` (`%`) và `unitAppearsInText()` ⇒ `纯棉100%T恤` → “Áo thun cotton 100%” KHÔNG bị
+  tố oan nữa (trước đây `%` bị chặn vì đứng trước chữ `T`).
+- N-7b: bỏ **danh từ đếm** (`chiếc, cái, bộ, hộp, gói`) khỏi `COUNTED_UNITS` — “Một chiếc áo thun
+  cotton” là mạo từ, không phải số liệu; vẫn giữ đơn vị đo lường/thời gian/tiền tệ (F-08a).
+- N-6: so khớp thêm bản **KHÔNG DẤU** (`deaccent()`) cho cả từ khoá khẳng định và cụm
+  số-bằng-chữ; thêm `№` vào nhóm ký hiệu số. Giới hạn còn lại (`xii` chữ thường, homoglyph,
+  “tốt nhứt”) ghi ở `docs/VERIFICATION.md` §10.3.
