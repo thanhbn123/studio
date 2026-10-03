@@ -1,0 +1,217 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [develop, main]
+
+# Không cần quyền ghi; CI chỉ đọc mã và chạy test.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # 1. Kiểm mã + test trên SQLite (nhanh, không cần service)
+  # ───────────────────────────────────────────────────────────────────────────
+  test-sqlite:
+    name: Test (Node ${{ matrix.node }}, SQLite)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['24.x']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Cài phụ thuộc
+        run: npm ci --no-audit --no-fund
+
+      - name: Kiểm cú pháp toàn bộ mã nguồn
+        run: |
+          fail=0
+          for f in $(find src tools test -name '*.js' -o -name '*.mjs' | sort); do
+            node --check "$f" || { echo "SYNTAX FAIL: $f"; fail=1; }
+          done
+          exit $fail
+
+      - name: Chạy test (SQLite)
+        run: npm test
+
+      - name: Chạy migration SQLite
+        run: node src/store/migrate.js --driver sqlite
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 2. Cùng bộ test, nhưng chạy trên PostgreSQL 16 THẬT.
+  #    Đây là bằng chứng cho yêu cầu "PostgreSQL-ready": cùng một schema.sql.
+  # ───────────────────────────────────────────────────────────────────────────
+  test-postgres:
+    name: Test (PostgreSQL 16)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: studio
+          POSTGRES_PASSWORD: studio
+          POSTGRES_DB: studio
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U studio -d studio"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      DB_DRIVER: postgres
+      DATABASE_URL: postgres://studio:studio@127.0.0.1:5432/studio
+      LOG_LEVEL: silent
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+          cache: npm
+
+      - name: Cài phụ thuộc
+        run: npm ci --no-audit --no-fund
+
+      - name: Chạy migration trên PostgreSQL
+        run: node src/store/migrate.js --driver postgres
+
+      - name: Chạy test trên PostgreSQL
+        run: npm test
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 3. Khởi động thật và gọi health — bắt lỗi chỉ xuất hiện lúc chạy
+  # ───────────────────────────────────────────────────────────────────────────
+  smoke:
+    name: Smoke test (server khởi động thật)
+    runs-on: ubuntu-latest
+    env:
+      NODE_ENV: production
+      HOST: 127.0.0.1
+      PORT: '3000'
+      DB_DRIVER: sqlite
+      SQLITE_PATH: /tmp/ci-smoke.db
+      AI_PROVIDER: mock
+      LOG_LEVEL: info
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+          cache: npm
+
+      - name: Cài phụ thuộc
+        run: npm ci --no-audit --no-fund
+
+      - name: Khởi động server nền
+        run: |
+          node src/server.js > /tmp/server.log 2>&1 &
+          echo $! > /tmp/server.pid
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:3000/api/health > /tmp/health.json; then break; fi
+            sleep 1
+          done
+          cat /tmp/health.json
+
+      - name: Kiểm health trả ok
+        run: |
+          python3 - <<'PY'
+          import json
+          d = json.load(open('/tmp/health.json'))
+          assert d['status'] == 'ok', d
+          assert d['db']['ok'] is True, d
+          print('health ok, dialect =', d['db']['dialect'])
+          PY
+
+      - name: Kiểm trang chủ phục vụ được
+        run: |
+          curl -sf http://127.0.0.1:3000/ | grep -q "VIP Product Studio"
+          echo "trang chủ OK"
+
+      - name: Kiểm chặn SSRF qua API thật
+        run: |
+          code=$(curl -s -o /tmp/ssrf.json -w '%{http_code}' -X POST http://127.0.0.1:3000/api/detect \
+            -H 'content-type: application/json' -d '{"url":"http://169.254.169.254/latest/meta-data/"}')
+          cat /tmp/ssrf.json
+          test "$code" -ge 400 || { echo "SSRF KHÔNG bị chặn!"; exit 1; }
+
+      - name: Dọn tiến trình
+        if: always()
+        run: |
+          if [ -f /tmp/server.pid ]; then kill "$(cat /tmp/server.pid)" 2>/dev/null || true; fi
+          echo "--- log server ---"
+          cat /tmp/server.log || true
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 4. Quét secret — không cho secret lọt vào repo
+  # ───────────────────────────────────────────────────────────────────────────
+  secret-scan:
+    name: Quét secret
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Không được commit file .env
+        run: |
+          if git ls-files | grep -E '(^|/)\.env$|(^|/)\.env\.(local|production|development)$'; then
+            echo "Phát hiện file .env bị commit — không được phép."; exit 1
+          fi
+          echo "Không có .env nào bị commit."
+
+      - name: Không được có khoá API trong mã nguồn
+        run: |
+          # Bỏ qua chính file này và tài liệu mô tả mẫu.
+          if grep -rInE '(sk-[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})' \
+               --include='*.js' --include='*.mjs' --include='*.json' --include='*.html' \
+               src public test tools 2>/dev/null | grep -v 'REDACTED' | grep -v 'sk-abcdef'; then
+            echo "Phát hiện chuỗi giống API key trong mã nguồn."; exit 1
+          fi
+          echo "Không thấy API key trong mã nguồn."
+
+      - name: Không được commit file cookie/session
+        run: |
+          if git ls-files | grep -E '\.session/|cookies\.(json|txt)$|\.pem$'; then
+            echo "Phát hiện file cookie/khoá bị commit."; exit 1
+          fi
+          echo "Không có file cookie/khoá bị commit."
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 5. Build Docker — đảm bảo image dựng được
+  # ───────────────────────────────────────────────────────────────────────────
+  docker-build:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dựng image
+        run: docker build -t vip-product-studio:ci .
+
+      - name: Chạy thử container và gọi health
+        run: |
+          docker run -d --name vps-ci -p 3000:3000 \
+            -e DB_DRIVER=sqlite -e SQLITE_PATH=/data/studio.db -e AI_PROVIDER=mock \
+            vip-product-studio:ci
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:3000/api/health; then break; fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:3000/api/health | grep -q '"status":"ok"'
+          docker logs vps-ci
+          docker rm -f vps-ci

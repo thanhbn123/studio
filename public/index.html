@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VIP Product Studio — Link sản phẩm → Nội dung bán hàng tiếng Việt</title>
+    <meta name="description" content="Dán link Taobao / 1688 / Pinduoduo để lấy dữ liệu sản phẩm và sinh nội dung bán hàng tiếng Việt." />
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23111827'/%3E%3Ctext x='16' y='22' font-size='16' text-anchor='middle' fill='%2360a5fa' font-family='sans-serif' font-weight='bold'%3EV%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="wrap topbar-inner">
+        <a class="brand" href="/" data-action="home">
+          <span class="brand-mark">V</span>
+          <span class="brand-text">
+            <strong>VIP Product Studio</strong>
+            <small>MVP-01 · Link Trung Quốc → Nội dung Việt</small>
+          </span>
+        </a>
+        <nav class="topnav">
+          <button class="btn ghost" data-action="home">Sản phẩm mới</button>
+          <button class="btn ghost" data-action="history">Lịch sử</button>
+          <span id="provider-badge" class="badge" title="Trạng thái AI provider">…</span>
+        </nav>
+      </div>
+    </header>
+
+    <main class="wrap" id="app">
+      <noscript>
+        <p class="notice error">Trang này cần JavaScript để chạy.</p>
+      </noscript>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+    <footer class="footer">
+      <div class="wrap">
+        <p>
+          MVP-01: trích xuất dữ liệu sản phẩm → Product Master → phân tích ảnh → nội dung tiếng Việt.
+          Chưa bao gồm chỉnh ảnh, video, hay đăng bài tự động.
+        </p>
+      </div>
+    </footer>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

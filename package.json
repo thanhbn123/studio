@@ -1,0 +1,22 @@
+{
+  "name": "vip-product-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MVP-01 — Taobao/1688/Pinduoduo link → Product Master → AI → nội dung bán hàng tiếng Việt",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test --test-concurrency=1 test/*.test.js",
+    "test:watch": "node --test --watch test/*.test.js",
+    "migrate": "node src/store/migrate.js",
+    "probe": "node tools/live-probe.mjs",
+    "verify": "node tools/verify.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}
