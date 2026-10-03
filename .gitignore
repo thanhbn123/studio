@@ -1,0 +1,34 @@
+# ── Secrets — TUYỆT ĐỐI không commit ────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.session/
+secrets/
+
+# ── Runtime data ───────────────────────────────────────────────────
+data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+uploads/
+
+# ── Node ───────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+.npm/
+
+# ── Test / coverage ────────────────────────────────────────────────
+coverage/
+.nyc_output/
+test-results/
+*.tap
+
+# ── OS / editor ────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
