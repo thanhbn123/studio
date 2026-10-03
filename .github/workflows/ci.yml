@@ -47,6 +47,9 @@ jobs:
       - name: Chạy test (SQLite)
         run: npm test
 
+      - name: Chạy chứng minh MVP-02 (offline, không gọi dịch vụ trả tiền)
+        run: npm run demo:imagelab
+
       - name: Chạy migration SQLite
         run: node src/store/migrate.js --driver sqlite
 
@@ -134,7 +137,9 @@ jobs:
           d = json.load(open('/tmp/health.json'))
           assert d['status'] == 'ok', d
           assert d['db']['ok'] is True, d
-          print('health ok, dialect =', d['db']['dialect'])
+          # MVP-02 phải nạp được (nếu không, tính năng dịch ảnh im lặng tắt).
+          assert d['imagelab']['available'] is True, d['imagelab']
+          print('health ok, dialect =', d['db']['dialect'], '| imagelab =', d['imagelab'])
           PY
 
       - name: Kiểm trang chủ phục vụ được
@@ -213,5 +218,16 @@ jobs:
             sleep 1
           done
           curl -sf http://127.0.0.1:3000/api/health | grep -q '"status":"ok"'
+          # MVP-02 phải nạp được trong image, và ảnh phải ghi được vào VOLUME /data.
+          curl -sf http://127.0.0.1:3000/api/health | grep -q '"available":true'
           docker logs vps-ci
           docker rm -f vps-ci
+
+      - name: Chạy luồng MVP-02 trong image (offline, ghi vào /data)
+        run: |
+          # Image runtime CỐ Ý không chứa `test/`, nên sinh ảnh mẫu bằng chính `tools/` trong image.
+          docker run --rm vip-product-studio:ci sh -c \
+            "node tools/make-test-image.mjs /data/anh-mau.png && node tools/imagelab-demo.mjs --image /data/anh-mau.png" \
+            | tee /tmp/demo.log | tail -8
+          grep -q "MOCK_VERIFIED" /tmp/demo.log
+          grep -q "Trạng thái job: succeeded" /tmp/demo.log

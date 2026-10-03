@@ -31,6 +31,13 @@ const toList = (raw, fallback = []) => {
     .filter(Boolean);
 };
 
+/** Số thực (dùng cho tỉ lệ/ngưỡng); giá trị không phải số → fallback. */
+const toNum = (raw, fallback) => {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
+};
+
 export const AI_PROVIDERS = ['deepseek', 'openai', 'anthropic', 'gemini', 'mock'];
 
 export function loadConfig(env = process.env) {
@@ -74,6 +81,48 @@ export function loadConfig(env = process.env) {
       maxImages: toInt(env.VISION_MAX_IMAGES, 6),
     },
 
+    // ── MVP-02: dịch chữ Trung trên ảnh sản phẩm ─────────────────────────────
+    // Giới hạn dùng chung cho toàn bộ imagelab (C1..C5 đều đọc khối này).
+    imagelab: {
+      // Bật mặc định vì provider mặc định là mock/purejs: chạy offline, is_mock = true.
+      enabled: toBool(env.IMAGELAB_ENABLED, true),
+      dir: toStr(env.IMAGELAB_DIR, './data/imagelab'),
+      maxImageBytes: toInt(env.IMAGELAB_MAX_IMAGE_BYTES, 8 * 1024 * 1024),
+      maxPixels: toInt(env.IMAGELAB_MAX_PIXELS, 16_000_000),
+      maxRegions: toInt(env.IMAGELAB_MAX_REGIONS, 200),
+      minConfidence: toNum(env.IMAGELAB_MIN_CONFIDENCE, 0.5),
+      fontScale: toNum(env.IMAGELAB_FONT_SCALE, 1),
+      maxOutputBytes: toInt(env.IMAGELAB_MAX_OUTPUT_BYTES, 16 * 1024 * 1024),
+    },
+
+    // OCR (C1). Mặc định an toàn: mock — dữ liệu dựng tay, is_mock = true, không gọi mạng.
+    ocr: {
+      provider: toStr(env.OCR_PROVIDER, 'mock').toLowerCase(),
+      apiKey: toStr(env.OCR_API_KEY, ''),
+      baseUrl: toStr(env.OCR_BASE_URL, ''),
+      model: toStr(env.OCR_MODEL, ''),
+      timeoutMs: toInt(env.OCR_TIMEOUT_MS, 60000),
+      mockFixture: toStr(env.OCR_MOCK_FIXTURE, 'src/imagelab/ocr/fixtures/mock-regions.json'),
+    },
+
+    // Render ảnh (C3). Mặc định an toàn: purejs — chạy offline, không cần key.
+    render: {
+      provider: toStr(env.RENDER_PROVIDER, 'purejs').toLowerCase(),
+      apiKey: toStr(env.RENDER_API_KEY, ''),
+      baseUrl: toStr(env.RENDER_BASE_URL, ''),
+      model: toStr(env.RENDER_MODEL, ''),
+      timeoutMs: toInt(env.RENDER_TIMEOUT_MS, 60000),
+    },
+
+    // Dịch chữ trên ảnh (C2) — mặc định KẾ THỪA khối `ai` (giống cách `vision` kế thừa).
+    translate: {
+      provider: toStr(env.TRANSLATE_PROVIDER, aiProvider).toLowerCase(),
+      apiKey: toStr(env.TRANSLATE_API_KEY, '') || toStr(env.AI_API_KEY, ''),
+      baseUrl: toStr(env.TRANSLATE_BASE_URL, '') || toStr(env.AI_BASE_URL, ''),
+      model: toStr(env.TRANSLATE_MODEL, '') || toStr(env.AI_MODEL, ''),
+      timeoutMs: toInt(env.TRANSLATE_TIMEOUT_MS, toInt(env.AI_TIMEOUT_MS, 120000)),
+    },
+
     session: {
       mode: toStr(env.SESSION_MODE, 'none').toLowerCase(),
       cookieFile: toStr(env.SESSION_COOKIE_FILE, './.session/cookies.json'),
@@ -112,6 +161,9 @@ export function loadConfig(env = process.env) {
       VISION_ANALYSIS: Number(env.COST_VISION_ANALYSIS ?? 0.003),
       TRANSLATION: Number(env.COST_TRANSLATION ?? 0.0008),
       CONTENT_GENERATE: Number(env.COST_CONTENT_GENERATE ?? 0.004),
+      // MVP-02 — đơn giá ước tính cho 2 operation mới (chưa thu tiền thật).
+      OCR_DETECT: Number(env.COST_OCR_DETECT ?? 0.0004),
+      IMAGE_RENDER: Number(env.COST_IMAGE_RENDER ?? 0.0015),
       currency: toStr(env.CREDIT_CURRENCY, 'USD'),
     },
   };
@@ -119,6 +171,11 @@ export function loadConfig(env = process.env) {
   if (!AI_PROVIDERS.includes(cfg.vision.provider)) {
     // Không throw ở đây: provider lạ sẽ do tầng provider báo lỗi rõ ràng.
     cfg.vision.providerUnknown = true;
+  }
+
+  if (!['mock', 'http', 'none'].includes(cfg.ocr.provider)) {
+    // Provider OCR lạ sẽ fail-closed về `none` ở tầng provider; cờ này để chẩn đoán.
+    cfg.ocr.providerUnknown = true;
   }
 
   return cfg;

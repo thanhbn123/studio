@@ -28,6 +28,21 @@ function scrubString(value) {
   return out;
 }
 
+/**
+ * Bỏ ĐƯỜNG DẪN TUYỆT ĐỐI của máy chủ khỏi một chuỗi (message/stack của Node luôn
+ * chứa chúng). Dùng ở tầng HTTP và tầng lắp ráp MVP-02: log không được tiết lộ cấu
+ * trúc thư mục nội bộ, và `/api/health` càng không.
+ *
+ * Cố ý KHÔNG nhúng vào `redact()`: `redact` chỉ che secret, còn việc lọc đường dẫn
+ * phải là quyết định tường minh ở nơi ghi log.
+ */
+export function scrubPaths(text) {
+  return String(text ?? '')
+    .replace(/file:\/\/\S+/g, '<path>')
+    .replace(/\/(?:Users|home|private|tmp|var|opt|mnt|Volumes|Applications|usr|etc)\/[^\s'"(),;]*/g, '<path>')
+    .replace(/[A-Za-z]:\\[^\s'"(),;]*/g, '<path>');
+}
+
 /** Che secret theo tên khoá và theo hình dạng giá trị. Trả về bản sao an toàn. */
 export function redact(input, depth = 0, seen = new WeakSet()) {
   if (input === null || input === undefined) return input;

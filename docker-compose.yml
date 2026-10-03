@@ -30,9 +30,32 @@ services:
       VISION_API_KEY: ${VISION_API_KEY:-}
       VISION_MODEL: ${VISION_MODEL:-}
 
+      # ── MVP-02 (dịch ảnh) ─────────────────────────────────────────────────
+      # Mặc định an toàn + miễn phí: OCR mock (fixture), render nội bộ `purejs`
+      # (chỉ PNG, không gọi dịch vụ trả tiền). Đặt biến trong `.env` để cắm dịch vụ thật.
+      IMAGELAB_ENABLED: ${IMAGELAB_ENABLED:-true}
+      # Ảnh nằm trong VOLUME /data để không mất khi dựng lại container.
+      IMAGELAB_DIR: /data/imagelab
+      OCR_PROVIDER: ${OCR_PROVIDER:-mock}
+      OCR_API_KEY: ${OCR_API_KEY:-}
+      OCR_BASE_URL: ${OCR_BASE_URL:-}
+      OCR_MODEL: ${OCR_MODEL:-}
+      RENDER_PROVIDER: ${RENDER_PROVIDER:-purejs}
+      RENDER_API_KEY: ${RENDER_API_KEY:-}
+      RENDER_BASE_URL: ${RENDER_BASE_URL:-}
+      RENDER_MODEL: ${RENDER_MODEL:-}
+      # Rỗng ⇒ kế thừa khối `ai` ở trên (dùng đúng provider AI đã cấu hình).
+      TRANSLATE_PROVIDER: ${TRANSLATE_PROVIDER:-}
+      TRANSLATE_API_KEY: ${TRANSLATE_API_KEY:-}
+      TRANSLATE_BASE_URL: ${TRANSLATE_BASE_URL:-}
+      TRANSLATE_MODEL: ${TRANSLATE_MODEL:-}
+
       # Mặc định TẮT truy cập mạng nội bộ — chỉ bật khi test cục bộ có kiểm soát.
       ALLOW_PRIVATE_NETWORK: "false"
       SESSION_MODE: ${SESSION_MODE:-none}
+    volumes:
+      # Giữ ảnh gốc + ảnh đã render qua các lần dựng lại container.
+      - appdata:/data
     depends_on:
       db:
         condition: service_healthy
@@ -60,3 +83,4 @@ services:
 
 volumes:
   pgdata:
+  appdata:

@@ -22,19 +22,29 @@ bán hàng tiếng Việt → bằng chứng + lịch sử + usage.
 
 ## MVP-02 — Image Translation Studio
 
+**Trạng thái: ĐÃ TRIỂN KHAI trên nhánh `feat/mvp02-imagelab` — CHỜ OWNER NGHIỆM THU.**
+
 **Mục tiêu:** dịch chữ Trung trên ảnh sản phẩm sang tiếng Việt, giữ nguyên bố cục và phong cách.
 
-Phạm vi dự kiến:
-- Phát hiện vùng chữ (OCR) trên ảnh gốc, trả về hộp bao + nội dung + ngôn ngữ.
-- Dịch nội dung sang tiếng Việt, có bảng duyệt để người dùng sửa từng dòng.
-- Xoá chữ cũ (inpainting) và render chữ Việt vào đúng vị trí, tự chọn cỡ chữ vừa hộp.
-- Giữ nguyên ảnh gốc bất biến; mọi ảnh sinh ra là bản mới có truy vết về ảnh gốc.
-- Ghi `usage_event` cho hai operation mới: `OCR_DETECT`, `IMAGE_RENDER`.
+Đã làm:
+- Phát hiện vùng chữ (OCR) trên ảnh gốc: hộp bao (pixel + chuẩn hoá) + nội dung + ngôn ngữ + độ tin cậy.
+- Phân loại từng vùng: `descriptive` / `brand` / `certification` / `price` / `unknown` (fail-closed).
+- Dịch sang tiếng Việt qua **bảng duyệt sửa từng dòng**, có từ điển thuật ngữ + 4 luật guardrail.
+- Xoá chữ cũ (inpaint) và render chữ Việt vào đúng hộp, tự chọn cỡ chữ vừa hộp; không vừa thì **bỏ qua**
+  và giữ nguyên chữ gốc (không bao giờ vẽ tràn).
+- Giữ nguyên ảnh gốc bất biến; mọi ảnh sinh ra là bản mới có `parent_id` + `sha256` truy vết.
+- Ghi `usage_event` cho hai operation mới: `OCR_DETECT`, `IMAGE_RENDER` (dịch dùng `TRANSLATION`).
 
-Điểm nối đã có: `uploads` (G11) đã lưu ảnh người dùng; `jobs` đã có stage; `usage_event` đã sẵn.
+Giới hạn THẬT đang có (đọc trước khi tin):
+- OCR mặc định là **mock** đọc từ fixture dựng tay (`is_mock = true`). OCR thật cần cắm provider
+  `OCR_PROVIDER=http` — **chưa đo được** vì chưa có dịch vụ.
+- Render nội bộ `purejs` **chỉ giải mã PNG** (8-bit, color type 0/2/4/6, non-interlaced).
+  JPEG/WebP/GIF trả `UNSUPPORTED_IMAGE` — cần `RENDER_PROVIDER=http` để xử lý.
+- Chưa có test nào trên UI `public/app.js` (escape XSS) và trên provider `http` thật.
 
-**Rủi ro cần quyết trước:** render chữ Việt lên ảnh sản phẩm có thể bị coi là làm sai lệch
-ảnh thương mại. Cần chốt quy tắc: chỉ dịch chữ mô tả, không sửa chữ là nhãn hiệu/chứng nhận.
+Quy tắc đã chốt cho rủi ro đạo đức (điều khoản "cần quyết trước" của bản roadmap cũ):
+**chỉ dịch chữ mô tả**; chữ là **nhãn hiệu / chứng nhận / giá** thì không dịch, không xoá, và lý do
+được ghi lại; người dùng chỉ override được khi gửi cờ rõ ràng, và override để lại vết.
 
 ---
 

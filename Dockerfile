@@ -1,8 +1,11 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# VIP Product Studio — MVP-01
+# VIP Product Studio — MVP-01 + MVP-02
 #
 # Ứng dụng chỉ cần Node và rất ít phụ thuộc runtime (chỉ `pg`, và chỉ khi dùng
 # PostgreSQL). Nhờ vậy image nhỏ và không cần biên dịch native module.
+#
+# MVP-02 (dịch ảnh) tự viết codec PNG + font bằng `node:zlib`, KHÔNG cần thư viện
+# ảnh native — nên image vẫn giữ nguyên độ phức tạp như MVP-01.
 # ─────────────────────────────────────────────────────────────────────────────
 FROM node:24-alpine AS deps
 
@@ -18,7 +21,10 @@ ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=3000 \
     DB_DRIVER=sqlite \
-    SQLITE_PATH=/data/studio.db
+    SQLITE_PATH=/data/studio.db \
+    IMAGELAB_DIR=/data/imagelab \
+    OCR_PROVIDER=mock \
+    RENDER_PROVIDER=purejs
 
 WORKDIR /app
 

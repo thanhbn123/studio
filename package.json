@@ -14,7 +14,8 @@
     "test:watch": "node --test --watch test/*.test.js",
     "migrate": "node src/store/migrate.js",
     "probe": "node tools/live-probe.mjs",
-    "verify": "node tools/verify.mjs"
+    "verify": "node tools/verify.mjs",
+    "demo:imagelab": "node tools/imagelab-demo.mjs"
   },
   "dependencies": {
     "pg": "^8.13.1"
