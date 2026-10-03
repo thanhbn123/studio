@@ -10,6 +10,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { URL } from 'node:url';
+import { scrubPaths } from '../logger.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const PUBLIC_DIR = path.resolve(HERE, '../../public');
@@ -274,7 +275,27 @@ export function createServer({ router, logger, staticRoot = PUBLIC_DIR } = {}) {
         sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'Không tìm thấy.' } });
       }
     } catch (err) {
-      logger?.error('http.request_failed', { path: pathname, method: req.method, error: err });
+      // Mức log theo LOẠI lỗi, và KHÔNG BAO GIỜ ghi đường dẫn tuyệt đối của máy chủ:
+      //  - 4xx (404 do kiểm quyền sở hữu, 409 khi còn dòng chờ duyệt, 415 ảnh sai định
+      //    dạng, 503 do tính năng chưa cấu hình…) là chuyện THƯỜNG GẶP → mức `warn`,
+      //    không kèm stack.
+      //  - 5xx mới là sự cố → mức `error`, giữ stack nhưng đã lọc đường dẫn.
+      // Trước đây mọi lỗi đều ghi `error` kèm nguyên object Error, khiến stack của Node
+      // (chứa `/Users/.../src/http/routes.js`) lọt vào log ở cả những ca 404 bình thường.
+      const status = Number(err?.status) || (err?.code === 'RATE_LIMITED' ? 429 : 500);
+      const detail = {
+        name: err?.name || 'Error',
+        code: err?.code || null,
+        message: scrubPaths(err?.message || err),
+      };
+      const context = {
+        path: pathname,
+        method: req.method,
+        status,
+        error: status >= 500 ? { ...detail, stack: scrubPaths(err?.stack) } : detail,
+      };
+      if (status >= 500) logger?.error('http.request_failed', context);
+      else logger?.warn?.('http.request_failed', context);
       if (!res.headersSent) sendError(res, err);
       else res.end();
     } finally {

@@ -457,6 +457,35 @@ imagelab: {
 6. **Escape toàn bộ** text lấy từ OCR/DB trước khi chèn vào DOM (`escapeHtml`) — chữ Trung trong
    ảnh là dữ liệu không tin cậy.
 
+### 4.6 Luật chống vỡ khi 5 agent lắp ráp SONG SONG
+
+Năm agent viết cùng lúc nên có lúc module anh em **chưa kịp tồn tại**. Vì vậy:
+
+- **C4 (`src/app.js`)**: khối MVP-02 phải được nạp **phòng thủ** — bọc trong `try/catch`
+  (dynamic `import()` cũng được). Nếu nạp lỗi: ghi log `imagelab.wiring_failed`, đặt
+  `app.imagelabPipeline = null`, `app.ocrProvider/renderProvider/translator = null`, và
+  **MVP-01 phải vẫn khởi động bình thường**. Không được để MVP-02 làm chết boot của MVP-01.
+- **C5 (`src/http/routes.js`)**: mọi route `/api/imagelab/*` phải kiểm
+  `imagelabPipeline`/`storage` trước; thiếu → `HttpError(503, 'IMAGELAB_UNAVAILABLE', ...)`.
+- `GET /api/health` và `GET /api/config` phải trả `imagelab: { available: boolean }` để UI biết.
+- Khi lắp ráp xong, agent Gộp sẽ **gỡ bỏ** lớp phòng thủ nếu không còn cần — nhưng chỉ sau khi
+  tất cả module đã tồn tại và test xanh.
+
+**Bổ sung sau khi Gộp lắp ráp (04/10/2026) — không đổi tên nào đã đóng băng ở trên:**
+
+- `imagelab` ở `/api/health` và `/api/config` trả thêm `reason: string|null` — lý do THẬT khi
+  `available = false` (đã lọc secret + đường dẫn tuyệt đối), `null` khi khả dụng. Log
+  `imagelab.wiring_failed` ghi ở mức **error** kèm `module` (đường dẫn tương đối của module hỏng).
+  `available` = nạp được pipeline + storage **và** `config.imagelab.enabled !== false`.
+- **Một luật, một chỗ:** C5 KHÔNG được chép lại luật của module anh em. Bản dự phòng
+  `applyEditsFallback` (mô phỏng `applyReviewEdits`) đã bị **xoá** vì lệch thật với C2; luật
+  "còn dòng nào chặn render" nay do `pendingReviewLines()` export từ `src/imagelab/pipeline.js`
+  cung cấp cho cả `renderApproved` (C4) và `POST .../render` (C5).
+- `POST /api/imagelab/jobs` chạy `ingest()` **ngay trong request** rồi mới xếp hàng `runOcr`, nhờ
+  vậy `asset_id` trong body 202 là giá trị THẬT (không còn `null`) và lỗi ảnh trả về dưới dạng
+  HTTP ngay (415 `UNSUPPORTED_IMAGE`, 413 `IMAGE_TOO_LARGE`/`PIXELS_EXCEEDED`) thay vì một job
+  chết trong hàng đợi.
+
 ---
 
 ## 5. ĐỊNH NGHĨA "XONG" CỦA MVP-02

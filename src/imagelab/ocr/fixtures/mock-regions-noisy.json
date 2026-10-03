@@ -1,0 +1,54 @@
+{
+  "note": "DỮ LIỆU MOCK DỰNG TAY — KHÔNG PHẢI KẾT QUẢ OCR THẬT. Fixture này cố tình chứa vùng BẨN để test nhánh fail-closed của normalizeRegions() (bỏ vùng + ghi lý do vào `dropped`). Dùng bằng cách đặt OCR_MOCK_FIXTURE=src/imagelab/ocr/fixtures/mock-regions-noisy.json. Provider mock LUÔN khai is_mock = true.",
+  "provider": "mock",
+  "is_mock": true,
+  "model": "mock-ocr-v1",
+  "image": "ảnh giả lập 640x480 (mock://ao-thun-nam-640x480.png) — không tồn tại trên đĩa",
+  "width": 640,
+  "height": 480,
+  "expect_note": "Kỳ vọng với minConfidence=0.5: 2 vùng hợp lệ (r1 纯棉短袖T恤 → descriptive, r2 品牌旗舰店 → brand) và 4 vùng bị bỏ kèm lý do: vùng chỉ có khoảng trắng, vùng confidence 0.21 dưới ngưỡng, vùng hộp nằm ngoài biên phải, vùng trùng khít với r1.",
+  "regions": [
+    {
+      "text": "纯棉短袖T恤",
+      "box": { "x": 20, "y": 30, "w": 200, "h": 40 },
+      "confidence": 0.91,
+      "lang": "zh-Hans",
+      "mock_note": "vùng HỢP LỆ #1 → descriptive"
+    },
+    {
+      "text": "   ",
+      "box": { "x": 20, "y": 90, "w": 160, "h": 30 },
+      "confidence": 0.8,
+      "lang": "zh-Hans",
+      "mock_note": "vùng BẨN: chỉ có khoảng trắng → bỏ"
+    },
+    {
+      "text": "夏季新款",
+      "box": { "x": 20, "y": 140, "w": 140, "h": 32 },
+      "confidence": 0.21,
+      "lang": "zh-Hans",
+      "mock_note": "vùng BẨN: confidence 0.21 < 0.5 → bỏ (đây là chữ THẬT nhưng đọc không chắc)"
+    },
+    {
+      "text": "品牌旗舰店",
+      "box": { "x": 380, "y": 40, "w": 200, "h": 36 },
+      "confidence": 0.94,
+      "lang": "zh-Hans",
+      "mock_note": "vùng HỢP LỆ #2 → brand (không dịch)"
+    },
+    {
+      "text": "厂家直销",
+      "box": { "x": 700, "y": 200, "w": 120, "h": 30 },
+      "confidence": 0.85,
+      "lang": "zh-Hans",
+      "mock_note": "vùng BẨN: hộp nằm ngoài biên phải (x=700 > width=640) → bỏ"
+    },
+    {
+      "text": "纯棉短袖T恤",
+      "box": { "x": 20, "y": 30, "w": 200, "h": 40 },
+      "confidence": 0.9,
+      "lang": "zh-Hans",
+      "mock_note": "vùng BẨN: trùng khít vùng HỢP LỆ #1 (cùng chữ, cùng hộp) → bỏ"
+    }
+  ]
+}

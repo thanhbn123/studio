@@ -1,0 +1,57 @@
+{
+  "note": "DỮ LIỆU MOCK DỰNG TAY — KHÔNG PHẢI KẾT QUẢ OCR THẬT. Đây là các vùng chữ Trung của một ảnh sản phẩm TMĐT (áo thun nam) do người viết dựng thủ công để test luồng MVP-02. Provider mock LUÔN khai is_mock = true. KHÔNG được dùng fixture này để kết luận bất cứ điều gì về một ảnh thật.",
+  "provider": "mock",
+  "is_mock": true,
+  "model": "mock-ocr-v1",
+  "image": "ảnh giả lập 800x800 (mock://ao-thun-nam-800x800.png) — không tồn tại trên đĩa",
+  "width": 800,
+  "height": 800,
+  "kind_note": "Fixture CHỈ chứa chữ + hộp + độ tin cậy + ngôn ngữ (đúng thứ một OCR engine trả về). Trường kind KHÔNG được ghi ở đây: kind do classifyRegion() suy ra lúc chuẩn hoá. Các chuỗi dưới đây phủ đủ 5 loại: brand=品牌旗舰店 · descriptive=纯棉短袖T恤, 厂家直销 一件代发 · certification=3C认证 合格证齐全 · price=¥39.9 包邮 · unknown=℡138-8888-6666 (chuỗi chỉ có số/ký hiệu, không có chữ để dịch).",
+  "lang_note": "zh-Hans = chữ Hán giản thể; und = không xác định được ngôn ngữ.",
+  "order_note": "Các vùng được cố tình xếp KHÔNG theo thứ tự đọc, để normalizeRegions() phải tự sắp (trên→dưới, trái→phải) và gán id r1..r6.",
+  "coordinate_note": "box là PIXEL trên ảnh 800x800, gốc toạ độ ở góc trên-trái; mọi hộp đều nằm trong biên ảnh.",
+  "regions": [
+    {
+      "text": "¥39.9 包邮",
+      "box": { "x": 520, "y": 700, "w": 180, "h": 44 },
+      "confidence": 0.95,
+      "lang": "zh-Hans",
+      "mock_note": "giá bán + freeship → price (không bao giờ dịch)"
+    },
+    {
+      "text": "品牌旗舰店",
+      "box": { "x": 40, "y": 40, "w": 200, "h": 40 },
+      "confidence": 0.97,
+      "lang": "zh-Hans",
+      "mock_note": "nhãn hiệu / cờ hiệu → brand (không dịch, không xoá)"
+    },
+    {
+      "text": "3C认证 合格证齐全",
+      "box": { "x": 40, "y": 250, "w": 260, "h": 34 },
+      "confidence": 0.9,
+      "lang": "zh-Hans",
+      "mock_note": "chứng nhận 3C + giấy hợp quy → certification (không dịch, không xoá)"
+    },
+    {
+      "text": "℡138-8888-6666",
+      "box": { "x": 40, "y": 700, "w": 220, "h": 28 },
+      "confidence": 0.76,
+      "lang": "und",
+      "mock_note": "hotline người bán → chuỗi chỉ có số/ký hiệu → unknown (fail-closed, không dịch)"
+    },
+    {
+      "text": "纯棉短袖T恤",
+      "box": { "x": 40, "y": 120, "w": 260, "h": 48 },
+      "confidence": 0.93,
+      "lang": "zh-Hans",
+      "mock_note": "mô tả sản phẩm → descriptive (được dịch)"
+    },
+    {
+      "text": "厂家直销 一件代发",
+      "box": { "x": 40, "y": 190, "w": 280, "h": 36 },
+      "confidence": 0.88,
+      "lang": "zh-Hans",
+      "mock_note": "khẩu hiệu bán hàng → descriptive (được dịch)"
+    }
+  ]
+}

@@ -5,7 +5,7 @@
  * không lộ secret, không lộ chi tiết nội bộ).
  */
 
-import { Router, HttpError, sendJson, readJson, sessionId, MAX_BODY_BYTES_DEFAULT } from './server.js';
+import { Router, HttpError, sendJson, readJson, sessionId, MAX_BODY_BYTES_DEFAULT, SECURITY_HEADERS } from './server.js';
 import { tryDetectSource } from '../sources/detect.js';
 import { STYLES, LENGTHS } from '../content/styles.js';
 import { JOB_STATUS } from '../store/index.js';
@@ -26,6 +26,123 @@ export function buildRouter(app) {
     return job;
   };
 
+  /* ─────────────── MVP-02 · tiện ích dùng chung cho imagelab ─────────────── */
+
+  // 4.6 — module anh em (pipeline/storage) có thể chưa nạp được khi 5 agent chạy
+  // song song. Mọi route /api/imagelab/* phải kiểm trước và trả 503 gọn gàng,
+  // tuyệt đối không để MVP-02 làm chết server của MVP-01.
+  const imagelabEnabled = () => config.imagelab?.enabled !== false;
+  /** "Khả dụng" = đã nạp được pipeline + storage VÀ tính năng không bị tắt. */
+  const imagelabAvailable = () => Boolean(app.imagelabPipeline && app.storage) && imagelabEnabled();
+  /** Lý do THẬT do `src/app.js` ghi lại khi khối MVP-02 nạp lỗi — không được im lặng. */
+  const imagelabUnavailableReason = () =>
+    app.imagelabUnavailableReason || 'Không rõ lý do — xem log máy chủ (imagelab.wiring_failed).';
+
+  /**
+   * Nạp module C2 (`applyReviewEdits`) và module C4 (`pendingReviewLines`).
+   *
+   * Cố ý KHÔNG chép lại luật của các module anh em vào file này: bản sao luật là thứ
+   * dễ lệch nhất (bản dự phòng cũ của `applyReviewEdits` từng từ chối `action: accept`
+   * trên vùng nhãn hiệu, trong khi C2 cho phép — hai luật, hai kết quả). Module không
+   * nạp được thì route báo 503 thẳng thắn, KHÔNG mô phỏng kết quả.
+   */
+  const moduleLoaders = new Map();
+  const loadImagelabFunction = (specifier, exportName) => {
+    const key = `${specifier}#${exportName}`;
+    if (!moduleLoaders.has(key)) {
+      moduleLoaders.set(key, (async () => {
+        try {
+          const mod = await import(specifier);
+          if (typeof mod?.[exportName] !== 'function') {
+            logger?.error?.('imagelab.module_export_missing', { module: specifier, export: exportName });
+            return null;
+          }
+          return mod[exportName];
+        } catch (err) {
+          // Không đưa cả object lỗi vào log: message/stack của Node chứa đường dẫn tuyệt đối.
+          logger?.error?.('imagelab.module_load_failed', {
+            module: specifier,
+            export: exportName,
+            error_name: err?.name || 'Error',
+            error_code: err?.code || null,
+            error_message: String(err?.message || err).replace(/\/(?:Users|home|private|tmp|var|opt|mnt|Volumes)\/\S*/g, '<path>'),
+          });
+          return null;
+        }
+      })());
+    }
+    return moduleLoaders.get(key);
+  };
+
+  const imagelabLimits = () => ({
+    max_image_bytes: config.imagelab?.maxImageBytes ?? config.net.maxUploadBytes,
+    max_pixels: config.imagelab?.maxPixels ?? DEFAULT_MAX_PIXELS,
+    max_regions: config.imagelab?.maxRegions ?? DEFAULT_MAX_REGIONS,
+    allowed_image_mime: config.net.allowedImageMime,
+  });
+
+  const providerInfo = (p) => ({
+    name: p?.name || 'none',
+    model: p?.model || '',
+    configured: Boolean(p?.configured),
+    is_mock: Boolean(p?.isMock),
+  });
+  const imagelabProviders = () => ({
+    ocr: providerInfo(app.ocrProvider),
+    render: providerInfo(app.renderProvider),
+    translate: providerInfo(app.translator),
+  });
+
+  const requireImagelab = () => {
+    if (!imagelabAvailable()) {
+      throw new HttpError(503, 'IMAGELAB_UNAVAILABLE', imagelabUnavailableReason());
+    }
+  };
+  const requirePipelineMethod = (name) => {
+    requireImagelab();
+    if (typeof app.imagelabPipeline?.[name] !== 'function') {
+      throw new HttpError(503, 'IMAGELAB_UNAVAILABLE', `Pipeline dịch ảnh thiếu phương thức "${name}" — tính năng chưa sẵn sàng.`);
+    }
+  };
+  const requireStoreMethod = (name) => {
+    if (typeof store[name] !== 'function') {
+      throw new HttpError(503, 'IMAGELAB_UNAVAILABLE', `Kho dữ liệu thiếu phương thức "${name}" — tính năng dịch ảnh chưa sẵn sàng.`);
+    }
+  };
+
+  /** Provider có TỰ KHAI là chưa cấu hình hay không (không suy diễn khi thiếu getter). */
+  const isUnconfigured = (p) => Boolean(p) && p.configured === false;
+
+  // Quyền sở hữu theo session: tài nguyên của người khác trả 404 y như tài nguyên
+  // không tồn tại — không xác nhận sự tồn tại của job/asset của session khác.
+  const requireImagelabJob = async (id, sid) => {
+    requireImagelab();
+    if (!UUID_RE.test(id)) throw new HttpError(400, 'BAD_JOB_ID', 'Mã job không hợp lệ.');
+    const job = await store.getJob(id);
+    if (!job || job.session_id !== sid) throw new HttpError(404, 'JOB_NOT_FOUND', 'Không tìm thấy job.');
+    return job;
+  };
+
+  const requireImagelabAsset = async (id, sid) => {
+    requireImagelab();
+    requireStoreMethod('getImageAsset');
+    if (!UUID_RE.test(id)) throw new HttpError(400, 'BAD_ASSET_ID', 'Mã ảnh không hợp lệ.');
+    const asset = await store.getImageAsset(id);
+    if (!asset) throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
+
+    if (asset.session_id) {
+      if (asset.session_id !== sid) throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
+    } else if (asset.job_id) {
+      // Thiếu session_id trên asset thì đối chiếu qua job sở hữu nó.
+      const job = await store.getJob(asset.job_id);
+      if (!job || job.session_id !== sid) throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
+    } else {
+      // Không xác định được chủ sở hữu → fail-closed, không trả dữ liệu.
+      throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
+    }
+    return asset;
+  };
+
   /* ───────────────────────────── Health ───────────────────────────── */
 
   router.get('/api/health', async (req, res) => {
@@ -44,6 +161,9 @@ export function buildRouter(app) {
       jobs: queue.stats(),
       connectors: registry.list(),
       connector_init_failures: registry.initFailures,
+      // 4.6 — UI/người vận hành dựa vào cờ này để biết MVP-02 có sẵn sàng không,
+      // và `reason` để biết VÌ SAO nó tắt (không im lặng).
+      imagelab: { available: imagelabAvailable(), reason: imagelabAvailable() ? null : imagelabUnavailableReason() },
     });
   });
 
@@ -66,6 +186,17 @@ export function buildRouter(app) {
         max_upload_files: config.net.maxUploadFiles,
         allowed_image_mime: config.net.allowedImageMime,
         max_images_for_vision: config.vision.maxImages,
+      },
+      // 4.5.1 — khối cấu hình MVP-02 mà UI dựa vào (nhãn MOCK, giới hạn ảnh, loại vùng).
+      imagelab: {
+        available: imagelabAvailable(),
+        // 4.6 — lý do thật khi tính năng không khả dụng (đã lọc đường dẫn nội bộ).
+        reason: imagelabAvailable() ? null : imagelabUnavailableReason(),
+        enabled: imagelabEnabled(),
+        ...imagelabProviders(),
+        limits: imagelabLimits(),
+        kinds: [...IMAGELAB_KINDS],
+        max_render_pixels: imagelabLimits().max_pixels,
       },
     });
   });
@@ -328,6 +459,235 @@ export function buildRouter(app) {
     sendJson(res, 201, { uploads: stored, count: stored.length });
   });
 
+  /* ══════════ MVP-02 · Dịch ảnh Trung → Việt (hợp đồng 4.5) ══════════ */
+
+  /* ── Tạo job dịch ảnh: nhận ảnh base64 đã kiểm magic bytes ── */
+
+  router.post('/api/imagelab/jobs', async (req, res) => {
+    requirePipelineMethod('ingest');
+    requirePipelineMethod('runOcr');
+    requireStoreMethod('createJob');
+
+    const sid = sessionId(req, res);
+    enforce(rateLimiters.jobs, `imagelab:${sid}`);
+
+    const limits = imagelabLimits();
+    // base64 phình ~4/3 so với nhị phân — nới body vừa đủ cho một ảnh.
+    const body = await readJson(req, {
+      maxBytes: Math.min(MAX_BODY_BYTES_DEFAULT, Math.ceil((limits.max_image_bytes * 4) / 3) + 64 * 1024),
+    });
+
+    const image = decodeImagelabImage(body.image, limits);
+    const options = sanitizeImagelabOptions(body.options, config);
+
+    // Fail-closed: provider chưa cấu hình thì báo ngay, không nhận ảnh rồi để job
+    // chết trong hàng đợi mà người dùng không hiểu vì sao.
+    if (isUnconfigured(app.ocrProvider) || isUnconfigured(app.translator)) {
+      throw new HttpError(502, 'NOT_CONFIGURED', 'Provider OCR/dịch chưa được cấu hình — chưa thể dịch ảnh.');
+    }
+
+    const jobId = await store.createJob({
+      sessionId: sid,
+      source: 'manual',
+      inputMode: 'manual',
+      kind: 'image_translation',
+    });
+
+    // Ingest chạy NGAY trong request (xác thực magic bytes thêm một lần, dò kích thước,
+    // ghi file + ghi DB) rồi mới xếp hàng OCR. Nhờ vậy:
+    //   - `asset_id` trả về là THẬT (hợp đồng 4.5), không phải null;
+    //   - ảnh hỏng/không hỗ trợ trả lỗi HTTP ngay, không biến thành một job chết
+    //     trong hàng đợi mà người dùng không hiểu vì sao.
+    let ingest;
+    try {
+      ingest = await app.imagelabPipeline.ingest(jobId, { image, sessionId: sid, options });
+    } catch (err) {
+      throw mapImagelabError(err, 'Không lưu được ảnh tải lên.');
+    }
+
+    queue.enqueue(jobId, () => app.imagelabPipeline.runOcr(jobId, { sessionId: sid, options }));
+
+    sendJson(res, 202, {
+      job_id: jobId,
+      asset_id: ingest?.asset_id ?? null,
+      status: JOB_STATUS.QUEUED,
+      poll: `/api/imagelab/jobs/${jobId}`,
+    });
+  });
+
+  /* ── Trạng thái job + vùng chữ + bản dịch để duyệt ── */
+
+  router.get('/api/imagelab/jobs/:id', async (req, res, params) => {
+    requireImagelab();
+    requireStoreMethod('listImageAssets');
+    requireStoreMethod('listOcrRegions');
+    requireStoreMethod('listTranslationLines');
+
+    const sid = sessionId(req, res);
+    const job = await requireImagelabJob(params.id, sid);
+
+    const [assets, rawRegions, rawLines] = await Promise.all([
+      store.listImageAssets(job.id, {}),
+      store.listOcrRegions(job.id),
+      store.listTranslationLines(job.id),
+    ]);
+
+    const list = Array.isArray(assets) ? assets : [];
+    const originals = list.filter((a) => a.role === 'original');
+    const rendered = list.filter((a) => a.role === 'rendered');
+    const asset = originals.find((a) => !a.parent_id) || originals[0] || null;
+    const lastRendered = rendered[rendered.length - 1] || null;
+
+    sendJson(res, 200, {
+      job: jobJson(job),
+      asset: assetJson(asset),
+      rendered: rendered.map(assetJson),
+      regions: (rawRegions || []).map(regionJson),
+      lines: (rawLines || []).map(lineJson),
+      render_summary: buildRenderSummary(lastRendered),
+      warnings: collectWarnings(asset, lastRendered),
+      providers: imagelabProviders(),
+      // Bổ sung (không nằm trong hợp đồng tối thiểu): vùng OCR bị bỏ + cảnh báo OCR,
+      // để UI hiện được "vùng bị bỏ kèm lý do" mà không phải bịa.
+      ocr: collectOcrMeta(asset),
+    });
+  });
+
+  /* ── Người dùng sửa/duyệt từng dòng ── */
+
+  router.put('/api/imagelab/jobs/:id/lines', async (req, res, params) => {
+    requireImagelab();
+    requireStoreMethod('listTranslationLines');
+    requireStoreMethod('updateTranslationLines');
+
+    const sid = sessionId(req, res);
+    enforce(rateLimiters.jobs, `imagelab-lines:${sid}`);
+    const job = await requireImagelabJob(params.id, sid);
+
+    const body = await readJson(req, { maxBytes: 512 * 1024 });
+    const edits = sanitizeEdits(body.edits);
+    const allowBrandOverride = body.allow_brand_override === true;
+
+    const current = ((await store.listTranslationLines(job.id)) || []).map(lineJson);
+
+    // Luật duyệt dòng nằm ở ĐÚNG MỘT chỗ: `applyReviewEdits` của C2. Ở đây từng có
+    // một bản dự phòng chép tay luật đó cho trường hợp C2 chưa tồn tại — nó đã lệch
+    // thật (từ chối `action: accept` trên vùng nhãn hiệu trong khi C2 cho phép), nên
+    // đã bị xoá. Thiếu module ⇒ báo 503, KHÔNG mô phỏng kết quả.
+    const applyReviewEdits = await loadImagelabFunction('../imagelab/translate/index.js', 'applyReviewEdits');
+    if (!applyReviewEdits) {
+      throw new HttpError(503, 'IMAGELAB_UNAVAILABLE', 'Module duyệt bản dịch chưa nạp được trên máy chủ này.');
+    }
+
+    let result;
+    try {
+      const applied = (await applyReviewEdits(current, edits, { allowBrandOverride })) || {};
+      result = {
+        lines: Array.isArray(applied.lines) ? applied.lines.map(lineJson) : current,
+        rejected: asArray(applied.rejected),
+        warnings: asArray(applied.warnings).map(String),
+      };
+    } catch (err) {
+      throw mapImagelabError(err, 'Không lưu được bản sửa.');
+    }
+
+    await store.updateTranslationLines(job.id, result.lines);
+
+    sendJson(res, 200, { lines: result.lines, rejected: result.rejected, warnings: result.warnings });
+  });
+
+  /* ── Render ảnh đã duyệt (chạy qua queue) ── */
+
+  router.post('/api/imagelab/jobs/:id/render', async (req, res, params) => {
+    requirePipelineMethod('renderApproved');
+    requireStoreMethod('listTranslationLines');
+
+    const sid = sessionId(req, res);
+    enforce(rateLimiters.jobs, `imagelab-render:${sid}`);
+    const job = await requireImagelabJob(params.id, sid);
+
+    const body = await readJson(req, { maxBytes: 256 * 1024 });
+    const onlyRegionIds = sanitizeRegionIds(body.only_region_ids);
+    const force = body.force === true;
+
+    if (isUnconfigured(app.renderProvider)) {
+      throw new HttpError(502, 'NOT_CONFIGURED', 'Provider render chưa được cấu hình — chưa thể render ảnh.');
+    }
+
+    const lines = ((await store.listTranslationLines(job.id)) || []).map(lineJson);
+    if (lines.length === 0) {
+      throw new HttpError(409, 'IMAGELAB_NO_LINES', 'Job chưa có dòng chữ nào để render.');
+    }
+    // Cùng MỘT hàm luật với `renderApproved` của pipeline (hợp đồng 4.4): dòng
+    // `NEEDS_REVIEW` mà `edited_by_user === true` coi như đã được người dùng xử lý.
+    // Trước đây route tự lọc `status === 'NEEDS_REVIEW'` nên chặn oan những dòng
+    // người dùng đã bấm bỏ qua trong khi pipeline cho qua.
+    const pendingReviewLines = await loadImagelabFunction('../imagelab/pipeline.js', 'pendingReviewLines');
+    if (!pendingReviewLines) {
+      throw new HttpError(503, 'IMAGELAB_UNAVAILABLE', 'Module pipeline dịch ảnh chưa nạp được trên máy chủ này.');
+    }
+    const pending = pendingReviewLines(lines);
+    if (pending.length > 0 && !force) {
+      throw new HttpError(409, 'REVIEW_REQUIRED', `Còn ${pending.length} dòng cần bạn duyệt trước khi render.`, {
+        pending_region_ids: pending.map((l) => l.region_id).slice(0, 100),
+      });
+    }
+
+    await store.updateJob(job.id, {
+      status: JOB_STATUS.QUEUED,
+      stage: 'rendering',
+      error_code: null,
+      error_message: null,
+    });
+
+    queue.enqueue(job.id, () =>
+      app.imagelabPipeline.renderApproved(job.id, { sessionId: sid, onlyRegionIds, force }),
+    );
+
+    sendJson(res, 202, { job_id: job.id, status: JOB_STATUS.QUEUED, force });
+  });
+
+  /* ── Metadata asset (KHÔNG kèm bytes, KHÔNG kèm đường dẫn nội bộ) ── */
+
+  router.get('/api/imagelab/assets/:id', async (req, res, params) => {
+    const sid = sessionId(req, res);
+    const asset = await requireImagelabAsset(params.id, sid);
+    sendJson(res, 200, assetJson(asset));
+  });
+
+  /* ── File ảnh nhị phân (có kiểm quyền sở hữu như mọi route khác) ── */
+
+  router.get('/api/imagelab/assets/:id/file', async (req, res, params) => {
+    const sid = sessionId(req, res);
+    const asset = await requireImagelabAsset(params.id, sid);
+
+    const allowed = config.net.allowedImageMime || [];
+    if (!asset.mime || !allowed.includes(asset.mime)) {
+      throw new HttpError(415, 'UNSUPPORTED_MEDIA_TYPE', 'Định dạng ảnh này không được phép trả về.');
+    }
+
+    let buffer;
+    try {
+      buffer = await app.storage.read(asset);
+    } catch (err) {
+      logger?.warn?.('imagelab.asset_read_failed', { asset_id: asset.id, error: err });
+      throw new HttpError(404, 'ASSET_FILE_NOT_FOUND', 'Không tìm thấy tệp ảnh.');
+    }
+    if (!buffer || buffer.length === 0) {
+      throw new HttpError(404, 'ASSET_FILE_NOT_FOUND', 'Không tìm thấy tệp ảnh.');
+    }
+
+    res.writeHead(200, {
+      ...SECURITY_HEADERS,
+      'content-type': asset.mime,
+      'content-length': buffer.length,
+      // Ảnh riêng của từng phiên — cấm mọi cache dùng chung.
+      'cache-control': 'private, no-store',
+      'content-disposition': `inline; filename="imagelab-${asset.role || 'image'}-${String(asset.id).slice(0, 8)}.${extForMime(asset.mime)}"`,
+    });
+    res.end(buffer);
+  });
+
   return router;
 }
 
@@ -351,6 +711,349 @@ function validateManualPayload(manual, config) {
       }
     }
   }
+}
+
+/* ══════════════ MVP-02 · helper thuần cho imagelab ══════════════ */
+
+const DEFAULT_MAX_PIXELS = 16_000_000;
+const DEFAULT_MAX_REGIONS = 40;
+const EDIT_ACTIONS = new Set(['accept', 'edit', 'skip']);
+const REGION_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+export const IMAGELAB_KINDS = Object.freeze(['descriptive', 'brand', 'certification', 'price', 'unknown']);
+
+const asArray = (v) => (Array.isArray(v) ? v : []);
+
+function parseJsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== 'string' || !value.trim()) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Job rút gọn cho UI — không lộ session_id hay chi tiết nội bộ. */
+function jobJson(job) {
+  return {
+    id: job.id,
+    kind: job.kind ?? null,
+    status: job.status,
+    stage: job.stage,
+    source: job.source,
+    input_mode: job.input_mode,
+    error_code: job.error_code ?? null,
+    error_message: job.error_message ?? null,
+    created_at: job.created_at,
+    updated_at: job.updated_at,
+    finished_at: job.finished_at ?? null,
+  };
+}
+
+/** Ảnh: chỉ metadata — TUYỆT ĐỐI không trả `storage_path` (đường dẫn nội bộ). */
+function assetJson(asset) {
+  if (!asset) return null;
+  return {
+    id: asset.id,
+    job_id: asset.job_id ?? null,
+    role: asset.role,
+    parent_id: asset.parent_id ?? null,
+    mime: asset.mime ?? null,
+    bytes: asset.bytes ?? null,
+    width: asset.width ?? null,
+    height: asset.height ?? null,
+    sha256: asset.sha256 ?? null,
+    source: asset.source ?? null,
+    meta: asset.meta && typeof asset.meta === 'object' ? asset.meta : null,
+    created_at: asset.created_at ?? null,
+  };
+}
+
+/**
+ * Chuẩn hoá vùng OCR: store có thể trả cột phẳng (x, y, w, h, text_original)
+ * hoặc object lồng (box, box_normalized, text) — nhận cả hai, không bịa field.
+ */
+function regionJson(r) {
+  const box = r.box && typeof r.box === 'object'
+    ? r.box
+    : { x: r.x, y: r.y, w: r.w, h: r.h };
+  const norm = r.box_normalized && typeof r.box_normalized === 'object'
+    ? r.box_normalized
+    : { x: r.x_norm, y: r.y_norm, w: r.w_norm, h: r.h_norm };
+  return {
+    id: r.region_key || r.id,
+    box,
+    box_normalized: norm,
+    text: r.text ?? r.text_original ?? '',
+    lang: r.lang || 'und',
+    confidence: r.confidence ?? null,
+    kind: r.kind || 'unknown',
+    kind_reason: r.kind_reason || '',
+    translatable: Boolean(r.translatable),
+    source: r.source || 'ocr',
+    asset_id: r.asset_id ?? null,
+  };
+}
+
+function lineJson(l) {
+  return {
+    region_id: l.region_id || l.region_key || '',
+    text_original: l.text_original ?? '',
+    text_vi: l.text_vi ?? '',
+    status: l.status ?? '',
+    provenance: l.provenance || 'none',
+    confidence: l.confidence ?? null,
+    violations: parseJsonArray(l.violations),
+    edited_by_user: Boolean(l.edited_by_user),
+    edited_at: l.edited_at ?? null,
+    notes: l.notes ?? '',
+  };
+}
+
+/** Tóm tắt render từ `meta` của asset đã render — null nếu chưa render. */
+function buildRenderSummary(rendered) {
+  if (!rendered) return null;
+  const meta = rendered.meta && typeof rendered.meta === 'object' ? rendered.meta : {};
+  return {
+    asset_id: rendered.id,
+    status: meta.status ?? null,
+    provider: meta.provider ?? null,
+    is_mock: meta.is_mock ?? null,
+    applied: asArray(meta.applied),
+    skipped: asArray(meta.skipped),
+    unsupported_glyphs: asArray(meta.unsupported_glyphs),
+    warnings: asArray(meta.warnings).map(String),
+    forced: meta.forced ?? null,
+    elapsed_ms: meta.elapsed_ms ?? null,
+  };
+}
+
+/** Gộp cảnh báo CÓ THẬT đã lưu trong meta của các asset (không tự sinh thêm). */
+function collectWarnings(...assets) {
+  const out = [];
+  for (const a of assets) {
+    const meta = a?.meta && typeof a.meta === 'object' ? a.meta : {};
+    for (const w of asArray(meta.warnings)) if (w) out.push(String(w));
+    const ocr = meta.ocr && typeof meta.ocr === 'object' ? meta.ocr : null;
+    for (const w of asArray(ocr?.warnings)) if (w) out.push(String(w));
+  }
+  return [...new Set(out)];
+}
+
+/** Trạng thái OCR + vùng bị bỏ (nếu pipeline có lưu vào meta của ảnh gốc). */
+function collectOcrMeta(asset) {
+  const meta = asset?.meta && typeof asset.meta === 'object' ? asset.meta : {};
+  const ocr = meta.ocr && typeof meta.ocr === 'object' ? meta.ocr : null;
+  return {
+    status: ocr?.status ?? null,
+    provider: ocr?.provider ?? null,
+    model: ocr?.model ?? null,
+    is_mock: ocr?.is_mock ?? null,
+    dropped: asArray(ocr?.dropped ?? meta.dropped),
+    warnings: asArray(ocr?.warnings ?? meta.warnings).map(String),
+  };
+}
+
+/**
+ * Giải mã + kiểm ảnh đầu vào: base64 hỏng → 400 BAD_IMAGE; không tin Content-Type
+ * client khai (magic bytes); chặn theo allowedImageMime / maxImageBytes / maxPixels.
+ */
+function decodeImagelabImage(image, limits) {
+  const raw = typeof image === 'string' ? image : image?.base64;
+  if (typeof raw !== 'string' || !raw.trim()) {
+    throw new HttpError(400, 'MISSING_IMAGE', 'Thiếu dữ liệu ảnh (`image.base64`).');
+  }
+
+  let b64 = raw.trim();
+  const dataUrl = /^data:[^;,]*;base64,/i.exec(b64);
+  if (dataUrl) b64 = b64.slice(dataUrl[0].length);
+  b64 = b64.replace(/\s+/g, '');
+
+  if (!b64 || !/^[A-Za-z0-9+/]+={0,2}$/.test(b64) || b64.length % 4 === 1) {
+    throw new HttpError(400, 'BAD_IMAGE', 'Dữ liệu ảnh base64 không hợp lệ.');
+  }
+  const buffer = Buffer.from(b64, 'base64');
+  if (buffer.length === 0) throw new HttpError(400, 'BAD_IMAGE', 'Dữ liệu ảnh base64 không hợp lệ.');
+
+  if (buffer.length > limits.max_image_bytes) {
+    throw new HttpError(413, 'IMAGE_TOO_LARGE', `Ảnh vượt giới hạn ${Math.round(limits.max_image_bytes / 1024 / 1024)}MB.`);
+  }
+
+  const mime = sniffImageMime(buffer);
+  const allowed = limits.allowed_image_mime || [];
+  if (!mime || !allowed.includes(mime)) {
+    throw new HttpError(415, 'UNSUPPORTED_MEDIA_TYPE', 'Ảnh không hợp lệ hoặc định dạng không được phép (chỉ nhận PNG/JPEG/WebP/GIF).');
+  }
+
+  const size = readImageDimensions(buffer, mime);
+  if (size && size.width > 0 && size.height > 0 && size.width * size.height > limits.max_pixels) {
+    throw new HttpError(413, 'IMAGE_TOO_LARGE', `Ảnh vượt giới hạn ${limits.max_pixels} pixel.`);
+  }
+
+  return {
+    base64: b64,
+    buffer,
+    mime,
+    bytes: buffer.length,
+    width: size?.width ?? null,
+    height: size?.height ?? null,
+    filename: sanitizeFilename(typeof image === 'object' ? image?.filename : '', { fallback: 'image' }),
+  };
+}
+
+/**
+ * Đọc kích thước ảnh từ header (không giải mã pixel). Trả null nếu không chắc —
+ * khi đó để pipeline tự báo UNSUPPORTED_IMAGE thay vì đoán bừa.
+ */
+function readImageDimensions(buf, mime) {
+  try {
+    if (mime === 'image/png') {
+      if (buf.length < 24 || buf.toString('ascii', 12, 16) !== 'IHDR') return null;
+      return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+    }
+    if (mime === 'image/gif') {
+      if (buf.length < 10) return null;
+      return { width: buf.readUInt16LE(6), height: buf.readUInt16LE(8) };
+    }
+    if (mime === 'image/webp') {
+      if (buf.length < 30) return null;
+      const fourcc = buf.toString('ascii', 12, 16);
+      if (fourcc === 'VP8X') {
+        return { width: 1 + buf.readUIntLE(24, 3), height: 1 + buf.readUIntLE(27, 3) };
+      }
+      if (fourcc === 'VP8L') {
+        const b0 = buf[21];
+        const b1 = buf[22];
+        const b2 = buf[23];
+        const b3 = buf[24];
+        return {
+          width: 1 + (b0 | ((b1 & 0x3f) << 8)),
+          height: 1 + (((b1 & 0xc0) >> 6) | (b2 << 2) | ((b3 & 0x0f) << 10)),
+        };
+      }
+      if (fourcc === 'VP8 ') {
+        // Khung keyframe: start code 0x9d 0x01 0x2a rồi mới tới kích thước.
+        if (buf[23] !== 0x9d || buf[24] !== 0x01 || buf[25] !== 0x2a) return null;
+        return { width: buf.readUInt16LE(26) & 0x3fff, height: buf.readUInt16LE(28) & 0x3fff };
+      }
+      return null;
+    }
+    if (mime === 'image/jpeg') {
+      let i = 2;
+      while (i + 9 < buf.length) {
+        if (buf[i] !== 0xff) {
+          i += 1;
+          continue;
+        }
+        const marker = buf[i + 1];
+        if (marker === 0xff || marker === 0x00) {
+          i += 1;
+          continue;
+        }
+        if (marker === 0xd8 || (marker >= 0xd0 && marker <= 0xd9)) {
+          i += 2;
+          continue;
+        }
+        const len = buf.readUInt16BE(i + 2);
+        if (len < 2) return null;
+        const isSof =
+          (marker >= 0xc0 && marker <= 0xc3) ||
+          (marker >= 0xc5 && marker <= 0xc7) ||
+          (marker >= 0xc9 && marker <= 0xcb) ||
+          (marker >= 0xcd && marker <= 0xcf);
+        if (isSof) return { height: buf.readUInt16BE(i + 5), width: buf.readUInt16BE(i + 7) };
+        i += 2 + len;
+      }
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+/** Tuỳ chọn gửi kèm pipeline — làm sạch, chặn prototype pollution, có trần kích thước. */
+function sanitizeImagelabOptions(raw, config) {
+  const options = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return options;
+
+  const context = sanitizeText(raw.context, { maxLength: 1000 });
+  if (context) options.context = context;
+
+  const extra = raw.glossary_extra;
+  if (extra && typeof extra === 'object' && !Array.isArray(extra)) {
+    const out = {};
+    for (const [k, v] of Object.entries(extra).slice(0, 200)) {
+      if (DANGEROUS_KEYS.has(k)) continue;
+      const key = sanitizeText(k, { maxLength: 120 });
+      const value = sanitizeText(v, { maxLength: 300 });
+      if (key && value) out[key] = value;
+    }
+    if (Object.keys(out).length > 0) options.glossary_extra = out;
+  }
+
+  const maxRegions = Number.parseInt(raw.max_regions, 10);
+  const cap = config.imagelab?.maxRegions ?? DEFAULT_MAX_REGIONS;
+  if (Number.isFinite(maxRegions) && maxRegions > 0) options.max_regions = Math.min(maxRegions, cap);
+
+  return options;
+}
+
+/** Danh sách sửa dòng: chỉ nhận id hợp lệ, text đã làm sạch, action trong danh sách đóng. */
+function sanitizeEdits(raw) {
+  if (!Array.isArray(raw)) throw new HttpError(400, 'BAD_EDITS', 'Thiếu danh sách `edits`.');
+  if (raw.length > 500) throw new HttpError(413, 'TOO_MANY_EDITS', 'Quá nhiều dòng cần lưu (tối đa 500).');
+
+  const out = [];
+  for (const e of raw) {
+    if (!e || typeof e !== 'object') continue;
+    const regionId = sanitizeText(e.region_id, { maxLength: 64 });
+    if (!REGION_ID_RE.test(regionId)) continue;
+    const textVi = sanitizeText(e.text_vi, { maxLength: 2000 });
+    const action = EDIT_ACTIONS.has(e.action) ? e.action : typeof e.text_vi === 'string' ? 'edit' : 'accept';
+    out.push({ region_id: regionId, text_vi: textVi, action });
+  }
+  if (out.length === 0) throw new HttpError(400, 'BAD_EDITS', 'Không có dòng hợp lệ nào để lưu.');
+  return out;
+}
+
+function sanitizeRegionIds(raw) {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new HttpError(400, 'BAD_REGION_IDS', '`only_region_ids` phải là một mảng.');
+  const out = [];
+  for (const v of raw.slice(0, 500)) {
+    const id = sanitizeText(v, { maxLength: 64 });
+    if (REGION_ID_RE.test(id)) out.push(id);
+  }
+  return [...new Set(out)];
+}
+
+/** Lỗi pipeline/provider → HTTP an toàn, giữ nguyên mã lỗi THẬT của provider. */
+function mapImagelabError(err, fallbackMessage = 'Không xử lý được yêu cầu.') {
+  if (err instanceof HttpError) return err;
+  const code = typeof err?.code === 'string' && err.code ? err.code : 'IMAGELAB_FAILED';
+  const message = typeof err?.message === 'string' && err.message ? err.message : fallbackMessage;
+  if (code === 'REVIEW_REQUIRED') return new HttpError(409, code, message);
+  if (code === 'IMAGELAB_NO_LINES') return new HttpError(409, code, message);
+  // Lỗi do CHÍNH ảnh người dùng gửi lên (ingest chạy trong request) — phải trả đúng
+  // loại lỗi 4xx kèm lý do thật, không gộp vào "provider báo lỗi 502".
+  if (code === 'UNSUPPORTED_IMAGE') return new HttpError(415, code, message);
+  if (code === 'IMAGE_TOO_LARGE' || code === 'PIXELS_EXCEEDED') return new HttpError(413, code, message);
+  if (code === 'INVALID_IMAGE' || code === 'INVALID_INPUT' || code === 'MISSING_IMAGE' || code === 'BAD_IMAGE') {
+    return new HttpError(400, code, message);
+  }
+  if (code === 'OUTPUT_TOO_LARGE') return new HttpError(413, code, message);
+  if (/^(OCR|RENDER|TRANSLATE)/.test(code) || code === 'NOT_CONFIGURED') {
+    return new HttpError(502, code, `Provider xử lý ảnh báo lỗi (${code}). Vui lòng thử lại hoặc kiểm tra cấu hình provider.`);
+  }
+  return new HttpError(500, code, fallbackMessage);
+}
+
+function extForMime(mime) {
+  return { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' }[mime] || 'bin';
 }
 
 export default buildRouter;
