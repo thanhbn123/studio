@@ -119,6 +119,8 @@ const IL_LINE_STATUS = {
   SKIPPED_BRAND: { label: 'KHÔNG dịch: nhãn hiệu', cls: 'warn' },
   SKIPPED_CERTIFICATION: { label: 'KHÔNG dịch: chứng nhận', cls: 'warn' },
   SKIPPED_PRICE: { label: 'KHÔNG dịch: giá', cls: 'warn' },
+  // F-06: người dùng CHỦ ĐỘNG bỏ qua — khác "cần duyệt" (guardrail chặn).
+  SKIPPED_BY_USER: { label: 'Bạn đã bỏ qua', cls: 'warn' },
   NEEDS_REVIEW: { label: 'Cần bạn duyệt', cls: 'warn' },
   USER_EDITED: { label: 'Bạn đã sửa', cls: 'ok' },
   FAILED: { label: 'Dịch lỗi', cls: 'bad' },
@@ -128,14 +130,16 @@ const IL_KIND_LABEL = { descriptive: 'Mô tả', brand: 'Nhãn hiệu', certific
 
 // Luật 3: vùng nhãn hiệu / chứng nhận / giá KHÔNG BAO GIỜ tự dịch — chỉ override có vết.
 const IL_LOCKED_KINDS = new Set(['brand', 'certification', 'price']);
-const IL_LOCKED_STATUSES = new Set(['SKIPPED_BRAND', 'SKIPPED_CERTIFICATION', 'SKIPPED_PRICE']);
+const IL_LOCKED_STATUSES = new Set(['SKIPPED_BRAND', 'SKIPPED_CERTIFICATION', 'SKIPPED_PRICE', 'SKIPPED_BY_USER']);
 
 const IL_SKIP_REASON = {
   TEXT_TOO_LONG: 'Chữ quá dài so với ô',
   BOX_TOO_SMALL: 'Ô quá nhỏ để vẽ chữ',
   NO_GLYPH: 'Thiếu glyph cho ký tự',
   BAD_BOX: 'Ô không hợp lệ',
-  NEEDS_REVIEW: 'Chưa được bạn duyệt',
+  NEEDS_REVIEW: 'Bị guardrail chặn — chưa được bạn duyệt',
+  SKIPPED_BY_USER: 'Bạn đã bỏ qua dòng này',
+  PROTECTED_BOX_MASKED: 'Nằm trọn trong vùng bảo vệ (nhãn hiệu/chứng nhận/giá) — không xoá, không vẽ',
   EMPTY_TEXT: 'Không có chữ để vẽ',
 };
 
@@ -1335,8 +1339,11 @@ function renderIlReview(data) {
             ? `<div class="il-lock-note">
                  <span>🔒 ${esc(region?.kind_reason || 'Vùng nhãn hiệu/chứng nhận/giá')}</span>
                  <button class="btn ghost tiny" data-action="iloverride" data-region="${esc(line.region_id)}">
-                   ${overridden ? 'huỷ cho phép dịch' : 'vẫn dịch vùng này'}
+                   ${overridden ? 'huỷ cho phép dịch' : 'vẫn dịch vùng này (sẽ thay chữ trên ảnh và ghi vết)'}
                  </button>
+                 ${overridden
+                   ? `<div class="muted small" style="margin-top:4px">Bạn đã cho phép dịch vùng này: khi RENDER, chữ trên ảnh sẽ bị THAY và hệ thống ghi vết vào <span class="mono">meta.overrides</span>.</div>`
+                   : ''}
                </div>`
             : ''}
         </td>
@@ -1414,14 +1421,47 @@ function renderIlWarnings(data) {
   const ocr = data.ocr || {};
   const summary = data.render_summary;
   const providers = data.providers || {};
+  const snapshot = data.providers_snapshot || {};
 
-  const mockSteps = [['ocr', 'OCR'], ['translate', 'dịch'], ['render', 'render']]
+  // F-03: nhãn MOCK phải theo DẤU VẾT CỦA JOB (mock_steps + meta ảnh đã lưu +
+  // render_summary.is_mock), KHÔNG theo cấu hình provider đang chạy. Cấu hình hiện tại
+  // chỉ được hiện như thông tin phụ.
+  const traceSteps = new Set(
+    (Array.isArray(data.mock_steps) ? data.mock_steps : []).map((s) => String(s)),
+  );
+  if (data.asset?.meta?.ocr?.is_mock) traceSteps.add('ocr');
+  if (data.asset?.meta?.translate?.is_mock) traceSteps.add('translate');
+  if (ocr.is_mock) traceSteps.add('ocr');
+  if (summary?.is_mock) traceSteps.add('render');
+  const jobMockSteps = [['ocr', 'OCR'], ['translate', 'dịch'], ['render', 'render (vẽ ảnh)']]
+    .filter(([key]) => traceSteps.has(key))
+    .map(([, label]) => label);
+  const currentMockSteps = [['ocr', 'OCR'], ['translate', 'dịch'], ['render', 'render']]
     .filter(([key]) => providers[key]?.is_mock)
     .map(([, label]) => label);
-  if (mockSteps.length) {
+
+  if (jobMockSteps.length) {
+    const items = [
+      'Dấu vết MOCK đọc từ chính JOB ĐÃ LƯU (content_meta.imagelab.mock_steps + meta ảnh), không phải từ cấu hình máy chủ đang chạy.',
+      'Kết quả của job này là dữ liệu minh hoạ — không dùng để đánh giá chất lượng hay đăng bán.',
+    ];
+    if (snapshot.ocr || snapshot.render || snapshot.translate) {
+      const snap = [snapshot.ocr, snapshot.translate, snapshot.render]
+        .filter(Boolean)
+        .map((p) => `${p.name || '?'}${p.is_mock ? ' (MOCK)' : ''}`)
+        .join(' · ');
+      items.push(`Provider lúc chạy job (đã lưu): ${snap}.`);
+    }
+    items.push(
+      currentMockSteps.length
+        ? `Provider hiện tại của máy chủ cũng đang là mock: ${currentMockSteps.join(', ')} (thông tin phụ).`
+        : 'Provider hiện tại của máy chủ KHÔNG còn là mock — job cũ vẫn mang nhãn MOCK vì dấu vết đã lưu.',
+    );
+    blocks.push({ cls: 'warn', title: `MOCK — job này đã chạy ${jobMockSteps.join(', ')} bằng dữ liệu giả lập`, items });
+  } else if (currentMockSteps.length) {
     blocks.push({
       cls: 'warn',
-      title: `MOCK — ${mockSteps.join(', ')} đang chạy dữ liệu giả lập`,
+      title: `MOCK — ${currentMockSteps.join(', ')} đang chạy dữ liệu giả lập (theo cấu hình máy chủ)`,
       items: ['Provider mock tự khai is_mock = true. Kết quả không phải đọc/dịch/vẽ thật.'],
     });
   }
@@ -1451,8 +1491,19 @@ function renderIlWarnings(data) {
         items: summary.unsupported_glyphs.map((g) => `Ký tự không có glyph: ${g}`),
       });
     }
+    // F-02: override có vết ⇒ vùng nhãn hiệu/chứng nhận/giá ĐÃ bị thay chữ trên ảnh.
+    const overrides = Array.isArray(summary.overrides) ? summary.overrides : [];
+    if (overrides.length) {
+      blocks.push({
+        cls: 'warn',
+        title: `${overrides.length} vùng nhãn hiệu/chứng nhận/giá ĐÃ BỊ THAY CHỮ trên ảnh theo yêu cầu của bạn`,
+        items: overrides.map(
+          (o) => `${o?.region_id || '?'} (${IL_KIND_LABEL[o?.kind] || o?.kind || '?'}) — override có vết${o?.edited_at ? ` lúc ${o.edited_at}` : ''}.`,
+        ),
+      });
+    }
     if (summary.forced) {
-      blocks.push({ cls: 'warn', title: 'Render đã bỏ qua cảnh báo cần duyệt (force)', items: ['Lý do đã được ghi vào meta của ảnh kết quả.'] });
+      blocks.push({ cls: 'warn', title: 'Render đã bỏ qua cảnh báo cần duyệt (force)', items: ['Dòng bị guardrail chặn KHÔNG được vẽ; lý do đã ghi vào meta của ảnh kết quả.'] });
     }
     for (const w of summary.warnings || []) blocks.push({ cls: 'warn', title: 'Cảnh báo từ bước render', items: [String(w)] });
   }
@@ -1497,7 +1548,7 @@ function toggleIlOverride(regionId) {
     if (on) input.focus();
   }
   const btn = row.querySelector('[data-action="iloverride"]');
-  if (btn) btn.textContent = on ? 'huỷ cho phép dịch' : 'vẫn dịch vùng này';
+  if (btn) btn.textContent = on ? 'huỷ cho phép dịch' : 'vẫn dịch vùng này (sẽ thay chữ trên ảnh và ghi vết)';
 }
 
 async function saveImagelabLines() {

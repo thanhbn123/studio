@@ -13,7 +13,18 @@
 import { Buffer } from 'node:buffer';
 import { RenderProvider, RENDER_STATUS } from '../provider.js';
 import { RenderError, RENDER_CODES } from '../errors.js';
-import { clampBox, detectImageMime, normalizeColor, probeImage, toRgba } from '../image.js';
+import {
+  boxesOverlap,
+  boxCoveredBy,
+  clampBox,
+  detectImageMime,
+  normalizeColor,
+  normalizeProtectedBoxes,
+  probeImage,
+  restoreBoxes,
+  snapshotBoxes,
+  toRgba,
+} from '../image.js';
 import { decodePng, encodePng, sha256 } from '../png.js';
 import { estimateBackground, eraseBox } from '../inpaint.js';
 import { layoutText } from '../layout.js';
@@ -27,7 +38,7 @@ export class PureJsRenderProvider extends RenderProvider {
     super({ name: 'purejs', model, isMock: false, configured: true, limits, logger });
   }
 
-  async renderImpl({ image, ops, opsSkipped, options }) {
+  async renderImpl({ image, ops, opsSkipped, options, protectedBoxes }) {
     const buffer = image.buffer;
     if (!buffer || buffer.length === 0) {
       throw new RenderError(RENDER_CODES.BAD_INPUT, 'Thiếu dữ liệu ảnh để render.');
@@ -56,6 +67,15 @@ export class PureJsRenderProvider extends RenderProvider {
     const applied = [];
     const skipped = [];
     const unsupported = [];
+    let maskedOps = 0; // số op bị mặt nạ vùng bảo vệ chặn MỘT PHẦN (⇒ kết quả chỉ là PARTIAL)
+
+    // MẶT NẠ VÙNG BẢO VỆ (bổ sung sau phản biện F-01 — hàng rào cuối của luật #3).
+    // Chụp lại pixel GỐC của mọi hộp bảo vệ rồi ghi trả sau MỖI op: dù op có yêu cầu
+    // `erase`/`erase_and_draw` phủ lên, không một pixel nào trong các hộp đó bị đổi.
+    const maskEntries = normalizeProtectedBoxes(protectedBoxes)
+      .map((entry) => ({ region_id: entry.region_id, box: clampBox(entry.box, dims) }))
+      .filter((entry) => entry.box)
+      .map((entry) => ({ ...entry, snapshot: snapshotBoxes(pixels, dims, [entry.box])[0] }));
 
     for (const op of ops) {
       const box = clampBox(op.box, dims);
@@ -64,6 +84,33 @@ export class PureJsRenderProvider extends RenderProvider {
         warnings.push(`Vùng ${op.region_id}: hộp không hợp lệ hoặc nằm ngoài ảnh — bỏ qua.`);
         continue;
       }
+
+      // Mặt nạ áp cho op này: mọi hộp bảo vệ TRỪ hộp của chính vùng đang vẽ (override
+      // có vết của người dùng được phép vẽ lên vùng của nó — F-02 — nhưng không được
+      // chạm sang vùng bảo vệ khác).
+      const ownId = op.region_id === undefined || op.region_id === null ? null : String(op.region_id);
+      const activeMasks = maskEntries.filter((m) => m.region_id === null || m.region_id !== ownId);
+
+      // Op nằm TRỌN trong vùng bảo vệ ⇒ không còn gì để vẽ: bỏ qua và NÓI RÕ,
+      // tuyệt đối không im lặng (luật #4).
+      const overlappedMasks = activeMasks.filter((m) => boxesOverlap(box, m.box));
+      if (overlappedMasks.length > 0 && boxCoveredBy(box, overlappedMasks.map((m) => m.box))) {
+        skipped.push({ region_id: op.region_id, reason: 'PROTECTED_BOX_MASKED' });
+        warnings.push(
+          `Vùng ${op.region_id}: hộp nằm TRỌN trong vùng được bảo vệ (nhãn hiệu/chứng nhận/giá) — KHÔNG xoá và KHÔNG vẽ.`,
+        );
+        continue;
+      }
+      // Chỉ ghi trả pixel gốc cho những hộp bảo vệ MÀ OP NÀY CÓ THỂ ĐÃ CHẠM TỚI —
+      // nếu ghi trả cả những hộp không liên quan thì op sau sẽ xoá mất thành quả của
+      // op trước (đúng lỗi đã bị bắt khi chạy lại kịch bản F-02 của phản biện).
+      const restoreMask = () => {
+        if (overlappedMasks.length === 0) return;
+        restoreBoxes(pixels, dims, overlappedMasks.map((m) => ({ box: m.box, data: m.snapshot.data })));
+      };
+      const masked = overlappedMasks.length > 0;
+      if (masked) maskedOps += 1;
+
       const padding = Number.isFinite(Number(op.style.padding)) ? Math.max(0, Number(op.style.padding)) : DEFAULT_PADDING;
       const color = normalizeColor(op.style.color);
       const align = ['left', 'center', 'right'].includes(op.style.align) ? op.style.align : 'center';
@@ -77,7 +124,13 @@ export class PureJsRenderProvider extends RenderProvider {
           skipped.push({ region_id: op.region_id, reason: 'BAD_BOX' });
           continue;
         }
-        applied.push({ region_id: op.region_id, action: 'erase', box: erased });
+        restoreMask();
+        if (masked) {
+          warnings.push(
+            `Vùng ${op.region_id}: op xoá bị MẶT NẠ vùng bảo vệ chặn một phần — pixel trong nhãn hiệu/chứng nhận/giá giữ nguyên.`,
+          );
+        }
+        applied.push({ region_id: op.region_id, action: 'erase', box: erased, ...(masked ? { masked: true } : {}) });
         continue;
       }
 
@@ -138,6 +191,12 @@ export class PureJsRenderProvider extends RenderProvider {
         for (const char of drawn.missing) if (!unsupported.includes(char)) unsupported.push(char);
         warnings.push(`Vùng ${op.region_id}: glyph "${drawn.missing.join(' ')}" không vẽ được ở bước cuối.`);
       }
+      restoreMask(); // trả lại pixel gốc trong vùng bảo vệ (nếu op có phủ lên)
+      if (masked) {
+        warnings.push(
+          `Vùng ${op.region_id}: op bị MẶT NẠ vùng bảo vệ chặn một phần — chữ chỉ được vẽ ngoài nhãn hiệu/chứng nhận/giá.`,
+        );
+      }
       applied.push({
         region_id: op.region_id,
         action: op.action,
@@ -145,6 +204,7 @@ export class PureJsRenderProvider extends RenderProvider {
         font_size: layout.font_size,
         lines: layout.lines.map((line) => line.text),
         text: op.text,
+        ...(masked ? { masked: true } : {}),
       });
     }
 
@@ -166,7 +226,10 @@ export class PureJsRenderProvider extends RenderProvider {
     }
 
     return {
-      status: skipped.length > 0 || unsupported.length > 0 ? RENDER_STATUS.PARTIAL : RENDER_STATUS.OK,
+      status:
+        skipped.length > 0 || unsupported.length > 0 || maskedOps > 0
+          ? RENDER_STATUS.PARTIAL
+          : RENDER_STATUS.OK,
       output: {
         buffer: outBuffer,
         mime: 'image/png',

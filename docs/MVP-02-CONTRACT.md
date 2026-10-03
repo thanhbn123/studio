@@ -129,6 +129,7 @@ vào báo cáo, KHÔNG tự sửa file người khác.
 | `SKIPPED_BRAND` | là nhãn hiệu → KHÔNG dịch, `text_vi = ''` |
 | `SKIPPED_CERTIFICATION` | là chứng nhận → KHÔNG dịch, `text_vi = ''` |
 | `SKIPPED_PRICE` | là giá → KHÔNG dịch (giá do người bán quyết) |
+| `SKIPPED_BY_USER` | **người dùng CHỦ ĐỘNG bỏ qua** (`action: 'skip'`) — khác `NEEDS_REVIEW`: không chặn render, luôn vào `skipped` kèm lý do (bổ sung sau phản biện F-06) |
 | `NEEDS_REVIEW` | có vi phạm guardrail, phải người duyệt |
 | `USER_EDITED` | người dùng đã sửa |
 | `FAILED` | provider lỗi cho riêng dòng này |
@@ -496,3 +497,75 @@ Năm agent viết cùng lúc nên có lúc module anh em **chưa kịp tồn t�
 - Mọi bước đều có `usage_event`; job lỗi có `error_code` + `finished_at`, không treo `running`.
 - Provider mock luôn tự khai `is_mock`; UI hiện nhãn MOCK; không có nhãn LIVE nào trong MVP-02.
 - `npm test` xanh (183 test cũ + test mới của agent test) và `node tools/verify.mjs` xanh.
+
+---
+
+## 6. SỬA ĐỔI SAU PHẢN BIỆN (vòng 2 — bổ sung, KHÔNG đổi tên nào đã đóng băng)
+
+Nguồn: [`docs/MVP-02-REVIEW.md`](MVP-02-REVIEW.md) (FAIL: 1 CRITICAL · 2 MAJOR · 5 MINOR).
+Mọi tên hàm / tên field / mã lỗi ở các mục 1–5 **giữ nguyên**; dưới đây chỉ bổ sung và siết luật.
+
+**F-01 — vùng bảo vệ (protected boxes), phòng thủ ba tầng**
+
+- `Region` không đổi. `normalizeRegions` (C1) bổ sung: hai vùng **cùng hộp nhưng khác chữ** →
+  giữ vùng có mức bảo vệ cao nhất (`brand|certification|price > unknown > descriptive`, trong
+  nhóm bảo vệ: `brand > certification > price`), vùng còn lại vào `dropped` kèm lý do; và thêm
+  `warnings` liệt kê mọi cặp hộp **giao nhau** (chạm cạnh không tính).
+- `render({ image, ops, options })` (C3) nhận thêm `options.protected_boxes` — mảng hộp, nhận cả
+  hai dạng `{x,y,w,h}` và `{region_id, box}`. Provider `purejs` **không được đổi bất kỳ pixel nào**
+  trong các hộp đó (mặt nạ ở tầng ghi pixel); op nằm trọn trong vùng bảo vệ → `skipped`
+  `PROTECTED_BOX_MASKED`; op bị chặn một phần → vẫn vẽ nhưng `applied[].masked = true` + cảnh báo.
+  Op của **chính** vùng được bảo vệ (override có vết) vẫn vẽ được lên vùng của nó.
+- `renderApproved` (C4) **không dựng op** nếu hộp của op giao với hộp của vùng được bảo vệ **khác**
+  (kể cả lồng nhau / trùng hộp) → `skipped` với lý do bắt đầu bằng `BOX_OVERLAPS_PROTECTED: <id> (<kind>)`.
+  Vùng được coi là bảo vệ khi `kind ∈ {brand,certification,price}` **hoặc** dòng có
+  `status ∈ {SKIPPED_BRAND, SKIPPED_CERTIFICATION, SKIPPED_PRICE}` (hai dấu hiệu độc lập).
+
+**F-02 — `allow_brand_override` có tác dụng thật (override có vết ĐƯỢC vẽ)**
+
+- `renderApproved` dựng op cho vùng `brand/certification/price` **chỉ khi** dòng có
+  `edited_by_user === true` **và** `provenance === 'user'` **và** `text_vi` khác rỗng.
+- Khi đó: `applied[].override = true`; `asset.meta.overrides = [{region_id, kind, edited_at}]`;
+  thêm warning tiếng Việt nói rõ vùng nhãn hiệu/chứng nhận ĐÃ bị thay theo yêu cầu người dùng;
+  `content_meta.imagelab.render.overrides = <số override>`; `render_summary.overrides` trả về UI.
+- Chỉ có `allow_brand_override: true` lúc `PUT .../lines` mà dòng **không có vết** ⇒ **không** vào op.
+
+**F-03 — nhãn MOCK theo job, không theo cấu hình**
+
+- `GET /api/imagelab/jobs/:id` trả thêm `mock_steps: string[]` (đọc từ
+  `content_meta.imagelab.mock_steps` + `image_assets.meta`) và
+  `providers_snapshot: { ocr, translate, render, recorded_at }` (ảnh chụp provider **lúc chạy**,
+  đã lưu trong job; `null` nếu job chưa chạy tới bước đó). `providers` vẫn là cấu hình HIỆN TẠI.
+- UI **luôn** hiện nhãn MOCK khi `mock_steps` khác rỗng, kể cả khi cấu hình hiện tại là provider thật.
+
+**F-04 — quyền sở hữu theo session cho route MVP-01 cũ**
+
+- `GET /api/jobs/:id`, `PUT /api/jobs/:id/content`, `POST /api/jobs/:id/regenerate`,
+  `GET /api/jobs/:id/usage`: job có `session_id` khác session người gọi → **404** (như `/api/imagelab/*`).
+  Request KHÔNG khai cookie session ⇒ coi là khách ẩn danh; riêng job `kind = 'image_translation'`
+  luôn đòi session khớp. `scope=all` của danh sách job giữ nguyên.
+- ⚠️ `session_id` **không phải xác thực** — xem `README.md` §3.5 và `docs/VERIFICATION.md` §8.2.
+
+**F-05 — cờ `expose` cho `HttpError`**
+
+- `new HttpError(status, code, message, details, { expose })` và `HttpError.safe(...)`.
+  `expose = true` ⇒ `sendError` trả ĐÚNG `message` (kể cả 5xx) và cả `details`; **không bao giờ** lộ stack.
+  Chỉ đánh dấu cho: `NOT_CONFIGURED`, `IMAGELAB_UNAVAILABLE`, `REVIEW_REQUIRED`, `IMAGELAB_NO_LINES`.
+
+**F-06 — tách `SKIPPED_BY_USER` khỏi `NEEDS_REVIEW`**
+
+- `applyReviewEdits` với `action: 'skip'` → `status = 'SKIPPED_BY_USER'`, `edited_by_user = true`,
+  `edited_at`, `provenance = 'user'`, `text_vi` giữ rỗng (không tính là vi phạm guardrail).
+- `pendingReviewLines()` chỉ lọc `status === 'NEEDS_REVIEW'` — **bất kể** `edited_by_user`;
+  còn `NEEDS_REVIEW` mà `force !== true` ⇒ 409 kèm danh sách dòng.
+- `force = true`: dòng `NEEDS_REVIEW` vào `skipped` + warning nổi bật "bị guardrail chặn nên KHÔNG được vẽ".
+  `SKIPPED_BY_USER` không chặn render và vào `skipped` với lý do "người dùng đã bỏ qua".
+
+**F-08 — siết guardrail dịch (C2)**
+
+- Mọi luật chạy trên văn bản đã **bỏ ký tự vô hình** (U+200B–U+200D, U+FEFF, U+2060) + NFC.
+- Số: `\p{Nd}` (mọi bộ chữ số Unicode, kể cả full-width `１２`); thêm luật **số viết bằng chữ
+  tiếng Việt + đơn vị/thời gian** (`một…mười, mười hai, hai mươi, trăm, nghìn, triệu, tỷ` đi kèm
+  `tháng, năm, ngày, giờ, phút, lần, %, kg, g, ml, l, cm, mm, m, W, V, mAh, chiếc, cái, bộ, hộp, gói`).
+- Chữ chưa dịch: kana (`\p{Script=Hiragana}`, `\p{Script=Katakana}`) và Hangul (`\p{Script=Hangul}`)
+  vào **cùng nhóm** "CHƯA DỊCH" với CJK.

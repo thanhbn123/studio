@@ -1,12 +1,23 @@
-# VIP Product Studio — MVP-01
+# VIP Product Studio — MVP-01 + MVP-02
 
-Dán link sản phẩm **Taobao / 1688 / Pinduoduo** → hệ thống tự nhận diện nguồn, lấy dữ liệu
-sản phẩm thật, chuẩn hoá thành **Product Master**, phân tích ảnh bằng AI, rồi sinh **bộ nội
-dung bán hàng tiếng Việt**.
+**MVP-01 — Product Content Studio.** Dán link sản phẩm **Taobao / 1688 / Pinduoduo** → hệ thống tự
+nhận diện nguồn, lấy dữ liệu sản phẩm thật, chuẩn hoá thành **Product Master**, phân tích ảnh bằng
+AI, rồi sinh **bộ nội dung bán hàng tiếng Việt**.
 
-> **Phạm vi MVP-01.** Chưa có: chỉnh ảnh, xoá chữ Trung, render chữ Việt lên ảnh, tạo ảnh AI,
-> edit video, voice-over, đăng bài tự động, Shopee API, thanh toán, subscription.
-> Kiến trúc đã chừa sẵn chỗ cho những phần đó — xem [`docs/ROADMAP.md`](docs/ROADMAP.md).
+**MVP-02 — Image Translation Studio.** Tải ảnh sản phẩm lên → phát hiện vùng chữ Trung (OCR) →
+phân loại từng vùng → dịch sang tiếng Việt qua **bảng duyệt từng dòng** → xoá chữ cũ và render chữ
+Việt vào đúng vị trí, giữ nguyên bố cục. **Ảnh gốc bất biến**; mọi ảnh sinh ra là bản mới có truy
+vết về ảnh gốc.
+
+> **Chưa có:** tạo ảnh AI, edit video, voice-over, đăng bài tự động, Shopee API, tài khoản người
+> dùng + credit, thanh toán. Kiến trúc đã chừa sẵn chỗ — xem [`docs/ROADMAP.md`](docs/ROADMAP.md).
+>
+> **Giới hạn thật của MVP-02 (đọc trước khi tin):** OCR mặc định là **MOCK** (đọc vùng chữ từ
+> fixture dựng tay, `is_mock = true`, UI hiện nhãn MOCK) — muốn OCR thật phải cắm provider qua
+> `OCR_PROVIDER=http` + `OCR_BASE_URL` + `OCR_API_KEY`. Bộ render nội bộ `purejs` **chỉ giải mã
+> PNG** (8-bit, color type 0/2/4/6, non-interlaced); JPEG/WebP/GIF trả `UNSUPPORTED_IMAGE` chứ
+> **không** giả vờ thành công — muốn xử lý các định dạng đó phải cắm `RENDER_PROVIDER=http`.
+> Chi tiết đo được: [`docs/VERIFICATION.md`](docs/VERIFICATION.md).
 
 ---
 
@@ -34,8 +45,13 @@ npm start          # http://127.0.0.1:3000
 ```bash
 npm test                                   # toàn bộ test (không cần mạng, không cần API key)
 npm run verify                             # kiểm cú pháp src/public/tools/test + toàn bộ test
+npm run demo:imagelab                      # MVP-02: chạy trọn luồng dịch ảnh + in bằng chứng đo được
 DATABASE_URL=postgres://... npm test       # bật thêm test PostgreSQL thật
 ```
+
+`npm run demo:imagelab` chạy trên ảnh PNG thật và in ra **sha256 ảnh gốc trước/sau** (chứng minh
+ảnh gốc không đổi), danh sách vùng chữ theo loại, số dòng bị khoá, và `usage_event` đọc lại từ DB.
+Nó **không** chứng minh OCR thật — output tự ghi nhãn `MOCK_VERIFIED` khi có bước dùng provider giả.
 
 ### Docker
 
@@ -72,9 +88,35 @@ Nếu connector bị chặn, pipeline **không chết**: nó chuyển sang **G11
 người dùng tự tải ảnh / nhập tên / nhập ghi chú, rồi vẫn chạy Content Engine.
 Các sàn không được phép là điểm chết duy nhất.
 
+### 2.1 Luồng MVP-02 — Image Translation Studio
+
+```
+Ảnh sản phẩm người dùng tải lên (PNG/JPEG/WebP/GIF — sniff magic bytes, không tin Content-Type)
+   │
+   ├─ IL-00  ingest   — lưu ẢNH GỐC bất biến (sha256 + storage_path), tạo job kind=image_translation
+   │
+   ├─ IL-01  OcrProvider      — phát hiện vùng chữ: hộp bao (pixel + chuẩn hoá), chữ nguyên văn,
+   │                            ngôn ngữ, độ tin cậy            [mock | http | none]
+   ├─ IL-02  classifyRegion   — mô tả | nhãn hiệu | chứng nhận | giá | unknown  (fail-closed)
+   ├─ IL-03  Translator       — dịch sang tiếng Việt + 4 luật guardrail, TỪ ĐIỂN thuật ngữ
+   ├─ IL-04  Bảng duyệt       — người dùng sửa/duyệt TỪNG DÒNG (vùng khoá phải override có vết)
+   │
+   ├─ IL-05  RenderProvider   — xoá chữ cũ (inpaint) + render chữ Việt vừa hộp (layout tự chọn cỡ)
+   │                            [mock | purejs | http | none]
+   │
+   ├─ IL-06  Ảnh MỚI có parent_id trỏ về ảnh gốc; ảnh gốc không đổi một byte nào
+   └─ IL-07  usage_event: OCR_DETECT · TRANSLATION · IMAGE_RENDER
+```
+
+Ba chốt chặn nằm ở **cả ba tầng** của luồng, không chỉ ở UI: vùng **nhãn hiệu / chứng nhận / giá**
+(1) không bao giờ được gửi cho provider dịch, (2) không bao giờ được dựng thành lệnh render,
+(3) không bao giờ bị xoá pixel — chúng bị bỏ qua và **lý do được ghi lại** để UI hiện ra.
+Vùng không đủ chỗ cho chữ Việt (`fits = false`) hoặc thiếu glyph cũng bị bỏ qua và giữ nguyên
+chữ gốc, không bao giờ vẽ tràn ra ngoài hộp.
+
 ---
 
-## 3. Ba nguyên tắc bất khả xâm phạm
+## 3. Bốn nguyên tắc bất khả xâm phạm
 
 Đây là phần quan trọng nhất của dự án — không phải tính năng, mà là **tính trung thực**.
 
@@ -115,6 +157,33 @@ Mọi dữ kiện trong `knowledge.facts` đều mang `provenance`:
    > dương tính giả trên nội dung sạch. Regex bắt được cái đã biết, không bắt được cái chưa
    > nghĩ tới — nên lỗ hổng này phải có test canh, không thể chỉ dựa vào việc "đã viết kỹ".
 
+### 3.4 Ảnh gốc bất biến, nhãn hiệu không bị đụng (MVP-02)
+
+Ba luật riêng của xử lý ảnh, đều được **khoá bằng test**:
+
+1. **Ảnh gốc bất biến.** Buffer đầu vào không bị sửa tại chỗ; file gốc không bao giờ bị ghi đè.
+   Mọi ảnh sinh ra là bản ghi mới có `parent_id` trỏ về ảnh gốc, kèm `sha256` của cả hai.
+   Test so `sha256` trước/sau và kiểm **pixel ngoài mọi hộp chữ không đổi**.
+2. **Nhãn hiệu / chứng nhận / giá không bao giờ bị dịch hay xoá.** Chúng bị khoá ở cả ba tầng
+   (dịch → dựng lệnh render → xoá pixel). Chỉ người dùng mới override được, và override để lại vết.
+3. **Không vừa hộp thì bỏ qua, không vẽ tràn.** `layoutText` phải chứng minh mọi đường bao chữ nằm
+   trong hộp; vùng không đủ chỗ hoặc thiếu glyph bị bỏ qua, **giữ nguyên chữ gốc**, và lý do được
+   ghi vào `skipped` để UI hiện ra.
+
+### 3.5 `session_id` KHÔNG phải xác thực (đọc trước khi tin "404 theo session")
+
+Cookie `sid` do **client tự gửi**; máy chủ chỉ dùng nó để **phân vùng lịch sử** và tránh
+truy cập nhầm giữa các phiên. Cụ thể:
+
+- `/api/imagelab/*` và bốn route MVP-01 (`GET /api/jobs/:id`, `PUT .../content`,
+  `POST .../regenerate`, `GET .../usage`) trả **404** khi job thuộc session khác — đây là
+  **chống truy cập nhầm**, KHÔNG phải hàng rào bảo mật: ai biết `job_id` và tự đặt cookie
+  `sid` của người khác vẫn đọc/ghi được. Request **không khai** cookie session nào được coi là
+  khách ẩn danh (MVP-01 vẫn chạy được không cần cookie).
+- `GET /api/jobs?scope=all` là **tính năng lịch sử có chủ ý**: nó liệt kê job của mọi phiên.
+- Việc phân vùng thật (tài khoản, đăng nhập, quyền) thuộc **MVP-05**; xem thêm
+  [`docs/VERIFICATION.md`](docs/VERIFICATION.md) §8.
+
 ---
 
 ## 4. Mức độ kiểm chứng
@@ -154,14 +223,21 @@ src/
 ├── vision/                G07 VisionProvider
 ├── merge/                 G08 knowledge merge
 ├── content/               G09 engine + styles + guardrails
-├── jobs/                  queue + pipeline
-├── store/                 SQLite & PostgreSQL, cùng một schema.sql
+├── jobs/                  queue + pipeline (MVP-01)
+├── imagelab/              MVP-02 — Image Translation Studio
+│   ├── ocr/               IL-01/02 OcrProvider (mock|http|none) + classifyRegion + normalizeRegions
+│   ├── translate/         IL-03/04 Translator (mock|ai|none) + từ điển + 4 luật guardrail + duyệt
+│   ├── render/            IL-05 render: PNG codec thuần JS, font 5×7 ghép dấu tiếng Việt,
+│   │                      layout tự chọn cỡ chữ, inpaint, provider (mock|purejs|http|none)
+│   ├── pipeline.js        ingest → runOcr → renderApproved (cổng duyệt bắt buộc)
+│   └── storage.js         lưu ảnh nguyên tử, chặn path traversal
+├── store/                 SQLite & PostgreSQL, cùng một schema.sql (jobs.kind + 3 bảng MVP-02)
 ├── session/               session cho sàn cần đăng nhập (none|file|cdp)
-└── http/                  server + routes
-public/                    giao diện (HTML/CSS/JS thuần, không build step)
-test/                      test + fixture
-tools/                     provider-probe, live-probe, sinh ảnh test
-docs/                      kiến trúc, bảo mật, kiểm chứng, roadmap
+└── http/                  server + routes (MVP-01 + 6 route /api/imagelab/*)
+public/                    giao diện (HTML/CSS/JS thuần, không build step) — 2 tab: Nội dung, Dịch ảnh
+test/                      test + fixture (MVP-01 + imagelab-*.test.js)
+tools/                     provider-probe, live-probe, imagelab-demo, sinh ảnh test
+docs/                      kiến trúc, bảo mật, kiểm chứng, roadmap, hợp đồng MVP-02
 ```
 
 ---
@@ -176,6 +252,14 @@ Vài điểm cần lưu ý:
 - `SESSION_MODE` — `cdp` cho phép dùng Chrome đang đăng nhập để lấy dữ liệu các sàn cần session
   **mà không export cookie vào repo**.
 - `ALLOW_PRIVATE_NETWORK=false` là mặc định an toàn. Chỉ bật khi test cục bộ có kiểm soát.
+- **MVP-02:** `IMAGELAB_ENABLED` (tắt hẳn tính năng), `IMAGELAB_DIR` (nơi lưu ảnh; mặc định
+  `./data/imagelab`, đã nằm trong `.gitignore`), `IMAGELAB_MAX_IMAGE_BYTES`, `IMAGELAB_MAX_PIXELS`
+  (chặn ảnh khổng lồ trước khi cấp phát bộ nhớ), `IMAGELAB_MAX_REGIONS`, `IMAGELAB_MIN_CONFIDENCE`.
+- `OCR_PROVIDER=mock` và `RENDER_PROVIDER=purejs` là mặc định **an toàn và miễn phí**. Cắm
+  `OCR_PROVIDER=http` + `OCR_BASE_URL` + `OCR_API_KEY` (và/hoặc `RENDER_PROVIDER=http` +
+  `RENDER_BASE_URL`) khi có dịch vụ thật. `TRANSLATE_PROVIDER` mặc định kế thừa khối `ai`.
+- `IMAGELAB_ENABLED=false` hoặc module MVP-02 nạp lỗi ⇒ MVP-01 **vẫn chạy bình thường**; lý do
+  hiện ở `GET /api/health` tại `imagelab.reason`, và các route `/api/imagelab/*` trả 503.
 
 ---
 

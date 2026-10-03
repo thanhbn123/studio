@@ -49,18 +49,29 @@ export const RENDERABLE_STATUSES = Object.freeze(['TRANSLATED', 'GLOSSARY', 'USE
  *
  * Đây là NGUỒN LUẬT DUY NHẤT cho câu hỏi "còn dòng nào phải duyệt không":
  * `renderApproved()` (C4) và route `POST /api/imagelab/jobs/:id/render` (C5) đều
- * gọi hàm này. Trước đây C5 tự chép lại luật (`status === 'NEEDS_REVIEW'`) nên
- * hai bản lệch nhau ở ca dòng đã được người dùng xử lý (`edited_by_user = true`,
- * ví dụ action `skip`) — route chặn 409 trong khi pipeline cho qua.
+ * gọi hàm này.
+ *
+ * Sửa theo F-06 của phản biện: cổng chỉ quan tâm `status === 'NEEDS_REVIEW'`, BẤT KỂ
+ * `edited_by_user`. Trước đây dòng `NEEDS_REVIEW` mà người dùng đã sửa (nhưng vẫn vi
+ * phạm guardrail) được miễn cổng 409 rồi bị bỏ im lặng khỏi ảnh — người dùng tưởng đã
+ * vẽ. Người dùng muốn bỏ qua thật thì dùng `action: 'skip'` (⇒ `SKIPPED_BY_USER`,
+ * không chặn render và xuất hiện trong `skipped` với lý do rõ ràng).
  */
 export function pendingReviewLines(lines) {
   return (Array.isArray(lines) ? lines : []).filter(
-    (l) => String(l?.status ?? '') === 'NEEDS_REVIEW' && l?.edited_by_user !== true,
+    (l) => String(l?.status ?? '') === 'NEEDS_REVIEW',
   );
 }
 
 /** Ba loại vùng KHÔNG BAO GIỜ được dịch/xoá (luật #3). */
 export const NEVER_RENDER_KINDS = Object.freeze(['brand', 'certification', 'price']);
+
+/** Nhãn tiếng Việt của kind — dùng cho cảnh báo override (không dùng cho logic). */
+const KIND_LABEL_VI = Object.freeze({
+  brand: 'nhãn hiệu',
+  certification: 'chứng nhận',
+  price: 'giá',
+});
 
 const MIME_EXT = Object.freeze({
   'image/png': 'png',
@@ -76,7 +87,8 @@ const STATUS_SKIP_REASON = Object.freeze({
   SKIPPED_BRAND: 'Vùng nhãn hiệu — không dịch, không xoá (luật bất khả xâm phạm #3).',
   SKIPPED_CERTIFICATION: 'Vùng chứng nhận — không dịch, không xoá (luật bất khả xâm phạm #3).',
   SKIPPED_PRICE: 'Vùng giá — giá do người bán quyết, không tự dịch.',
-  NEEDS_REVIEW: 'Dòng cần người duyệt nhưng CHƯA được duyệt — bỏ qua, không vẽ.',
+  SKIPPED_BY_USER: 'Người dùng đã bỏ qua dòng này — không vẽ chữ Việt vào vùng (có ghi vết).',
+  NEEDS_REVIEW: 'Dòng bị guardrail chặn (cần người duyệt) nhưng CHƯA được duyệt — bỏ qua, KHÔNG vẽ.',
   FAILED: 'Provider dịch lỗi cho riêng dòng này — bỏ qua.',
 });
 
@@ -189,6 +201,15 @@ function clampBox(box, width, height) {
   }
   if (!(w > 0) || !(h > 0)) return null;
   return { x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) };
+}
+
+/**
+ * Hai hộp pixel có GIAO nhau (diện tích chung > 0) hay không — bổ sung sau phản biện F-01.
+ * Chạm cạnh không tính là giao: hai vùng chữ xếp sát nhau vẫn được vẽ bình thường.
+ */
+function boxesIntersect(a, b) {
+  if (!a || !b) return false;
+  return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
 }
 
 export class ImageTranslationPipeline {
@@ -791,7 +812,7 @@ export class ImageTranslationPipeline {
     let forcedReason = null;
     if (force === true) {
       forcedReason = pending.length > 0
-        ? `Người dùng buộc render (force = true) dù còn ${pending.length} dòng NEEDS_REVIEW chưa duyệt: ${pending.map((l) => l.region_id).slice(0, 10).join(', ')}. Các dòng này KHÔNG được vẽ.`
+        ? `⚠️ Người dùng buộc render (force = true) dù còn ${pending.length} dòng bị guardrail chặn (NEEDS_REVIEW) chưa duyệt: ${pending.map((l) => l.region_id).slice(0, 10).join(', ')}. Các dòng bị guardrail chặn nên KHÔNG được vẽ — chữ đó sẽ KHÔNG xuất hiện trên ảnh.`
         : 'Người dùng gọi render với force = true (không có dòng NEEDS_REVIEW nào bị ảnh hưởng).';
       warnings.push(forcedReason);
     }
@@ -801,6 +822,30 @@ export class ImageTranslationPipeline {
     const regionById = new Map(persistedRegions.map((r) => [String(r.id), r]));
     const ops = [];
     const skipped = [];
+    const overrides = [];
+
+    // F-01 lớp 1 (sau phản biện) — hộp của MỌI vùng được bảo vệ, BẤT KỂ trạng thái dòng.
+    // Op của vùng khác không được phép giao với bất kỳ hộp nào trong số này: thà giữ lại
+    // chữ Trung còn hơn xoá mất nhãn hiệu/chứng nhận (fail-closed).
+    //
+    // Vùng được coi là bảo vệ khi hội đủ MỘT trong hai dấu hiệu ĐỘC LẬP:
+    //   (1) `kind ∈ {brand, certification, price}` — nguồn luật #3; hoặc
+    //   (2) dòng dịch có `status ∈ {SKIPPED_BRAND, SKIPPED_CERTIFICATION, SKIPPED_PRICE}`
+    //       — dấu hiệu thứ hai của C2, cứu được ca provider OCR trả vùng THIẾU `kind`
+    //       (khi đó mọi vùng thành `unknown`, chỉ còn `status` là đáng tin).
+    const lineByRegion = new Map();
+    for (const line of allLines) lineByRegion.set(String(line?.region_id ?? ''), line);
+    const protectedBoxes = [];
+    for (const region of persistedRegions) {
+      const rid = String(region?.id ?? '');
+      const kind = String(region?.kind ?? '');
+      const status = String(lineByRegion.get(rid)?.status ?? '');
+      const protectedByKind = NEVER_RENDER_KINDS.includes(kind);
+      const protectedByStatus = status === 'SKIPPED_BRAND' || status === 'SKIPPED_CERTIFICATION' || status === 'SKIPPED_PRICE';
+      if (!protectedByKind && !protectedByStatus) continue;
+      const pbox = this.#boxOf(region, original);
+      if (pbox) protectedBoxes.push({ region_id: rid, kind, box: pbox });
+    }
 
     for (const line of allLines) {
       const rid = String(line?.region_id ?? '');
@@ -825,19 +870,38 @@ export class ImageTranslationPipeline {
         skipped.push({ region_id: rid, reason: 'Không tìm thấy vùng OCR tương ứng trong DB.' });
         continue;
       }
-      if (NEVER_RENDER_KINDS.includes(region.kind)) {
-        skipped.push({ region_id: rid, reason: KIND_SKIP_REASON[region.kind] });
+      // Luật #3 (sửa theo F-02 của phản biện): vùng brand/certification/price CHỈ được
+      // dựng op khi có OVERRIDE CÓ VẾT — người dùng đã thực sự sửa/duyệt dòng đó
+      // (`edited_by_user = true` + `provenance = 'user'` + có chữ Việt). Mọi trường hợp
+      // khác (kể cả `allow_brand_override` lúc PUT mà dòng KHÔNG có vết) vẫn bị bỏ qua.
+      const kind = String(region.kind ?? '');
+      const protectedKind = NEVER_RENDER_KINDS.includes(kind);
+      const tracedOverride =
+        line.edited_by_user === true &&
+        String(line.provenance ?? '') === 'user' &&
+        String(line.text_vi ?? '').trim() !== '';
+      if (protectedKind && !tracedOverride) {
+        skipped.push({ region_id: rid, reason: KIND_SKIP_REASON[kind] });
         continue;
       }
       // KHÔNG chặn thêm theo `translatable`: hợp đồng 4.4 chỉ cho phép dựng op khi
-      // dòng có text_vi + status ∈ {TRANSLATED, GLOSSARY, USER_EDITED}, và CẤM TUYỆT ĐỐI
-      // với brand/certification/price (đã chặn ở trên). Vùng `unknown` do người dùng
-      // tự sửa (USER_EDITED, có edited_by_user + provenance 'user') là override CÓ VẾT
-      // nên được phép vẽ; nếu chặn ở đây thì UI sẽ hiện dòng "đã duyệt" mà không bao giờ
-      // được render — đúng kiểu thất bại im lặng mà luật #4 cấm.
+      // dòng có text_vi + status ∈ {TRANSLATED, GLOSSARY, USER_EDITED}, và chặn TUYỆT ĐỐI
+      // với brand/certification/price khi không có override có vết (đã chặn ở trên).
+      // Vùng `unknown` do người dùng tự sửa (USER_EDITED, có edited_by_user + provenance
+      // 'user') là override CÓ VẾT nên được phép vẽ; nếu chặn ở đây thì UI sẽ hiện dòng
+      // "đã duyệt" mà không bao giờ được render — đúng kiểu thất bại im lặng mà luật #4 cấm.
       const box = this.#boxOf(region, original);
       if (!box) {
         skipped.push({ region_id: rid, reason: 'Hộp bao không hợp lệ (BAD_BOX) — không vẽ để tránh tràn ra ngoài vùng.' });
+        continue;
+      }
+      // F-01 lớp 1: op KHÔNG được GIAO với hộp của vùng được bảo vệ KHÁC (chồng một phần,
+      // lồng nhau, hay trùng hộp) — nếu giao thì KHÔNG dựng op và nói rõ chồng lên vùng nào.
+      const clash = protectedBoxes.find((p) => p.region_id !== rid && boxesIntersect(box, p.box));
+      if (clash) {
+        const reason = `BOX_OVERLAPS_PROTECTED: ${clash.region_id} (${clash.kind}) — hộp của vùng “${rid}” giao với vùng được bảo vệ nên KHÔNG xoá/vẽ (luật #3); giữ nguyên chữ Trung trong vùng đó.`;
+        skipped.push({ region_id: rid, reason });
+        warnings.push(reason);
         continue;
       }
       ops.push({
@@ -847,6 +911,15 @@ export class ImageTranslationPipeline {
         text: String(line.text_vi).trim(),
         style: { align: 'center', padding: 2 },
       });
+
+      if (protectedKind) {
+        overrides.push({ region_id: rid, kind, edited_at: line.edited_at ?? null });
+        warnings.push(
+          `⚠️ Vùng ${KIND_LABEL_VI[kind] || kind} “${rid}” ĐÃ BỊ THAY CHỮ TRÊN ẢNH theo yêu cầu người dùng (override có vết: ${line.status}, provenance=user${
+            line.edited_at ? `, lúc ${line.edited_at}` : ''
+          }).`,
+        );
+      }
     }
 
     const failedResult = (code, message, extra = {}) => ({
@@ -864,7 +937,17 @@ export class ImageTranslationPipeline {
 
     if (ops.length === 0) {
       // Không có gì đủ điều kiện vẽ: nói rõ lý do, KHÔNG tạo ảnh rỗng giả.
-      throw new ImageLabError('IMAGELAB_NO_LINES', 'Không có dòng nào đủ điều kiện render (xem `skipped` để biết lý do).', { skipped });
+      // F-01: job chạy qua hàng đợi nên `skipped` không tới được UI — nhét lý do THẬT
+      // vào error_message để người dùng biết vì sao (thường là "hộp giao vùng bảo vệ").
+      const summary = skipped
+        .slice(0, 3)
+        .map((s) => `${s.region_id || '?'}: ${String(s.reason).slice(0, 120)}`)
+        .join(' | ');
+      throw new ImageLabError(
+        'IMAGELAB_NO_LINES',
+        `Không có dòng nào đủ điều kiện render (xem \`skipped\` để biết lý do).${summary ? ` Lý do: ${summary}` : ''}`,
+        { skipped },
+      );
     }
 
     if (!this.renderProvider || this.renderProvider.configured === false) {
@@ -900,6 +983,11 @@ export class ImageTranslationPipeline {
           maxOutputBytes: cfg.maxOutputBytes,
           force: force === true,
           jobId,
+          // F-01 lớp 2 (hàng rào cuối ở tầng pixel): provider THẬT không được đổi bất kỳ
+          // pixel nào trong hộp của vùng brand/certification/price, kể cả khi op phủ lên.
+          // Kèm `region_id` để op của CHÍNH vùng đó (override có vết — F-02) vẫn vẽ được
+          // lên vùng của nó, trong khi mọi vùng bảo vệ khác vẫn đóng băng pixel.
+          protected_boxes: protectedBoxes.map((p) => ({ region_id: p.region_id, box: p.box })),
         },
       });
     } catch (err) {
@@ -968,7 +1056,12 @@ export class ImageTranslationPipeline {
     // ── Lưu ảnh render: BẢN GHI MỚI, parent_id trỏ về ảnh gốc ─────────────
     const providerSkipped = Array.isArray(render?.skipped) ? render.skipped : [];
     const providerWarnings = Array.isArray(render?.warnings) ? render.warnings.map(String).slice(0, 50) : [];
-    const applied = Array.isArray(render?.applied) ? render.applied : [];
+    // F-02: op của vùng nhãn hiệu/chứng nhận/giá (override có vết) phải mang cờ `override`
+    // trong `applied` để C5/UI nhìn là biết vùng đó bị thay theo yêu cầu người dùng.
+    const overrideIds = new Set(overrides.map((o) => String(o.region_id)));
+    const applied = (Array.isArray(render?.applied) ? render.applied : []).map((a) =>
+      overrideIds.has(String(a?.region_id)) ? { ...a, override: true } : a,
+    );
     const mergedSkipped = [...skipped, ...providerSkipped];
     const mergedWarnings = [...warnings, ...providerWarnings, ...extraWarnings];
     const providerName = String(render?.provider || this.renderProvider.name || '');
@@ -983,6 +1076,8 @@ export class ImageTranslationPipeline {
       applied,
       applied_count: applied.length,
       skipped: mergedSkipped,
+      // F-02: vết của mọi override nhãn hiệu/chứng nhận/giá đã dùng cho ảnh này.
+      overrides,
       unsupported_glyphs: Array.isArray(render?.unsupported_glyphs) ? render.unsupported_glyphs : [],
       warnings: mergedWarnings,
       provider: providerName,
@@ -1070,6 +1165,7 @@ export class ImageTranslationPipeline {
             skipped: mergedSkipped.length,
             unsupported_glyphs: meta.unsupported_glyphs.length,
             forced: Boolean(forcedReason),
+            overrides: overrides.length,
             rendered_asset_id: renderedId,
           },
           warnings: mergedWarnings,
@@ -1105,6 +1201,7 @@ export class ImageTranslationPipeline {
       ops,
       skipped: mergedSkipped,
       warnings: mergedWarnings,
+      overrides,
       mock_steps: mockSteps,
     };
   }

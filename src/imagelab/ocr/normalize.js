@@ -10,7 +10,14 @@
  */
 
 import { sanitizeText } from '../../security/sanitize.js';
-import { REGION_KINDS, PROTECTION_RANK, classifyRegion, containsCjk, reasonForKind } from './classify.js';
+import {
+  REGION_KINDS,
+  PROTECTION_RANK,
+  classifyRegion,
+  containsCjk,
+  dedupePriority,
+  reasonForKind,
+} from './classify.js';
 
 /** Ngôn ngữ được phép theo hợp đồng 3.2. Giá trị lạ → coi như không khai. */
 const ALLOWED_LANGS = Object.freeze(['zh', 'zh-Hans', 'zh-Hant', 'und']);
@@ -97,6 +104,16 @@ function dropEntry(reason, text) {
 }
 
 /**
+ * Hai hộp pixel có GIAO nhau (diện tích chung > 0) hay không.
+ * Chạm cạnh (không có diện tích chung) KHÔNG tính là giao — nếu tính, hai vùng chữ
+ * xếp sát nhau sẽ bị chặn oan.
+ */
+function boxesIntersect(a, b) {
+  if (!a || !b) return false;
+  return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+}
+
+/**
  * Chuẩn hoá danh sách vùng thô.
  *
  * @param {Array<object>} rawRegions vùng do provider trả về (có thể bẩn/không phải mảng)
@@ -137,7 +154,13 @@ export function normalizeRegions(rawRegions, { width, height, maxRegions, minCon
     return { regions: [], dropped, warnings };
   }
 
-  const seen = new Set();
+  // Khử trùng theo HỘP (bổ sung sau phản biện F-01):
+  //  - cùng hộp + cùng chữ  → bỏ vùng đến sau (như cũ);
+  //  - cùng hộp + KHÁC chữ  → giữ vùng "hạn chế nhất" (brand|certification|price >
+  //    unknown > descriptive), vùng còn lại vào `dropped` kèm lý do. Nếu không xử lý,
+  //    một vùng `descriptive` có thể chiếm đúng hộp của vùng `brand` và op của nó sẽ
+  //    xoá sạch nhãn hiệu (đúng ca CRITICAL mà phản biện dựng được).
+  const boxSlot = new Map();
   const kept = [];
   let outOfRangeConfidence = 0;
 
@@ -185,14 +208,6 @@ export function normalizeRegions(rawRegions, { width, height, maxRegions, minCon
       return;
     }
 
-    // Trùng khít = cùng chữ VÀ cùng hộp sau khi đã clamp.
-    const key = `${text}\u0000${x},${y},${w},${h}`;
-    if (seen.has(key)) {
-      dropped.push(dropEntry('trùng khít vùng đã có (cùng chữ và cùng hộp)', text));
-      return;
-    }
-    seen.add(key);
-
     // Phân loại: tự phân loại trước, rồi hợp nhất với kind provider khai — chỉ leo thang.
     const auto = classifyRegion(text);
     const providedKind = REGION_KINDS.includes(r.kind) ? r.kind : null;
@@ -208,6 +223,36 @@ export function normalizeRegions(rawRegions, { width, height, maxRegions, minCon
       // else: giữ auto (leo thang bảo vệ — provider không được phép hạ cấp).
     }
 
+    // Trùng HỘP (sau khi đã clamp): xử lý theo mức bảo vệ của `kind`.
+    const boxKey = `${x},${y},${w},${h}`;
+    const existing = boxSlot.get(boxKey);
+    if (existing) {
+      if (existing.text === text) {
+        dropped.push(dropEntry('trùng khít vùng đã có (cùng chữ và cùng hộp)', text));
+        return;
+      }
+      const newPriority = dedupePriority(kind);
+      const oldPriority = dedupePriority(existing.kind);
+      if (newPriority > oldPriority) {
+        // Vùng mới hạn chế hơn ⇒ bỏ vùng cũ, giữ vùng mới.
+        existing.dropped = true;
+        dropped.push(
+          dropEntry(
+            `trùng hộp nhưng khác chữ — bỏ vùng này vì vùng mới có mức bảo vệ cao hơn (${kind} > ${existing.kind})`,
+            existing.text,
+          ),
+        );
+      } else {
+        dropped.push(
+          dropEntry(
+            `trùng hộp nhưng khác chữ — bỏ vùng này vì vùng đã giữ có mức bảo vệ cao hơn hoặc bằng (${existing.kind} ≥ ${kind})`,
+            text,
+          ),
+        );
+        return;
+      }
+    }
+
     const providedLang = typeof r.lang === 'string' ? r.lang.trim() : '';
     const lang = ALLOWED_LANGS.includes(providedLang)
       ? providedLang
@@ -215,7 +260,7 @@ export function normalizeRegions(rawRegions, { width, height, maxRegions, minCon
         ? 'zh'
         : 'und';
 
-    kept.push({
+    const entry = {
       index,
       x,
       y,
@@ -227,7 +272,10 @@ export function normalizeRegions(rawRegions, { width, height, maxRegions, minCon
       kind,
       kind_reason: kindReason,
       source: r.source === 'user' ? 'user' : 'ocr',
-    });
+      dropped: false,
+    };
+    kept.push(entry);
+    boxSlot.set(boxKey, entry);
   });
 
   if (outOfRangeConfidence > 0) {
@@ -237,7 +285,9 @@ export function normalizeRegions(rawRegions, { width, height, maxRegions, minCon
   }
 
   // Thứ tự đọc: trên → dưới, trái → phải (hoà thì giữ nguyên thứ tự gốc).
-  const ordered = kept.sort((a, b) => a.y - b.y || a.x - b.x || a.index - b.index);
+  // Vùng đã bị vùng khác "chiếm hộp" (mức bảo vệ thấp hơn) không được giữ lại.
+  const survivors = kept.filter((r) => r.dropped !== true);
+  const ordered = survivors.sort((a, b) => a.y - b.y || a.x - b.x || a.index - b.index);
 
   const limited = Number.isFinite(cap) ? ordered.slice(0, cap) : ordered;
   for (const extra of Number.isFinite(cap) ? ordered.slice(cap) : []) {
@@ -266,6 +316,26 @@ export function normalizeRegions(rawRegions, { width, height, maxRegions, minCon
 
   if (dropped.length > 0) {
     warnings.push(`Đã bỏ ${dropped.length} vùng OCR không dùng được (lý do nằm trong "dropped").`);
+  }
+
+  // Cảnh báo hộp GIAO NHAU (bổ sung sau phản biện F-01): hộp chồng lấn là dấu hiệu
+  // dữ liệu OCR có vấn đề, và là đường vào của lỗi "op vùng mô tả xoá pixel nhãn hiệu".
+  // Pipeline đã chặn cứng ở tầng dựng op, nhưng người vận hành vẫn phải được biết.
+  const overlaps = [];
+  for (let i = 0; i < regions.length; i += 1) {
+    for (let j = i + 1; j < regions.length; j += 1) {
+      if (boxesIntersect(regions[i].box, regions[j].box)) {
+        overlaps.push(`${regions[i].id} (${regions[i].kind}) × ${regions[j].id} (${regions[j].kind})`);
+      }
+    }
+  }
+  if (overlaps.length > 0) {
+    const shown = overlaps.slice(0, 5).join('; ');
+    warnings.push(
+      `Có ${overlaps.length} cặp hộp vùng OCR giao nhau — dữ liệu OCR có vấn đề: ${shown}${
+        overlaps.length > 5 ? `; … còn ${overlaps.length - 5} cặp nữa` : ''
+      }. Vùng giao với nhãn hiệu/chứng nhận/giá sẽ KHÔNG được xoá/vẽ đè (luật #3).`,
+    );
   }
 
   return { regions, dropped, warnings };

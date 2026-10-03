@@ -37,6 +37,28 @@ export const PROTECTION_RANK = Object.freeze({
   price: 2,
 });
 
+/**
+ * Thứ tự ưu tiên khi HAI VÙNG TRÙNG HỘP nhưng KHÁC CHỮ (bổ sung sau phản biện F-01).
+ *
+ * `PROTECTION_RANK` ở trên dùng để hợp nhất kind (chỉ leo thang), không phân biệt được
+ * brand với price. Khi hai vùng chiếm đúng một hộp, ta phải giữ vùng "hạn chế nhất"
+ * theo đúng thứ tự hợp đồng: `brand|certification|price > unknown > descriptive`;
+ * trong nhóm được bảo vệ, thứ tự brand > certification > price để kết quả TẤT ĐỊNH
+ * (cùng dữ liệu vào ⇒ cùng vùng được giữ).
+ */
+export const DEDUPE_PRIORITY = Object.freeze({
+  brand: 4,
+  certification: 3,
+  price: 2,
+  unknown: 1,
+  descriptive: 0,
+});
+
+/** Điểm ưu tiên khi khử trùng theo hộp; kind lạ ⇒ 0 (không được leo thang). */
+export function dedupePriority(kind) {
+  return DEDUPE_PRIORITY[String(kind ?? '').toLowerCase()] ?? 0;
+}
+
 /** Lý do hiển thị thẳng lên UI (tiếng Việt, không chứa secret). */
 export const KIND_REASONS = Object.freeze({
   // Nguyên văn ví dụ trong hợp đồng 3.2.

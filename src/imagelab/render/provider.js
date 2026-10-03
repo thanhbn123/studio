@@ -12,7 +12,7 @@
 
 import { Buffer } from 'node:buffer';
 import { RenderError, RENDER_CODES, UNSUPPORTED_IMAGE_CODES } from './errors.js';
-import { probeImage } from './image.js';
+import { probeImage, normalizeProtectedBoxes } from './image.js';
 import { sha256 } from './png.js';
 import { normalizeOps } from './ops.js';
 
@@ -111,6 +111,11 @@ export class RenderProvider {
 
   /**
    * Render — luôn trả RenderResult đầy đủ.
+   *
+   * `options.protected_boxes` (bổ sung sau phản biện F-01): mảng hộp pixel mà provider
+   * THẬT SỰ ghi pixel KHÔNG được phép thay đổi — hàng rào cuối của luật #3, độc lập với
+   * việc pipeline đã lọc op hay chưa. Được chuẩn hoá ở đây rồi truyền xuống provider con.
+   *
    * @param {{image?:object|Buffer, ops?:Array, options?:object}} [params]
    */
   async render({ image, ops, options } = {}) {
@@ -118,6 +123,8 @@ export class RenderProvider {
     const img = normalizeImage(image);
     const originalSha = img.buffer && img.buffer.length ? sha256(img.buffer) : '';
     const normalized = normalizeOps(ops);
+    const opts = options && typeof options === 'object' ? options : {};
+    const protectedBoxes = normalizeProtectedBoxes(opts.protected_boxes);
     const warnings = [];
 
     const base = {
@@ -151,7 +158,8 @@ export class RenderProvider {
         image: img,
         ops: normalized.ops,
         opsSkipped: normalized.skipped,
-        options: options && typeof options === 'object' ? options : {},
+        options: opts,
+        protectedBoxes,
         originalSha256: originalSha,
       })) ?? {};
       return finish({

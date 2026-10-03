@@ -135,21 +135,24 @@ export function applyReviewEdits(lines, edits, { allowBrandOverride = false, now
     }
 
     if (action === 'skip') {
+      // F-06 (sau phản biện): bỏ qua là quyết định CỦA NGƯỜI DÙNG ⇒ trạng thái riêng
+      // `SKIPPED_BY_USER`, không phải `NEEDS_REVIEW` (guardrail chặn). Nhờ vậy dòng này
+      // KHÔNG chặn cổng render 409, nhưng vẫn vào `skipped` khi render kèm lý do rõ ràng.
       const iso = clock().toISOString();
       const guarded = enforceTranslationGuardrails(
         {
           ...line,
           text_vi: '',
-          status: TRANSLATE_STATUS.NEEDS_REVIEW,
+          status: TRANSLATE_STATUS.SKIPPED_BY_USER,
           provenance: PROVENANCE.USER,
           edited_by_user: true,
           edited_at: iso,
-          notes: 'Người dùng bỏ qua dòng này — sẽ không render chữ Việt vào vùng.',
-          violations: ['Người dùng chủ động bỏ qua dòng này (không render).'],
+          notes: 'Người dùng chủ động bỏ qua dòng này — sẽ không render chữ Việt vào vùng (có ghi vết).',
+          violations: [],
         },
         { region: raw.region ?? line.region },
       );
-      outLines[idx] = { ...guarded.line, status: TRANSLATE_STATUS.NEEDS_REVIEW };
+      outLines[idx] = { ...guarded.line, status: TRANSLATE_STATUS.SKIPPED_BY_USER };
       applied += 1;
       skipped += 1;
       continue;

@@ -6,36 +6,93 @@
  *
  * Bốn luật bắt buộc (mỗi vi phạm là một câu tiếng Việt trong `violations`, và đặt NEEDS_REVIEW):
  *   a) `text_vi` chứa số liệu / đơn vị KHÔNG có trong `text_original`;
- *   b) `text_vi` vẫn còn ký tự CJK (U+3400–U+4DBF, U+4E00–U+9FFF) → "CHƯA DỊCH";
+ *   b) `text_vi` vẫn còn ký tự CHƯA DỊCH — Hán (U+3400–U+4DBF, U+4E00–U+9FFF),
+ *      kana Nhật (`\p{Script=Hiragana}`/`\p{Script=Katakana}`) và Hangul (`\p{Script=Hangul}`);
  *   c) `text_vi` chứa từ khẳng định thuộc nhóm cấm mà `text_original` không có;
  *   d) `text_vi` rỗng nhưng `translatable === true`.
+ *
+ * Siết thêm sau phản biện F-08 (giới hạn của phương pháp regex, đã ghi rõ để không ai
+ * đọc thành "guardrail chặn mọi ca bịa"):
+ *   - MỌI luật chạy trên văn bản đã bỏ ký tự vô hình (U+200B–U+200D, U+FEFF, U+2060) + NFC;
+ *   - Số dùng `\p{Nd}` (bắt cả chữ số full-width １２ và các bộ chữ số khác);
+ *   - Số VIẾT BẰNG CHỮ tiếng Việt đi kèm đơn vị/thời gian ("mười hai tháng") cũng bị coi
+ *     là số liệu ⇒ vi phạm (a) nếu chữ gốc không có số đó.
  *
  * ⚠️ BÀI HỌC ĐÃ TRẢ GIÁ CỦA DỰ ÁN: `\b` của JavaScript chỉ hiểu [A-Za-z0-9_], nên
  * `\b(?:bảo hành|chống nước)\b` KHÔNG BAO GIỜ khớp. Vì vậy trong file này:
  *   - KHÔNG dùng `\b` quanh bất kỳ từ tiếng Việt / chữ Hán nào;
- *   - `\b` chỉ xuất hiện quanh token thuần ASCII (bh, iso, ce, ip68, 3c, số 1…).
+ *   - `\b` chỉ xuất hiện quanh token thuần ASCII (bh, iso, ce, ip68, 3c, số 1…);
+ *   - chỗ cần biên từ của chữ có dấu thì dùng lookaround `(?<![\p{L}\p{N}])` / `(?![\p{L}\p{N}])`.
  */
 
 import { TRANSLATE_STATUS } from './lines.js';
 
-/* ─────────────────────── 1. Phát hiện ký tự CJK ─────────────────────── */
+/* ───────────────── 0. Chuẩn hoá trước khi so khớp (F-08) ─────────────────
+ *
+ * Kẻ bịa có thể chèn ký tự VÔ HÌNH vào giữa từ khoá ("bảo\u200bhành") để regex
+ * không khớp. Mọi luật vì vậy phải chạy trên văn bản đã BỎ ký tự vô hình (thay bằng
+ * khoảng trắng để "bảo\u200bhành" vẫn tách thành "bảo hành") và đã chuẩn hoá Unicode
+ * (NFC) — nhưng KHÔNG được sửa văn bản gốc của người dùng.
+ */
+
+/** Ký tự vô hình: zero-width space/non-joiner/joiner, BOM, word-joiner. */
+const INVISIBLE_RE = /[\u200B-\u200D\uFEFF\u2060]/g;
+
+/** Bỏ hẳn ký tự vô hình (dùng khi cần dán liền hai mảnh chữ). */
+export function stripInvisible(text) {
+  return String(text ?? '').replace(INVISIBLE_RE, '');
+}
+
+/**
+ * Chuẩn hoá văn bản để so khớp: ký tự vô hình → khoảng trắng, gộp khoảng trắng, NFC.
+ * Thay bằng khoảng trắng (không xoá hẳn) để từ khoá bị cắt vẫn khớp lại được.
+ */
+export function normalizeForMatch(text) {
+  return String(text ?? '')
+    .replace(INVISIBLE_RE, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .normalize('NFC');
+}
+
+/* ─────────────────────── 1. Phát hiện ký tự CHƯA DỊCH ─────────────────────── */
 
 const CJK_CLASS = '\\u3400-\\u4DBF\\u4E00-\\u9FFF\\uF900-\\uFAFF';
 
-/** `text_vi` còn chữ Hán ⇒ CHƯA DỊCH. */
+/**
+ * Hệ chữ KHÁC không được phép còn lại trong bản dịch tiếng Việt (F-08):
+ * kana Nhật (`\p{Script=Hiragana}`, `\p{Script=Katakana}`) và Hangul (`\p{Script=Hangul}`).
+ */
+const OTHER_SCRIPT_CLASS = '\\p{Script=Hiragana}\\p{Script=Katakana}\\p{Script=Hangul}';
+
+/** Lớp ký tự "chưa dịch": CJK + kana + Hangul. */
+const UNTRANSLATED_CLASS = `${CJK_CLASS}${OTHER_SCRIPT_CLASS}`;
+
+/** `text` còn chữ Hán ⇒ CHƯA DỊCH (giữ tên cũ cho tương thích). */
 export function hasCjk(text) {
-  return new RegExp(`[${CJK_CLASS}]`).test(String(text ?? ''));
+  return new RegExp(`[${CJK_CLASS}]`).test(normalizeForMatch(text));
+}
+
+/** `text` còn bất kỳ hệ chữ chưa dịch nào (Hán, kana, Hangul). */
+export function hasUntranslatedScript(text) {
+  return new RegExp(`[${UNTRANSLATED_CLASS}]`, 'u').test(normalizeForMatch(text));
 }
 
 /** Trích vài đoạn chữ Hán còn sót để hiện lên UI (tối đa `maxRuns` đoạn). */
 export function cjkSample(text, maxRuns = 3) {
-  const runs = String(text ?? '').match(new RegExp(`[${CJK_CLASS}]+`, 'g')) || [];
+  const runs = normalizeForMatch(text).match(new RegExp(`[${CJK_CLASS}]+`, 'g')) || [];
+  return runs.slice(0, maxRuns).join(' ');
+}
+
+/** Trích vài đoạn chữ CHƯA DỊCH (Hán/kana/Hangul) để hiện lên UI. */
+export function untranslatedSample(text, maxRuns = 3) {
+  const runs = normalizeForMatch(text).match(new RegExp(`[${UNTRANSLATED_CLASS}]+`, 'gu')) || [];
   return runs.slice(0, maxRuns).join(' ');
 }
 
 /** Danh sách ký tự CJK duy nhất (để ghi log / đối chiếu). */
 export function cjkChars(text) {
-  const found = String(text ?? '').match(new RegExp(`[${CJK_CLASS}]`, 'g')) || [];
+  const found = normalizeForMatch(text).match(new RegExp(`[${CJK_CLASS}]`, 'g')) || [];
   return [...new Set(found)];
 }
 
@@ -95,6 +152,46 @@ export function convertChineseNumerals(text) {
   return String(text ?? '').replace(CN_NUMERAL_RUN, (run) => ` ${chineseRunToNumber(run)} `);
 }
 
+/**
+ * Đổi MỌI chữ số thuộc hệ thập phân Unicode (`\p{Nd}`) về ASCII: chữ số full-width
+ * `１２３` → `123`, chữ số Ả Rập - Ấn `١٢` → `12`… Nhờ vậy "１２ tháng" không lọt
+ * qua luật (a) chỉ vì dùng bộ chữ số khác (F-08).
+ */
+export function toAsciiDigits(text) {
+  return String(text ?? '').replace(/\p{Nd}/gu, (ch) => {
+    const value = digitValueOf(ch);
+    return value === null ? '' : String(value);
+  });
+}
+
+/**
+ * Điểm bắt đầu (ký tự "0") của 72 khối chữ số thập phân Unicode (`\p{Nd}`), Unicode 15.
+ * Mọi khối đều dài bội số của 10, nên `(mã điểm - điểm bắt đầu) % 10` là giá trị chữ số.
+ * (Không dùng `Number('１')` — V8 trả `NaN`; NFKC cũng chỉ phủ được một phần bộ chữ số.)
+ */
+const ND_BLOCK_STARTS = Object.freeze([
+  0x30, 0x660, 0x6f0, 0x7c0, 0x966, 0x9e6, 0xa66, 0xae6, 0xb66, 0xbe6, 0xc66, 0xce6, 0xd66,
+  0xde6, 0xe50, 0xed0, 0xf20, 0x1040, 0x1090, 0x17e0, 0x1810, 0x1946, 0x19d0, 0x1a80, 0x1a90,
+  0x1b50, 0x1bb0, 0x1c40, 0x1c50, 0xa620, 0xa8d0, 0xa900, 0xa9d0, 0xa9f0, 0xaa50, 0xabf0,
+  0xff10, 0x104a0, 0x10d30, 0x10d40, 0x11066, 0x110f0, 0x11136, 0x111d0, 0x112f0, 0x11450,
+  0x114d0, 0x11650, 0x116c0, 0x116d0, 0x11730, 0x118e0, 0x11950, 0x11bf0, 0x11c50, 0x11d50,
+  0x11da0, 0x11de0, 0x11f50, 0x16130, 0x16a60, 0x16ac0, 0x16b50, 0x16d70, 0x1ccf0, 0x1d7ce,
+  0x1e140, 0x1e2f0, 0x1e4f0, 0x1e5f1, 0x1e950, 0x1fbf0,
+]);
+
+/** Giá trị 0..9 của một ký tự chữ số Unicode; `null` nếu không phải `\p{Nd}`. */
+export function digitValueOf(ch) {
+  const s = String(ch ?? '');
+  if (!s || !/^\p{Nd}$/u.test(s)) return null;
+  const cp = s.codePointAt(0);
+  let start = ND_BLOCK_STARTS[0];
+  for (const candidate of ND_BLOCK_STARTS) {
+    if (candidate <= cp) start = candidate;
+    else break;
+  }
+  return (cp - start) % 10;
+}
+
 /** Chuẩn hoá một token số để so khớp: "3,5" → "3.5"; "1.000" → "1000". */
 export function normalizeNumberToken(token) {
   const t = String(token ?? '').trim();
@@ -103,9 +200,9 @@ export function normalizeNumberToken(token) {
   return t.replace(',', '.');
 }
 
-/** Tập hợp số có trong văn bản (đã đổi chữ số Hán). */
+/** Tập hợp số có trong văn bản (đã đổi chữ số Hán + mọi bộ chữ số Unicode về ASCII). */
 export function numbersIn(text) {
-  const converted = convertChineseNumerals(text);
+  const converted = toAsciiDigits(convertChineseNumerals(normalizeForMatch(text)));
   const set = new Set();
   for (const m of converted.matchAll(/\d+(?:[.,]\d+)?/g)) {
     const n = normalizeNumberToken(m[0]);
@@ -117,11 +214,117 @@ export function numbersIn(text) {
 /** Số Ả Rập (không đổi chữ số Hán) — dùng cho phía tiếng Việt. */
 export function asciiNumbersIn(text) {
   const set = new Set();
-  for (const m of String(text ?? '').matchAll(/\d+(?:[.,]\d+)?/g)) {
+  for (const m of toAsciiDigits(normalizeForMatch(text)).matchAll(/\d+(?:[.,]\d+)?/g)) {
     const n = normalizeNumberToken(m[0]);
     if (n) set.add(n);
   }
   return set;
+}
+
+/* ─── Số viết bằng CHỮ tiếng Việt (một…mười, mười hai, hai mươi, trăm, nghìn…) ───
+ *
+ * F-08: "Áo thun cotton mười hai tháng hậu mãi" từng lọt vì không có chữ số nào.
+ * Luật bổ sung: cụm số-viết-bằng-chữ ĐI KÈM một đơn vị/thời gian trong danh sách
+ * dưới đây ⇒ coi là số liệu; nếu giá trị đó không có trong chữ gốc ⇒ vi phạm (a).
+ */
+
+const VI_NUMBER_WORDS = Object.freeze({
+  không: 0,
+  linh: 0,
+  lẻ: 0,
+  một: 1,
+  mốt: 1,
+  hai: 2,
+  ba: 3,
+  bốn: 4,
+  tư: 4,
+  năm: 5,
+  lăm: 5,
+  sáu: 6,
+  bảy: 7,
+  tám: 8,
+  chín: 9,
+});
+
+const VI_MULTIPLIERS = Object.freeze({
+  chục: 10,
+  mươi: 10,
+  mười: 10,
+  trăm: 100,
+  nghìn: 1000,
+  nghàn: 1000,
+  ngàn: 1000,
+  triệu: 1000000,
+  tỷ: 1000000000,
+  tỉ: 1000000000,
+});
+
+/** Cụm từ chỉ số bằng chữ; dài trước để regex không cắt sai. */
+const VI_NUM_WORD_ALT =
+  'không|linh|lẻ|một|mốt|hai|ba|bốn|tư|năm|lăm|sáu|bảy|tám|chín|chục|mươi|mười|trăm|nghìn|nghàn|ngàn|triệu|tỷ|tỉ';
+
+const VI_NUM_WORD_RUN = `(?:${VI_NUM_WORD_ALT})(?:\\s+(?:${VI_NUM_WORD_ALT})){0,4}`;
+
+/** Đơn vị / mốc thời gian phải đi kèm thì cụm số-bằng-chữ mới bị coi là "số liệu". */
+const COUNTED_UNITS = Object.freeze([
+  'tháng', 'năm', 'ngày', 'giờ', 'phút', 'lần', '%', 'kg', 'g', 'ml', 'l', 'cm', 'mm', 'm',
+  'W', 'V', 'mAh', 'chiếc', 'cái', 'bộ', 'hộp', 'gói',
+]);
+
+const COUNTED_UNIT_ALT = COUNTED_UNITS
+  .slice()
+  .sort((a, b) => b.length - a.length)
+  .map((u) => u.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  .join('|');
+
+const VI_WORD_NUMBER_UNIT_RE = new RegExp(
+  `(?<![\\p{L}\\p{N}])(${VI_NUM_WORD_RUN})\\s*(${COUNTED_UNIT_ALT})(?![\\p{L}\\p{N}])`,
+  'giu',
+);
+
+/** Đổi cụm số-bằng-chữ tiếng Việt thành số: "mười hai" → 12, "hai mươi" → 20. */
+export function vietnameseWordsToNumber(run) {
+  const words = String(run ?? '')
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+  let total = 0;
+  let section = 0;
+  let digit = 0;
+  let seen = false;
+  for (const word of words) {
+    if (VI_NUMBER_WORDS[word] !== undefined) {
+      digit = VI_NUMBER_WORDS[word];
+      seen = true;
+    } else if (VI_MULTIPLIERS[word] !== undefined) {
+      const unit = VI_MULTIPLIERS[word];
+      seen = true;
+      if (unit >= 1000) {
+        section = (section + digit) * unit;
+        total += section;
+        section = 0;
+      } else {
+        section += (digit || 1) * unit;
+      }
+      digit = 0;
+    }
+  }
+  if (!seen) return null;
+  return total + section + digit;
+}
+
+/**
+ * Tìm các cụm "số viết bằng chữ + đơn vị" trong bản dịch.
+ * @returns {{phrase: string, unit: string, value: number|null}[]}
+ */
+export function wordNumberUnitsIn(text) {
+  const s = normalizeForMatch(text);
+  const out = [];
+  for (const m of s.matchAll(VI_WORD_NUMBER_UNIT_RE)) {
+    const phrase = `${m[1]} ${m[2]}`.replace(/\s+/g, ' ').trim();
+    out.push({ phrase, unit: String(m[2]), value: vietnameseWordsToNumber(m[1]) });
+  }
+  return out;
 }
 
 /** Đơn vị tiếng Trung → đơn vị chuẩn (không dùng cờ /g để tránh trạng thái lastIndex). */
@@ -188,7 +391,7 @@ function canonicalUnit(raw) {
 
 /** Tập hợp đơn vị có trong văn bản (cả đơn vị Latin lẫn từ chỉ đơn vị tiếng Trung). */
 export function unitsIn(text) {
-  const s = String(text ?? '');
+  const s = normalizeForMatch(text);
   const set = new Set();
   for (const m of s.matchAll(new RegExp(VI_NUM_UNIT_SOURCE, 'gi'))) {
     const u = canonicalUnit(m[2]);
@@ -202,12 +405,19 @@ export function unitsIn(text) {
 
 /**
  * Luật (a): số liệu / đơn vị trong `text_vi` mà `text_original` không có.
+ *
+ * F-08: ngoài chữ số (mọi bộ chữ số Unicode), còn bắt SỐ VIẾT BẰNG CHỮ tiếng Việt
+ * khi nó đi kèm đơn vị/thời gian ("mười hai tháng", "hai mươi lần"…) — nếu giá trị
+ * đó không có trong chữ gốc thì vẫn là bịa số liệu.
+ *
  * @returns {string[]} câu tiếng Việt
  */
 export function checkNumericClaims(textOriginal, textVi) {
   const out = [];
-  const originalNumbers = numbersIn(textOriginal);
-  const viNumbers = asciiNumbersIn(textVi);
+  const original = normalizeForMatch(textOriginal);
+  const vi = normalizeForMatch(textVi);
+  const originalNumbers = numbersIn(original);
+  const viNumbers = asciiNumbersIn(vi);
 
   const missing = [...viNumbers].filter((n) => !originalNumbers.has(n));
   if (missing.length > 0) {
@@ -218,8 +428,18 @@ export function checkNumericClaims(textOriginal, textVi) {
     }
   }
 
-  const originalUnits = unitsIn(textOriginal);
-  const missingUnits = [...unitsIn(textVi)].filter((u) => !originalUnits.has(u));
+  // Số viết bằng chữ tiếng Việt + đơn vị (F-08).
+  for (const hit of wordNumberUnitsIn(vi)) {
+    const value = hit.value;
+    if (value === null || !Number.isFinite(value)) continue;
+    if (originalNumbers.has(String(value))) continue; // chữ gốc có đúng số đó
+    const label = `“${hit.phrase}”${String(value) !== hit.phrase ? ` (= ${value})` : ''}`;
+    const violation = `Số liệu ${label} không có trong chữ gốc — không được tự thêm số.`;
+    if (!out.includes(violation)) out.push(violation);
+  }
+
+  const originalUnits = unitsIn(original);
+  const missingUnits = [...unitsIn(vi)].filter((u) => !originalUnits.has(u));
   if (missingUnits.length > 0) {
     const shown = missingUnits.slice(0, 3).map((u) => `“${u}”`).join(', ');
     out.push(`Đơn vị ${shown} không có trong chữ gốc — không được tự thêm đơn vị.`);
@@ -292,8 +512,9 @@ export const CLAIM_GROUPS = Object.freeze([
  */
 export function checkClaimWords(textOriginal, textVi) {
   const out = [];
-  const original = String(textOriginal ?? '');
-  const viText = String(textVi ?? '');
+  // F-08: bỏ ký tự vô hình trước khi so khớp ("bảo\u200bhành" vẫn là "bảo hành").
+  const original = normalizeForMatch(textOriginal);
+  const viText = normalizeForMatch(textVi);
   for (const group of CLAIM_GROUPS) {
     const re = new RegExp(group.vi.source, group.vi.flags.includes('g') ? group.vi.flags : `${group.vi.flags}g`);
     const hits = [...new Set([...viText.matchAll(re)].map((m) => m[0]))];
@@ -318,6 +539,7 @@ export function resolveTranslatable(line, region) {
   if (line?.status === TRANSLATE_STATUS.SKIPPED_BRAND) return false;
   if (line?.status === TRANSLATE_STATUS.SKIPPED_CERTIFICATION) return false;
   if (line?.status === TRANSLATE_STATUS.SKIPPED_PRICE) return false;
+  if (line?.status === TRANSLATE_STATUS.SKIPPED_BY_USER) return false;
   if (typeof line?.translatable === 'boolean') return line.translatable;
   if (typeof region?.translatable === 'boolean') return region.translatable;
   return kind === 'descriptive' || kind === '';
@@ -331,8 +553,10 @@ export function resolveTranslatable(line, region) {
  */
 export function enforceTranslationGuardrails(line, { region } = {}) {
   const base = { ...(line || {}) };
-  const textOriginal = String(base.text_original ?? region?.text ?? '');
-  const textVi = String(base.text_vi ?? '');
+  // F-08: mọi phép so khớp chạy trên văn bản đã bỏ ký tự vô hình + NFC; văn bản trong
+  // `line` KHÔNG bị sửa (giữ nguyên thứ người dùng gõ).
+  const textOriginal = normalizeForMatch(base.text_original ?? region?.text ?? '');
+  const textVi = normalizeForMatch(base.text_vi ?? '');
   const translatable = resolveTranslatable(base, region);
 
   const violations = [...(Array.isArray(base.violations) ? base.violations : [])];
@@ -340,18 +564,24 @@ export function enforceTranslationGuardrails(line, { region } = {}) {
   // (a) số liệu / đơn vị không có trong chữ gốc
   violations.push(...checkNumericClaims(textOriginal, textVi));
 
-  // (b) còn ký tự CJK → CHƯA DỊCH
-  if (hasCjk(textVi)) {
+  // (b) còn ký tự CHƯA DỊCH (Hán, kana, Hangul) → CHƯA DỊCH
+  if (hasUntranslatedScript(textVi)) {
     violations.push(
-      `CHƯA DỊCH: bản dịch còn ký tự Trung Quốc (${cjkSample(textVi)}) — phải dịch hết hoặc để người duyệt.`,
+      `CHƯA DỊCH: bản dịch còn ký tự chưa dịch (${untranslatedSample(textVi)}) — phải dịch hết hoặc để người duyệt.`,
     );
   }
 
   // (c) khẳng định không có trong chữ gốc
   violations.push(...checkClaimWords(textOriginal, textVi));
 
-  // (d) rỗng nhưng phải dịch. Bỏ qua dòng FAILED: lỗi provider đã có mã lỗi riêng (luật 4 của hợp đồng).
-  if (translatable && textVi.trim() === '' && base.status !== TRANSLATE_STATUS.FAILED) {
+  // (d) rỗng nhưng phải dịch. Bỏ qua dòng FAILED (lỗi provider đã có mã riêng) và
+  // dòng SKIPPED_BY_USER (người dùng CHỦ ĐỘNG bỏ qua — không phải vi phạm).
+  if (
+    translatable &&
+    textVi.trim() === '' &&
+    base.status !== TRANSLATE_STATUS.FAILED &&
+    base.status !== TRANSLATE_STATUS.SKIPPED_BY_USER
+  ) {
     violations.push('Bản dịch rỗng nhưng vùng này phải dịch (translatable = true) — cần người duyệt.');
   }
 
@@ -360,8 +590,15 @@ export function enforceTranslationGuardrails(line, { region } = {}) {
   if (status === undefined || status === null) {
     status = textVi.trim() === '' ? TRANSLATE_STATUS.NEEDS_REVIEW : TRANSLATE_STATUS.TRANSLATED;
   }
-  // Có vi phạm ⇒ NEEDS_REVIEW. Ngoại lệ duy nhất: dòng FAILED giữ nguyên trạng thái lỗi provider.
-  if (unique.length > 0 && status !== TRANSLATE_STATUS.FAILED) status = TRANSLATE_STATUS.NEEDS_REVIEW;
+  // Có vi phạm ⇒ NEEDS_REVIEW. Ngoại lệ: dòng FAILED (lỗi provider) và SKIPPED_BY_USER
+  // (quyết định của người dùng) giữ nguyên trạng thái của chúng.
+  if (
+    unique.length > 0 &&
+    status !== TRANSLATE_STATUS.FAILED &&
+    status !== TRANSLATE_STATUS.SKIPPED_BY_USER
+  ) {
+    status = TRANSLATE_STATUS.NEEDS_REVIEW;
+  }
 
   const next = { ...base, status, violations: unique };
   return { line: next, violations: unique };

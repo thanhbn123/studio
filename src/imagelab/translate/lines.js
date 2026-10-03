@@ -5,13 +5,17 @@
  * Mọi dòng do module này sinh ra chỉ có 10 field đó (C4 lưu DB, C5 hiển thị, test có thể so khít).
  */
 
-/** Tám trạng thái hợp lệ — không được sinh ra giá trị nào khác. */
+/** Chín trạng thái hợp lệ — không được sinh ra giá trị nào khác. */
 export const TRANSLATE_STATUS = Object.freeze({
   TRANSLATED: 'TRANSLATED',
   GLOSSARY: 'GLOSSARY',
   SKIPPED_BRAND: 'SKIPPED_BRAND',
   SKIPPED_CERTIFICATION: 'SKIPPED_CERTIFICATION',
   SKIPPED_PRICE: 'SKIPPED_PRICE',
+  // Bổ sung sau phản biện F-06: người dùng CHỦ ĐỘNG bỏ qua dòng (action `skip`) —
+  // khác hẳn `NEEDS_REVIEW` (bị guardrail chặn, còn phải duyệt). Không chặn render,
+  // nhưng luôn xuất hiện trong `skipped` kèm lý do để không im lặng.
+  SKIPPED_BY_USER: 'SKIPPED_BY_USER',
   NEEDS_REVIEW: 'NEEDS_REVIEW',
   USER_EDITED: 'USER_EDITED',
   FAILED: 'FAILED',
@@ -19,7 +23,8 @@ export const TRANSLATE_STATUS = Object.freeze({
 
 export const TRANSLATE_STATUS_LIST = Object.freeze(Object.values(TRANSLATE_STATUS));
 
-/** Các trạng thái "bỏ qua vì không được phép dịch". */
+/** Các trạng thái "bỏ qua vì không được phép dịch" (KHÔNG gồm `SKIPPED_BY_USER` — đó là
+ *  quyết định của người dùng, không phải vùng bị khoá theo luật #3). */
 export const SKIPPED_STATUSES = Object.freeze([
   TRANSLATE_STATUS.SKIPPED_BRAND,
   TRANSLATE_STATUS.SKIPPED_CERTIFICATION,

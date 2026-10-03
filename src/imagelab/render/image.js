@@ -289,3 +289,123 @@ export function normalizeColor(value, fallback = [20, 20, 20, 255]) {
   }
   return fallback;
 }
+
+/* ─────────── Vùng BẢO VỆ (protected boxes) — bổ sung sau phản biện F-01 ───────────
+ *
+ * Hợp đồng luật #3: nhãn hiệu / chứng nhận / giá KHÔNG BAO GIỜ bị xoá. Tầng pipeline
+ * đã không dựng op cho vùng giao với các hộp đó, nhưng đây là hàng rào CUỐI ở tầng
+ * pixel: dù op có yêu cầu `erase`/`erase_and_draw` phủ lên, provider thật (purejs)
+ * vẫn phải trả lại NGUYÊN VẸN từng pixel trong các hộp được bảo vệ.
+ */
+
+/** Chuẩn hoá danh sách hộp pixel; bỏ hộp sai kiểu / rỗng. Không tự clamp vào ảnh. */
+export function normalizeBoxes(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+  const out = [];
+  for (const item of list) {
+    if (!item || typeof item !== 'object') continue;
+    const x = Number(item.x);
+    const y = Number(item.y);
+    const w = Number(item.w ?? item.width);
+    const h = Number(item.h ?? item.height);
+    if (![x, y, w, h].every((v) => Number.isFinite(v))) continue;
+    const box = { x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) };
+    if (box.w <= 0 || box.h <= 0) continue;
+    out.push(box);
+  }
+  return out;
+}
+
+/**
+ * Chuẩn hoá `options.protected_boxes` — nhận HAI dạng:
+ *   - `{ x, y, w, h }`                → bảo vệ với MỌI op;
+ *   - `{ region_id, box: {x,y,w,h} }` → bảo vệ với mọi op TRỪ op của chính vùng đó,
+ *     để override CÓ VẾT của người dùng vẫn vẽ được lên vùng của nó (F-02).
+ * @returns {{region_id: string|null, box: {x:number,y:number,w:number,h:number}}[]}
+ */
+export function normalizeProtectedBoxes(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+  const out = [];
+  for (const item of list) {
+    if (!item || typeof item !== 'object') continue;
+    const nested = item.box && typeof item.box === 'object' ? item.box : null;
+    const box = normalizeBoxes([nested ?? item])[0];
+    if (!box) continue;
+    const regionId = item.region_id === undefined || item.region_id === null ? null : String(item.region_id);
+    out.push({ region_id: regionId, box });
+  }
+  return out;
+}
+
+/** Hai hộp có giao nhau (diện tích chung > 0) hay không. */
+export function boxesOverlap(a, b) {
+  if (!a || !b) return false;
+  return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+}
+
+/**
+ * `box` có bị các hộp `covers` phủ KÍN hoàn toàn không (không còn pixel nào lộ ra)?
+ * Dùng để biết một op có bị mặt nạ vô hiệu hoá toàn bộ hay chỉ một phần.
+ */
+export function boxCoveredBy(box, covers) {
+  if (!box) return false;
+  const x0 = box.x;
+  const x1 = box.x + box.w;
+  const y0 = box.y;
+  const y1 = box.y + box.h;
+  const parts = (Array.isArray(covers) ? covers : [])
+    .map((c) => ({
+      x0: Math.max(c.x, x0),
+      x1: Math.min(c.x + c.w, x1),
+      y0: Math.max(c.y, y0),
+      y1: Math.min(c.y + c.h, y1),
+    }))
+    .filter((c) => c.x0 < c.x1 && c.y0 < c.y1);
+  if (parts.length === 0) return false;
+  for (let y = y0; y < y1; y += 1) {
+    const spans = parts
+      .filter((c) => y >= c.y0 && y < c.y1)
+      .map((c) => [c.x0, c.x1])
+      .sort((a, b) => a[0] - b[0]);
+    let cursor = x0;
+    for (const [sx0, sx1] of spans) {
+      if (sx0 > cursor) return false; // còn khe hở ⇒ chưa phủ kín
+      if (sx1 > cursor) cursor = sx1;
+      if (cursor >= x1) break;
+    }
+    if (cursor < x1) return false;
+  }
+  return true;
+}
+
+/** Chụp lại pixel của từng hộp (bản sao) để khôi phục sau mỗi op. */
+export function snapshotBoxes(pixels, dims, boxes) {
+  const out = [];
+  for (const raw of Array.isArray(boxes) ? boxes : []) {
+    const box = clampBox(raw, dims);
+    if (!box) continue;
+    const rowBytes = box.w * 4;
+    const data = Buffer.allocUnsafe(rowBytes * box.h);
+    for (let y = 0; y < box.h; y += 1) {
+      const src = ((box.y + y) * dims.width + box.x) * 4;
+      pixels.copy(data, y * rowBytes, src, src + rowBytes);
+    }
+    out.push({ box, data });
+  }
+  return out;
+}
+
+/** Ghi trả pixel gốc cho các hộp đã chụp. Trả về số pixel được khôi phục. */
+export function restoreBoxes(pixels, dims, snapshots) {
+  let restored = 0;
+  for (const snap of Array.isArray(snapshots) ? snapshots : []) {
+    const { box, data } = snap;
+    const rowBytes = box.w * 4;
+    for (let y = 0; y < box.h; y += 1) {
+      const dst = ((box.y + y) * dims.width + box.x) * 4;
+      data.copy(pixels, dst, y * rowBytes, y * rowBytes + rowBytes);
+    }
+    restored += box.w * box.h;
+  }
+  return restored;
+}

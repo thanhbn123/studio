@@ -18,12 +18,27 @@ export const PUBLIC_DIR = path.resolve(HERE, '../../public');
 export const MAX_BODY_BYTES_DEFAULT = 12 * 1024 * 1024; // 12MB — đủ cho vài ảnh base64
 
 export class HttpError extends Error {
-  constructor(status, code, message, details = {}) {
+  /**
+   * @param {number} status mã HTTP
+   * @param {string} code mã lỗi ổn định cho UI
+   * @param {string} message câu tiếng Việt an toàn (không chứa secret/đường dẫn nội bộ)
+   * @param {object} [details] chi tiết có cấu trúc (chỉ trả khi status < 500)
+   * @param {{expose?: boolean}} [options] `expose = true` ⇒ `sendError` được phép trả
+   *        ĐÚNG `message` đã viết, kể cả với 5xx (F-05). Chỉ đánh dấu cho những lỗi có
+   *        thông báo tiếng Việt do chính repo viết; KHÔNG bao giờ lộ stack.
+   */
+  constructor(status, code, message, details = {}, { expose = false } = {}) {
     super(message);
     this.name = 'HttpError';
     this.status = status;
     this.code = code;
     this.details = details;
+    this.expose = expose === true;
+  }
+
+  /** Lỗi có thông báo AN TOÀN để hiện thẳng cho người dùng (kể cả 5xx) — F-05. */
+  static safe(status, code, message, details = {}) {
+    return new HttpError(status, code, message, details, { expose: true });
   }
 }
 
@@ -193,6 +208,8 @@ export function sendJson(res, status, payload, extraHeaders = {}) {
 export function sendError(res, err) {
   const status = err?.status || (err?.code === 'RATE_LIMITED' ? 429 : 500);
   // Thông báo lỗi an toàn: không lộ stack, không lộ đường dẫn nội bộ, không lộ secret.
+  // F-05: lỗi 5xx có `expose = true` (thông báo tiếng Việt do repo tự viết) được trả
+  // ĐÚNG câu đó thay vì câu chung — vẫn KHÔNG bao giờ trả stack.
   const isServer = status >= 500;
   const payload = {
     error: {
@@ -200,7 +217,7 @@ export function sendError(res, err) {
       message: isServer && !err?.expose
         ? 'Lỗi hệ thống. Vui lòng thử lại.'
         : err?.message || 'Lỗi không xác định.',
-      ...(err?.details && status < 500 ? { details: err.details } : {}),
+      ...(err?.details && (status < 500 || err?.expose) ? { details: err.details } : {}),
     },
   };
   if (err?.retryAfterMs) payload.error.retry_after_ms = err.retryAfterMs;
@@ -235,6 +252,19 @@ export function sessionId(req, res) {
     res.setHeader('set-cookie', `sid=${sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`);
   }
   return sid;
+}
+
+/**
+ * Session mà NGƯỜI GỌI thực sự KHAI qua cookie — `null` nếu không khai (khách ẩn danh).
+ *
+ * Dùng cho luật "404 theo session" của các route MVP-01 cũ (F-04): request KHÔNG khai
+ * session nào thì không thể đối chiếu chủ sở hữu, nên bị coi là khách ẩn danh — đúng
+ * giới hạn đã ghi ở MVP-01 (`session_id` KHÔNG phải xác thực; MVP-05 sẽ thay bằng tài
+ * khoản thật). Xem `docs/VERIFICATION.md` và `README.md`.
+ */
+export function presentedSessionId(req) {
+  const raw = parseCookies(req?.headers?.cookie || '').sid;
+  return typeof raw === 'string' && /^[A-Za-z0-9_-]{16,64}$/.test(raw) ? raw : null;
 }
 
 export function parseCookies(header) {

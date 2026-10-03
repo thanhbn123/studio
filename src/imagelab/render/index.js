@@ -24,7 +24,23 @@ export { layoutText } from './layout.js';
 export { loadFont, BitmapFont } from './font/index.js';
 export { sha256, decodePng, encodePng, readPngHeader, crc32 } from './png.js';
 export { estimateBackground, eraseBox } from './inpaint.js';
-export { probeImage, toRgba, clampBox, normalizeColor, getPixel, setPixel, blendPixel, fillRect } from './image.js';
+export {
+  probeImage,
+  toRgba,
+  clampBox,
+  normalizeColor,
+  getPixel,
+  setPixel,
+  blendPixel,
+  fillRect,
+  // Vùng bảo vệ (bổ sung sau phản biện F-01)
+  normalizeBoxes,
+  normalizeProtectedBoxes,
+  boxesOverlap,
+  boxCoveredBy,
+  snapshotBoxes,
+  restoreBoxes,
+} from './image.js';
 export { drawLayout } from './draw.js';
 export { normalizeOps, RENDER_ACTIONS } from './ops.js';
 export { MockRenderProvider } from './providers/mock.js';

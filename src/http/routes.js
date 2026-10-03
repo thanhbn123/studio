@@ -5,7 +5,7 @@
  * không lộ secret, không lộ chi tiết nội bộ).
  */
 
-import { Router, HttpError, sendJson, readJson, sessionId, MAX_BODY_BYTES_DEFAULT, SECURITY_HEADERS } from './server.js';
+import { Router, HttpError, sendJson, readJson, sessionId, presentedSessionId, MAX_BODY_BYTES_DEFAULT, SECURITY_HEADERS } from './server.js';
 import { tryDetectSource } from '../sources/detect.js';
 import { STYLES, LENGTHS } from '../content/styles.js';
 import { JOB_STATUS } from '../store/index.js';
@@ -24,6 +24,30 @@ export function buildRouter(app) {
     const job = await store.getJob(id);
     if (!job) throw new HttpError(404, 'JOB_NOT_FOUND', 'Không tìm thấy job.');
     return job;
+  };
+
+  /**
+   * F-04 (sau phản biện) — route MVP-01 CŨ cũng phải kiểm quyền sở hữu theo session,
+   * đúng chính sách của `/api/imagelab/*`: tài nguyên của session khác trả **404**
+   * (không xác nhận sự tồn tại).
+   *
+   * ⚠️ `session_id` KHÔNG phải xác thực (cookie do client gửi — đã ghi từ MVP-01):
+   * luật này chỉ chống TRUY CẬP NHẦM giữa các phiên, KHÔNG phải hàng rào bảo mật.
+   * Request KHÔNG khai cookie session nào được coi là khách ẩn danh (MVP-01 vẫn chạy
+   * được không cần cookie); riêng job ImageLab (`kind = 'image_translation'`) thì luôn
+   * yêu cầu session khớp, vì đó là tài nguyên của MVP-02.
+   */
+  const requireOwnJob = async (req, res, id) => {
+    const job = await requireJob(id);
+    if (!job.session_id) return job; // job cũ không gắn session → không có gì để đối chiếu
+    const sid = sessionId(req, res);
+    if (job.session_id === sid) return job;
+    const presented = presentedSessionId(req);
+    const isImagelabJob = String(job.kind ?? '') === 'image_translation';
+    if (presented !== null || isImagelabJob) {
+      throw new HttpError(404, 'JOB_NOT_FOUND', 'Không tìm thấy job.');
+    }
+    return job; // khách ẩn danh (không khai session) — hành vi MVP-01 giữ nguyên
   };
 
   /* ─────────────── MVP-02 · tiện ích dùng chung cho imagelab ─────────────── */
@@ -95,18 +119,19 @@ export function buildRouter(app) {
 
   const requireImagelab = () => {
     if (!imagelabAvailable()) {
-      throw new HttpError(503, 'IMAGELAB_UNAVAILABLE', imagelabUnavailableReason());
+      // F-05: thông báo tiếng Việt tự viết, đã lọc đường dẫn/secret → được phép hiện thẳng.
+      throw HttpError.safe(503, 'IMAGELAB_UNAVAILABLE', imagelabUnavailableReason());
     }
   };
   const requirePipelineMethod = (name) => {
     requireImagelab();
     if (typeof app.imagelabPipeline?.[name] !== 'function') {
-      throw new HttpError(503, 'IMAGELAB_UNAVAILABLE', `Pipeline dịch ảnh thiếu phương thức "${name}" — tính năng chưa sẵn sàng.`);
+      throw HttpError.safe(503, 'IMAGELAB_UNAVAILABLE', `Pipeline dịch ảnh thiếu phương thức "${name}" — tính năng chưa sẵn sàng.`);
     }
   };
   const requireStoreMethod = (name) => {
     if (typeof store[name] !== 'function') {
-      throw new HttpError(503, 'IMAGELAB_UNAVAILABLE', `Kho dữ liệu thiếu phương thức "${name}" — tính năng dịch ảnh chưa sẵn sàng.`);
+      throw HttpError.safe(503, 'IMAGELAB_UNAVAILABLE', `Kho dữ liệu thiếu phương thức "${name}" — tính năng dịch ảnh chưa sẵn sàng.`);
     }
   };
 
@@ -303,7 +328,8 @@ export function buildRouter(app) {
   /* ───────────────────── G10 — màn hình kết quả ───────────────────── */
 
   router.get('/api/jobs/:id', async (req, res, params) => {
-    const job = await requireJob(params.id);
+    // F-04: job của session khác (hoặc job ImageLab không có session khớp) → 404.
+    const job = await requireOwnJob(req, res, params.id);
     const [usage, evidence] = await Promise.all([store.usageSummary(job.id), store.getEvidence(job.id)]);
     sendJson(res, 200, {
       id: job.id,
@@ -340,7 +366,7 @@ export function buildRouter(app) {
   router.post('/api/jobs/:id/regenerate', async (req, res, params) => {
     const sid = sessionId(req, res);
     enforce(rateLimiters.jobs, `regen:${sid}`);
-    const job = await requireJob(params.id);
+    const job = await requireOwnJob(req, res, params.id); // F-04
     const body = await readJson(req, { maxBytes: 256 * 1024 });
     const opts = parseContentOptions({
       style: body.style ?? job.style,
@@ -366,7 +392,7 @@ export function buildRouter(app) {
   /* ─────────────── G10 — Edit: người dùng sửa nội dung ─────────────── */
 
   router.put('/api/jobs/:id/content', async (req, res, params) => {
-    const job = await requireJob(params.id);
+    const job = await requireOwnJob(req, res, params.id); // F-04: chặn GHI trộm qua route cũ
     const body = await readJson(req, { maxBytes: 1024 * 1024 });
     if (!body || typeof body !== 'object') throw new HttpError(400, 'BAD_CONTENT', 'Thiếu nội dung.');
 
@@ -410,7 +436,7 @@ export function buildRouter(app) {
   /* ─────────────────────── G13 — usage của job ─────────────────────── */
 
   router.get('/api/jobs/:id/usage', async (req, res, params) => {
-    const job = await requireJob(params.id);
+    const job = await requireOwnJob(req, res, params.id); // F-04
     const [events, summary] = await Promise.all([store.listUsage(job.id), store.usageSummary(job.id)]);
     sendJson(res, 200, { job_id: job.id, events, summary });
   });
@@ -483,7 +509,7 @@ export function buildRouter(app) {
     // Fail-closed: provider chưa cấu hình thì báo ngay, không nhận ảnh rồi để job
     // chết trong hàng đợi mà người dùng không hiểu vì sao.
     if (isUnconfigured(app.ocrProvider) || isUnconfigured(app.translator)) {
-      throw new HttpError(502, 'NOT_CONFIGURED', 'Provider OCR/dịch chưa được cấu hình — chưa thể dịch ảnh.');
+      throw HttpError.safe(502, 'NOT_CONFIGURED', 'Provider OCR/dịch chưa được cấu hình — chưa thể dịch ảnh.');
     }
 
     const jobId = await store.createJob({
@@ -547,6 +573,12 @@ export function buildRouter(app) {
       render_summary: buildRenderSummary(lastRendered),
       warnings: collectWarnings(asset, lastRendered),
       providers: imagelabProviders(),
+      // F-03 (sau phản biện): nhãn MOCK phải theo DẤU VẾT CỦA JOB, không theo cấu hình
+      // máy chủ đang chạy. `mock_steps` đọc từ `content_meta.imagelab.mock_steps` +
+      // meta của chính các ảnh thuộc job; `providers_snapshot` là ảnh chụp provider
+      // tại THỜI ĐIỂM CHẠY đã lưu trong job (khác `providers` = cấu hình hiện tại).
+      mock_steps: collectMockSteps(job, list),
+      providers_snapshot: providersSnapshot(job, list),
       // Bổ sung (không nằm trong hợp đồng tối thiểu): vùng OCR bị bỏ + cảnh báo OCR,
       // để UI hiện được "vùng bị bỏ kèm lý do" mà không phải bịa.
       ocr: collectOcrMeta(asset),
@@ -576,7 +608,7 @@ export function buildRouter(app) {
     // đã bị xoá. Thiếu module ⇒ báo 503, KHÔNG mô phỏng kết quả.
     const applyReviewEdits = await loadImagelabFunction('../imagelab/translate/index.js', 'applyReviewEdits');
     if (!applyReviewEdits) {
-      throw new HttpError(503, 'IMAGELAB_UNAVAILABLE', 'Module duyệt bản dịch chưa nạp được trên máy chủ này.');
+      throw HttpError.safe(503, 'IMAGELAB_UNAVAILABLE', 'Module duyệt bản dịch chưa nạp được trên máy chủ này.');
     }
 
     let result;
@@ -611,12 +643,12 @@ export function buildRouter(app) {
     const force = body.force === true;
 
     if (isUnconfigured(app.renderProvider)) {
-      throw new HttpError(502, 'NOT_CONFIGURED', 'Provider render chưa được cấu hình — chưa thể render ảnh.');
+      throw HttpError.safe(502, 'NOT_CONFIGURED', 'Provider render chưa được cấu hình — chưa thể render ảnh.');
     }
 
     const lines = ((await store.listTranslationLines(job.id)) || []).map(lineJson);
     if (lines.length === 0) {
-      throw new HttpError(409, 'IMAGELAB_NO_LINES', 'Job chưa có dòng chữ nào để render.');
+      throw HttpError.safe(409, 'IMAGELAB_NO_LINES', 'Job chưa có dòng chữ nào để render.');
     }
     // Cùng MỘT hàm luật với `renderApproved` của pipeline (hợp đồng 4.4): dòng
     // `NEEDS_REVIEW` mà `edited_by_user === true` coi như đã được người dùng xử lý.
@@ -624,11 +656,11 @@ export function buildRouter(app) {
     // người dùng đã bấm bỏ qua trong khi pipeline cho qua.
     const pendingReviewLines = await loadImagelabFunction('../imagelab/pipeline.js', 'pendingReviewLines');
     if (!pendingReviewLines) {
-      throw new HttpError(503, 'IMAGELAB_UNAVAILABLE', 'Module pipeline dịch ảnh chưa nạp được trên máy chủ này.');
+      throw HttpError.safe(503, 'IMAGELAB_UNAVAILABLE', 'Module pipeline dịch ảnh chưa nạp được trên máy chủ này.');
     }
     const pending = pendingReviewLines(lines);
     if (pending.length > 0 && !force) {
-      throw new HttpError(409, 'REVIEW_REQUIRED', `Còn ${pending.length} dòng cần bạn duyệt trước khi render.`, {
+      throw HttpError.safe(409, 'REVIEW_REQUIRED', `Còn ${pending.length} dòng cần bạn duyệt trước khi render.`, {
         pending_region_ids: pending.map((l) => l.region_id).slice(0, 100),
       });
     }
@@ -827,8 +859,85 @@ function buildRenderSummary(rendered) {
     unsupported_glyphs: asArray(meta.unsupported_glyphs),
     warnings: asArray(meta.warnings).map(String),
     forced: meta.forced ?? null,
+    // F-02: vết override nhãn hiệu/chứng nhận/giá đã dùng cho ảnh này.
+    overrides: asArray(meta.overrides),
     elapsed_ms: meta.elapsed_ms ?? null,
   };
+}
+
+const MOCK_STEP_ORDER = Object.freeze(['ocr', 'translate', 'render']);
+
+const isTruthyMock = (value) => value === true || value === 1 || value === '1' || value === 'true';
+
+/**
+ * F-03 — các bước đã chạy bằng provider MOCK, đọc từ DẤU VẾT ĐÃ LƯU của job:
+ * `content_meta.imagelab.mock_steps` (pipeline ghi lúc chạy) + meta của chính các ảnh
+ * thuộc job (`asset.meta.ocr.is_mock`, `asset.meta.is_mock` của ảnh render).
+ *
+ * Tuyệt đối KHÔNG suy ra từ cấu hình provider đang chạy: khởi động lại máy chủ với
+ * provider thật trên cùng DB thì job cũ vẫn phải báo MOCK.
+ */
+function collectMockSteps(job, assets) {
+  const steps = new Set();
+  const il = job?.content_meta?.imagelab;
+  if (il && typeof il === 'object') {
+    for (const s of asArray(il.mock_steps)) if (s) steps.add(String(s));
+  }
+  for (const a of asArray(assets)) {
+    const meta = a?.meta && typeof a.meta === 'object' ? a.meta : {};
+    if (isTruthyMock(meta.ocr?.is_mock)) steps.add('ocr');
+    if (isTruthyMock(meta.translate?.is_mock)) steps.add('translate');
+    if (isTruthyMock(meta.is_mock)) steps.add('render');
+  }
+  return MOCK_STEP_ORDER.filter((s) => steps.has(s)).concat([...steps].filter((s) => !MOCK_STEP_ORDER.includes(s)));
+}
+
+/**
+ * F-03 — ẢNH CHỤP provider tại THỜI ĐIỂM CHẠY, lấy từ dữ liệu đã lưu của job
+ * (`content_meta.imagelab.ocr/translate/render`), không phải từ `app.*Provider`.
+ * Trường nào job chưa chạy tới thì để `null` (không bịa).
+ */
+function providersSnapshot(job, assets) {
+  const il = job?.content_meta?.imagelab;
+  const meta = il && typeof il === 'object' ? il : {};
+  const fromRecord = (rec) => {
+    if (!rec || typeof rec !== 'object') return null;
+    return {
+      name: rec.provider ?? null,
+      model: rec.model ?? null,
+      is_mock: rec.is_mock ?? null,
+      status: rec.status ?? null,
+    };
+  };
+  const snapshot = {
+    ocr: fromRecord(meta.ocr),
+    translate: fromRecord(meta.translate),
+    render: fromRecord(meta.render),
+    recorded_at: meta.updated_at ?? null,
+  };
+  // Dự phòng (job cũ chưa có content_meta): đọc thẳng meta ảnh đã lưu.
+  if (!snapshot.ocr || !snapshot.render) {
+    for (const a of asArray(assets)) {
+      const am = a?.meta && typeof a.meta === 'object' ? a.meta : {};
+      if (!snapshot.ocr && am.ocr && typeof am.ocr === 'object') {
+        snapshot.ocr = {
+          name: am.ocr.provider ?? null,
+          model: am.ocr.model ?? null,
+          is_mock: am.ocr.is_mock ?? null,
+          status: am.ocr.status ?? null,
+        };
+      }
+      if (!snapshot.render && a?.role === 'rendered' && am.provider) {
+        snapshot.render = {
+          name: am.provider ?? null,
+          model: am.model ?? null,
+          is_mock: am.is_mock ?? null,
+          status: am.status ?? null,
+        };
+      }
+    }
+  }
+  return snapshot;
 }
 
 /** Gộp cảnh báo CÓ THẬT đã lưu trong meta của các asset (không tự sinh thêm). */
@@ -1036,8 +1145,8 @@ function mapImagelabError(err, fallbackMessage = 'Không xử lý được yêu 
   if (err instanceof HttpError) return err;
   const code = typeof err?.code === 'string' && err.code ? err.code : 'IMAGELAB_FAILED';
   const message = typeof err?.message === 'string' && err.message ? err.message : fallbackMessage;
-  if (code === 'REVIEW_REQUIRED') return new HttpError(409, code, message);
-  if (code === 'IMAGELAB_NO_LINES') return new HttpError(409, code, message);
+  if (code === 'REVIEW_REQUIRED') return HttpError.safe(409, code, message);
+  if (code === 'IMAGELAB_NO_LINES') return HttpError.safe(409, code, message);
   // Lỗi do CHÍNH ảnh người dùng gửi lên (ingest chạy trong request) — phải trả đúng
   // loại lỗi 4xx kèm lý do thật, không gộp vào "provider báo lỗi 502".
   if (code === 'UNSUPPORTED_IMAGE') return new HttpError(415, code, message);
@@ -1046,7 +1155,11 @@ function mapImagelabError(err, fallbackMessage = 'Không xử lý được yêu 
     return new HttpError(400, code, message);
   }
   if (code === 'OUTPUT_TOO_LARGE') return new HttpError(413, code, message);
-  if (/^(OCR|RENDER|TRANSLATE)/.test(code) || code === 'NOT_CONFIGURED') {
+  if (code === 'NOT_CONFIGURED') {
+    // F-05: câu này do repo tự viết, không chứa chi tiết provider → hiện thẳng.
+    return HttpError.safe(502, code, message);
+  }
+  if (/^(OCR|RENDER|TRANSLATE)/.test(code)) {
     return new HttpError(502, code, `Provider xử lý ảnh báo lỗi (${code}). Vui lòng thử lại hoặc kiểm tra cấu hình provider.`);
   }
   return new HttpError(500, code, fallbackMessage);
