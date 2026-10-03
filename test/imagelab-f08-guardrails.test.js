@@ -130,3 +130,55 @@ describe('MVP-02 F-08 · guardrail bắt biến thể từng lọt', () => {
     assert.match(out.violations.join(' | '), /bảo hành/i);
   });
 });
+
+/**
+ * VÒNG 6 — hai lỗ hổng guardrail còn lại sau phán quyết PASS, vá được mà KHÔNG tăng dương tính giả:
+ *   (1) HOMOGLYPH: từ khoá viết bằng ký tự Kirin/Greek giống hình ("bảo hànһ", "chống nướϲ");
+ *   (2) CHÍNH TẢ: biến thể thường gặp ("tốt nhứt", "chính hảng").
+ *
+ * Điều quan trọng không kém: câu tiếng Việt CÓ DẤU trùng chuỗi bỏ dấu với từ khoá ("Chỉnh hàng",
+ * "Đất chuẩn bị trồng", "Tột nhất") vẫn phải SẠCH — đó là lý do nhánh bỏ dấu chỉ chạy khi văn bản
+ * KHÔNG có dấu (N-10), và gộp homoglyph chỉ đụng ký tự Kirin/Greek.
+ */
+describe('MVP-02 vòng 6 · homoglyph + biến thể chính tả', () => {
+  const mustCatch = [
+    ['纯棉T恤', 'Áo thun bảo hànһ', /bảo hành/i, 'Kirin һ (U+04BB)'],
+    ['纯棉T恤', 'Áo thun сhính hãng', /chính hãng/i, 'Kirin с (U+0441)'],
+    ['纯棉T恤', 'Áo thun chống nướϲ', /chống nước/i, 'Greek ϲ (U+03F2, NFKC → ς)'],
+    ['纯棉T恤', 'Áo thun chống nướс', /chống nước/i, 'Kirin с ở cuối từ'],
+    ['纯棉T恤', 'Áo thun ｂảo hànһ', /bảo hành/i, 'full-width + homoglyph cùng lúc'],
+    ['纯棉T恤', 'Áo thun tốt nhứt thị trường', /tốt nhất/i, 'biến thể chính tả "nhứt"'],
+    ['纯棉T恤', 'Hàng chính hảng nhập khẩu', /chính hãng/i, 'biến thể chính tả "hảng"'],
+  ];
+
+  for (const [src, vi, re, note] of mustCatch) {
+    test(`${note}: "${vi}" phải bị bắt`, () => {
+      const out = check(src, vi);
+      assert.equal(out.line.status, TRANSLATE_STATUS.NEEDS_REVIEW, `phải NEEDS_REVIEW: ${vi}`);
+      assert.match(out.violations.join(' | '), re);
+    });
+  }
+
+  const mustStayClean = [
+    ['Áo thun cotton thoáng mát', 'câu sạch thường'],
+    ['Chỉnh hàng cho đẹp', 'trùng chuỗi bỏ dấu với "chính hãng" nhưng KHÁC NGHĨA'],
+    ['Đất chuẩn bị trồng cây', 'trùng chuỗi bỏ dấu với "đạt chuẩn"'],
+    ['Tột nhất là bền', 'trùng chuỗi bỏ dấu với "tốt nhất"'],
+    ['Áo thun cao cấp', '"cao cấp" KHÔNG phải từ khoá (chỉ "cao cấp nhất" mới bị chặn)'],
+    ['Áo dài tay, đồng phục công ty', 'chữ bình thường'],
+  ];
+
+  for (const [vi, note] of mustStayClean) {
+    test(`KHÔNG tố oan — ${note}: "${vi}"`, () => {
+      const out = check('纯棉T恤', vi);
+      assert.deepEqual(out.violations, [], `bị tố oan: ${out.violations.join(' | ')}`);
+      assert.equal(out.line.status, TRANSLATE_STATUS.TRANSLATED);
+    });
+  }
+
+  test('gộp homoglyph KHÔNG được phá việc phát hiện chữ Hán chưa dịch', () => {
+    const out = check('纯棉T恤', 'Áo thun cotton 高级');
+    assert.equal(out.line.status, TRANSLATE_STATUS.NEEDS_REVIEW);
+    assert.match(out.violations.join(' | '), /CHƯA DỊCH/);
+  });
+});

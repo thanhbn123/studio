@@ -76,15 +76,59 @@ export function stripInvisible(text) {
 }
 
 /**
- * Chuẩn hoá văn bản để so khớp: ký tự vô hình → khoảng trắng, gộp khoảng trắng, NFKC.
- * Thay bằng khoảng trắng (không xoá hẳn) để từ khoá bị cắt vẫn khớp lại được.
+ * HOMOGLYPH → Latin (vòng 6, sau phán quyết PASS): bản dịch có thể trốn từ khoá bằng ký tự
+ * Kirin/Greek giống hình ("bảo hànһ", "сao cấp"). Bảng dưới chỉ chứa ký tự THẬT SỰ giống hình
+ * chữ Latin dùng trong tiếng Việt; văn bản tiếng Việt thật hầu như không chứa Kirin/Greek, nên
+ * rủi ro tố oan thấp — và kể cả khi bị tố oan thì hệ quả chỉ là `NEEDS_REVIEW` cho người duyệt.
+ */
+const HOMOGLYPH_MAP = new Map(
+  Object.entries({
+    // Kirin → Latin
+    а: 'a', А: 'A', в: 'B', В: 'B', е: 'e', Е: 'E', ё: 'e', Ё: 'E', к: 'k', К: 'K',
+    м: 'm', М: 'M', н: 'h', Н: 'H', о: 'o', О: 'O', р: 'p', Р: 'P', с: 'c', С: 'C',
+    т: 't', Т: 'T', у: 'y', У: 'Y', х: 'x', Х: 'X', і: 'i', І: 'I', ј: 'j', Ј: 'J',
+    һ: 'h', ԁ: 'd', ѕ: 's', Ѕ: 'S', ԛ: 'q', ԝ: 'w',
+    // Greek → Latin
+    α: 'a', Α: 'A', ε: 'e', Ε: 'E', ι: 'i', Ι: 'I', κ: 'k', Κ: 'K', ν: 'v', Ν: 'N',
+    ο: 'o', Ο: 'O', ρ: 'p', Ρ: 'P', τ: 't', Τ: 'T', υ: 'u', Υ: 'Y', χ: 'x', Χ: 'X', ѵ: 'v',
+    // Vài ký tự "gần giống" khác hay gặp khi copy từ nguồn lạ.
+    // Lưu ý: NFKC chạy TRƯỚC khi gộp nên ϲ (U+03F2) đã thành ς (U+03C2) và Ϲ (U+03F9) thành Σ
+    // (U+03A3) — vì vậy phải map cả các dạng SAU chuẩn hoá, không chỉ dạng gõ vào.
+    ϲ: 'c', Ϲ: 'C', ς: 'c', Σ: 'C', σ: 'c', ɡ: 'g', ѡ: 'w', ⅰ: 'i', ⅼ: 'l',
+  }),
+);
+
+/** Đổi ký tự giống hình về Latin (giữ nguyên mọi ký tự khác, không đụng chữ Hán/kana/Hangul). */
+export function foldHomoglyphs(text) {
+  let out = '';
+  for (const ch of String(text ?? '')) out += HOMOGLYPH_MAP.get(ch) ?? ch;
+  return out;
+}
+
+/**
+ * Biến thể CHÍNH TẢ thường gặp của từ khoá khẳng định (vòng 6).
+ * KHÔNG dùng `\b` quanh từ tiếng Việt (`\b` của JS chỉ hiểu ASCII — bài học đã trả giá ở MVP-01);
+ * dùng lookaround với `\p{L}` (Unicode) nên mới đúng.
+ */
+const SPELLING_VARIANTS = [
+  [/(?<![\p{L}])nhứt(?![\p{L}])/giu, 'nhất'], // "tốt nhứt" = "tốt nhất"
+  [/(?<![\p{L}])hảng(?![\p{L}])/giu, 'hãng'], // "chính hảng" = "chính hãng"
+];
+
+/**
+ * Chuẩn hoá văn bản để so khớp: ký tự vô hình → khoảng trắng, gộp khoảng trắng, NFKC,
+ * gộp homoglyph Kirin/Greek về Latin, và chuẩn hoá vài biến thể chính tả.
+ * Thay ký tự vô hình bằng khoảng trắng (không xoá hẳn) để từ khoá bị cắt vẫn khớp lại được.
  */
 export function normalizeForMatch(text) {
-  return String(text ?? '')
+  let s = String(text ?? '')
     .replace(INVISIBLE_RE, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .normalize('NFKC');
+  s = foldHomoglyphs(s);
+  for (const [re, to] of SPELLING_VARIANTS) s = s.replace(re, to);
+  return s;
 }
 
 /* ─────────────────────── 1. Phát hiện ký tự CHƯA DỊCH ─────────────────────── */

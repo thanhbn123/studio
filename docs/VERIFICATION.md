@@ -495,3 +495,30 @@ chạy trên môi trường khác):
 
 Tổng sau khi thêm: `npm test` → **435 test · 434 pass · 0 fail · 1 skipped** (skip duy nhất là ca
 “thiếu `DATABASE_URL`” trong `test/store.test.js`, chỉ chạy khi KHÔNG có PostgreSQL).
+
+### 12.4 Vòng 6b — hai lỗ hổng guardrail vá được + phủ rate limit
+
+Sau phán quyết PASS, còn hai nhóm lỗi guardrail được ghi là “còn lọt”. Một trong hai nhóm **vá
+được mà không tăng dương tính giả**, nên đã vá:
+
+| Lỗ hổng đã vá | Cách vá | Bằng chứng (`test/imagelab-f08-guardrails.test.js`) |
+|---|---|---|
+| **Homoglyph**: từ khoá viết bằng ký tự Kirin/Greek giống hình (“bảo hànһ”, “chống nướϲ”, “сhính hãng”) | `normalizeForMatch` gộp homoglyph Kirin/Greek về Latin (`foldHomoglyphs`). Lưu ý thứ tự: **NFKC chạy trước** nên `ϲ` (U+03F2) đã thành `ς` (U+03C2) và `Ϲ` thành `Σ` — phải map cả dạng SAU chuẩn hoá | 7 ca phải bắt đều `NEEDS_REVIEW`; 6 ca phải sạch (“Chỉnh hàng”, “Đất chuẩn bị trồng”, “Tột nhất”, “Áo thun cao cấp”, câu sạch) đều `TRANSLATED` |
+| **Chính tả**: “tốt nhứt”, “chính hảng” | `SPELLING_VARIANTS` với lookaround `\p{L}` (**không** dùng `\b` — `\b` của JS chỉ hiểu ASCII, bài học MVP-01) | 2 ca phải bắt đều `NEEDS_REVIEW` |
+
+Vẫn **cố ý KHÔNG vá** (đã ghi ở §10.3/§11.1 vì vá sẽ tăng dương tính giả): `xii` (số La Mã viết
+bằng chữ ASCII thường — không phân biệt được với từ thật), `3件装 → "3 bộ"` (danh từ đếm đã bị loại
+khỏi `COUNTED_UNITS` để chữa dương tính giả N-7b). Ghi chú thêm: “cao cấp” **không phải** từ khoá
+(chỉ “cao cấp nhất” mới bị chặn) — có test khẳng định điều này để sau này không ai tưởng là lỗi.
+
+**Phủ rate limit** (`test/imagelab-ratelimit.test.js`, mục agent test ghi là chưa phủ):
+`POST /render` quá hạn mức → **429 `RATE_LIMITED`** (không 5xx); và **hạn mức là RIÊNG theo
+session** — session A hết hạn mức không làm session B bị chặn.
+
+> **Bài học hạ tầng test (đã trả giá):** `sessionId()` chỉ nhận cookie `sid` khớp
+> `/^[A-Za-z0-9_-]{16,64}$/`; sid **ngắn hơn 16 ký tự** bị server cấp sid MỚI cho mỗi request,
+> nên job tạo ở request này không đọc được ở request sau (404 “không tìm thấy job”). Đã ghi chú
+> ngay trong file test. Đây là hành vi CÓ CHỦ Ý (chống session id đoán được), không phải lỗi.
+
+Tổng sau vòng 6b: `npm test` → **451 test · 450 pass · 0 fail · 1 skipped**; `npm run verify` EXIT=0;
+`npm run demo:imagelab` → `succeeded`.
