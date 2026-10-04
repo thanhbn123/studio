@@ -42,6 +42,11 @@ async function api(path, options = {}) {
     const err = new Error(json?.error?.message || `HTTP ${res.status}`);
     err.code = json?.error?.code;
     err.status = res.status;
+    // MVP-03 (§3.5/§3.7): 422 `OVERLAY_UNSUPPORTED_CLAIM` trả danh sách vi phạm trong body
+    // (E4 trả CẢ `error.details.violations` lẫn `violations` phẳng) — giữ nguyên cả hai để UI
+    // hiện ĐÚNG các vi phạm đó, không nuốt mất.
+    err.payload = json?.error || null;
+    err.body = json || null;
     throw err;
   }
   return json;
@@ -184,6 +189,33 @@ const state = {
       dirtyPaint: false,
     },
   },
+  // MVP-03 — Tạo ảnh (imagestudio). Tách riêng khỏi `il` để không giẫm chân MVP-02.
+  is: {
+    jobId: null,
+    job: null,
+    poll: null,
+    pollCount: 0,
+    loading: null,
+    pending: null, // { name, bytes, mime, base64, dataUrl }
+    busy: false,
+    error: null,
+    templates: null, // [{ id, label, kind, synthetic }] từ GET /api/imagestudio/templates
+    limits: null, // retouch_limits của MÁY CHỦ (§3.6) — UI KHÔNG hardcode ngưỡng
+    mattingProvider: null,
+    providers: null, // khối `providers` trả kèm job
+    templatesLoading: false,
+    templatesError: null,
+    overlayBlocked: null, // { code, reason, violations } — 422 phải hiện ĐỦ vi phạm
+    dirtyPaint: false,
+    options: {
+      template: 'trang',
+      remove_background: true,
+      // N1 (vòng 9): mặc định KHÔNG bỏ qua cảnh báo biên nhập nhằng.
+      matting_allow_ambiguous: false,
+      retouch: { brightness: 0, contrast: 0, saturation: 0, sharpen: 0 },
+      overlay_text: '',
+    },
+  },
 };
 
 /* ─────────────────────────── Khởi động ─────────────────────────── */
@@ -202,6 +234,7 @@ async function boot() {
   // để điều hướng bằng hash luôn đổi view đúng.
   window.addEventListener('hashchange', route);
   wireImagelabGlobal();
+  wireImagestudioGlobal();
   route();
 }
 
@@ -227,9 +260,24 @@ function renderBadge() {
 
 function route() {
   const hash = location.hash || '#/';
+  // MVP-03 (§3.7) — tab thứ ba “Tạo ảnh”, route hash riêng: `#/taoanh` và `#/taoanh/:id`.
+  const isMatch = /^#\/taoanh(?:\/([A-Za-z0-9_-]+))?/.exec(hash);
+  if (isMatch) {
+    stopPolling();
+    stopIlPolling();
+    if (isMatch[1]) {
+      openImagestudioJob(isMatch[1]);
+    } else {
+      stopIsPolling();
+      isReset();
+      renderImagestudio();
+    }
+    return;
+  }
   const ilMatch = /^#\/imagelab(?:\/([A-Za-z0-9_-]+))?/.exec(hash);
   if (ilMatch) {
     stopPolling();
+    stopIsPolling(); // rời tab “Tạo ảnh” thì dừng vòng poll của nó (không kéo người dùng về trang cũ)
     if (ilMatch[1]) {
       openImagelabJob(ilMatch[1]);
     } else {
@@ -336,6 +384,35 @@ function onGlobalClick(ev) {
       ilManualReset();
       location.hash = '#/imagelab';
       renderImagelab();
+    },
+    // ── MVP-03 — Tạo ảnh ──
+    imagestudio: () => {
+      // Đang ở đúng tab này thì `location.hash` không đổi ⇒ không có hashchange, phải tự vẽ lại.
+      if (String(location.hash || '').startsWith('#/taoanh')) {
+        stopIsPolling();
+        isReset();
+        renderImagestudio();
+      } else {
+        location.hash = '#/taoanh';
+      }
+    },
+    ispick: () => $('#is-file')?.click(),
+    isclear: () => {
+      state.is.pending = null;
+      state.is.error = null;
+      renderImagestudio();
+    },
+    issubmit: () => submitImagestudioJob(),
+    isgenerate: () => regenerateImagestudio(),
+    isreload: () => loadImagestudioTemplates(true),
+    isrefresh: () => {
+      if (state.is.jobId) openImagestudioJob(state.is.jobId, { force: true });
+    },
+    isnew: () => {
+      stopIsPolling();
+      isReset();
+      location.hash = '#/taoanh';
+      renderImagestudio();
     },
   };
   if (handlers[action]) handlers[action](ev);
@@ -1758,7 +1835,16 @@ function renderIlManual(data) {
   const jobRunning = jobStatus === 'queued' || jobStatus === 'running';
   // Nhãn viết tại chỗ (không mượn hằng số khác) để khối này chạy được cả khi hàm UI được
   // trích ra chạy riêng trong test/script kiểm chứng.
-  const jobStatusLabel = jobStatus === 'queued' ? 'đang xếp hàng chờ OCR' : 'đang chạy OCR/dịch';
+  // IL08-07: nhãn nêu ĐÚNG bước đang chạy (`job.stage`) — job có thể đang RENDER, không phải OCR.
+  const IL_STAGE_LABEL = {
+    queued: 'đang xếp hàng chờ xử lý',
+    storing: 'đang lưu ảnh gốc',
+    ocr: 'đang nhận dạng chữ (OCR)',
+    translating: 'đang dịch chữ',
+    rendering: 'đang render ảnh',
+  };
+  const jobStage = String(data.job?.stage || '');
+  const jobStatusLabel = IL_STAGE_LABEL[jobStage] || (jobStatus === 'queued' ? 'đang xếp hàng chờ xử lý' : 'đang xử lý ảnh');
   const asset = data.asset || null;
   const rows = open ? ilManualRows(data) : [];
   const over = limit !== null && rows.length > limit;
@@ -1845,13 +1931,13 @@ function renderIlManual(data) {
     ${m.error ? `<div class="notice error">${esc(m.error)}</div>` : ''}
     ${m.notice ? `<div class="notice ok">${esc(m.notice)}</div>` : ''}
     ${jobRunning
-      ? `<div class="notice warn"><strong>Job ${esc(jobStatusLabel)} — chờ OCR/dịch xong rồi hãy lưu vùng.</strong>
+      ? `<div class="notice warn"><strong>Job ${esc(jobStatusLabel)} — chờ bước này xong rồi hãy lưu vùng.</strong>
            <p style="margin:6px 0 0">Bạn vẫn nhập/sửa bảng được; nút lưu sẽ mở lại khi job xong. Máy chủ từ chối lưu lúc này
            (409 <span class="mono">IMAGELAB_JOB_RUNNING</span>) để vùng bạn nhập không bị bước OCR ghi đè.</p></div>`
       : ''}
     <div class="row" style="margin-top:12px">
       <button class="btn primary" data-action="ilmanualsave"${m.busy || jobRunning ? ' disabled' : ''}>${
-        jobRunning ? 'ĐANG OCR — CHỜ XONG' : m.busy ? 'ĐANG LƯU…' : 'LƯU VÙNG &amp; DỊCH'
+        jobRunning ? 'JOB ĐANG CHẠY — CHỜ XONG' : m.busy ? 'ĐANG LƯU…' : 'LƯU VÙNG &amp; DỊCH'
       }</button>
       <button class="btn ghost" data-action="ilmanualadd">Thêm vùng</button>
       <button class="btn ghost tiny" data-action="ilmanualreload">Nạp lại vùng của job</button>
@@ -2076,6 +2162,1192 @@ async function renderImagelabImage(force) {
     }
     renderImagelab();
   }
+}
+
+/* ═════════════ MVP-03 — TAB “TẠO ẢNH” (Image Generation / Retouching) ═════════════
+ * Hợp đồng §3.7. Ba luật riêng của MVP-03 được UI NÓI THẲNG ra, không giấu:
+ *   1. Không bóp méo sản phẩm — ảnh ra cùng khung hình; retouch bị KẸP trong ngưỡng CỦA MÁY CHỦ.
+ *   2. Nền mới là MÔ PHỎNG — mẫu nền hiện nhãn “MÔ PHỎNG”; UI không bao giờ nói “nền thật”.
+ *   3. Tách nền fail-closed — không đủ tự tin thì UI nói rõ “không tách được nền, ảnh chỉ được retouch”.
+ *
+ * Mọi chữ đi qua `esc()` trước khi vào DOM, kể cả giá trị trong `value=""`.
+ * Hàm THUẦN, dễ trích để test (không cần DOM): renderImagestudioBody, renderIsUpload, renderIsOptions,
+ * renderIsTemplates, renderIsParam, renderIsJob, renderIsSteps, renderIsCompare, renderIsWarnings,
+ * renderIsOverlayBlocked, isErrorBox, isJobOptions, isLimitFor, isNumText, isViolationText.
+ */
+
+const IS_STATUS_LABEL = {
+  queued: 'Đang chờ',
+  running: 'Đang xử lý',
+  succeeded: 'Hoàn tất',
+  partial: 'Xong một phần (PARTIAL)',
+  failed: 'Thất bại',
+  needs_manual: 'Cần bổ sung dữ liệu',
+};
+
+const IS_STAGE_LABEL = {
+  queued: 'Xếp hàng',
+  storing: 'Đang lưu ảnh gốc',
+  matting: 'Đang tách nền (fail-closed)',
+  composing: 'Đang ghép nền MÔ PHỎNG',
+  retouching: 'Đang retouch trong ngưỡng cho phép',
+  done: 'Xong',
+  failed: 'Lỗi',
+};
+
+const IS_STAGE_ORDER = ['queued', 'storing', 'matting', 'composing', 'retouching', 'done'];
+
+const IS_STAGE_STEPS = [['storing', 'Lưu ảnh gốc'], ['matting', 'Tách nền (không đủ tự tin ⇒ TỪ CHỐI cắt)'], ['composing', 'Ghép nền MÔ PHỎNG'], ['retouching', 'Retouch trong ngưỡng'], ['done', 'Hoàn tất']];
+
+const IS_PARAM_LABEL = {
+  brightness: 'Độ sáng',
+  contrast: 'Tương phản',
+  saturation: 'Bão hoà',
+  sharpen: 'Nét',
+};
+
+const IS_PARAM_ORDER = ['brightness', 'contrast', 'saturation', 'sharpen'];
+
+/** Nhãn trung thực BẮT BUỘC cho mọi nền do hệ thống sinh ra (§0 luật 2). */
+const IS_SYNTHETIC_NOTE = 'nền MÔ PHỎNG (không phải ảnh thật)';
+
+const IS_OVERLAY_CLAIM_NOTE = 'Chữ có khẳng định (bảo hành, chứng nhận, số liệu…) mà ảnh/tên sản phẩm không có sẽ bị CHẶN, không vẽ.';
+
+const IS_MATTING_FAIL_TEXT = {
+  UNIFORM_BACKGROUND_NOT_FOUND: 'Không tách được nền: nền không đủ đồng nhất nên hệ thống TỪ CHỐI cắt (fail-closed). Ảnh chỉ được retouch, nền gốc giữ nguyên.',
+  SUSPICIOUS_MASK: 'TỪ CHỐI tách nền vì NGHI NGỜ ĐÃ ĂN MẤT SẢN PHẨM (một mảng lớn không-phải-nền bị cắt, hoặc phần giữ lại quá nhỏ). Ảnh chỉ được retouch, nền gốc giữ nguyên.',
+  // N1 (vòng 9): KHÁC hẳn "nghi ngờ ăn mất sản phẩm" — mask bao ĐÚNG sản phẩm, chỉ mờ ở viền.
+  SEGMENTATION_AMBIGUOUS: 'KHÔNG GHÉP NỀN vì biên nhập nhằng (bóng đổ mềm / viền mờ / sản phẩm sáng gần màu nền) — sản phẩm vẫn được giữ nguyên. Ảnh của bạn vẫn được retouch theo tham số; muốn ghép nền hãy dùng ảnh có nền phẳng hơn, hoặc bật “Vẫn ghép nền dù biên nhập nhằng” (có ghi vết).',
+  SEGMENTATION_FAILED: 'Không tách được nền: hệ thống không đủ tự tin nên TỪ CHỐI cắt (fail-closed). Ảnh chỉ được retouch, nền gốc giữ nguyên.',
+  UNSUPPORTED_IMAGE: 'Ảnh không giải mã được ở bước tách nền. Ảnh chỉ được retouch, nền gốc giữ nguyên.',
+  NOT_CONFIGURED: 'Không tách được nền: provider tách nền chưa được cấu hình. Ảnh chỉ được retouch, nền gốc giữ nguyên.',
+  FAILED: 'Không tách được nền: bước tách nền thất bại. Ảnh chỉ được retouch, nền gốc giữ nguyên.',
+};
+
+/** Lỗi 5xx bị server che message ⇒ UI tự dịch mã lỗi sang câu tiếng Việt (như MVP-02). */
+const IS_ERROR_HINT = {
+  IMAGESTUDIO_UNAVAILABLE: 'Máy chủ chưa nạp được module tạo ảnh. Các tính năng MVP-01/MVP-02 vẫn dùng bình thường.',
+  NOT_CONFIGURED: 'Provider tách nền / retouch chưa được cấu hình trên máy chủ.',
+  MATTING_NOT_CONFIGURED: 'Provider tách nền chưa được cấu hình — ảnh sẽ chỉ được retouch.',
+  RETOUCH_NOT_CONFIGURED: 'Provider retouch chưa được cấu hình.',
+  RATE_LIMITED: 'Bạn thao tác quá nhanh — chờ một lát rồi thử lại.',
+  BAD_IMAGE: 'Dữ liệu ảnh không hợp lệ.',
+  IMAGE_TOO_LARGE: 'Ảnh vượt giới hạn cho phép.',
+  UNSUPPORTED_MEDIA_TYPE: 'Ảnh không hợp lệ hoặc định dạng không được phép (PNG / JPEG / WebP / GIF).',
+  OVERLAY_UNSUPPORTED_CLAIM: 'Chữ overlay có khẳng định không có bằng chứng trong ảnh/tên sản phẩm nên bị CHẶN — không vẽ.',
+  JOB_NOT_FOUND: 'Không tìm thấy job này (có thể thuộc phiên làm việc khác).',
+};
+
+/** Số lần poll tối đa trước khi nói thẳng “có thể job bị kẹt” (1.5s × 240 ≈ 6 phút). */
+const IS_MAX_POLLS = 240;
+
+/* ── Đọc ngưỡng / tham số ───────────────────────────────────────────────────── */
+
+/** Ngưỡng retouch của MÁY CHỦ (§3.6). UI KHÔNG hardcode: thiếu ⇒ null và thanh trượt bị khoá. */
+function isLimits() {
+  const fromApi = state.is?.limits;
+  const fromConfig = state.config?.imagestudio?.retouch_limits;
+  const src = fromApi && typeof fromApi === 'object' ? fromApi : fromConfig;
+  return src && typeof src === 'object' ? src : null;
+}
+
+/** Ngưỡng của MỘT tham số (biên độ dương) — null nghĩa là chưa biết thì KHÔNG cho kéo. */
+function isLimitFor(name) {
+  const lim = isLimits();
+  const n = Number(lim && lim[name]);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function isParamValue(name) {
+  const v = Number(state.is?.options?.retouch?.[name]);
+  return Number.isFinite(v) ? v : 0;
+}
+
+/** Tham số HIỆU LỰC sau khi máy chủ kẹp — cảnh báo phải nói đúng con số này. */
+function isEffectiveValue(retouch, name) {
+  const eff = retouch && retouch.params_effective;
+  if (!eff || typeof eff !== 'object' || !Object.prototype.hasOwnProperty.call(eff, name)) return null;
+  const n = Number(eff[name]);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Số có dấu, gọn: +0.25 / -0.1 / 0 — không làm tròn thành con số khác. */
+function isNumText(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '0';
+  const s = n.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+  if (s === '' || s === '-' || Number(s) === 0) return '0';
+  return n > 0 ? `+${s}` : s;
+}
+
+/** Số không dấu (số đo thật của matting). */
+function isNumPlain(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  const s = n.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+  return s === '' || s === '-' ? '0' : s;
+}
+
+function isJobRunning(job) {
+  if (!job || typeof job !== 'object') return false;
+  const stage = String(job.stage || '').toLowerCase();
+  const status = String(job.status || '').toLowerCase();
+  if (stage === 'done' || stage === 'failed') return false;
+  if (status === 'succeeded' || status === 'failed' || status === 'partial' || status === 'needs_manual') return false;
+  return true;
+}
+
+/** Số đo THẬT của matting — hiện nguyên, không diễn giải thành “chắc là ổn”. */
+function isMaskItems(mask) {
+  if (!mask || typeof mask !== 'object') return [];
+  const items = [];
+  if (mask.uniformity !== null && mask.uniformity !== undefined) {
+    items.push(`Độ đồng nhất nền đo được: ${isNumPlain(mask.uniformity)} (càng thấp càng khó tách).`);
+  }
+  if (mask.background_ratio !== null && mask.background_ratio !== undefined) {
+    items.push(`Tỉ lệ pixel thuộc nền: ${isNumPlain(mask.background_ratio)}.`);
+  }
+  if (mask.coverage !== null && mask.coverage !== undefined) {
+    items.push(`Tỉ lệ pixel giữ lại (sản phẩm): ${isNumPlain(mask.coverage)}.`);
+  }
+  if (mask.seed_colors !== null && mask.seed_colors !== undefined) {
+    items.push(`Số cụm màu nền: ${isNumPlain(mask.seed_colors)}.`);
+  }
+  return items;
+}
+
+/** Vi phạm của guardrail overlay có thể là chuỗi hoặc object — hiện sao cho đọc được. */
+function isViolationText(v) {
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  const parts = [v.group || v.kind, v.word || v.text || v.claim || v.value, v.reason || v.message].filter(
+    (x) => x !== null && x !== undefined && x !== '',
+  );
+  if (parts.length) return parts.map((x) => String(x)).join(' · ');
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return 'vi phạm không đọc được';
+  }
+}
+
+/** Vi phạm nhét trong body 422 (§3.5) — `api()` giữ nguyên cả phong bì lỗi lẫn body phẳng. */
+function isErrorViolations(err) {
+  const holders = [err?.payload || {}, err?.body || {}];
+  const raw = [];
+  for (const holder of holders) {
+    const details = holder.details || {};
+    for (const src of [holder.violations, details.violations]) {
+      if (Array.isArray(src)) raw.push(...src);
+    }
+  }
+  // E4 trả CÙNG danh sách ở hai chỗ (`violations` phẳng + `error.details.violations`) ⇒ khử
+  // trùng, để người dùng không phải đọc cùng một vi phạm hai lần.
+  const seen = new Set();
+  const out = [];
+  for (const v of raw) {
+    const t = isViolationText(v);
+    if (!t || seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return out;
+}
+
+/** 422 của overlay (mọi mã `OVERLAY_*`) ⇒ khối cảnh báo riêng, hiện ĐỦ lý do + vi phạm. */
+function isOverlayBlockedFromError(err) {
+  const violations = isErrorViolations(err);
+  const code = String(err?.code || '');
+  // `OVERLAY_NOT_TRANSLATED` (còn chữ Hán) có thể KHÔNG kèm vi phạm nào — vẫn phải hiện thành
+  // khối “bị chặn”, không rơi xuống thành lỗi chung chung.
+  if (!code.startsWith('OVERLAY_') && violations.length === 0) return null;
+  return { code: code || 'OVERLAY_UNSUPPORTED_CLAIM', reason: err?.message || 'Máy chủ không nêu lý do.', violations };
+}
+
+function isErrorText(err) {
+  const prefix = err?.code ? `${err.code}: ` : '';
+  const hint = err?.status >= 500 ? IS_ERROR_HINT[err.code] : null;
+  return `${prefix}${hint || err?.message || 'Lỗi không xác định.'}`;
+}
+
+/* ── Tham số gửi lên API ───────────────────────────────────────────────────── */
+
+/** `options` gửi lên: chỉ gửi tham số THẬT SỰ khác 0; overlay chỉ gửi khi có chữ. */
+function isJobOptions() {
+  const o = state.is?.options || {};
+  const retouch = {};
+  for (const name of IS_PARAM_ORDER) {
+    const v = Number(o.retouch && o.retouch[name]);
+    if (Number.isFinite(v) && v !== 0) retouch[name] = v;
+  }
+  const overlayText = String(o.overlay_text ?? '').trim();
+  const options = { template: o.template || null, remove_background: o.remove_background !== false };
+  // N1: chỉ gửi khi người dùng THẬT SỰ bật (mặc định máy chủ từ chối ghép nền khi biên nhập nhằng).
+  if (o.matting_allow_ambiguous === true) options.matting_allow_ambiguous = true;
+  if (Object.keys(retouch).length) options.retouch = retouch;
+  if (overlayText) options.overlay = { text: overlayText };
+  return options;
+}
+
+/** Mặc định mẫu nền = `trang` (§3.2); máy chủ không có `trang` thì lấy mẫu đầu tiên. */
+function ensureIsTemplate() {
+  const list = Array.isArray(state.is?.templates) ? state.is.templates : [];
+  const ids = list.map((t) => String(t?.id ?? ''));
+  if (!ids.length) return;
+  if (ids.includes(String(state.is.options.template || ''))) return;
+  state.is.options.template = ids.includes('trang') ? 'trang' : ids[0];
+}
+
+/** GET job cũng trả `templates` + `retouch_limits` (§3.6) — dùng luôn, khỏi phụ thuộc một lần gọi. */
+function adoptIsMeta(data) {
+  if (!data || typeof data !== 'object') return;
+  if (Array.isArray(data.templates) && data.templates.length) {
+    state.is.templates = data.templates;
+    ensureIsTemplate();
+  }
+  if (data.retouch_limits && typeof data.retouch_limits === 'object') state.is.limits = data.retouch_limits;
+  if (data.providers) state.is.providers = data.providers;
+}
+
+/** Khi MỞ một job đã có: nạp lại tham số job đã dùng để “tạo lại với tham số khác” bắt đầu từ đó. */
+function syncIsOptionsFromJob(data) {
+  if (!data || typeof data !== 'object') return;
+  const renderedList = Array.isArray(data.rendered) ? data.rendered : [];
+  const rendered = renderedList[renderedList.length - 1] || null;
+  const meta = rendered?.meta || {};
+  const tpl = data.compose?.template || meta.template;
+  const tplId = typeof tpl === 'string' ? tpl : tpl?.id;
+  if (tplId) state.is.options.template = String(tplId);
+  const eff = data.retouch?.params_effective;
+  if (eff && typeof eff === 'object') {
+    for (const name of IS_PARAM_ORDER) {
+      const n = Number(eff[name]);
+      if (Number.isFinite(n)) state.is.options.retouch[name] = n;
+    }
+  }
+  const overlayText = data.overlay?.text ?? meta.overlay?.text;
+  if (typeof overlayText === 'string' && overlayText.trim()) state.is.options.overlay_text = overlayText;
+  if (data.providers) state.is.providers = data.providers;
+}
+
+/* ── Khối render (thuần, không đụng DOM) ───────────────────────────────────── */
+
+function isProviderBadges() {
+  const cfg = state.config?.imagestudio || {};
+  const known = state.is?.providers || {};
+  const matting = known.matting || cfg.matting || state.is?.mattingProvider || null;
+  const retouch = known.retouch || cfg.retouch || null;
+  return `${ilProviderBadge('Tách nền', matting)}${ilProviderBadge('Retouch', retouch)}`;
+}
+
+function isMockNotice() {
+  const cfg = state.config?.imagestudio || {};
+  const steps = [['matting', 'tách nền (matting)'], ['retouch', 'retouch']]
+    .filter(([key]) => cfg?.[key]?.is_mock)
+    .map(([, label]) => label);
+  if (!steps.length) return '';
+  return `<div class="notice warn">
+    <strong>MOCK — ${esc(steps.join(', '))} đang chạy bằng dữ liệu giả lập.</strong>
+    <p style="margin:6px 0 0">Kết quả không phải tách nền / retouch thật. Không dùng để đánh giá chất lượng hoặc đăng bán.</p>
+  </div>`;
+}
+
+/** Nói rõ ngưỡng đang dùng là SỐ CỦA MÁY CHỦ — và nếu chưa có thì thanh trượt bị khoá. */
+function isLimitsNotice() {
+  const pairs = IS_PARAM_ORDER.map((name) => [name, isLimitFor(name)]);
+  if (pairs.every(([, v]) => v === null)) {
+    return `<div class="notice warn small" style="margin-bottom:0">Chưa lấy được <span class="mono">retouch_limits</span> từ máy chủ — 4 thanh trượt bị khoá. UI KHÔNG tự bịa ngưỡng.</div>`;
+  }
+  return `<div class="muted small" style="margin-top:10px">Ngưỡng retouch đang dùng (số của MÁY CHỦ, UI không hardcode):
+    ${pairs.map(([name, v]) => `${esc(IS_PARAM_LABEL[name] || name)} ${v === null ? '—' : `±${esc(v)}`}`).join(' · ')}</div>`;
+}
+
+function isHeaderPanel() {
+  const cfg = state.config?.imagestudio || {};
+  const available = cfg.available !== false;
+  return `<section class="panel">
+    <div class="spread">
+      <div style="min-width:0">
+        <h2 style="margin:0 0 4px">Tạo ảnh marketing từ ảnh thật</h2>
+        <p class="muted small" style="margin:0">
+          Tách nền là <strong>fail-closed</strong>: không đủ tự tin thì hệ thống TỪ CHỐI cắt và chỉ retouch.
+          Nền do hệ thống sinh ra luôn là <strong>${esc(IS_SYNTHETIC_NOTE)}</strong> — hệ thống KHÔNG tạo ảnh nền thật.
+          Ảnh ra <strong>cùng kích thước</strong> ảnh gốc, <strong>ảnh gốc không bị sửa</strong>.
+        </p>
+      </div>
+      <span class="badge ${available ? 'ok' : 'bad'}">${available ? 'Sẵn sàng' : 'Chưa khả dụng'}</span>
+    </div>
+    <div class="row" style="margin-top:10px">${isProviderBadges()}</div>
+    ${isMockNotice()}
+    ${isLimitsNotice()}
+  </section>`;
+}
+
+function isUnavailablePanel() {
+  const cfg = state.config?.imagestudio || {};
+  const reason = cfg.reason || state.is?.templatesError || null;
+  return `<section class="panel"><div class="notice error"><strong>Tính năng tạo ảnh chưa sẵn sàng trên máy chủ này (IMAGESTUDIO_UNAVAILABLE).</strong>
+    <p style="margin:6px 0 0">Lý do máy chủ báo: ${esc(reason || 'không nêu lý do — xem log máy chủ (imagestudio.wiring_failed).')}</p>
+    <p style="margin:6px 0 0">Các tính năng MVP-01 và “Dịch ảnh Trung → Việt” (MVP-02) vẫn dùng bình thường.</p></div></section>`;
+}
+
+function isErrorBox() {
+  if (!state.is?.error) return '';
+  return `<div class="notice error">${esc(state.is.error)}</div>`;
+}
+
+/** 422 khi tạo/tạo lại: hiện đúng reason + từng vi phạm (không nuốt). */
+function renderIsOverlayBlocked() {
+  const b = state.is?.overlayBlocked;
+  if (!b) return '';
+  const violations = Array.isArray(b.violations) ? b.violations : [];
+  return `<div class="notice error">
+    <strong>Chữ overlay bị CHẶN — không vẽ (${esc(b.code || 'OVERLAY_UNSUPPORTED_CLAIM')})</strong>
+    <p style="margin:6px 0 0">${esc(b.reason || 'Máy chủ không nêu lý do.')}</p>
+    ${violations.length ? `<ul>${violations.map((v) => `<li>${esc(v)}</li>`).join('')}</ul>` : ''}
+    <p class="muted small" style="margin:6px 0 0">${esc(IS_OVERLAY_CLAIM_NOTE)} Sửa chữ cho khớp với thứ ảnh/tên sản phẩm thực có, rồi gửi lại.</p>
+  </div>`;
+}
+
+function renderIsTemplates() {
+  const list = Array.isArray(state.is?.templates) ? state.is.templates : [];
+  if (!list.length) {
+    const err = state.is?.templatesError;
+    return `<div class="notice warn"><strong>Chưa có danh sách mẫu nền.</strong>
+      <p style="margin:6px 0 0">${err ? esc(err) : 'Đang lấy danh sách mẫu nền từ máy chủ…'}</p>
+      <button class="btn tiny" data-action="isreload" style="margin-top:8px">THỬ LẤY LẠI MẪU NỀN</button>
+    </div>`;
+  }
+  const chosen = String(state.is?.options?.template ?? '');
+  return `<div class="is-templates">${list
+    .map((t) => {
+      const id = String(t?.id ?? '');
+      const label = String(t?.label ?? id);
+      const synthetic = t?.synthetic === true;
+      const checked = chosen === id;
+      return `<label class="is-template${checked ? ' active' : ''}">
+        <input type="radio" name="is-template" value="${esc(id)}" data-is-template ${checked ? 'checked' : ''} />
+        <span class="is-template-label">${esc(label)}</span>
+        ${synthetic ? '<span class="badge warn">MÔ PHỎNG</span>' : ''}
+        <span class="mono muted small">${esc(id)}</span>
+      </label>`;
+    })
+    .join('')}</div>`;
+}
+
+function renderIsParam(name) {
+  const label = IS_PARAM_LABEL[name] || name;
+  const lim = isLimitFor(name);
+  const value = isParamValue(name);
+  const inputId = `is-param-${name}`;
+  if (lim === null) {
+    return `<div class="is-slider">
+      <div class="is-slider-head"><label for="${esc(inputId)}">${esc(label)} <span class="mono muted">(${esc(name)})</span></label></div>
+      <div class="muted small">Chưa lấy được ngưỡng của tham số này từ máy chủ nên thanh trượt bị khoá — UI không tự bịa ngưỡng.</div>
+    </div>`;
+  }
+  return `<div class="is-slider">
+    <div class="is-slider-head">
+      <label for="${esc(inputId)}">${esc(label)} <span class="mono muted">(${esc(name)})</span></label>
+      <span class="row">
+        <span class="badge">ngưỡng ±${esc(lim)}</span>
+        <span class="mono" id="is-val-${esc(name)}">${esc(isNumText(value))}</span>
+      </span>
+    </div>
+    <input id="${esc(inputId)}" type="range" min="${esc(-lim)}" max="${esc(lim)}" step="0.01"
+      value="${esc(value)}" data-is-param="${esc(name)}" ${state.is?.busy ? 'disabled' : ''} />
+  </div>`;
+}
+
+/** Form tham số dùng cho cả “TẠO ẢNH” (create) và “TẠO LẠI với tham số khác” (regenerate). */
+function renderIsOptions(mode) {
+  const o = state.is?.options || {};
+  const busy = Boolean(state.is?.busy);
+  const running = isJobRunning(state.is?.job?.job);
+  const removeBg = o.remove_background !== false;
+  const overlayText = String(o.overlay_text ?? '');
+  const canCreate = Boolean(state.is?.pending);
+  const button = mode === 'regenerate'
+    ? `<button class="btn primary" data-action="isgenerate" ${busy || running ? 'disabled' : ''}>${busy ? 'ĐANG GỬI…' : running ? 'ĐANG CHẠY — CHỜ XONG…' : 'TẠO LẠI VỚI THAM SỐ NÀY'}</button>`
+    : `<button class="btn primary" data-action="issubmit" ${canCreate && !busy ? '' : 'disabled'}>${busy ? 'ĐANG TẠO…' : 'TẠO ẢNH'}</button>`;
+  return `
+    <section class="panel" id="is-options">
+      <h3 style="margin-top:0">${mode === 'regenerate' ? 'Tạo lại với tham số khác' : '2 · Chọn nền, retouch và chữ overlay'}</h3>
+      <p class="muted small" style="margin-top:0">
+        Mọi mẫu nền dưới đây do hệ thống tự sinh: <strong>${esc(IS_SYNTHETIC_NOTE)}</strong>.
+        Hệ thống không resize / crop / bóp méo sản phẩm.
+      </p>
+      ${renderIsTemplates()}
+      <label class="is-check">
+        <input type="checkbox" data-is-bg ${removeBg ? 'checked' : ''} ${busy ? 'disabled' : ''} />
+        <span><strong>Tách nền</strong> (<span class="mono">remove_background</span>) — không đủ tự tin thì hệ thống TỪ CHỐI cắt, ảnh chỉ được retouch.</span>
+      </label>
+      <label class="is-check">
+        <input type="checkbox" data-is-ambiguous ${o.matting_allow_ambiguous === true ? 'checked' : ''} ${busy || !removeBg ? 'disabled' : ''} />
+        <span><strong>Vẫn ghép nền dù biên nhập nhằng</strong> (<span class="mono">matting_allow_ambiguous</span>) —
+          dùng khi ảnh có bóng đổ mềm/viền mờ. Mặc định hệ thống <strong>KHÔNG ghép nền</strong> trong ca này
+          (ảnh vẫn được retouch); bật lên thì vẫn ghép nhưng <strong>có ghi vết</strong> và phải tự kiểm ảnh TRƯỚC|SAU.</span>
+      </label>
+      ${removeBg
+        ? ''
+        : `<div class="notice warn small" style="margin-top:6px">Bạn đang TẮT tách nền ⇒ <strong>giữ nguyên nền gốc</strong> của ảnh; hệ thống chỉ retouch (và chỉ vẽ chữ overlay nếu hợp lệ).</div>`}
+      <div class="is-sliders">${IS_PARAM_ORDER.map((name) => renderIsParam(name)).join('')}</div>
+      <div class="is-overlay">
+        <label for="is-overlay-text">Chữ overlay (tuỳ chọn)</label>
+        <input id="is-overlay-text" type="text" maxlength="500" placeholder="Ví dụ: Bảo hành 12 tháng"
+          value="${esc(overlayText)}" data-is-overlay ${busy ? 'disabled' : ''} />
+        <p class="muted small" style="margin:6px 0 0">${esc(IS_OVERLAY_CLAIM_NOTE)} Chữ Hán chưa dịch cũng bị chặn.
+          Vị trí chữ do máy chủ đặt mặc định (UI chưa có kéo-vẽ vị trí).</p>
+      </div>
+      <div class="row" style="margin-top:12px">${button}</div>
+    </section>`;
+}
+
+function renderIsUpload() {
+  const lim = state.config?.imagelab?.limits || {};
+  const maxMb = Math.round(Number(lim.max_image_bytes || 0) / 1024 / 1024);
+  const p = state.is?.pending;
+  return `
+    <section class="panel">
+      <h3 style="margin-top:0">1 · Chọn ảnh sản phẩm (PNG)</h3>
+      <div class="drop" id="is-drop" data-action="ispick">
+        <div id="is-drop-text">Kéo ảnh PNG vào đây hoặc bấm để chọn</div>
+      </div>
+      <input id="is-file" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden />
+      ${p
+        ? `<div class="il-picked">
+             <img src="${esc(p.dataUrl)}" alt="Ảnh đã chọn" />
+             <div>
+               <div class="mono small">${esc(p.name)} · ${esc(Math.round(Number(p.bytes || 0) / 1024))}KB · ${esc(p.mime || '')}</div>
+               <div class="muted small">Ảnh gốc được lưu thành bản ghi BẤT BIẾN (sha256 giữ nguyên trước/sau).</div>
+             </div>
+           </div>`
+        : ''}
+      <p class="muted small" style="margin-top:10px">
+        Giới hạn: ${esc(maxMb)}MB · ${esc(lim.max_pixels || 0)} pixel.
+        Ảnh ra <strong>cùng kích thước</strong> ảnh gốc — hệ thống không resize / crop / bóp méo sản phẩm.
+      </p>
+      <div class="row">
+        <button class="btn ${p ? 'ghost' : 'primary'}" data-action="ispick">${p ? 'CHỌN ẢNH KHÁC' : 'CHỌN ẢNH PNG'}</button>
+        ${p ? '<button class="btn ghost" data-action="isclear">Bỏ ảnh đã chọn</button>' : ''}
+      </div>
+    </section>`;
+}
+
+function renderIsSteps(stage) {
+  const idx = IS_STAGE_ORDER.indexOf(String(stage || '').toLowerCase());
+  return `<ol class="il-steps">${IS_STAGE_STEPS.map(([key, label]) => {
+    const i = IS_STAGE_ORDER.indexOf(key);
+    const cls = idx < 0 ? '' : i < idx ? 'done' : i === idx ? 'current' : '';
+    return `<li class="${cls}"><span class="il-dot"></span>${esc(label)}</li>`;
+  }).join('')}</ol>`;
+}
+
+function renderIsJob() {
+  const data = state.is?.job || {};
+  const job = data.job || {};
+  const stage = String(job.stage || 'queued').toLowerCase();
+  const status = String(job.status || 'queued').toLowerCase();
+  const running = isJobRunning(job);
+  const statusCls = status === 'succeeded' ? 'ok' : status === 'failed' ? 'bad' : 'warn';
+  const failCode = job.error_code ? ` (${esc(job.error_code)})` : '';
+  const stageLabel = IS_STAGE_LABEL[stage] || job.stage || 'Đang xử lý';
+  return `
+    <section class="panel">
+      <div class="spread">
+        <div style="min-width:0">
+          <h2 style="margin:0 0 4px">Job tạo ảnh <span class="mono small">${esc(String(job.id || '').slice(0, 8))}</span></h2>
+          <div class="muted small">Bước: ${esc(stageLabel)}</div>
+        </div>
+        <div class="row">
+          <span class="badge ${statusCls}">${esc(IS_STATUS_LABEL[status] || job.status || 'Đang chờ')}</span>
+          <button class="btn ghost tiny" data-action="isrefresh">Kiểm tra lại</button>
+          <button class="btn ghost tiny" data-action="isnew">Ảnh khác</button>
+        </div>
+      </div>
+      ${running ? renderIsSteps(stage) : ''}
+      ${running
+        ? `<div class="status" style="margin-top:10px"><span class="spinner"></span>
+             <span>${esc(stageLabel)}… <span class="muted small">(tự cập nhật mỗi 1.5 giây)</span></span></div>`
+        : ''}
+      ${status === 'failed'
+        ? `<div class="notice error"><strong>Job thất bại${failCode}</strong>
+             <p style="margin:6px 0 0">${esc(job.error_message || 'Không rõ nguyên nhân.')}</p></div>`
+        : ''}
+    </section>
+    ${data.asset ? renderIsCompare(data) : ''}
+    ${data.asset ? renderIsOptions('regenerate') : ''}
+    ${renderIsWarnings(data)}`;
+}
+
+function renderIsCompare(data) {
+  const asset = data?.asset;
+  if (!asset) return '';
+  const renderedList = Array.isArray(data.rendered) ? data.rendered : [];
+  const rendered = renderedList[renderedList.length - 1] || null;
+  const matting = data.matting || {};
+  const rawTpl = data.compose?.template || rendered?.meta?.template || null;
+  const template = typeof rawTpl === 'string'
+    ? { id: rawTpl, label: rawTpl, synthetic: rendered?.meta?.synthetic_background === true }
+    : rawTpl;
+  const synthetic = template?.synthetic === true || rendered?.meta?.synthetic_background === true;
+  const mock = matting.is_mock === true || rendered?.meta?.matting?.is_mock === true;
+  const sizeMismatch = Boolean(
+    asset.width && asset.height && rendered?.width && rendered?.height
+      && (Number(asset.width) !== Number(rendered.width) || Number(asset.height) !== Number(rendered.height)),
+  );
+  const src = (a) => `/api/imagelab/assets/${encodeURIComponent(a.id)}/file`;
+  const ext = (mime) => ({ 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' }[mime] || 'img');
+  return `
+    <section class="panel">
+      <div class="spread">
+        <h2 style="margin:0">Trước / Sau</h2>
+        <div class="row">
+          ${synthetic ? `<span class="badge warn">${esc(IS_SYNTHETIC_NOTE)}${template?.label ? `: ${esc(template.label)}` : ''}</span>` : ''}
+          ${mock ? '<span class="badge warn">MOCK — tách nền giả lập</span>' : ''}
+          ${sizeMismatch ? '<span class="badge bad">KÍCH THƯỚC KHÁC ẢNH GỐC</span>' : ''}
+          ${rendered ? `<a class="btn tiny primary" href="${esc(src(rendered))}" download="taoanh-${esc(String(rendered.id).slice(0, 8))}.${esc(ext(rendered.mime))}">Tải ảnh về</a>` : ''}
+        </div>
+      </div>
+      <div class="il-compare">
+        <figure>
+          <img src="${esc(src(asset))}" alt="Ảnh gốc" />
+          <figcaption>
+            <strong>Ảnh gốc</strong> (bất biến) · ${esc(asset.mime || '')}${asset.width ? ` · ${esc(asset.width)}×${esc(asset.height)}` : ''}<br />
+            <span class="mono">sha256 ${esc(String(asset.sha256 || '').slice(0, 16))}…</span>
+          </figcaption>
+        </figure>
+        ${rendered
+          ? `<figure>
+               <img src="${esc(src(rendered))}" alt="Ảnh tạo mới" />
+               <figcaption>
+                 <strong>Ảnh tạo mới</strong> (bản ghi mới, parent = ảnh gốc) · ${esc(rendered.mime || '')}${rendered.width ? ` · ${esc(rendered.width)}×${esc(rendered.height)}` : ''}<br />
+                 <span class="mono">sha256 ${esc(String(rendered.sha256 || '').slice(0, 16))}…</span>
+                 ${template?.label ? `<br />mẫu nền: ${esc(template.label)}${synthetic ? ` — ${esc(IS_SYNTHETIC_NOTE)}` : ''}` : ''}
+               </figcaption>
+             </figure>`
+          : `<figure class="il-empty"><div class="muted small">Chưa có ảnh mới. Job đang chạy hoặc chưa tạo được ảnh — xem cảnh báo bên dưới.</div></figure>`}
+      </div>
+      ${renderedList.length > 1
+        ? `<p class="muted small">Có ${esc(renderedList.length)} bản tạo — đang hiện bản mới nhất; các bản trước vẫn giữ nguyên trong lịch sử.</p>`
+        : ''}
+    </section>`;
+}
+
+/** Cảnh báo THẬT của MVP-03 — không được ẩn bất kỳ cảnh báo nào (§3.7). */
+function renderIsWarnings(data) {
+  data = data || {};
+  const blocks = [];
+  const job = data.job || {};
+  const matting = data.matting || {};
+  const compose = data.compose || {};
+  const retouch = data.retouch || {};
+  const providers = data.providers || {};
+  const renderedList = Array.isArray(data.rendered) ? data.rendered : [];
+  const rendered = renderedList[renderedList.length - 1] || null;
+  const asset = data.asset || null;
+  const requestedOverlay = String(state.is?.options?.overlay_text ?? '').trim();
+  // E4 trả `last_run` = LƯỢT CHẠY MỚI NHẤT, kể cả lượt KHÔNG tạo ảnh mới (ví dụ NO_CHANGES).
+  // Dữ liệu đó không thuộc về ảnh đang hiện ⇒ trình bày thành khối RIÊNG, không trộn hai lượt.
+  const lastRun = data.last_run && typeof data.last_run === 'object' ? data.last_run : null;
+  const lastFailures = Array.isArray(lastRun?.failures) ? lastRun.failures : [];
+  const failOf = (step) => {
+    const hit = lastFailures.find((f) => String(f?.step) === step && f?.code);
+    return hit ? String(hit.code) : null;
+  };
+  const overlay = data.overlay || lastRun?.overlay || {};
+  // `meta.template` có thể là object hoặc chuỗi id (E2/E3) — chuẩn hoá để KHÔNG bỏ sót nhãn MÔ PHỎNG.
+  const rawTpl = compose.template || rendered?.meta?.template || lastRun?.template || null;
+  const template = typeof rawTpl === 'string' ? { id: rawTpl, label: rawTpl } : rawTpl;
+  const synthetic = template?.synthetic === true
+    || rendered?.meta?.synthetic_background === true
+    || data.synthetic_background === true
+    || lastRun?.synthetic_background === true;
+
+  // (1) MOCK — theo DẤU VẾT CỦA JOB trước, cấu hình máy chủ hiện tại chỉ là thông tin phụ (luật F-03).
+  const jobMock = [];
+  if (matting.is_mock === true) jobMock.push('tách nền (matting)');
+  if (retouch.is_mock === true) jobMock.push('retouch');
+  if (compose.is_mock === true) jobMock.push('ghép nền (compose)');
+  if (!jobMock.length && rendered?.meta?.matting?.is_mock === true) jobMock.push('tách nền (matting, theo meta ảnh đã lưu)');
+  const currentMock = [['matting', 'tách nền'], ['retouch', 'retouch']]
+    .filter(([key]) => providers[key]?.is_mock === true)
+    .map(([, label]) => label);
+  if (jobMock.length) {
+    blocks.push({
+      cls: 'warn',
+      title: `MOCK — job này đã chạy ${jobMock.join(', ')} bằng dữ liệu giả lập`,
+      items: [
+        'Dấu vết MOCK đọc từ chính JOB ĐÃ LƯU, không phải từ cấu hình máy chủ đang chạy.',
+        'Kết quả không phải tách nền / ghép nền / retouch thật — không dùng để đánh giá chất lượng hoặc đăng bán.',
+      ],
+    });
+  } else if (currentMock.length) {
+    blocks.push({
+      cls: 'warn',
+      title: `MOCK — ${currentMock.join(', ')} đang chạy dữ liệu giả lập (theo cấu hình máy chủ)`,
+      items: ['Provider mock tự khai is_mock = true. Kết quả không phải xử lý thật.'],
+    });
+  }
+
+  // (2) Tách nền fail-closed (§0 luật 3) — nói thẳng, kèm SỐ ĐO THẬT.
+  // Nếu ảnh đã tạo không có trace matting (E3 chưa ghi), đọc mã lỗi từ LƯỢT CHẠY MỚI NHẤT.
+  const mattingCode = matting.error_code
+    || (matting.status && matting.status !== 'OK' ? matting.status : null)
+    || failOf('matting');
+  if (mattingCode) {
+    blocks.push({
+      cls: 'warn',
+      title: IS_MATTING_FAIL_TEXT[mattingCode]
+        || `Không tách được nền (${mattingCode}) — ảnh chỉ được retouch, nền gốc giữ nguyên.`,
+      items: [
+        ...(matting.error_message ? [String(matting.error_message)] : []),
+        ...isMaskItems(matting.mask),
+      ],
+    });
+  }
+  for (const w of matting.warnings || []) blocks.push({ cls: 'warn', title: 'Cảnh báo từ bước tách nền', items: [String(w)] });
+
+  // (2a) N3 (vòng 9): SỐ ĐO BIÊN phải HIỆN RA, không chỉ nằm trong câu warnings.
+  // N9 (vòng 10): số đo có thể tới từ `GET data.matting.mask`, `rendered[].meta.matting.mask` hoặc
+  // `last_run.matting.mask` — đọc CẢ BA để khối này không còn "không bao giờ hiện".
+  const maskSrc = matting.mask
+    || rendered?.meta?.matting?.mask
+    || rendered?.meta?.imagestudio?.matting?.mask
+    || lastRun?.matting?.mask
+    || null;
+  const bd = maskSrc?.boundary_delta || null;
+  const mattingMeta = matting && Object.keys(matting).length ? matting : (rendered?.meta?.matting || lastRun?.matting || {});
+  if (bd || maskSrc) {
+    const items = [];
+    if (maskSrc?.kept_bbox_ratio !== undefined && maskSrc?.kept_bbox_ratio !== null) {
+      items.push(`Hộp bao phần giữ lại chiếm ${isNumText(Number(maskSrc.kept_bbox_ratio) * 100)}% khung ảnh.`);
+    }
+    if (bd) {
+      items.push(
+        `Biên phía NỀN: Δp95 ${isNumText(bd.p95)}/255, tỉ lệ pixel nền sát sản phẩm vượt ngưỡng an toàn: ${isNumText(Number(bd.over_ratio) * 100)}%.`,
+      );
+      if (bd.kept_under_ratio !== undefined) {
+        items.push(
+          `Biên phía GIỮ LẠI: Δmin ${isNumText(bd.kept_min)}/255, tỉ lệ pixel giữ lại chỉ khác nền dưới ngưỡng dứt khoát: ${isNumText(Number(bd.kept_under_ratio) * 100)}%.`,
+        );
+      }
+      if (bd.dirty_removed !== undefined) {
+        const keptPct = bd.dirty_ratio_kept !== undefined ? ` (${isNumText(Number(bd.dirty_ratio_kept) * 100)}% diện tích vùng giữ lại)` : '';
+        items.push(
+          `Pixel bị coi là nền nhưng KHÔNG sạch màu nền: ${isNumText(bd.dirty_removed)} px${keptPct} — ` +
+            `${isNumText(Number(bd.dirty_removed_ratio ?? 0) * 100)}% khung ảnh; nằm sâu trong hộp bao sản phẩm: ${isNumText(bd.dirty_inside_bbox ?? 0)} px.`,
+        );
+      }
+    }
+    if (mattingMeta.boundary_checked === false || maskSrc?.boundary_checked === false) {
+      items.push('Provider ngoài (không phải purejs) KHÔNG đo được biên — hãy kiểm ảnh TRƯỚC|SAU.');
+    }
+    if (mattingMeta.ambiguous_override === true) {
+      items.push('⚠️ Lượt này ĐÃ BỎ QUA cảnh báo biên nhập nhằng theo yêu cầu người dùng (có ghi vết trong meta ảnh).');
+    }
+    if (items.length) blocks.push({ cls: 'muted', title: 'Số đo vùng tách nền (đọc được, không phải kết luận suông)', items });
+  }
+
+  // (2b) N5 (vòng 9): BẰNG CHỨNG đã dùng để duyệt chữ overlay — truy vết được nguồn.
+  const ev = overlay?.evidence_used || lastRun?.overlay?.evidence_used || rendered?.meta?.overlay?.evidence_used || null;
+  if (ev && (Array.isArray(ev.sources) ? ev.sources.length : 0) > 0) {
+    const label = { product_name: 'tên sản phẩm (đã lưu)', ocr_region: 'vùng chữ OCR (đã lưu)', user_region: 'vùng chữ do người dùng nhập (đã lưu)', job_notes: 'ghi chú đã lưu trong job' };
+    const regions = Array.isArray(ev.region_ids) && ev.region_ids.length ? ` — vùng: ${ev.region_ids.map((r) => `#${r}`).join(', ')}` : '';
+    blocks.push({
+      cls: 'muted',
+      title: 'Bằng chứng dùng để duyệt chữ overlay',
+      items: [`Nguồn: ${ev.sources.map((x) => label[x] || x).join('; ')}${regions}. Tổng ${isNumText(ev.chars)} ký tự.`],
+    });
+  }
+
+  // (2b) M03-01c (vòng 8): CẢNH BÁO NỔI BẬT cho MỌI lượt có tách nền — vùng "sản phẩm" do
+  // MÁY ĐOÁN theo màu nền, không phải sự thật đã kiểm. Trước đây UI chỉ hiện khi có lỗi,
+  // nên một mask ăn mất sản phẩm vẫn đi kèm lời khẳng định "pixel giữ nguyên từng byte".
+  const mattingRan = Boolean(
+    matting.status === 'OK'
+    || failOf('matting')
+    || rendered?.meta?.generator?.matting_status
+    || rendered?.meta?.matting
+    || lastRun?.matting
+    || lastRun?.matting_status,
+  );
+  if (mattingRan) {
+    blocks.push({
+      cls: 'warn',
+      title: 'Vùng tách nền do MÁY ĐOÁN theo màu nền — hãy kiểm ảnh TRƯỚC|SAU',
+      items: [
+        'Phần "sản phẩm giữ lại" là kết quả đoán của thuật toán (flood fill từ viền), KHÔNG phải vùng đã được xác nhận.',
+        'Hãy mở ảnh TRƯỚC|SAU và soi kỹ: viền sản phẩm, bóng đổ, chi tiết cùng màu nền (đồ trắng trên nền trắng).',
+        'Máy chỉ khẳng định được: pixel NGOÀI vùng đã tách giữ nguyên từng byte.',
+        ...(isMaskItems(matting.mask).length ? isMaskItems(matting.mask) : []),
+      ],
+    });
+  }
+
+  // (3) Tham số bị KẸP: hiện TÊN + GIÁ TRỊ HIỆU LỰC (không có đường vượt ngưỡng mà im lặng).
+  // Nguồn: trace của ảnh đã tạo, nếu chưa có thì lấy của LƯỢT CHẠY MỚI NHẤT (`last_run`).
+  const clampedSrc = (Array.isArray(retouch.clamped) && retouch.clamped.length ? retouch.clamped : lastRun?.retouch_clamped) || [];
+  const clamped = clampedSrc.map(String);
+  const effectiveSrc = retouch.params_effective || lastRun?.retouch_effective || null;
+  if (clamped.length) {
+    blocks.push({
+      cls: 'warn',
+      title: `${clamped.length} tham số retouch bị KẸP về ngưỡng cho phép`,
+      items: clamped.map((name) => {
+        const eff = isEffectiveValue({ params_effective: effectiveSrc }, name);
+        const lim = isLimitFor(name);
+        return `Tham số ${IS_PARAM_LABEL[name] || name} (${name}) bị kẹp — giá trị hiệu lực: ${eff === null ? 'máy chủ không trả params_effective' : isNumText(eff)}${lim === null ? '' : ` (ngưỡng ±${lim})`}.`;
+      }),
+    });
+  }
+  const rejectedSrc = (Array.isArray(retouch.rejected) && retouch.rejected.length ? retouch.rejected : lastRun?.retouch_rejected) || [];
+  const rejected = rejectedSrc.map(String);
+  if (rejected.length) {
+    blocks.push({
+      cls: 'warn',
+      title: `${rejected.length} tham số retouch bị TỪ CHỐI (không phải số hữu hạn) — coi như không truyền`,
+      items: rejected,
+    });
+  }
+
+  // (4) NO_CHANGES — phải nói rõ “không có gì thay đổi”, không được báo OK.
+  const jobNoChanges = String(job.error_code || '').toUpperCase() === 'NO_CHANGES'
+    || String(retouch.error_code || '').toUpperCase() === 'NO_CHANGES'
+    || String(lastRun?.error_code || '').toUpperCase() === 'NO_CHANGES';
+  const retouchNoChange = String(retouch.status || '').toUpperCase() === 'NO_CHANGES';
+  if (jobNoChanges) {
+    blocks.push({
+      cls: 'warn',
+      title: 'Không có gì thay đổi — ảnh kết quả giống ảnh gốc',
+      items: [
+        'Không tách được nền VÀ các tham số retouch đều bằng 0 (hoặc không có hiệu lực) nên hệ thống KHÔNG báo “OK”.',
+        'Muốn có ảnh khác: bật/tắt tách nền, chọn mẫu nền khác, hoặc kéo thanh trượt rồi bấm “TẠO LẠI VỚI THAM SỐ NÀY”.',
+      ],
+    });
+  } else if (retouchNoChange) {
+    blocks.push({
+      cls: 'warn',
+      title: 'Retouch: không có gì thay đổi',
+      items: ['Các tham số retouch đều bằng 0 nên bước retouch không sửa pixel nào.'],
+    });
+  }
+
+  // (5) Overlay bị CHẶN vì thiếu bằng chứng — hiện reason + TỪNG vi phạm.
+  if (overlay.applied === false) {
+    blocks.push({
+      cls: 'error',
+      title: 'Chữ overlay bị CHẶN — không vẽ lên ảnh',
+      items: [
+        String(overlay.reason || 'Máy chủ không nêu lý do.'),
+        ...(Array.isArray(overlay.violations) ? overlay.violations.map(isViolationText).filter(Boolean) : []),
+        ...(Array.isArray(overlay.warnings) ? overlay.warnings.map(String) : []),
+      ],
+    });
+  } else if (overlay.applied === true) {
+    blocks.push({
+      cls: 'ok',
+      title: 'Đã vẽ chữ overlay (có kiểm chống bịa)',
+      items: Array.isArray(overlay.warnings) ? overlay.warnings.map(String) : [],
+    });
+  } else if (requestedOverlay) {
+    blocks.push({
+      cls: 'warn',
+      title: 'Chữ overlay bạn yêu cầu CHƯA được máy chủ xác nhận',
+      items: [
+        `Bạn đã nhập: “${requestedOverlay}” nhưng máy chủ không trả trường \`applied\` cho overlay (applied = ${String(overlay.applied)}) — UI KHÔNG dám khẳng định là đã vẽ. Hãy kiểm ảnh kết quả.`,
+        IS_OVERLAY_CLAIM_NOTE,
+      ],
+    });
+  }
+
+  // (6) Nền MÔ PHỎNG phải được khai ngay tại kết quả (§0 luật 2).
+  if (synthetic) {
+    blocks.push({
+      cls: 'warn',
+      title: `Nền của ảnh này là ${IS_SYNTHETIC_NOTE}`,
+      items: [
+        `Mẫu nền: ${template?.label || template?.id || 'không rõ tên mẫu'}. Nền do hệ thống tự sinh, KHÔNG phải ảnh chụp thật.`,
+        'Không quảng cáo ảnh này là ảnh chụp bối cảnh thật.',
+      ],
+    });
+  }
+  for (const w of compose.warnings || []) blocks.push({ cls: 'warn', title: 'Cảnh báo từ bước ghép nền', items: [String(w)] });
+
+  // (6b) LƯỢT CHẠY MỚI NHẤT (E4 `last_run`) — kể cả lượt KHÔNG tạo ảnh mới. Trình bày riêng để
+  // không trộn số liệu của lượt này với ảnh đang hiển thị (có thể là ảnh của lượt trước).
+  const alreadyShown = new Set(
+    [
+      ...(Array.isArray(matting.warnings) ? matting.warnings : []),
+      ...(Array.isArray(compose.warnings) ? compose.warnings : []),
+      ...(Array.isArray(retouch.warnings) ? retouch.warnings : []),
+      ...(Array.isArray(data.warnings) ? data.warnings : []),
+    ].map(String),
+  );
+  const lastItems = [];
+  const lastStageCode = String(lastRun?.error_code || '');
+  const lastStatus = String(lastRun?.status || '');
+  if (lastStatus) lastItems.push(`Trạng thái lượt chạy mới nhất: ${lastStatus}${lastStageCode ? ` (mã lỗi ${lastStageCode})` : ''}.`);
+  else if (lastStageCode) lastItems.push(`Mã lỗi của lượt chạy mới nhất: ${lastStageCode}.`);
+  if (lastRun?.error_message) lastItems.push(String(lastRun.error_message));
+  for (const f of lastFailures) {
+    const step = String(f?.step || '?');
+    const code = String(f?.code || '?');
+    const plain = IS_MATTING_FAIL_TEXT[code] ? ` ${IS_MATTING_FAIL_TEXT[code]}` : '';
+    lastItems.push(`Bước ${step} lỗi: ${code}.${plain}${f?.message ? ` ${String(f.message)}` : ''}`);
+  }
+  for (const w of Array.isArray(lastRun?.warnings) ? lastRun.warnings : []) {
+    const line = String(w);
+    // Cảnh báo của lượt chạy có thể trùng với cảnh báo từng bước đã hiện ở khối trên — chỉ
+    // bỏ dòng TRÙNG NGUYÊN VĂN, không bỏ bất kỳ cảnh báo nào khác.
+    if (!alreadyShown.has(line)) lastItems.push(line);
+  }
+  if (lastItems.length && lastRun?.rendered_asset_id !== (rendered?.id ?? null)) {
+    lastItems.push('Lượt chạy này KHÔNG (hoặc chưa) tạo ra ảnh mới — ảnh đang hiện thuộc lượt trước đó.');
+  }
+  if (lastRun && (lastItems.length || lastStatus || lastStageCode)) {
+    blocks.push({ cls: lastStageCode ? 'warn' : '', title: 'Lượt chạy mới nhất của job', items: lastItems });
+  }
+
+  // (7) Cảnh báo chung của API — hiện hết.
+  for (const w of data.warnings || []) blocks.push({ cls: 'warn', title: 'Cảnh báo', items: [String(w)] });
+
+  // (8) Lưới an toàn: ảnh ra KHÁC kích thước ảnh gốc = vi phạm luật 1 ⇒ nói thẳng, không giấu.
+  if (asset?.width && rendered?.width
+    && (Number(asset.width) !== Number(rendered.width) || Number(asset.height) !== Number(rendered.height))) {
+    blocks.unshift({
+      cls: 'error',
+      title: 'ẢNH RA KHÁC KÍCH THƯỚC ẢNH GỐC — vi phạm luật “không bóp méo sản phẩm”',
+      items: [
+        `Ảnh gốc ${asset.width}×${asset.height} nhưng ảnh tạo ${rendered.width}×${rendered.height}. Báo người điều phối; KHÔNG dùng ảnh này để đăng bán.`,
+      ],
+    });
+  }
+
+  if (!blocks.length) return '';
+  return `<section class="panel">
+    <h2>Cảnh báo thật từ hệ thống</h2>
+    ${blocks
+      .map(
+        (b) => `<div class="notice ${b.cls}">
+          <strong>${esc(b.title)}</strong>
+          ${b.items && b.items.length ? `<ul>${b.items.map((i) => `<li>${esc(i)}</li>`).join('')}</ul>` : ''}
+        </div>`,
+      )
+      .join('')}
+  </section>`;
+}
+
+/** Thân màn “Tạo ảnh” — hàm THUẦN để test trích ra chạy không cần DOM. */
+function renderImagestudioBody() {
+  const cfg = state.config?.imagestudio || {};
+  const available = cfg.available !== false;
+  const job = state.is?.job;
+  return `
+    ${isHeaderPanel()}
+    ${available ? (job ? renderIsJob() : renderIsUpload()) : isUnavailablePanel()}
+    ${available && !job ? renderIsOptions('create') : ''}
+    ${renderIsOverlayBlocked()}
+    ${isErrorBox()}
+  `;
+}
+
+function renderImagestudio() {
+  state.view = 'imagestudio';
+  stopPolling();
+  stopIlPolling();
+  app.innerHTML = renderImagestudioBody();
+  const cfg = state.config?.imagestudio || {};
+  if (cfg.available !== false && !state.is.templates && !state.is.templatesLoading && !state.is.templatesError) {
+    loadImagestudioTemplates();
+  }
+}
+
+/* ── Nạp mẫu nền + ngưỡng THẬT từ máy chủ ──────────────────────────────────── */
+
+async function loadImagestudioTemplates(force) {
+  if (!force && (state.is.templates || state.is.templatesLoading)) return;
+  state.is.templatesLoading = true;
+  if (force) state.is.templatesError = null;
+  try {
+    const res = await api('/api/imagestudio/templates');
+    state.is.templates = Array.isArray(res?.templates) ? res.templates : [];
+    state.is.limits = res?.retouch_limits || state.is.limits || state.config?.imagestudio?.retouch_limits || null;
+    state.is.mattingProvider = res?.matting_provider || state.is.mattingProvider || null;
+    state.is.templatesError = null;
+    ensureIsTemplate();
+  } catch (err) {
+    // Máy chủ chưa nối module (§3.6 ⇒ 503) — thử dùng khối `imagestudio` của /api/config, KHÔNG bịa mẫu nền.
+    const cfg = state.config?.imagestudio;
+    if (Array.isArray(cfg?.templates) && cfg.templates.length) state.is.templates = cfg.templates;
+    if (cfg?.retouch_limits && !state.is.limits) state.is.limits = cfg.retouch_limits;
+    state.is.templatesError = isErrorText(err);
+  } finally {
+    state.is.templatesLoading = false;
+  }
+  if (state.view === 'imagestudio') renderImagestudio();
+}
+
+/* ── Chọn ảnh + tạo job ────────────────────────────────────────────────────── */
+
+async function pickImagestudioFiles(files) {
+  const file = [...(files || [])][0];
+  if (!file) return;
+  const lim = state.config?.imagelab?.limits || {};
+  const allowed = lim.allowed_image_mime || ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+  if (!allowed.includes(file.type)) {
+    state.is.error = `Định dạng "${file.type || 'không rõ'}" không được phép. Chỉ nhận PNG / JPEG / WebP / GIF.`;
+    renderImagestudio();
+    return;
+  }
+  if (lim.max_image_bytes && file.size > lim.max_image_bytes) {
+    state.is.error = `Ảnh vượt giới hạn ${Math.round(lim.max_image_bytes / 1024 / 1024)}MB.`;
+    renderImagestudio();
+    return;
+  }
+  try {
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(new Error('Không đọc được tệp ảnh.'));
+      reader.readAsDataURL(file);
+    });
+    state.is.pending = {
+      name: file.name || 'image',
+      bytes: file.size,
+      mime: file.type,
+      base64: dataUrl.slice(dataUrl.indexOf(',') + 1),
+      dataUrl,
+    };
+    state.is.error = null;
+  } catch (err) {
+    state.is.error = err.message;
+  }
+  renderImagestudio();
+}
+
+async function submitImagestudioJob() {
+  const pending = state.is.pending;
+  if (!pending || state.is.busy) return;
+  state.is.busy = true;
+  state.is.error = null;
+  state.is.overlayBlocked = null;
+  renderImagestudio();
+  try {
+    const res = await api('/api/imagestudio/jobs', {
+      method: 'POST',
+      body: { image: { base64: pending.base64, filename: pending.name }, options: isJobOptions() },
+    });
+    state.is.busy = false;
+    state.is.pending = null;
+    state.is.jobId = res.job_id;
+    state.is.job = null;
+    location.hash = `#/taoanh/${res.job_id}`;
+    await openImagestudioJob(res.job_id);
+  } catch (err) {
+    state.is.busy = false;
+    const blocked = isOverlayBlockedFromError(err);
+    if (blocked) {
+      state.is.overlayBlocked = blocked;
+      state.is.error = null;
+      toast('Chữ overlay bị chặn — xem vi phạm trong khối cảnh báo.');
+    } else {
+      state.is.error = isErrorText(err);
+    }
+    renderImagestudio();
+  }
+}
+
+/** §3.7 — “TẠO LẠI với tham số khác” ⇒ POST /api/imagestudio/jobs/:id/generate. */
+async function regenerateImagestudio() {
+  const jobId = state.is?.job?.job?.id;
+  if (!jobId || state.is.busy) return;
+  state.is.busy = true;
+  state.is.error = null;
+  state.is.overlayBlocked = null;
+  renderImagestudio();
+  try {
+    await api(`/api/imagestudio/jobs/${jobId}/generate`, { method: 'POST', body: { options: isJobOptions() } });
+    state.is.busy = false;
+    toast('Đang tạo lại ảnh với tham số mới…');
+    startIsPolling();
+    renderImagestudio();
+  } catch (err) {
+    state.is.busy = false;
+    const blocked = isOverlayBlockedFromError(err);
+    if (blocked) {
+      state.is.overlayBlocked = blocked;
+      toast('Chữ overlay bị chặn — xem vi phạm trong khối cảnh báo.');
+    } else {
+      state.is.error = isErrorText(err);
+    }
+    renderImagestudio();
+  }
+}
+
+/* ── Theo dõi tiến trình (poll theo `stage`) ───────────────────────────────── */
+
+function isReset() {
+  stopIsPolling();
+  state.is.jobId = null;
+  state.is.job = null;
+  state.is.pending = null;
+  state.is.busy = false;
+  state.is.error = null;
+  state.is.overlayBlocked = null;
+  state.is.providers = null;
+  state.is.pollCount = 0;
+  state.is.dirtyPaint = false;
+}
+
+async function openImagestudioJob(id, { force = false } = {}) {
+  if (!id) return;
+  if (!force && state.is.jobId === id && state.is.job) {
+    renderImagestudio();
+    startIsPollIfRunning();
+    return;
+  }
+  if (!force && state.is.loading === id) return;
+  state.is.loading = id;
+  state.is.jobId = id;
+  if (!state.is.job || state.is.job?.job?.id !== id) {
+    app.innerHTML = '<section class="panel"><div class="status"><span class="spinner"></span> Đang tải job tạo ảnh…</div></section>';
+  }
+  try {
+    const data = await api(`/api/imagestudio/jobs/${id}`);
+    state.is.job = data;
+    state.is.error = null;
+    state.is.overlayBlocked = null;
+    adoptIsMeta(data);
+    syncIsOptionsFromJob(data); // tham số của job ⇒ mốc bắt đầu cho “TẠO LẠI với tham số khác”
+  } catch (err) {
+    state.is.job = null;
+    state.is.error = isErrorText(err);
+  } finally {
+    state.is.loading = null;
+  }
+  renderImagestudio();
+  startIsPollIfRunning();
+}
+
+function startIsPollIfRunning() {
+  if (isJobRunning(state.is.job?.job)) startIsPolling();
+  else stopIsPolling();
+}
+
+/** Đang gõ/kéo trong form tham số thì vòng poll KHÔNG vẽ lại (mất focus/thanh trượt nhảy). */
+function isOptionsHasFocus() {
+  const el = document.activeElement;
+  if (!el || typeof el.tagName !== 'string') return false;
+  if (el.tagName === 'INPUT' && el.type === 'range') return true;
+  if (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') return false;
+  return Boolean(el.closest?.('#is-options'));
+}
+
+function startIsPolling() {
+  stopIsPolling();
+  state.is.pollCount = 0;
+  state.is.poll = setInterval(async () => {
+    // Rời khỏi khu tạo ảnh thì tự dừng, không kéo người dùng về trang cũ.
+    if (state.view !== 'imagestudio' || !state.is.jobId) {
+      stopIsPolling();
+      return;
+    }
+    state.is.pollCount += 1;
+    if (state.is.pollCount > IS_MAX_POLLS) {
+      stopIsPolling();
+      const stage = String(state.is.job?.job?.stage || '').toLowerCase();
+      state.is.error = `Job vẫn ở bước “${IS_STAGE_LABEL[stage] || stage || 'không rõ'}” sau ${IS_MAX_POLLS} lần kiểm tra — có thể job bị kẹt. Bấm “Kiểm tra lại” hoặc xem log máy chủ.`;
+      renderImagestudio();
+      return;
+    }
+    try {
+      const data = await api(`/api/imagestudio/jobs/${state.is.jobId}`);
+      state.is.job = data;
+      adoptIsMeta(data);
+      if (!isJobRunning(data.job)) stopIsPolling();
+      if (isOptionsHasFocus()) state.is.dirtyPaint = true;
+      else renderImagestudio();
+    } catch (err) {
+      stopIsPolling();
+      state.is.error = `Mất kết nối khi theo dõi tiến trình: ${err.message}`;
+      renderImagestudio();
+    }
+  }, 1500);
+}
+
+function stopIsPolling() {
+  if (state.is.poll) clearInterval(state.is.poll);
+  state.is.poll = null;
+}
+
+/* ── Gắn sự kiện cho khu tạo ảnh (chỉ gắn một lần) ─────────────────────────── */
+
+/** Giữ giá trị người dùng đang chọn trong `state` để render lại KHÔNG mất tham số. */
+function isSyncField(target) {
+  if (!target || !target.dataset) return;
+  const param = target.dataset.isParam;
+  if (param) {
+    const v = Number(target.value);
+    state.is.options.retouch[param] = Number.isFinite(v) ? v : 0;
+    const out = document.getElementById(`is-val-${param}`);
+    if (out) out.textContent = isNumText(state.is.options.retouch[param]);
+    return;
+  }
+  if (target.dataset.isTemplate !== undefined) {
+    state.is.options.template = String(target.value || '');
+    renderImagestudio(); // đổi mẫu nền ⇒ vẽ lại để thấy mẫu đang chọn (không mất chữ đang gõ ở ô khác)
+    return;
+  }
+  if (target.dataset.isBg !== undefined) {
+    state.is.options.remove_background = Boolean(target.checked);
+    renderImagestudio();
+    return;
+  }
+  if (target.dataset.isAmbiguous !== undefined) {
+    state.is.options.matting_allow_ambiguous = Boolean(target.checked);
+    renderImagestudio();
+    return;
+  }
+  if (target.dataset.isOverlay !== undefined) {
+    state.is.options.overlay_text = String(target.value ?? '');
+  }
+}
+
+function wireImagestudioGlobal() {
+  document.addEventListener('change', (ev) => {
+    const t = ev.target;
+    if (t instanceof HTMLInputElement && t.id === 'is-file') pickImagestudioFiles(t.files);
+    isSyncField(t);
+  });
+  // Trong lúc người dùng đang gõ/kéo trong form tham số, vòng poll hoãn vẽ lại; rời khỏi form thì vẽ bù.
+  document.addEventListener('input', (ev) => isSyncField(ev.target));
+  document.addEventListener('focusout', (ev) => {
+    if (!state.is.dirtyPaint) return;
+    if (ev.relatedTarget?.closest?.('#is-options')) return;
+    state.is.dirtyPaint = false;
+    if (state.view === 'imagestudio') renderImagestudio();
+  });
+  for (const name of ['dragenter', 'dragover']) {
+    document.addEventListener(name, (ev) => {
+      if (ev.target.closest?.('#is-drop')) {
+        ev.preventDefault();
+        $('#is-drop')?.classList.add('hover');
+      }
+    });
+  }
+  for (const name of ['dragleave', 'drop']) {
+    document.addEventListener(name, (ev) => {
+      if (ev.target.closest?.('#is-drop')) {
+        ev.preventDefault();
+        $('#is-drop')?.classList.remove('hover');
+      }
+    });
+  }
+  document.addEventListener('drop', (ev) => {
+    if (ev.target.closest?.('#is-drop')) pickImagestudioFiles(ev.dataTransfer?.files);
+  });
 }
 
 boot();

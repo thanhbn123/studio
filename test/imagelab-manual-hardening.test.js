@@ -18,7 +18,7 @@ import { createImageStorage } from '../src/imagelab/storage.js';
 import { createTranslator } from '../src/imagelab/translate/index.js';
 import { createRenderProvider } from '../src/imagelab/render/index.js';
 import { ImageTranslationPipeline } from '../src/imagelab/pipeline.js';
-import { normalizeManualRegions } from '../src/imagelab/manual-regions.js';
+import { normalizeManualRegions, withKindDowngradeTrace } from '../src/imagelab/manual-regions.js';
 import { silent } from './helpers.js';
 import {
   cookie,
@@ -97,7 +97,10 @@ describe('IL08-01 — job OCR đang chạy KHÔNG được xoá vùng nhập tay
         sessionId: SID,
         regions: [{ box: { x: 5, y: 5, w: 50, h: 20 }, text: DESC_TEXT }],
       }),
-      (err) => err.code === 'IMAGELAB_JOB_RUNNING' && /chờ xong rồi hãy nhập vùng chữ/.test(err.message),
+      // IL08-07: câu chặn nay nêu ĐÚNG bước đang chạy (job này stage = 'ocr').
+      (err) => err.code === 'IMAGELAB_JOB_RUNNING'
+        && /chạy bước nhận dạng chữ \(OCR\)/.test(err.message)
+        && /chờ bước này xong rồi hãy nhập vùng chữ/.test(err.message),
       'job đang chạy ⇒ phải TỪ CHỐI bằng IMAGELAB_JOB_RUNNING',
     );
     assert.deepEqual(await store.listOcrRegions(jobId), [], 'bị từ chối thì không được ghi vùng nào');
@@ -279,6 +282,141 @@ describe('IL08-05 — body vượt trần ⇒ JSON 413', () => {
       // Server vẫn sống và dữ liệu job KHÔNG bị đụng.
       const after = await j(await fetch(`${ctx.base}/api/imagelab/jobs/${created.job_id}`, { headers: cookie(SID) }));
       assert.ok(after.job, 'server phải còn phục vụ sau khi từ chối body quá lớn');
+    } finally {
+      await ctx.close();
+    }
+  });
+});
+
+/* ═══════════════ VÒNG 7 — IL08-06 / IL08-07 ═══════════════ */
+
+describe('IL08-06 — vết hạ mức bảo vệ phải BỀN và ĐỌC LẠI ĐƯỢC', () => {
+  test('hàm thuần: vết nằm trong `kind_reason` nên đọc lại được từ bản ghi DB', () => {
+    const out = normalizeManualRegions(
+      [{ box: { x: 10, y: 10, w: 100, h: 20 }, text: PRICE_TEXT, kind: 'descriptive', allow_kind_downgrade: true }],
+      { width: 200, height: 200, maxRegions: 5 },
+    );
+    const r = out.regions[0];
+    assert.equal(r.kind, 'descriptive');
+    assert.equal(r.kind_downgraded, true);
+    assert.equal(r.kind_declared_by_user, 'descriptive');
+    assert.equal(r.kind_classified_by_machine, 'price');
+    assert.match(r.kind_reason, /NGƯỜI DÙNG HẠ MỨC từ price/);
+
+    // Đọc lại y như thể vừa lấy từ DB (chỉ có `kind` + `kind_reason`).
+    const traced = withKindDowngradeTrace({ id: r.id, kind: r.kind, kind_reason: r.kind_reason });
+    assert.equal(traced.kind_downgraded, true);
+    assert.equal(traced.kind_classified_by_machine, 'price');
+    // Vùng KHÔNG hạ mức thì không được có vết (không bịa).
+    assert.equal(withKindDowngradeTrace({ kind: 'descriptive', kind_reason: 'chữ mô tả thông thường' }).kind_downgraded, undefined);
+  });
+
+  test('API: vết ra tới response + content_meta, và CÒN sau lần lưu kế tiếp', async () => {
+    const ctx = await startImagelabApp();
+    try {
+      const created = await j(await postJson(ctx.base, '/api/imagelab/jobs', {
+        image: { base64: headphones().toString('base64') },
+      }, SID));
+      await waitJob(ctx.base, created.job_id, SID);
+
+      const r1 = await j(await putJson(ctx.base, `/api/imagelab/jobs/${created.job_id}/regions`, {
+        regions: [{ box: { x: 10, y: 10, w: 100, h: 20 }, text: PRICE_TEXT, kind: 'descriptive', allow_kind_downgrade: true }],
+        replace: true,
+      }, SID));
+      assert.equal(r1.regions[0].kind_downgraded, true, 'response phải mang vết ngay lượt lưu đầu');
+      assert.equal(r1.regions[0].kind_declared_by_user, 'descriptive');
+      assert.equal(r1.regions[0].kind_classified_by_machine, 'price');
+
+      const meta1 = (await ctx.store.getJob(created.job_id)).content_meta?.imagelab;
+      const list1 = meta1?.manual?.kind_downgrades || [];
+      assert.equal(list1.length, 1, 'content_meta.imagelab.manual.kind_downgrades phải có vết');
+      assert.equal(list1[0].kind_downgraded, true);
+      assert.equal(list1[0].classified_by_machine, 'price');
+      assert.ok(meta1.warnings.some((w) => /HẠ MỨC/.test(String(w))));
+
+      // LƯU LẦN KẾ TIẾP (ghi thêm một vùng sạch) — vết của vùng cũ KHÔNG được biến mất.
+      await putJson(ctx.base, `/api/imagelab/jobs/${created.job_id}/regions`, {
+        regions: [{ box: { x: 120, y: 150, w: 40, h: 15 }, text: DESC_TEXT, kind: 'descriptive' }],
+        replace: false,
+      }, SID);
+
+      const meta2 = (await ctx.store.getJob(created.job_id)).content_meta?.imagelab;
+      assert.equal((meta2?.manual?.kind_downgrades || []).length, 1, 'vết phải BỀN qua lần lưu sau');
+      assert.ok(
+        (meta2.warnings || []).some((w) => /vẫn đang ở mức/.test(String(w))),
+        'lần lưu sau vẫn phải nhắc lại vết hạ mức còn hiệu lực',
+      );
+
+      // Người dùng MỞ LẠI trang: vết phải đọc được từ GET.
+      const got = await j(await fetch(`${ctx.base}/api/imagelab/jobs/${created.job_id}`, { headers: cookie(SID) }));
+      assert.equal((got.kind_downgrades || []).length, 1, 'GET phải trả vết có cấu trúc');
+      const u1 = got.regions.find((r) => r.kind_downgraded === true);
+      assert.ok(u1, 'GET phải trả vùng mang vết');
+      assert.equal(u1.kind_classified_by_machine, 'price');
+      assert.ok(got.regions.some((r) => r.kind_downgraded === undefined), 'vùng không hạ mức KHÔNG được gắn cờ');
+    } finally {
+      await ctx.close();
+    }
+  });
+});
+
+describe('IL08-07 — chẩn đoán đúng bước đang chạy + không chặn vĩnh viễn job kẹt', () => {
+  test('có việc THẬT trong hàng đợi: 409 nêu đúng bước (không hardcode OCR/dịch)', async () => {
+    const config = imagelabConfig();
+    const store = await createStore(config, silent);
+    const gated = gatedOcrProvider();
+    const pipeline = new ImageTranslationPipeline({
+      config,
+      logger: silent,
+      store,
+      storage: createImageStorage(config, { logger: silent }),
+      ocrProvider: gated.provider,
+      translator: createTranslator(config, { logger: silent }),
+      renderProvider: createRenderProvider(config, { logger: silent }),
+    });
+    const jobId = await store.createJob({ sessionId: SID, kind: 'image_translation' });
+    await pipeline.ingest(jobId, { image: { base64: headphones().toString('base64') }, sessionId: SID });
+    await store.updateJob(jobId, { status: 'running', stage: 'rendering' }); // job đang RENDER
+
+    await assert.rejects(
+      () => pipeline.setManualRegions(jobId, {
+        sessionId: SID,
+        regions: [{ box: { x: 5, y: 5, w: 50, h: 20 }, text: DESC_TEXT }],
+        ocrPending: true, // hàng đợi CÓ việc thật
+      }),
+      (err) => err.code === 'IMAGELAB_JOB_RUNNING'
+        && /chạy bước render ảnh/.test(err.message)
+        && !/OCR\/dịch/.test(err.message),
+      'câu chặn phải nêu đúng bước đang chạy',
+    );
+    await store.close();
+  });
+
+  test('job KẸT `running` mà hàng đợi rỗng (mồ côi) ⇒ CHO lưu + cảnh báo, không chặn vĩnh viễn', async () => {
+    const ctx = await startImagelabApp();
+    try {
+      const created = await j(await postJson(ctx.base, '/api/imagelab/jobs', {
+        image: { base64: headphones().toString('base64') },
+      }, SID));
+      await waitJob(ctx.base, created.job_id, SID);
+
+      // Mô phỏng tiến trình CHẾT giữa lúc OCR: DB nói đang chạy, hàng đợi KHÔNG còn việc nào.
+      await ctx.store.updateJob(created.job_id, { status: 'running', stage: 'ocr' });
+      assert.equal(ctx.app.queue.isPending(created.job_id), false, 'tiền đề: hàng đợi rỗng');
+
+      const res = await putJson(ctx.base, `/api/imagelab/jobs/${created.job_id}/regions`, {
+        regions: [{ box: { x: 5, y: 5, w: 50, h: 20 }, text: DESC_TEXT }],
+      }, SID);
+      assert.equal(res.status, 200, 'job mồ côi KHÔNG được chặn vĩnh viễn');
+      const body = await j(res);
+      assert.ok(
+        body.warnings.some((w) => /HÀNG ĐỢI không còn việc nào/.test(String(w))),
+        'phải NÓI THẬT là job mồ côi, không im lặng',
+      );
+      const regions = await ctx.store.listOcrRegions(created.job_id);
+      assert.equal(regions.filter((r) => r.source === 'user').length, 1, 'dữ liệu người dùng phải được ghi');
+      const job = await ctx.store.getJob(created.job_id);
+      assert.equal(job.status, 'awaiting_review', 'job thoát khỏi trạng thái kẹt');
     } finally {
       await ctx.close();
     }

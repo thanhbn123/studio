@@ -6,6 +6,7 @@
  */
 
 import { Router, HttpError, sendJson, readJson, sessionId, presentedSessionId, MAX_BODY_BYTES_DEFAULT, SECURITY_HEADERS } from './server.js';
+import { scrubPaths } from '../logger.js';
 import { tryDetectSource } from '../sources/detect.js';
 import { STYLES, LENGTHS } from '../content/styles.js';
 import { JOB_STATUS } from '../store/index.js';
@@ -168,6 +169,258 @@ export function buildRouter(app) {
     return asset;
   };
 
+  /* ─────────────── MVP-03 · tiện ích dùng chung cho imagestudio ─────────────── */
+
+  // 3.6 — E3 (pipeline + wiring) do agent khác viết song song nên có thể CHƯA có mặt lúc
+  // server khởi động. Mọi route /api/imagestudio/* phải kiểm trước và trả 503 gọn gàng,
+  // tuyệt đối không để MVP-03 làm chết server của MVP-01/MVP-02.
+  const IMAGESTUDIO_MODULE_MESSAGE =
+    'Không nạp được module mẫu nền / ngưỡng retouch của MVP-03 — tính năng tạo ảnh chưa sẵn sàng. Chi tiết ở log máy chủ (imagestudio.module_load_failed).';
+
+  /**
+   * MVP-03 có bị TẮT bằng cấu hình không.
+   *
+   * Cách chọn (nói rõ để không ai đoán): MVP-03 dùng CHUNG kho ảnh `src/imagelab/storage.js`
+   * và trần ảnh `imagelab.maxImageBytes/maxPixels` với MVP-02, nên `imagelab.enabled = false`
+   * cũng phải tắt MVP-03; đồng thời tôn trọng cờ riêng `imagestudio.enabled` nếu có, để tắt
+   * riêng MVP-03 mà không phải bật lại MVP-02. Thiếu cả hai khoá ⇒ coi như đang bật.
+   */
+  const imagestudioEnabled = () => config.imagestudio?.enabled !== false && config.imagelab?.enabled !== false;
+
+  /**
+   * Kho ảnh để ĐỌC tệp: ưu tiên kho dùng chung của MVP-02, thiếu thì lấy kho riêng mà E3 đã
+   * bơm vào pipeline (app.js có thể nạp kho riêng khi khối ImageLab hỏng) — không đoán.
+   */
+  const imagestudioStorage = () => app.storage || app.imagestudioPipeline?.storage || null;
+
+  /**
+   * "Khả dụng" = có pipeline E3 + không bị tắt bằng cấu hình.
+   * KHÔNG lấy `storage` làm điều kiện: E3 có thể đang dùng kho riêng, và route chỉ cần kho
+   * ở đúng chỗ đọc tệp (khi đó thiếu kho ⇒ 503 ngay tại route đó).
+   */
+  const imagestudioAvailable = () => Boolean(app.imagestudioPipeline) && imagestudioEnabled();
+
+  /** Lý do THẬT khiến MVP-03 không chạy được (câu tiếng Việt, không lộ đường dẫn nội bộ). */
+  const imagestudioUnavailableReason = () => {
+    if (app.imagestudioUnavailableReason) return String(app.imagestudioUnavailableReason);
+    if (!imagestudioEnabled()) return 'Tính năng tạo ảnh đang bị tắt bằng cấu hình (IMAGELAB_ENABLED/IMAGESTUDIO_ENABLED = false).';
+    return 'Không nạp được pipeline tạo ảnh MVP-03 — tính năng tạo ảnh bị tắt. Chi tiết ở log máy chủ (imagestudio.wiring_failed).';
+  };
+
+  const requireImagestudio = () => {
+    if (!imagestudioAvailable()) throw HttpError.safe(503, 'IMAGESTUDIO_UNAVAILABLE', imagestudioUnavailableReason());
+  };
+
+  const requireImagestudioMethod = (name) => {
+    requireImagestudio();
+    if (typeof app.imagestudioPipeline?.[name] !== 'function') {
+      throw HttpError.safe(503, 'IMAGESTUDIO_UNAVAILABLE', `Pipeline tạo ảnh thiếu phương thức "${name}" — tính năng chưa sẵn sàng.`);
+    }
+  };
+
+  const requireImagestudioStoreMethod = (name) => {
+    if (typeof store[name] !== 'function') {
+      throw HttpError.safe(503, 'IMAGESTUDIO_UNAVAILABLE', `Kho dữ liệu thiếu phương thức "${name}" — tính năng tạo ảnh chưa sẵn sàng.`);
+    }
+  };
+
+  /** Thông tin provider MVP-03 — ĐÚNG ba field hợp đồng §3.6, không suy diễn thêm. */
+  const imagestudioProviderInfo = (p) => ({
+    name: p?.name || 'none',
+    is_mock: Boolean(p?.isMock),
+    configured: Boolean(p?.configured),
+  });
+  const imagestudioProviders = () => ({
+    matting: imagestudioProviderInfo(app.mattingProvider),
+    retouch: imagestudioProviderInfo(app.retouchProvider),
+  });
+
+  /**
+   * Nạp module TĨNH của MVP-03 (`TEMPLATES`, `RETOUCH_LIMITS`) — nạp PHÒNG THỦ như MVP-02:
+   * module anh em có thể chưa tồn tại lúc 5 agent chạy song song, và lỗi nạp KHÔNG được làm
+   * sập server. Phần nào thiếu thì trả `null` — KHÔNG bịa giá trị thay thế.
+   */
+  const imagestudioModules = new Map();
+  const loadImagestudioModule = (specifier) => {
+    if (!imagestudioModules.has(specifier)) {
+      imagestudioModules.set(specifier, (async () => {
+        try {
+          return await import(specifier);
+        } catch (err) {
+          logger?.error?.('imagestudio.module_load_failed', {
+            module: specifier,
+            error_name: err?.name || 'Error',
+            error_code: err?.code || null,
+            // Không đưa cả object lỗi vào log: message/stack của Node chứa đường dẫn tuyệt đối.
+            error_message: String(err?.message || err).replace(/\/(?:Users|home|private|tmp|var|opt|mnt|Volumes)\/\S*/g, '<path>'),
+          });
+          return null;
+        }
+      })());
+    }
+    return imagestudioModules.get(specifier);
+  };
+
+  const imagestudioStaticModules = async () => {
+    const [compose, retouch] = await Promise.all([
+      loadImagestudioModule('../imagestudio/compose/index.js'),
+      loadImagestudioModule('../imagestudio/retouch/index.js'),
+    ]);
+    return {
+      templates: Array.isArray(compose?.TEMPLATES) ? compose.TEMPLATES : null,
+      retouchLimits: retouch?.RETOUCH_LIMITS && typeof retouch.RETOUCH_LIMITS === 'object' ? retouch.RETOUCH_LIMITS : null,
+    };
+  };
+
+  const requireImagestudioTemplates = async () => {
+    const mods = await imagestudioStaticModules();
+    if (!mods.templates || !mods.retouchLimits) {
+      throw HttpError.safe(503, 'IMAGESTUDIO_UNAVAILABLE', IMAGESTUDIO_MODULE_MESSAGE);
+    }
+    return mods;
+  };
+
+  /** Quyền sở hữu job theo session: job của session khác trả 404 y như job không tồn tại. */
+  const requireImagestudioJob = async (id, sid) => {
+    requireImagestudio();
+    if (!UUID_RE.test(id)) throw new HttpError(400, 'BAD_JOB_ID', 'Mã job không hợp lệ.');
+    const job = await store.getJob(id);
+    if (!job || job.session_id !== sid) throw new HttpError(404, 'JOB_NOT_FOUND', 'Không tìm thấy job.');
+    return job;
+  };
+
+  /** Quyền sở hữu ẢNH theo session — cùng luật với `requireImagelabAsset` (khác chủ ⇒ 404). */
+  const requireImagestudioAsset = async (id, sid) => {
+    requireImagestudio();
+    requireImagestudioStoreMethod('getImageAsset');
+    if (!UUID_RE.test(id)) throw new HttpError(400, 'BAD_ASSET_ID', 'Mã ảnh không hợp lệ.');
+    const asset = await store.getImageAsset(id);
+    if (!asset) throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
+
+    if (asset.session_id) {
+      if (asset.session_id !== sid) throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
+    } else if (asset.job_id) {
+      const job = await store.getJob(asset.job_id);
+      if (!job || job.session_id !== sid) throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
+    } else {
+      // Không xác định được chủ sở hữu → fail-closed, không trả dữ liệu.
+      throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
+    }
+    return asset;
+  };
+
+  /**
+   * "Chữ gốc của job" (§3.5) = vùng chữ OCR + tên sản phẩm + ghi chú người dùng.
+   *
+   * Job MVP-03 không chạy OCR nên phần này thường RỖNG — và rỗng nghĩa là KHÔNG có bằng
+   * chứng, đúng luật fail-closed (mọi khẳng định bị chặn), KHÔNG phải "cho qua".
+   * Chỉ đọc dữ liệu ĐÃ LƯU của job; KHÔNG nhận "bằng chứng" từ chính body đang gọi.
+   */
+  const collectImagestudioEvidence = async (job) => {
+    const parts = [];
+    // Tên sản phẩm của job (E3 cũng đọc field này — giữ hai bên cùng một định nghĩa).
+    const productName = typeof job?.product_name === 'string' ? job.product_name.trim() : '';
+    if (productName) parts.push(productName);
+    if (job?.id && typeof store.listOcrRegions === 'function') {
+      try {
+        for (const region of asArray(await store.listOcrRegions(job.id))) {
+          const text =
+            typeof region?.text === 'string' ? region.text : typeof region?.text_original === 'string' ? region.text_original : '';
+          if (text.trim()) parts.push(text);
+        }
+      } catch (err) {
+        logger?.warn?.('imagestudio.evidence_failed', {
+          job_id: job.id,
+          error_name: err?.name || 'Error',
+          error_code: err?.code || null,
+        });
+      }
+    }
+    const meta = job?.content_meta && typeof job.content_meta === 'object' ? job.content_meta : {};
+    for (const holder of [meta.imagestudio, meta.imagelab]) {
+      if (!holder || typeof holder !== 'object') continue;
+      for (const key of IMAGESTUDIO_EVIDENCE_KEYS) {
+        const text = holder[key];
+        if (typeof text === 'string' && text.trim()) parts.push(text);
+      }
+    }
+    return parts.join('\n');
+  };
+
+  /**
+   * Kiểm overlay TRƯỚC khi xếp hàng (§3.5) — để trả HTTP **422** ngay thay vì 202 rồi
+   * người dùng ngồi chờ một tấm ảnh không bao giờ có chữ.
+   *
+   * Đây KHÔNG phải hàng rào duy nhất: `drawOverlay` của E2 vẫn kiểm lại y hệt lúc vẽ, nên
+   * không có đường nào vẽ được khẳng định thiếu bằng chứng. Route chỉ chuyển kết quả kiểm
+   * thành mã HTTP đúng hợp đồng.
+   *
+   * @returns {Promise<{code:string,message:string,violations:string[]}|null>} null = được vẽ
+   */
+  const preflightOverlayBlock = async (job, options) => {
+    const overlay = options?.overlay;
+    const text = typeof overlay?.text === 'string' ? overlay.text.trim() : '';
+    if (!text) return null; // không có chữ overlay ⇒ không có gì để chặn
+
+    const [checkClaimWords, checkNumericClaims, hasUntranslatedScript] = await Promise.all([
+      loadImagelabFunction('../imagelab/translate/guardrails.js', 'checkClaimWords'),
+      loadImagelabFunction('../imagelab/translate/guardrails.js', 'checkNumericClaims'),
+      loadImagelabFunction('../imagelab/translate/guardrails.js', 'hasUntranslatedScript'),
+    ]);
+    if (!checkClaimWords || !checkNumericClaims || !hasUntranslatedScript) {
+      throw HttpError.safe(503, 'IMAGESTUDIO_UNAVAILABLE', 'Thiếu module kiểm chống bịa (guardrails) — chưa thể nhận chữ overlay.');
+    }
+
+    // M03-04: "chưa dịch" kiểm TRƯỚC danh sách vi phạm — cùng một câu vừa có chữ Hán vừa có
+    // số liệu thì lý do đúng là CHƯA DỊCH, không phải "khẳng định không có bằng chứng".
+    if (hasUntranslatedScript(text)) {
+      return {
+        code: 'OVERLAY_NOT_TRANSLATED',
+        message: 'Chữ overlay còn chữ Hán/kana/Hangul chưa dịch — KHÔNG vẽ (mục 3.5).',
+        violations: [],
+      };
+    }
+
+    let violations = [];
+    try {
+      const evidence = await collectImagestudioEvidence(job);
+      violations = [
+        ...asArray(checkClaimWords(evidence, text)),
+        ...asArray(checkNumericClaims(evidence, text)),
+      ].map(String);
+    } catch (err) {
+      // Không kiểm được thì KHÔNG cho qua (fail-closed) và cũng không cáo buộc sai.
+      logger?.warn?.('imagestudio.overlay_check_failed', { error_name: err?.name || 'Error', error_code: err?.code || null });
+      throw HttpError.safe(503, 'IMAGESTUDIO_UNAVAILABLE', 'Chưa kiểm được chữ overlay (lỗi bộ kiểm chống bịa) — chưa thể nhận yêu cầu.');
+    }
+
+    if (violations.length > 0) {
+      const shown = text.length > 120 ? `${text.slice(0, 120)}…` : text;
+      return {
+        code: 'OVERLAY_UNSUPPORTED_CLAIM',
+        message: `Chữ overlay “${shown}” chứa khẳng định/số liệu không có bằng chứng trong chữ gốc của job — KHÔNG vẽ (mục 3.5).`,
+        violations,
+      };
+    }
+    return null;
+  };
+
+  /** Đánh dấu job hỏng (best-effort) — không để job treo 'queued' khi ingest ném lỗi. */
+  const markImagestudioJobFailed = async (jobId, err) => {
+    if (typeof store.updateJob !== 'function') return;
+    try {
+      await store.updateJob(jobId, {
+        status: JOB_STATUS.FAILED,
+        stage: 'failed',
+        error_code: err?.code || 'IMAGESTUDIO_INGEST_FAILED',
+        error_message: scrubPaths(String(err?.message || 'Không lưu được ảnh tải lên.')),
+        finished_at: new Date().toISOString(),
+      });
+    } catch (inner) {
+      logger?.warn?.('imagestudio.fail_mark_failed', { job_id: jobId, error_name: inner?.name || 'Error' });
+    }
+  };
+
   /* ───────────────────────────── Health ───────────────────────────── */
 
   router.get('/api/health', async (req, res) => {
@@ -196,6 +449,11 @@ export function buildRouter(app) {
 
   router.get('/api/config', async (req, res) => {
     const sessionStatus = await sessions.status();
+    // MVP-03: mẫu nền + ngưỡng retouch nạp PHÒNG THỦ (module anh em có thể chưa có mặt).
+    // Thiếu module ⇒ khối `imagestudio` báo `available: false` + templates rỗng, KHÔNG làm
+    // hỏng /api/config mà MVP-01/MVP-02 đang dùng.
+    const isModules = await imagestudioStaticModules();
+    const isReady = imagestudioAvailable() && Boolean(isModules.templates && isModules.retouchLimits);
     sendJson(res, 200, {
       styles: Object.values(STYLES).map((s) => ({ id: s.id, label: s.label, description: s.description })),
       lengths: Object.values(LENGTHS).map((l) => ({ id: l.id, label: l.label })),
@@ -222,6 +480,19 @@ export function buildRouter(app) {
         limits: imagelabLimits(),
         kinds: [...IMAGELAB_KINDS],
         max_render_pixels: imagelabLimits().max_pixels,
+      },
+      // 3.6 — khối MVP-03 cho UI (tab "Tạo ảnh"): mẫu nền MÔ PHỎNG + ngưỡng retouch +
+      // provider. `available` = pipeline E3 + kho ảnh + module mẫu nền/ngưỡng + cờ cấu hình
+      // (xem `imagestudioEnabled`); `reason` nói thẳng vì sao tắt — không im lặng.
+      imagestudio: {
+        available: isReady,
+        reason: isReady ? null : imagestudioAvailable() ? IMAGESTUDIO_MODULE_MESSAGE : imagestudioUnavailableReason(),
+        enabled: imagestudioEnabled(),
+        // Chỉ ba field UI cần; `synthetic` giữ nguyên giá trị THẬT của mẫu (không tự gán true).
+        templates: (isModules.templates || []).map((t) => ({ id: t.id, label: t.label, synthetic: t.synthetic === true })),
+        retouch_limits: isModules.retouchLimits || null,
+        matting: imagestudioProviderInfo(app.mattingProvider),
+        retouch: imagestudioProviderInfo(app.retouchProvider),
       },
     });
   });
@@ -581,6 +852,8 @@ export function buildRouter(app) {
       store.listOcrRegions(job.id),
       store.listTranslationLines(job.id),
     ]);
+    // IL08-06: decorator vết hạ mức (module thuần của tầng imagelab, nạp qua loader).
+    const traceDowngrade = await loadImagelabFunction('../imagelab/manual-regions.js', 'withKindDowngradeTrace');
 
     const list = Array.isArray(assets) ? assets : [];
     const originals = list.filter((a) => a.role === 'original');
@@ -592,7 +865,12 @@ export function buildRouter(app) {
       job: jobJson(job),
       asset: assetJson(asset),
       rendered: rendered.map(assetJson),
-      regions: (rawRegions || []).map(regionJson),
+      regions: (rawRegions || []).map((r) => regionJson(r, traceDowngrade)),
+      // IL08-06 (vòng 7): vết hạ mức có cấu trúc — MỞ LẠI TRANG vẫn đọc được (không phải
+      // trạng thái in-memory của lần lưu trước). Mỗi vùng cũng mang vết riêng ở `regions[]`.
+      kind_downgrades: Array.isArray(job.content_meta?.imagelab?.manual?.kind_downgrades)
+        ? job.content_meta.imagelab.manual.kind_downgrades
+        : [],
       lines: (rawLines || []).map(lineJson),
       render_summary: buildRenderSummary(lastRendered),
       warnings: collectWarnings(asset, lastRendered),
@@ -711,10 +989,11 @@ export function buildRouter(app) {
       throw mapImagelabError(err, 'Không lưu được vùng chữ nhập tay.');
     }
 
+    const traceDowngrade = await loadImagelabFunction('../imagelab/manual-regions.js', 'withKindDowngradeTrace');
     sendJson(res, 200, {
       job_id: job.id,
       status: result?.status ?? JOB_STATUS.AWAITING_REVIEW,
-      regions: asArray(result?.regions).map(regionJson),
+      regions: asArray(result?.regions).map((r) => regionJson(r, traceDowngrade)),
       lines: asArray(result?.lines).map(lineJson),
       // Vùng bị bỏ: `{ index, code, reason, text? }` — UI phải hiện ra (§11.2 luật 10).
       rejected: asArray(result?.rejected),
@@ -847,6 +1126,212 @@ export function buildRouter(app) {
     res.end(buffer);
   });
 
+  /* ══════════ MVP-03 · Tạo ảnh (Image Generation/Retouching, hợp đồng 3.6) ══════════ */
+
+  /* ── Tạo job tạo ảnh: nhận ảnh base64 đã kiểm magic bytes, ingest NGAY trong request ── */
+
+  router.post('/api/imagestudio/jobs', async (req, res) => {
+    requireImagestudioMethod('ingest');
+    requireImagestudioMethod('generate');
+    requireImagestudioStoreMethod('createJob');
+    await requireImagestudioTemplates();
+
+    const sid = sessionId(req, res);
+    enforce(rateLimiters.jobs, `imagestudio:${sid}`);
+
+    const limits = imagelabLimits();
+    // base64 phình ~4/3 so với nhị phân — nới body vừa đủ cho một ảnh.
+    const body = await readJson(req, {
+      maxBytes: Math.min(MAX_BODY_BYTES_DEFAULT, Math.ceil((limits.max_image_bytes * 4) / 3) + 64 * 1024),
+    });
+
+    // Kiểm ảnh y như MVP-02 (dùng lại ĐÚNG một hàm): không tin Content-Type client khai
+    // (magic bytes), chặn theo allowedImageMime + maxImageBytes + maxPixels; lỗi 400/413/415
+    // kèm câu tiếng Việt. Không kiểm provider matting ở đây: theo §3.3, tách nền thất bại
+    // KHÔNG được làm chết job — vẫn còn đường chỉ-retouch (status PARTIAL).
+    const image = decodeImagelabImage(body.image, limits);
+    const options = sanitizeImagestudioOptions(body.options);
+
+    // §3.5 — overlay thiếu bằng chứng thì KHÔNG nhận job rồi để nó chạy mà không vẽ: trả 422
+    // ngay, chưa tạo job nào (không để lại rác). Job chưa tồn tại nên "chữ gốc" đúng bằng
+    // RỖNG ⇒ mọi khẳng định/số liệu đều bị chặn.
+    const blocked = await preflightOverlayBlock(null, options);
+    if (blocked) return sendImagestudioOverlayBlocked(res, blocked);
+
+    const jobId = await store.createJob({
+      sessionId: sid,
+      source: 'manual',
+      inputMode: 'manual',
+      kind: IMAGESTUDIO_KIND,
+    });
+
+    // Ingest chạy NGAY trong request (như MVP-02 đã làm) để `asset_id` trả về là THẬT và
+    // ảnh hỏng/không hỗ trợ ra HTTP ngay, không biến thành job chết trong hàng đợi.
+    let ingest;
+    try {
+      ingest = await app.imagestudioPipeline.ingest(jobId, { image, sessionId: sid, options });
+    } catch (err) {
+      await markImagestudioJobFailed(jobId, err);
+      throw mapImagestudioError(err, 'Không lưu được ảnh tải lên.');
+    }
+
+    queue.enqueue(jobId, () => app.imagestudioPipeline.generate(jobId, { sessionId: sid, options, force: false }));
+
+    sendJson(res, 202, {
+      job_id: jobId,
+      asset_id: ingest?.asset_id ?? null,
+      status: JOB_STATUS.QUEUED,
+      poll: `/api/imagestudio/jobs/${jobId}`,
+    });
+  });
+
+  /* ── Trạng thái job + ảnh gốc/ảnh đã tạo + dấu vết từng bước ── */
+
+  router.get('/api/imagestudio/jobs/:id', async (req, res, params) => {
+    requireImagestudio();
+    requireImagestudioStoreMethod('listImageAssets');
+    const { templates, retouchLimits } = await requireImagestudioTemplates();
+
+    const sid = sessionId(req, res);
+    const job = await requireImagestudioJob(params.id, sid);
+
+    const list = asArray(await store.listImageAssets(job.id, {}));
+    const originals = list.filter((a) => a.role === 'original');
+    const rendered = list.filter((a) => a.role === 'rendered');
+    const asset = originals.find((a) => !a.parent_id) || originals[0] || null;
+    const latest = rendered[rendered.length - 1] || null;
+
+    // E3 ghi dấu vết từng bước vào `meta` của ảnh rendered mới nhất (§3.3). Đọc ĐÚNG những
+    // gì đã lưu; chưa chạy tới bước nào ⇒ null/[] — KHÔNG suy diễn, KHÔNG bịa. Chấp nhận cả
+    // hai cách đặt khoá (`meta.<bước>` và `meta.imagestudio.<bước>`) để không lệch E3.
+    const meta = latest?.meta && typeof latest.meta === 'object' ? latest.meta : {};
+    const blob = meta.imagestudio && typeof meta.imagestudio === 'object' ? { ...meta, ...meta.imagestudio } : meta;
+    const run = job.content_meta?.imagestudio && typeof job.content_meta.imagestudio === 'object' ? job.content_meta.imagestudio : null;
+    // Bản tổng hợp của job CHỈ được ghép vào ảnh khi nó MÔ TẢ ĐÚNG ảnh này (cùng lượt chạy),
+    // nếu không sẽ gán số liệu của lượt chạy khác cho ảnh cũ — đúng kiểu "bịa" cần tránh.
+    const sameRun = run && latest && run.rendered_asset_id === latest.id ? run : null;
+    const traces = imagestudioStepTraces(blob, sameRun);
+
+    sendJson(res, 200, {
+      job: jobJson(job),
+      asset: assetJson(asset),
+      rendered: rendered.map(assetJson),
+      matting: traces.matting,
+      compose: traces.compose,
+      retouch: traces.retouch,
+      overlay: blob.overlay ?? null,
+      warnings: asArray(blob.warnings).map(String),
+      // Bổ sung ngoài danh sách tối thiểu: các field §3.3 bắt buộc ghi lên ảnh rendered
+      // (`retouch_effective`, `synthetic_background`) — chuyển thẳng, không diễn giải.
+      retouch_effective: blob.retouch_effective ?? null,
+      synthetic_background: blob.synthetic_background ?? null,
+      // Lượt chạy MỚI NHẤT của job (kể cả khi lượt đó KHÔNG tạo ảnh mới, ví dụ NO_CHANGES):
+      // UI cần thấy nó, và nó được tách khỏi dữ liệu của ảnh để không trộn hai lượt.
+      last_run: imagestudioLastRun(run),
+      providers: imagestudioProviders(),
+      templates,
+      retouch_limits: retouchLimits,
+    });
+  });
+
+  /* ── Chạy lại (hoặc chạy tiếp) với tham số mới — ảnh cũ KHÔNG bị ghi đè ── */
+
+  router.post('/api/imagestudio/jobs/:id/generate', async (req, res, params) => {
+    requireImagestudioMethod('generate');
+    requireImagestudioStoreMethod('listImageAssets');
+    requireImagestudioStoreMethod('updateJob');
+    await requireImagestudioTemplates();
+
+    const sid = sessionId(req, res);
+    enforce(rateLimiters.jobs, `imagestudio-generate:${sid}`);
+    const job = await requireImagestudioJob(params.id, sid);
+
+    if (String(job.kind ?? '') !== IMAGESTUDIO_KIND) {
+      throw HttpError.safe(409, 'IMAGESTUDIO_NOT_IMAGE_JOB', 'Job này không phải job tạo ảnh (`image_generation`) — không chạy tạo ảnh được.');
+    }
+
+    const body = await readJson(req, { maxBytes: 256 * 1024 });
+    const options = sanitizeImagestudioOptions(body.options);
+    // `force` chỉ có nghĩa "chạy lại dù chưa đổi gì" — KHÔNG bao giờ miễn kiểm chống bịa
+    // (§3.5): overlay thiếu bằng chứng vẫn bị 422, không có cờ nào mở được đường đó.
+    const force = body.force === true;
+
+    const originals = asArray(await store.listImageAssets(job.id, { role: 'original' }));
+    if (originals.length === 0) {
+      throw HttpError.safe(409, 'IMAGESTUDIO_NO_ORIGINAL', 'Job này chưa có ảnh gốc — hãy tải ảnh lên trước khi tạo ảnh.');
+    }
+
+    // 422 TRƯỚC khi xếp hàng (xem `preflightOverlayBlock`): người dùng biết ngay chữ sẽ
+    // không được vẽ, thay vì 202 rồi chờ một tấm ảnh không có chữ. Job giữ nguyên trạng thái.
+    const blocked = await preflightOverlayBlock(job, options);
+    if (blocked) return sendImagestudioOverlayBlocked(res, blocked);
+
+    await store.updateJob(job.id, {
+      status: JOB_STATUS.QUEUED,
+      stage: 'queued',
+      error_code: null,
+      error_message: null,
+    });
+
+    // Ảnh MỚI: pipeline ghi asset role `rendered` với `parent_id` = ảnh gốc; ảnh cũ còn nguyên.
+    queue.enqueue(job.id, () => app.imagestudioPipeline.generate(job.id, { sessionId: sid, options, force }));
+
+    sendJson(res, 202, { job_id: job.id, status: JOB_STATUS.QUEUED, force, poll: `/api/imagestudio/jobs/${job.id}` });
+  });
+
+  /* ── Danh sách mẫu nền MÔ PHỎNG + ngưỡng retouch (UI dựng thanh trượt từ đây) ── */
+
+  router.get('/api/imagestudio/templates', async (req, res) => {
+    requireImagestudio();
+    const { templates, retouchLimits } = await requireImagestudioTemplates();
+    sendJson(res, 200, {
+      templates,
+      retouch_limits: retouchLimits,
+      matting_provider: imagestudioProviderInfo(app.mattingProvider),
+    });
+  });
+
+  /* ── File ảnh nhị phân (kiểm quyền sở hữu theo session như mọi route khác) ──
+   * `GET /api/imagelab/assets/:id/file` cũng đã kiểm quyền theo session và PHỤC VỤ ĐƯỢC ảnh
+   * của job MVP-03 (asset cùng bảng, cùng kho). Route này là đường RIÊNG của MVP-03 để UI
+   * không phụ thuộc vào việc khối ImageLab có khả dụng hay không.
+   */
+
+  router.get('/api/imagestudio/assets/:id/file', async (req, res, params) => {
+    const sid = sessionId(req, res);
+    const asset = await requireImagestudioAsset(params.id, sid);
+    const storage = imagestudioStorage();
+    if (!storage || typeof storage.read !== 'function') {
+      throw HttpError.safe(503, 'IMAGESTUDIO_UNAVAILABLE', 'Không có kho ảnh để đọc tệp — tính năng tạo ảnh chưa sẵn sàng.');
+    }
+
+    const allowed = config.net.allowedImageMime || [];
+    if (!asset.mime || !allowed.includes(asset.mime)) {
+      throw new HttpError(415, 'UNSUPPORTED_MEDIA_TYPE', 'Định dạng ảnh này không được phép trả về.');
+    }
+
+    let buffer;
+    try {
+      buffer = await storage.read(asset);
+    } catch (err) {
+      logger?.warn?.('imagestudio.asset_read_failed', { asset_id: asset.id, error_name: err?.name || 'Error' });
+      throw new HttpError(404, 'ASSET_FILE_NOT_FOUND', 'Không tìm thấy tệp ảnh.');
+    }
+    if (!buffer || buffer.length === 0) {
+      throw new HttpError(404, 'ASSET_FILE_NOT_FOUND', 'Không tìm thấy tệp ảnh.');
+    }
+
+    res.writeHead(200, {
+      ...SECURITY_HEADERS,
+      'content-type': asset.mime,
+      'content-length': buffer.length,
+      // Ảnh riêng của từng phiên — cấm mọi cache dùng chung.
+      'cache-control': 'private, no-store',
+      'content-disposition': `inline; filename="imagestudio-${asset.role || 'image'}-${String(asset.id).slice(0, 8)}.${extForMime(asset.mime)}"`,
+    });
+    res.end(buffer);
+  });
+
   return router;
 }
 
@@ -947,14 +1432,30 @@ function assetJson(asset) {
  * Chuẩn hoá vùng OCR: store có thể trả cột phẳng (x, y, w, h, text_original)
  * hoặc object lồng (box, box_normalized, text) — nhận cả hai, không bịa field.
  */
-function regionJson(r) {
+/**
+ * `Region` → JSON cho client. `withKindDowngradeTrace` được TRUYỀN VÀO (không static-import
+ * module imagelab ở đây): routes.js nạp module imagelab qua loader để còn trả 503 khi module
+ * thiếu, thay vì làm sập cả app.
+ *
+ * IL08-06 (vòng 7): vùng bị NGƯỜI DÙNG hạ mức bảo vệ phải mang vết ra tới client (PUT và GET
+ * dùng chung hàm này) — vết đọc lại từ `kind_reason` ĐÃ LƯU, không phải trạng thái in-memory.
+ */
+function regionJson(r, withKindDowngradeTrace = null) {
   const box = r.box && typeof r.box === 'object'
     ? r.box
     : { x: r.x, y: r.y, w: r.w, h: r.h };
   const norm = r.box_normalized && typeof r.box_normalized === 'object'
     ? r.box_normalized
     : { x: r.x_norm, y: r.y_norm, w: r.w_norm, h: r.h_norm };
+  const traced = typeof withKindDowngradeTrace === 'function' ? withKindDowngradeTrace(r) : r;
   return {
+    ...(traced?.kind_downgraded
+      ? {
+          kind_downgraded: true,
+          kind_declared_by_user: traced.kind_declared_by_user ?? null,
+          kind_classified_by_machine: traced.kind_classified_by_machine ?? null,
+        }
+      : {}),
     id: r.region_key || r.id,
     box,
     box_normalized: norm,
@@ -1373,6 +1874,307 @@ function mapImagelabError(err, fallbackMessage = 'Không xử lý được yêu 
 
 function extForMime(mime) {
   return { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' }[mime] || 'bin';
+}
+
+/* ══════════════════ MVP-03 · hằng số + bộ làm sạch dùng chung ══════════════════ */
+
+/** Loại job của MVP-03 (§3.3, giá trị ĐÓNG BĂNG — E3 export cùng tên ở `imagestudio/pipeline.js`). */
+const IMAGESTUDIO_KIND = 'image_generation';
+
+/**
+ * Các khoá mà `drawOverlay` (E2) coi là "chữ gốc của job" — dùng để (a) gom bằng chứng từ
+ * dữ liệu ĐÃ LƯU của job và (b) biết khi nào client tự khai bằng chứng (khi đó tầng vẽ phán
+ * quyết, route không chặn trước). Danh sách này bám `resolveSourceText` của E2.
+ */
+const IMAGESTUDIO_EVIDENCE_KEYS = Object.freeze([
+  'source_text',
+  'sourceText',
+  'source',
+  'text_source',
+  'text_original',
+  'job_text',
+  'job_source',
+  'evidence',
+  'evidence_text',
+  'evidence_texts',
+  'original_text',
+  'ocr_text',
+  'product_name',
+  'user_note',
+  'note',
+  'notes',
+]);
+
+const IMAGESTUDIO_OVERLAY_TEXT_MAX = 500;
+
+const isPlainObject = (v) => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+
+/**
+ * Body `options` của MVP-03 (`{ template?, remove_background?, retouch?, overlay? }`).
+ *
+ * Nguyên tắc: route KIỂM KIỂU và LÀM SẠCH, nhưng KHÔNG áp luật nghiệp vụ thay các tầng dưới.
+ * Đặc biệt KHÔNG kẹp tham số retouch ở đây: việc kẹp theo `RETOUCH_LIMITS` + ghi `clamped[]`
+ * thuộc E1/E3 (§3.4) — kẹp sớm ở route sẽ làm MẤT vết "tham số bị kẹp" mà hợp đồng bắt buộc.
+ * Ngoại lệ duy nhất: kiểu SAI rõ ràng (không phải object/boolean/số) ⇒ 400 ngay, không đoán.
+ */
+function sanitizeImagestudioOptions(raw) {
+  const options = {};
+  if (raw === undefined || raw === null) return options;
+  if (!isPlainObject(raw)) {
+    throw HttpError.safe(400, 'BAD_OPTIONS', '`options` phải là một object.');
+  }
+
+  const template = sanitizeText(raw.template, { maxLength: 64 });
+  if (template) options.template = template;
+
+  if (raw.remove_background !== undefined && raw.remove_background !== null) {
+    if (typeof raw.remove_background !== 'boolean') {
+      throw HttpError.safe(400, 'BAD_OPTIONS', '`options.remove_background` phải là true hoặc false.');
+    }
+    options.remove_background = raw.remove_background;
+  }
+
+  if (raw.retouch !== undefined && raw.retouch !== null) {
+    if (!isPlainObject(raw.retouch)) {
+      throw HttpError.safe(400, 'BAD_OPTIONS', '`options.retouch` phải là object các tham số số (brightness/contrast/saturation/sharpen).');
+    }
+    options.retouch = sanitizeRetouchPassThrough(raw.retouch);
+  }
+
+  if (raw.overlay !== undefined && raw.overlay !== null) {
+    options.overlay = sanitizeImagestudioOverlay(raw.overlay);
+  }
+
+  // N1 (vòng 9): người dùng CHẤP NHẬN ghép nền dù biên nhập nhằng (bóng đổ mềm/viền mờ).
+  // Mặc định KHÔNG bật; bật thì tầng matting vẫn ghép nhưng ghi vết nổi bật.
+  if (raw.matting_allow_ambiguous !== undefined && raw.matting_allow_ambiguous !== null) {
+    if (typeof raw.matting_allow_ambiguous !== 'boolean') {
+      throw HttpError.safe(400, 'BAD_OPTIONS', '`options.matting_allow_ambiguous` phải là true hoặc false.');
+    }
+    options.matting_options = { ...(options.matting_options || {}), matting_allow_ambiguous: raw.matting_allow_ambiguous === true };
+  }
+
+  return options;
+}
+
+/**
+ * Tham số retouch: chuyển THẲNG giá trị cho tầng retouch (E1/E3 tự kẹp + tự ghi
+ * `clamped[]`/`rejected[]`); chỉ loại khoá nguy hiểm (prototype pollution) và hạ giá trị
+ * không nguyên thuỷ xuống `null` — tầng retouch coi `null` là "không phải số hữu hạn" nên
+ * VẪN báo trong `rejected[]`, không im lặng. Trần 32 khoá để body rác không phình vô hạn.
+ */
+function sanitizeRetouchPassThrough(raw) {
+  const out = {};
+  for (const [key, value] of Object.entries(raw).slice(0, 32)) {
+    if (DANGEROUS_KEYS.has(key)) continue;
+    const name = sanitizeText(key, { maxLength: 32 });
+    if (!name) continue;
+    out[name] = value === null || ['number', 'string', 'boolean'].includes(typeof value) ? value : null;
+  }
+  return out;
+}
+
+/** `overlay` (§3.2): `{ text, x, y, size?, color?, align? }` + các khoá bằng chứng (nếu client khai). */
+function sanitizeImagestudioOverlay(raw) {
+  if (!isPlainObject(raw)) {
+    throw HttpError.safe(400, 'BAD_OPTIONS', '`options.overlay` phải là object dạng { text, x, y, size?, color?, align? }.');
+  }
+  const out = { text: '' };
+  const rawText = raw.text;
+  if (rawText !== undefined && rawText !== null) {
+    if (typeof rawText !== 'string' && typeof rawText !== 'number') {
+      throw HttpError.safe(400, 'BAD_OPTIONS', '`options.overlay.text` phải là chuỗi.');
+    }
+    out.text = sanitizeText(rawText, { maxLength: IMAGESTUDIO_OVERLAY_TEXT_MAX });
+  }
+
+  for (const key of ['x', 'y', 'size']) {
+    const value = raw[key];
+    if (value === undefined || value === null) continue;
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      throw HttpError.safe(400, 'BAD_OPTIONS', `\`options.overlay.${key}\` phải là một số hữu hạn.`);
+    }
+    out[key] = value;
+  }
+  // `align` lạ KHÔNG bị từ chối: `drawOverlay` đã fail-closed về 'left' cho giá trị không
+  // nằm trong left|center|right — chép lại luật đó ở route là thêm một bản dễ lệch.
+  const color = sanitizeText(raw.color, { maxLength: 32 });
+  if (color) out.color = color;
+  const align = sanitizeText(raw.align, { maxLength: 16 });
+  if (align) out.align = align;
+
+  // M03-02 (vòng 8): bằng chứng do CLIENT khai bị BỎ HOÀN TOÀN — không chuyển xuống tầng vẽ,
+  // không dùng làm "chữ gốc của job". Bằng chứng chỉ lấy từ dữ liệu ĐÃ LƯU của job (tên sản
+  // phẩm, vùng OCR, vùng người dùng nhập, ghi chú đã lưu) — bài học "bằng chứng vòng" §7.1.
+  // Khoá nào client có gửi thì GHI LẠI TÊN để câu trả lời nói rõ là đã bỏ qua (không im lặng).
+  const ignored = [];
+  for (const key of IMAGESTUDIO_EVIDENCE_KEYS) {
+    const value = raw[key];
+    const hasText = typeof value === 'string' && value.trim();
+    const hasLines = Array.isArray(value) && value.some((l) => typeof l === 'string' && l.trim());
+    const hasObject = value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0;
+    if (hasText || hasLines || hasObject) ignored.push(key);
+  }
+  if (ignored.length > 0) out.client_evidence_ignored = ignored;
+  return out;
+}
+
+/**
+ * 422 khi overlay bị chặn vì thiếu bằng chứng (§3.5).
+ *
+ * Trả CẢ HAI hình dạng: phong bì lỗi chuẩn của repo (`{ error: { code, message, details } }`)
+ * và các trường phẳng `{ code, message, violations }` mà hợp đồng 3.6 yêu cầu — UI/test đọc
+ * kiểu nào cũng đúng, và KHÔNG lộ stack/đường dẫn nội bộ.
+ */
+function sendImagestudioOverlayBlocked(res, { code, message, violations } = {}) {
+  const list = asArray(violations).map(String);
+  const errorCode = code || 'OVERLAY_UNSUPPORTED_CLAIM';
+  sendJson(res, 422, {
+    error: { code: errorCode, message, details: { violations: list } },
+    code: errorCode,
+    message,
+    violations: list,
+  });
+}
+
+/**
+ * Dấu vết ba bước của ẢNH ĐÃ TẠO, đọc từ ĐÚNG dữ liệu E3 lưu (`meta` của ảnh rendered).
+ *
+ * Ưu tiên `meta.matting/compose/retouch` nếu E3 ghi thẳng bản mô tả đầy đủ. Nếu chưa, dựng
+ * bản mô tả TỐI THIỂU từ hai nguồn THẬT đã lưu:
+ *   - `meta.generator` (E3 luôn ghi): `matting_status`, `compose_background_ratio`, `retouch_status`;
+ *   - `meta.retouch_effective/retouch_clamped/retouch_rejected`, `meta.template`;
+ *   - bản tổng hợp của CHÍNH lượt chạy đã tạo ra ảnh này (`run`, truyền vào chỉ khi khớp
+ *     `rendered_asset_id`) để lấy `providers`, `composed`, mã lỗi từng bước.
+ * Trường nào E3 KHÔNG lưu (mask, coverage, output…) để `null` — KHÔNG bịa số đo.
+ */
+function imagestudioStepTraces(blob, run) {
+  const generator = isPlainObject(blob?.generator) ? blob.generator : null;
+  const providers = isPlainObject(run?.providers) ? run.providers : null;
+  const failures = asArray(run?.failures);
+  const failureCode = (step) => {
+    const hit = failures.find((f) => f && String(f.step) === step && f.code);
+    return hit ? String(hit.code) : null;
+  };
+  const asFinite = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+
+  const matting =
+    blob?.matting ??
+    (generator?.matting_status
+      ? {
+          status: String(generator.matting_status),
+          provider: providers?.matting?.name ?? null,
+          is_mock: providers?.matting?.is_mock ?? null,
+          error_code: failureCode('matting'),
+          mask: null,
+          output: null,
+          kept_bbox: null,
+          warnings: [],
+        }
+      : null);
+
+  const compose =
+    blob?.compose ??
+    (generator || run
+      ? {
+          applied: typeof run?.composed === 'boolean' ? run.composed : null,
+          template: blob?.template ?? null,
+          background_ratio: asFinite(generator?.compose_background_ratio),
+          output: null,
+          warnings: [],
+        }
+      : null);
+
+  const retouch =
+    blob?.retouch ??
+    (generator?.retouch_status || blob?.retouch_effective
+      ? {
+          status: generator?.retouch_status ? String(generator.retouch_status) : null,
+          params_effective: blob?.retouch_effective ?? null,
+          clamped: asArray(blob?.retouch_clamped).map(String),
+          rejected: asArray(blob?.retouch_rejected).map(String),
+          error_code: failureCode('retouch'),
+          output: null,
+          warnings: [],
+        }
+      : null);
+
+  return { matting, compose, retouch };
+}
+
+/**
+ * Lượt chạy MỚI NHẤT của job (E3 lưu ở `jobs.content_meta.imagestudio`) — kể cả khi lượt đó
+ * KHÔNG tạo ảnh mới (NO_CHANGES). Chỉ trả field cần cho UI và ĐÃ LỌC đường dẫn nội bộ.
+ */
+function imagestudioLastRun(run) {
+  if (!isPlainObject(run)) return null;
+  const text = (v) => (typeof v === 'string' && v ? scrubPaths(v) : null);
+  return {
+    status: run.status ?? null,
+    error_code: run.error_code ?? null,
+    error_message: text(run.error_message),
+    updated_at: run.updated_at ?? null,
+    rendered_asset_id: run.rendered_asset_id ?? null,
+    original_asset_id: run.original_asset_id ?? null,
+    template: run.template ?? null,
+    synthetic_background: run.synthetic_background ?? null,
+    // N9 (vòng 10): `last_run` cũng mang theo bản tóm tắt matting (có mask) — lượt KHÔNG tạo
+    // ảnh mới (NO_CHANGES / bị chặn) vẫn phải cho UI đọc được số đo thay vì mất hút.
+    matting: isPlainObject(run.matting) ? run.matting : null,
+    retouch_effective: run.retouch_effective ?? null,
+    retouch_clamped: asArray(run.retouch_clamped).map(String),
+    retouch_rejected: asArray(run.retouch_rejected).map(String),
+    overlay: run.overlay ?? null,
+    providers: run.providers ?? null,
+    warnings: asArray(run.warnings).map(String),
+    failures: asArray(run.failures)
+      .slice(0, 20)
+      .map((f) => ({ step: f?.step ?? null, code: f?.code ?? null, message: text(f?.message) })),
+  };
+}
+
+/**
+ * Lỗi pipeline/provider MVP-03 → HTTP an toàn, giữ mã lỗi THẬT của tầng dưới.
+ * Mọi câu chữ đều đi qua `scrubPaths` trước khi ra client (chặn rò đường dẫn nội bộ).
+ */
+function mapImagestudioError(err, fallbackMessage = 'Không tạo được ảnh.') {
+  if (err instanceof HttpError) return err;
+  const code = typeof err?.code === 'string' && err.code ? err.code : 'IMAGESTUDIO_FAILED';
+  const message = scrubPaths(typeof err?.message === 'string' && err.message ? err.message : fallbackMessage);
+  const details = err?.details && typeof err.details === 'object' ? err.details : {};
+
+  // §3.5 — overlay bị chặn vì thiếu bằng chứng: 422 kèm danh sách vi phạm.
+  if (code === 'OVERLAY_UNSUPPORTED_CLAIM' || code === 'OVERLAY_NOT_TRANSLATED') {
+    return HttpError.safe(422, code, message, details);
+  }
+  // §0 luật 3 — tách nền không đủ tự tin thì NÓI THẲNG kèm số đo thật, không cắt bừa.
+  if (code === 'SEGMENTATION_FAILED' || code === 'UNIFORM_BACKGROUND_NOT_FOUND' || code === 'SUSPICIOUS_MASK') {
+    return HttpError.safe(422, code, message, details);
+  }
+  if (
+    code === 'IMAGESTUDIO_NO_ORIGINAL' ||
+    code === 'IMAGESTUDIO_NO_ASSET' ||
+    code === 'IMAGESTUDIO_NOT_IMAGE_JOB' ||
+    code === 'IMAGESTUDIO_JOB_RUNNING' ||
+    code === 'ALREADY_INGESTED'
+  ) {
+    return HttpError.safe(409, code, message, details);
+  }
+  if (code === 'TEMPLATE_NOT_FOUND') return new HttpError(400, code, message);
+  if (code === 'UNSUPPORTED_IMAGE') return new HttpError(415, code, message);
+  if (code === 'IMAGE_TOO_LARGE' || code === 'PIXELS_EXCEEDED' || code === 'OUTPUT_TOO_LARGE' || code === 'TOO_MANY_REGIONS') {
+    return new HttpError(413, code, message);
+  }
+  if (code === 'MISSING_IMAGE' || code === 'BAD_IMAGE' || code === 'INVALID_IMAGE' || code === 'INVALID_INPUT' || code === 'BAD_OPTIONS') {
+    return new HttpError(400, code, message);
+  }
+  if (code === 'NOT_CONFIGURED') return HttpError.safe(502, code, message);
+  // Lỗi provider của MVP-03: KHÔNG dội chi tiết provider ra client (có thể chứa đường dẫn).
+  if (/^(MATTING|COMPOSE|RETOUCH)/.test(code)) {
+    return new HttpError(502, code, `Provider xử lý ảnh MVP-03 báo lỗi (${code}). Vui lòng thử lại hoặc kiểm tra cấu hình provider.`);
+  }
+  // Còn lại dùng chung bảng ánh xạ của MVP-02 (đã xử lý MISSING_IMAGE/BAD_IMAGE/NOT_CONFIGURED/…).
+  return mapImagelabError({ code: err?.code, message, details }, fallbackMessage);
 }
 
 export default buildRouter;

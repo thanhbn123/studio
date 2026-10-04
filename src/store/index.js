@@ -37,12 +37,18 @@ export const USAGE_OPERATIONS = Object.freeze([
   // MVP-02
   'OCR_DETECT',
   'IMAGE_RENDER',
+  // MVP-03 — chỉ ghi khi bước THẬT SỰ chạy (matting từ chối ⇒ không có IMAGE_MATTING).
+  'IMAGE_MATTING',
+  'IMAGE_COMPOSE',
+  'IMAGE_RETOUCH',
 ]);
 
-/** Loại job: MVP-01 sinh nội dung, MVP-02 dịch chữ trên ảnh. */
+/** Loại job: MVP-01 sinh nội dung, MVP-02 dịch chữ trên ảnh, MVP-03 tạo ảnh. */
 export const JOB_KINDS = Object.freeze({
   CONTENT: 'content',
   IMAGE_TRANSLATION: 'image_translation',
+  // MVP-03 (E3): job tạo ảnh/retouch. Cột `jobs.kind` đã có từ MVP-02 nên KHÔNG cần migration.
+  IMAGE_GENERATION: 'image_generation',
 });
 
 export const IMAGE_ASSET_ROLES = Object.freeze(['original', 'rendered']);

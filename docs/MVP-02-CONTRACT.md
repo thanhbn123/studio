@@ -793,8 +793,17 @@ Lỗi (dùng `HttpError.safe` để giữ câu tiếng Việt):
    - Client khai **thấp hơn** ⇒ **GIỮ mức cao hơn** + ghi `warnings` nói rõ đã nâng lên mức nào
      và vì sao (chống lách luật #3: khai `descriptive` cho chữ giá/nhãn hiệu/chứng nhận).
    - Muốn hạ THẬT: gửi `allow_kind_downgrade: true` **cho từng vùng** ⇒ dùng kind client khai
-     và **bắt buộc ghi vết** `kind_downgraded: true` + `kind_declared_by_user` + warning nổi bật.
-     Không có cờ thì **không bao giờ** hạ.
+     và **bắt buộc ghi vết**; không có cờ thì **không bao giờ** hạ.
+     **(vòng 7 — IL08-06)** Vết phải **BỀN** và **ĐỌC LẠI ĐƯỢC** ở ba nơi:
+     1. `ocr_regions.kind_reason` mang hậu tố `[NGƯỜI DÙNG HẠ MỨC từ <kind máy phân loại>]`
+        (bền theo bản ghi vùng, `source='user'` giữ nguyên);
+     2. `content_meta.imagelab.manual.kind_downgrades = [{kind_downgraded, region_id,
+        declared_by_user, classified_by_machine, applied_kind, at}]` — **giữ qua các lần lưu
+        sau**, chỉ lọc bỏ vùng không còn tồn tại; mỗi lần lưu còn nhắc lại bằng một câu cảnh
+        báo `⚠️ Vùng … vẫn đang ở mức … do NGƯỜI DÙNG HẠ MỨC …`;
+     3. `GET /api/imagelab/jobs/:id` trả `kind_downgrades: [...]` (cấp job) và **mỗi vùng** đã hạ
+        mức có `kind_downgraded: true` + `kind_declared_by_user` + `kind_classified_by_machine`.
+     Vùng KHÔNG hạ mức thì **không** có các field này (không bịa vết).
    - Không khai `kind` (hoặc khai giá trị không hợp lệ) ⇒ như cũ: dùng `classifyRegion(text)`.
    **Bất biến:** `translatable === (kind === 'descriptive')` — luôn giữ.
 4. `confidence`: mặc định `1` (người dùng tự nhập, không phải máy đoán), clamp `0..1`.
@@ -813,9 +822,15 @@ Lỗi (dùng `HttpError.safe` để giữ câu tiếng Việt):
    giờ** `LIVE_VERIFIED`.
 10. `rejected` phải liệt kê **mọi** vùng bị bỏ kèm `index` (vị trí trong mảng client gửi) và lý do
     tiếng Việt; UI phải hiện ra.
-11. **(vòng 6 — IL08-01)** Job đang `running`, hoặc đang `queued` **và thật sự có lượt OCR nằm
-    trong hàng đợi** ⇒ `409 IMAGELAB_JOB_RUNNING` + câu tiếng Việt (“job đang chạy OCR/dịch —
-    chờ xong rồi hãy nhập vùng”), **KHÔNG ghi gì**. Lớp chặn thứ hai nằm ở `runOcr`: trước khi
+11. **(vòng 6 — IL08-01; sửa vòng 7 — IL08-07)** Cổng chặn dựa trên **việc THẬT đang chờ/chạy
+    trong hàng đợi** (`JobQueue.isPending(jobId)`), không chỉ cột `jobs.status`:
+    - Hàng đợi **có** việc cho job ⇒ `409 IMAGELAB_JOB_RUNNING`, **KHÔNG ghi gì**; câu tiếng Việt
+      phải nêu **ĐÚNG BƯỚC** đang chạy theo `jobs.stage` (“Job đang chạy bước render ảnh…”,
+      “bước nhận dạng chữ (OCR)”, “bước dịch chữ”…) — **không** hardcode “OCR/dịch”.
+    - Hàng đợi **KHÔNG** còn việc nào mà `jobs.status` vẫn `queued`/`running` (job **mồ côi**:
+      tiến trình chết / máy chủ vừa khởi động lại) ⇒ **CHO LƯU** + cảnh báo nói thật
+      `⚠️ Job đang ở trạng thái "running" … nhưng HÀNG ĐỢI không còn việc nào cho job này …`
+      (không chặn vĩnh viễn người dùng). Lớp chặn thứ hai nằm ở `runOcr`: trước khi
     ghi vùng OCR, nó **đọc lại job**; nếu đã có `content_meta.imagelab.manual_regions === true`
     hoặc tồn tại vùng `source = 'user'` ⇒ **DỪNG, không ghi đè**, giữ `awaiting_review`, ghi
     `content_meta.imagelab.ocr_superseded` + cảnh báo “KHÔNG ghi đè”. UI **disable** nút lưu khi

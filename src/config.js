@@ -114,6 +114,43 @@ export function loadConfig(env = process.env) {
       timeoutMs: toInt(env.RENDER_TIMEOUT_MS, 60000),
     },
 
+    // ── MVP-03: tạo ảnh (tách nền → ghép nền → retouch → overlay) ───────────
+    // Ba khối dưới đây là ĐƯỜNG CẤU HÌNH DUY NHẤT của MVP-03. Trước vòng 8, `src/config.js`
+    // không có khoá nào trong số này nên `IMAGESTUDIO_ENABLED=false` bị bỏ qua và
+    // `MATTING_PROVIDER`/`RETOUCH_PROVIDER` luôn rơi về `purejs` (lỗi do agent test tìm ra).
+    imagestudio: {
+      // Bật mặc định vì provider mặc định là purejs: chạy offline, không cần key.
+      enabled: toBool(env.IMAGESTUDIO_ENABLED, true),
+      // ⚠️ N4 (vòng 9): KHÔNG có `dir` riêng. Ảnh gốc VÀ ảnh tạo ra dùng CHUNG kho ảnh
+      // `IMAGELAB_DIR` (`src/imagelab/storage.js`) — khai một biến thư mục riêng mà không
+      // dòng mã nào đọc là config chết, dễ làm vận hành tin sai chỗ lưu ảnh.
+    },
+
+    // Tách nền. Mặc định an toàn: purejs (flood fill từ viền, chạy offline).
+    // `tolerance`/`minUniformity` KHÔNG khai ở đây: chúng là ngưỡng CHẤT LƯỢNG của thuật toán
+    // (mặc định trong `matting/background.js`), siết/nới qua môi trường là đổi luật fail-closed.
+    matting: {
+      provider: toStr(env.MATTING_PROVIDER, 'purejs').toLowerCase(),
+      apiKey: toStr(env.MATTING_API_KEY, ''),
+      baseUrl: toStr(env.MATTING_BASE_URL, ''),
+      model: toStr(env.MATTING_MODEL, ''),
+      timeoutMs: toInt(env.MATTING_TIMEOUT_MS, 60000),
+    },
+
+    // Retouch. KHÔNG có provider `http` (4 tham số ngưỡng áp ngay trong tiến trình).
+    // `limits` chỉ được SIẾT so với `RETOUCH_LIMITS` của hợp đồng §3.4 — `resolveRetouchLimits`
+    // lấy `min(cấu hình, hợp đồng)` nên khai số to hơn cũng KHÔNG nới được ngưỡng.
+    retouch: {
+      provider: toStr(env.RETOUCH_PROVIDER, 'purejs').toLowerCase(),
+      model: toStr(env.RETOUCH_MODEL, ''),
+      limits: {
+        brightness: toNum(env.RETOUCH_MAX_BRIGHTNESS, 0.25),
+        contrast: toNum(env.RETOUCH_MAX_CONTRAST, 0.25),
+        saturation: toNum(env.RETOUCH_MAX_SATURATION, 0.3),
+        sharpen: toNum(env.RETOUCH_MAX_SHARPEN, 0.5),
+      },
+    },
+
     // Dịch chữ trên ảnh (C2) — mặc định KẾ THỪA khối `ai` (giống cách `vision` kế thừa).
     translate: {
       provider: toStr(env.TRANSLATE_PROVIDER, aiProvider).toLowerCase(),
@@ -164,6 +201,10 @@ export function loadConfig(env = process.env) {
       // MVP-02 — đơn giá ước tính cho 2 operation mới (chưa thu tiền thật).
       OCR_DETECT: Number(env.COST_OCR_DETECT ?? 0.0004),
       IMAGE_RENDER: Number(env.COST_IMAGE_RENDER ?? 0.0015),
+      // MVP-03 — đơn giá ước tính cho 3 operation mới (chưa thu tiền thật).
+      IMAGE_MATTING: Number(env.COST_IMAGE_MATTING ?? 0.002),
+      IMAGE_COMPOSE: Number(env.COST_IMAGE_COMPOSE ?? 0.0005),
+      IMAGE_RETOUCH: Number(env.COST_IMAGE_RETOUCH ?? 0.0005),
       currency: toStr(env.CREDIT_CURRENCY, 'USD'),
     },
   };

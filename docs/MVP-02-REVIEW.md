@@ -625,3 +625,55 @@ Script tấn công: `/tmp/atk-il08/*.mjs` (không sửa file nào trong repo). L
 2. **Nhánh lỗi ghi DB (`DB_WRITE_FAILED`) và nhánh `translator` ném exception**: không dựng được qua HTTP với provider mock ⇒ chưa đo được dấu vết khi đó (đường `#failJob` có thể ghi evidence `upload+render` trơn, thiếu `+manual-regions`).
 3. **Trình duyệt thật**: các hàm UI được chạy thật trong Node nhưng chưa mở DOM/CSS (focus, `focusout`, vòng poll `dirtyPaint`).
 4. **PostgreSQL** và **proxy/body-limit thật** trước app.
+
+---
+
+# VÒNG 6 — IL-08 chấm lại tại commit `631d113`
+
+**Phán quyết: `PASS CÓ ĐIỀU KIỆN`.** Cả 5 phát hiện vòng 5 (IL08-01…IL08-05) **đã được vá THẬT** — tôi tấn công lại độc lập (không tin bản mô tả của nhóm gộp), kể cả dựng lại đúng kịch bản TOCTOU mà bản vá tự nhận là đã đóng. Điều kiện đi kèm là 2 phát hiện **MINOR mới** (IL08-06, IL08-07) và 1 giới hạn vận hành — không có lỗ hổng mất dữ liệu/phá luật #3 nào còn lại.
+
+**Mã đã kiểm:** `manual-regions.js e3b6a217…` · `pipeline.js 172e3df2…` · `routes.js 5633f9d0…` · `server.js 124a094b…` · `queue.js 9a52152f…` · `app.js 2e91847e…` — **giống hệt** ở `631d113` và ở HEAD lúc chấm (`a356d28`): `git diff --stat 631d113 HEAD -- src/imagelab src/http src/jobs public` ⇒ rỗng (commit sau chỉ thêm tài liệu MVP-03 + `src/imagestudio/`). Script vòng 6: `/tmp/atk-il08b/*.mjs`; bộ vòng 5 chạy lại từ `/tmp/atk-il08b/` (bản sao) — **lưu ý `14-asymmetry.mjs` còn câu “KẾT LUẬN” in cứng của vòng 5, tôi chỉ đọc BẢNG dữ liệu**.
+
+## V6.1 — Bảng IL08-01…IL08-05
+
+| # | Kết luận | Bằng chứng (lệnh + output thật) |
+|---|---|---|
+| IL08-01 (CRITICAL) | **ĐÃ VÁ THẬT — cả 3 lớp** | (a) `node /tmp/atk-il08b/05-limits-race.mjs`: job `{"status":"running","stage":"ocr"}` → `PUT /regions` = **409**, `DB ngay sau PUT: {regions: [], lines: []}`; (b) `node r6-01-race2.mjs` phần A: gọi thẳng `pipeline.runOcr` sau khi đã có vùng user → `vùng người dùng CÒN NGUYÊN? true`, `meta.ocr_superseded {skipped_write:true, user_regions:1}`, cảnh báo “KHÔNG ghi đè”; phần B (2 tiến trình chung DB + **ép `jobs.status='awaiting_review'` để lách guard (a)** — PUT thứ 2 = 200 thật) → thả cổng OCR → `SAU khi A chạy xong — vùng trong DB [u1, source=user]`, `vùng NGƯỜI DÙNG còn nguyên? true`; phần C3 (cùng job enqueue 2 lượt OCR) → vùng user còn nguyên; (c) `15-ui-race-window.mjs`: `nút lưu disabled=true` + có câu “chờ OCR”. |
+| IL08-02 (MAJOR) | **ĐÃ VÁ THẬT** | `node r6-02-kind.mjs`: 54 chuỗi khai `descriptive` **không cờ** → `kind lưu THẤP HƠN C1: 0`, `kind lưu KHÁC C1: 0`, `chữ C1 bảo vệ (35) mà VẪN translatable/dịch được: 0`; 12 biến thể không cờ (`"true"`/`1`/`{}`/`__proto__`/`DESCRIPTIVE`/`null`/`["descriptive"]`/`"unknown"`…) đều giữ `price` + `SKIPPED_PRICE`; `03-render-gap.mjs` G1 (`免运费` khai descriptive) → `kind=price`, `SKIPPED_PRICE`, **không render** (chữ gốc giữ nguyên). Có cờ: 35/35 hạ thật + 35 warning, nhưng C2 vẫn chặn `NIKE 官方旗舰店`/`品牌旗舰店`/`3C认证 合格证齐全`/`¥199.00 包邮` → `SKIPPED_*`. |
+| IL08-03 (MINOR) | **ĐÃ VÁ THẬT** | `09-trace.mjs` T2: `GET ocr` có `superseded_by_manual_regions: true` + `superseded_at` + `note` (“…KHÔNG mô tả vùng chữ đang có của job”); `r6-04b-warnui.mjs` (hàm UI thật `renderIlWarnings`): `có superseded → có "TRƯỚC ĐÓ"? true` / `không superseded → KHÔNG có "TRƯỚC ĐÓ"? true`; khối bị hạ từ `warn` xuống trung tính. |
+| IL08-04 (MINOR) | **ĐÃ VÁ THẬT** | `11-abuse.mjs` mục D: job tạo với `options.max_regions=1` → `PUT 5 vùng nhập tay = 413`, `vùng trong DB: 1` (trần job giữ được cả SAU khi OCR xong, vì `runOcr` nay giữ field `imagelab` cũ). |
+| IL08-05 (MINOR) | **ĐÃ VÁ THẬT** | `12b-body.mjs`: body 600 KB → `{"status":413,"code":"PAYLOAD_TOO_LARGE"}` (JSON thật, không còn ECONNRESET), DB không đổi, `GET → 200`; `r6-03-body.mjs`: 30 lần × 700 KB → `duyNhat: ["413/PAYLOAD_TOO_LARGE"]`, 32 ms, `heapUsed delta −1.5 MB`; body 20 MB khai `Content-Length` → `HTTP/1.1 413 Payload Too Large`, heap `+0.5 MB`; `r6-03b-chunked.mjs`: chunked 2 MB / Content-Length 2 MB / chunked 800 KB **gửi nhỏ giọt** → cả ba đều nhận `HTTP/1.1 413 Payload Too Large` + JSON. |
+
+## V6.2 — LỖ HỔNG MỚI (vòng 6, đều MINOR)
+
+| # | Mức | Phát hiện | Bằng chứng |
+|---|---|---|---|
+| IL08-06 | MINOR | **Vết hạ mức `allow_kind_downgrade` KHÔNG bền và không có cấu trúc** (hợp đồng §11 đòi “bắt buộc ghi vết `kind_downgraded: true` + `kind_declared_by_user`”): hai field đó chỉ tồn tại trong mảng in-memory của hàm thuần, **không có cột DB**, **không có trong `regions[]` trả về**, và chỉ còn lại dưới dạng **chuỗi warning trong `content_meta.imagelab.warnings`** — chuỗi này bị **ghi đè ở lần lưu kế tiếp**, trong khi vùng đã hạ mức vẫn nằm trong DB với `kind='descriptive'` + `kind_reason='chữ mô tả thông thường'` (đọc lên như thể MÁY phân loại, trong khi máy đã nói `price`). | `node r6-02b-trace.mjs`: T1 `content_meta warnings có "HẠ MỨC"? [1 câu]` nhưng `toàn bộ content_meta.imagelab có chuỗi "kind_downgraded" không? false`; `r6-02-kind.mjs` mục 2: `trường kind_downgraded trong response region: 0`; T2 sau 1 lần `replace:false`: `content_meta warnings còn "HẠ MỨC"? []` + vùng hạ mức vẫn còn; T3 `GET job.content_meta.imagelab.warnings có HẠ MỨC? []`; `pragma_table_info('ocr_regions')` không có cột vết. |
+| IL08-07 | MINOR | **Chặn nhầm câu chữ khi RENDER (không phải OCR) đang chạy**: `POST /render` đặt `status=queued/running` + `queue.enqueue` nên `isPending=true` ⇒ `PUT /regions` trả `409 IMAGELAB_JOB_RUNNING` với câu **“Job đang chạy OCR/dịch…”** — chẩn đoán SAI (không có OCR/dịch nào chạy). Việc CHẶN thì hợp lý (tránh ghi chồng lúc render), nhưng câu chữ làm người dùng tưởng phải chờ OCR. | `node r6-05-render-busy.mjs`: giữ provider render → `job row {status:"running", stage:"rendering"}` → `PUT /regions = 409`, message `"Job đang chạy OCR/dịch (status = running, stage = rendering)…"`, `details {status, stage:"rendering", ocr_pending:true}`; sau khi render xong `PUT lại = 200`. |
+| — | Ghi nhận (không tính lỗi mới) | **Job kẹt `running` không có đường thoát**: nếu tiến trình chết giữa OCR (DB `running`, hàng đợi rỗng) thì guard (a) chặn vĩnh viễn và repo **không có route retry/khôi phục** — IL-08 không dùng được cho job đó. Đây là khoảng trống phục hồi sau sự cố có từ trước (MVP-02), bản vá IL08-01 chỉ kế thừa. | `node r6-01-race2.mjs` phần C2: `DB running + queue rỗng → PUT = 409 IMAGELAB_JOB_RUNNING`; không có route `POST …/ocr` trong `routes.js`. |
+
+## V6.3 — ĐÃ CỐ PHÁ MÀ **KHÔNG** PHÁ ĐƯỢC (vòng 6)
+
+1. **TOCTOU thật giữa kiểm tra và ghi** (`r6-01-race2.mjs` B): hai app chung DB, OCR bị giữ ở cổng, **ép trạng thái DB thành `awaiting_review`** để lách guard (a) — PUT lọt (200, vùng `source=user` vào DB), rồi thả cổng cho OCR chạy tới chỗ ghi ⇒ guard (b) đọc lại DB và **DỪNG**, vùng người dùng còn nguyên + `ocr_superseded`.
+2. **`isPending` nói dối** (`r6-01-race2.mjs` C): job DB `queued` mà hàng đợi rỗng ⇒ PUT 200 **và không có gì ghi đè sau đó** (không có worker); job DB `queued/running` mà hàng đợi rỗng theo hướng ngược lại ⇒ chặn (fail-safe). Cùng job **enqueue OCR 2 lần** ⇒ vùng user vẫn còn.
+3. **OCR chạy lại trên job đã có vùng người dùng** (`r6-01-race2.mjs` A) ⇒ không ghi đè, giữ `awaiting_review`, có `ocr_superseded` + cảnh báo.
+4. **Hạ mức bảo vệ không cờ** (12 biến thể: `"true"`/`1`/`{}`/`__proto__`/viết hoa/khoảng trắng/`null`/mảng/kind lạ/khoảng trắng) ⇒ **không** hạ được; 54/54 chuỗi giữ đúng mức C1; 0 chuỗi bảo vệ nào dịch được (`r6-02-kind.mjs`).
+5. **Hạ mức có cờ + nhãn hiệu thật** ⇒ C2 vẫn `SKIPPED_BRAND/CERTIFICATION/PRICE` (`r6-02-kind.mjs` mục 5).
+6. **Body lớn**: 30×700 KB, 2 MB chunked, 20 MB khai `Content-Length`, chunked gửi nhỏ giọt ⇒ đều JSON 413, heap không tăng, không treo, DB không đổi (`r6-03-body.mjs`, `r6-03b-chunked.mjs`).
+7. **Job không phải job ảnh (MVP-01)** ⇒ `409 IMAGELAB_NO_ORIGINAL`, `DB có vùng nào bị ghi không? n=0` (`r6-07-misc.mjs`).
+8. **Sau render**: `manual_regions`/`regions_source` vẫn còn, ảnh gốc bất biến (`sha256` không đổi), sửa vùng tiếp vẫn được (`r6-07-misc.mjs`).
+9. **Toàn bộ đòn vòng 5 chạy lại** (16 script, tất cả EXIT 0): IDOR 404 giống byte-for-byte · cổng `MANUAL_EDITS_WOULD_BE_LOST` (15 biến thể lách) · 30 ca toạ độ (không nới rộng/không bỏ im lặng/không tràn khung) · trần + id trùng + 1000 vùng/body · không bịa `OCR_DETECT`, 0 `LIVE_VERIFIED` · XSS (hàm UI thật, kể cả trường `superseded`/`note` mới) · prototype pollution · JSON hỏng · bất biến `translatable === (kind==='descriptive')` = 0 vi phạm.
+
+## V6.4 — HỒI QUY ĐO ĐƯỢC
+
+- `npm test` → **578 test / 577 pass / 1 skip / 0 fail**, `EXIT=0`.
+- `node tools/verify.mjs` → **EXIT 0**; `npm run demo:imagelab` → **EXIT 0**; `node tools/imagelab-demo.mjs --regions` → **EXIT 0**.
+- Script cũ vòng 4/5 chạy lại: `/tmp/atk5` → `x1-f01-pixel` 0, `x22-guardrail-regression` 0, `d5-dos` 0, `x24-old-vs-new` 0; `/tmp/atk6` → `x30-round5-attack` 0, `x31-interlace-and-partial` 0, `x23-unit-substitution` 0, `x20-http-hardening` 0, `d1-security` 0, `a1-honesty` 0, `x29-refuse-trace` 0 (`PROTECTED_PIXELS_CHANGED` vẫn từ chối ảnh lem). **`/tmp/atk5/r3-f06-gate.mjs` EXIT=1 nhưng KHÔNG phải lỗi sản phẩm**: script thiếu fixture `/tmp/atk5/fixture-gate.json` (đã bị xoá khỏi /tmp) nên `lines: []` → `TypeError`; tôi dựng lại fixture (`r6-06-f06gate.mjs`) và cổng F-06 vẫn đúng: `render không force → 409 REVIEW_REQUIRED`, `only vùng không pending → 409` (không lách được), `force + only → 202` kèm cảnh báo “dòng bị guardrail chặn … KHÔNG được vẽ”.
+- Test mới của nhóm gộp: `test/imagelab-manual-hardening.test.js` — 10 `test(`, 45 `assert`, **không** có assert rỗng/`skip`/`todo`; `test/il08-manual-regions-race.probe.mjs` chạy tay ⇒ `PROBE XANH`, khẳng định đúng hành vi đã vá.
+
+## V6.5 — CHƯA KIỂM ĐƯỢC (vòng 6)
+
+1. **Provider THẬT** (OCR/dịch/render trả tiền): vẫn chỉ `mock`/`purejs`; nhánh `#failJob` khi `translator` ném exception và nhánh `DB_WRITE_FAILED` chưa dựng được qua HTTP.
+2. **Trình duyệt thật / DOM** (focus, `focusout`, vòng poll `dirtyPaint` khi job đang chạy).
+3. **PostgreSQL** và **proxy/body-limit thật** trước app.
+4. **Khôi phục sau sự cố** (job kẹt `running`): tôi chỉ mô phỏng bằng cách sửa DB trực tiếp, chưa kill tiến trình thật giữa lúc OCR.
