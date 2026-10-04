@@ -69,6 +69,35 @@ export const BOUNDARY_DECISIVE_DELTA = 20;
  * ~0.03), còn ca "ăn mất sản phẩm" chiếm trọn thân sản phẩm (≥ 0.30). Ngưỡng nằm giữa hai cụm đó.
  */
 export const AMBIGUOUS_DIRTY_AREA_MAX = 0.15;
+
+/**
+ * N7 (vòng 10) — MẪU SỐ ĐÚNG của phép đo "nền bẩn".
+ *
+ * Vòng 9 đo `dirty_removed / (width*height)` = tỉ lệ trên TOÀN KHUNG ẢNH ⇒ trên khung lớn,
+ * một sản phẩm nhỏ bị ăn HẾT vẫn ra tỉ lệ nhỏ và bị xếp vào nhánh "nhập nhằng" (kèm câu khẳng
+ * định SAI là "sản phẩm vẫn được giữ nguyên"). Nay đo theo **vùng GIỮ LẠI**:
+ *   `dirty_ratio_kept = dirty_removed / kept_pixels`
+ * ⇒ ăn hết sản phẩm luôn cho tỉ lệ ≫ 1 (mọi pixel giữ lại đều là "vật lạ" sót lại), còn dải
+ * mỏng bóng đổ chỉ ~0.06–0.20. Ngưỡng `AMBIGUOUS_DIRTY_RATIO_MAX = 1.0` (= phần bị ăn nhiều
+ * hơn TOÀN BỘ phần giữ lại) áp trên tỉ lệ MỚI này — đo thật: bóng mềm 0.061/0.080/0.123/0.196;
+ * ca ăn sản phẩm 2.24 (96×96) và 5.82 / 19.23 (khung 300×300).
+ */
+export const AMBIGUOUS_DIRTY_RATIO_MAX = 1.0;
+
+/**
+ * N7: số pixel bẩn được phép nằm SÂU BÊN TRONG hộp bao vùng giữ (cách biên ≥ 2 px) mà vẫn
+ * coi là "nhập nhằng". Bất kỳ pixel bẩn nào nằm sâu trong hộp bao sản phẩm đều là dấu hiệu
+ * flood fill đã khoét vào GIỮA sản phẩm (lỗ hổng) ⇒ NGUY HIỂM, không phải nhập nhằng.
+ */
+export const DIRTY_INSIDE_BBOX_TOLERANCE = 0;
+
+/**
+ * N7: khoảng cách tối thiểu (theo 4 hướng, trong vùng NỀN đã tách) tới vùng GIỮ LẠI để một
+ * pixel bẩn được coi là "nằm sâu trong sản phẩm". Pixel bẩn SÁT vùng giữ (cách 1 px) là dải
+ * bóng đổ/viền mờ bình thường; pixel bẩn cách ≥ 2 px nằm trong hộp bao sản phẩm nghĩa là
+ * flood fill đã khoét vào GIỮA sản phẩm.
+ */
+export const DIRTY_DEEP_MIN_DISTANCE = 2;
 /** Tỉ lệ pixel viền tối thiểu thuộc cụm màu chủ đạo để coi nền là "đồng nhất". */
 export const DEFAULT_MIN_UNIFORMITY = 0.75;
 /** Số ô lượng tử màu cho mỗi kênh khi gom cụm (16 ⇒ 16×16×16 = 4096 ô). */
@@ -352,14 +381,77 @@ export function measureBoundaryDelta(pixels, similar, {
     }
   }
 
-  // N1 (vòng 9): tổng diện tích pixel nền đã tách mà Δ > safeDelta — tức phần bị ăn KHÔNG
-  // phải nền sạch. Vài pixel lẻ = viền mờ/bóng đổ (nhập nhằng); một mảng LỚN = đã ăn mất
-  // một vật thể (khả năng cao là sản phẩm) ⇒ nguy hiểm thật.
+  // N1 (vòng 9) + N7 (vòng 10): pixel nền đã tách mà Δ > safeDelta — phần bị ăn KHÔNG phải
+  // nền sạch. Đo thêm: (a) tỉ lệ theo VÙNG GIỮ LẠI (mẫu số đúng), (b) số pixel bẩn nằm SÂU
+  // trong hộp bao vùng giữ (flood fill khoét vào giữa sản phẩm).
+  const totalPx = width * height;
   let dirtyRemoved = 0;
-  for (let i = 0; i < width * height; i += 1) {
-    if (similar[i] !== 2) continue;
+  let keptPixels = 0;
+  for (let i = 0; i < totalPx; i += 1) {
+    if (similar[i] !== 2) {
+      keptPixels += 1;
+      continue;
+    }
     const p = i * 4;
     if (colorDistance(pixels[p], pixels[p + 1], pixels[p + 2], target.r, target.g, target.b) > safeDelta) dirtyRemoved += 1;
+  }
+  const keptBox = keptBoundingBox(similar, { width, height });
+  // Khoảng cách (4 hướng) từ mỗi pixel NỀN tới vùng GIỮ LẠI gần nhất: BFS nhiều nguồn.
+  // depth 1 = kề vùng giữ (dải bóng đổ/viền mờ); ≥ DIRTY_DEEP_MIN_DISTANCE = nằm sâu trong nền.
+  const depth = new Int32Array(totalPx).fill(-1);
+  {
+    const queue = new Int32Array(totalPx);
+    let head = 0;
+    let tail = 0;
+    for (let i = 0; i < totalPx; i += 1) {
+      if (similar[i] === 2) continue;
+      // pixel giữ lại: đánh dấu 0 rồi loang sang các pixel nền kề nó
+      depth[i] = 0;
+    }
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const i = y * width + x;
+        if (similar[i] !== 2) continue;
+        const nearKept =
+          (x > 0 && similar[i - 1] !== 2) ||
+          (x + 1 < width && similar[i + 1] !== 2) ||
+          (y > 0 && similar[i - width] !== 2) ||
+          (y + 1 < height && similar[i + width] !== 2);
+        if (nearKept) {
+          depth[i] = 1;
+          queue[tail] = i;
+          tail += 1;
+        }
+      }
+    }
+    while (head < tail) {
+      const i = queue[head];
+      head += 1;
+      const x = i % width;
+      const y = (i - x) / width;
+      const d = depth[i] + 1;
+      if (x > 0 && similar[i - 1] === 2 && depth[i - 1] < 0) { depth[i - 1] = d; queue[tail] = i - 1; tail += 1; }
+      if (x + 1 < width && similar[i + 1] === 2 && depth[i + 1] < 0) { depth[i + 1] = d; queue[tail] = i + 1; tail += 1; }
+      if (y > 0 && similar[i - width] === 2 && depth[i - width] < 0) { depth[i - width] = d; queue[tail] = i - width; tail += 1; }
+      if (y + 1 < height && similar[i + width] === 2 && depth[i + width] < 0) { depth[i + width] = d; queue[tail] = i + width; tail += 1; }
+    }
+  }
+  let dirtyInsideBbox = 0;
+  if (keptBox) {
+    const x0 = Math.max(0, keptBox.x + 2);
+    const y0 = Math.max(0, keptBox.y + 2);
+    const x1 = Math.min(width, keptBox.x + keptBox.w - 2);
+    const y1 = Math.min(height, keptBox.y + keptBox.h - 2);
+    for (let y = y0; y < y1; y += 1) {
+      for (let x = x0; x < x1; x += 1) {
+        const i = y * width + x;
+        if (similar[i] !== 2) continue;
+        // "SÂU BÊN TRONG": trong hộp bao (đã co 2 px) VÀ cách vùng giữ ≥ 2 px.
+        if (depth[i] < DIRTY_DEEP_MIN_DISTANCE) continue;
+        const p = i * 4;
+        if (colorDistance(pixels[p], pixels[p + 1], pixels[p + 2], target.r, target.g, target.b) > safeDelta) dirtyInsideBbox += 1;
+      }
+    }
   }
 
   const p95Of = (list) => (list.length === 0 ? 0 : list[Math.min(list.length - 1, Math.floor(list.length * 0.95))]);
@@ -380,7 +472,16 @@ export function measureBoundaryDelta(pixels, similar, {
     kept_under_ratio: Number(underRatio.toFixed(4)),
     decisive_delta: decisiveDelta,
     dirty_removed: dirtyRemoved,
-    dirty_removed_ratio: Number((dirtyRemoved / (width * height)).toFixed(4)),
+    // N8 (vòng 10): KHÔNG `toFixed(4)` — trên khung 16 MP, 800 pixel bẩn (0.00005) sẽ bị làm
+    // tròn thành 0 và mất luôn tín hiệu. Giữ 8 chữ số; phân loại thì so trên SỐ NGUYÊN pixel.
+    dirty_removed_ratio: Number((dirtyRemoved / totalPx).toFixed(8)),
+    kept_pixels: keptPixels,
+    // Mẫu số ĐÚNG (N7): tỉ lệ trên vùng GIỮ LẠI, không phải trên khung ảnh.
+    dirty_ratio_kept: Number((dirtyRemoved / Math.max(1, keptPixels)).toFixed(8)),
+    dirty_inside_bbox: dirtyInsideBbox,
+    // Cùng mẫu số với `dirty_ratio_kept` để so được với cùng một ngưỡng (đo thật: bóng mềm
+    // 0.015–0.032; ca "khoét vào giữa sản phẩm" 5.8–19.2).
+    dirty_inside_bbox_ratio: Number((dirtyInsideBbox / Math.max(1, keptPixels)).toFixed(8)),
     suspicious: overRatio > BOUNDARY_OVER_RATIO_MAX || underRatio > BOUNDARY_OVER_RATIO_MAX,
   };
 }

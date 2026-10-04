@@ -2118,6 +2118,9 @@ function imagestudioLastRun(run) {
     original_asset_id: run.original_asset_id ?? null,
     template: run.template ?? null,
     synthetic_background: run.synthetic_background ?? null,
+    // N9 (vòng 10): `last_run` cũng mang theo bản tóm tắt matting (có mask) — lượt KHÔNG tạo
+    // ảnh mới (NO_CHANGES / bị chặn) vẫn phải cho UI đọc được số đo thay vì mất hút.
+    matting: isPlainObject(run.matting) ? run.matting : null,
     retouch_effective: run.retouch_effective ?? null,
     retouch_clamped: asArray(run.retouch_clamped).map(String),
     retouch_rejected: asArray(run.retouch_rejected).map(String),

@@ -32,7 +32,9 @@ export const SUSPICIOUS_KEPT_BBOX_RATIO = 0.1;
 import { clampBox, detectImageMime, toRgba } from '../../../imagelab/render/image.js';
 import { decodePng, encodePng, sha256 } from '../../../imagelab/render/png.js';
 import {
-  AMBIGUOUS_DIRTY_AREA_MAX,
+  AMBIGUOUS_DIRTY_RATIO_MAX,
+  DIRTY_DEEP_MIN_DISTANCE,
+  DIRTY_INSIDE_BBOX_TOLERANCE,
   BOUNDARY_OVER_RATIO_MAX,
   DEFAULT_TOLERANCE,
   applyAlphaMask,
@@ -182,8 +184,18 @@ export class PureJsMattingProvider extends MattingProvider {
     //     "đảo nhỏ" giữa nền lớn, hoặc DIỆN TÍCH NỀN BẨN > 15% (ăn mất một mảng không-phải-nền);
     //   · NHẬP NHẰNG (mask bao đúng sản phẩm, chỉ mờ ở viền): có pixel nền bẩn nhưng ít
     //     (bóng đổ/viền mờ) ⇒ không ghép nền mặc định, VẪN cho retouch.
-    const dirtyArea = Number(boundary.dirty_removed_ratio ?? 0);
-    const tooDirtyRemoved = dirtyArea > AMBIGUOUS_DIRTY_AREA_MAX;
+    // N7 (vòng 10): đo theo VÙNG GIỮ LẠI (không phải toàn khung) + tín hiệu "khoét sâu vào
+    // giữa hộp bao sản phẩm". Ăn hết một sản phẩm nhỏ trên khung lớn ⇒ tỉ lệ theo vùng giữ ≫ 1.
+    const dirtyAreaFrame = Number(boundary.dirty_removed_ratio ?? 0);
+    const dirtyRatioKept = Number(boundary.dirty_ratio_kept ?? 0);
+    const dirtyInsideBbox = Number(boundary.dirty_inside_bbox ?? 0);
+    const dirtyInsideRatio = Number(boundary.dirty_inside_bbox_ratio ?? 0);
+    const tooDirtyRemoved = dirtyRatioKept > AMBIGUOUS_DIRTY_RATIO_MAX;
+    // "Khoét vào giữa sản phẩm" cũng so theo VÙNG GIỮ LẠI (không phải số tuyệt đối): dải bóng
+    // đổ luôn có vài chục pixel lọt vào góc lõm của hộp bao, còn cắt vào giữa sản phẩm thì
+    // khối lượng bẩn bên trong hộp bao lớn hơn hẳn phần giữ lại.
+    const cutIntoProduct = dirtyInsideBbox > DIRTY_INSIDE_BBOX_TOLERANCE
+      && dirtyInsideRatio > AMBIGUOUS_DIRTY_RATIO_MAX;
     const boundaryFuzzy =
       boundary.count > 0 && boundary.over_ratio > BOUNDARY_OVER_RATIO_MAX;
 
@@ -201,8 +213,17 @@ export class PureJsMattingProvider extends MattingProvider {
     }
     if (tooDirtyRemoved) {
       dangerReasons.push(
-        `NỀN ĐÃ TÁCH KHÔNG SẠCH: ${(dirtyArea * 100).toFixed(1)}% ảnh bị coi là nền mà lệch màu nền quá ` +
-          `${boundary.safe_delta}/255 (ngưỡng ${(AMBIGUOUS_DIRTY_AREA_MAX * 100).toFixed(0)}%) — nhiều khả năng đã ăn mất một phần sản phẩm`,
+        `NỀN ĐÃ TÁCH KHÔNG SẠCH: ${boundary.dirty_removed} pixel bị coi là nền mà lệch màu nền quá ` +
+          `${boundary.safe_delta}/255 = ${(dirtyRatioKept * 100).toFixed(1)}% DIỆN TÍCH VÙNG GIỮ LẠI ` +
+          `(ngưỡng ${(AMBIGUOUS_DIRTY_RATIO_MAX * 100).toFixed(0)}%; ${(dirtyAreaFrame * 100).toFixed(2)}% khung ảnh) — nhiều khả năng đã ăn mất một phần sản phẩm`,
+      );
+    }
+    if (cutIntoProduct) {
+      dangerReasons.push(
+        `CẮT SÂU VÀO SẢN PHẨM: ${dirtyInsideBbox} pixel bị coi là nền nằm SÂU BÊN TRONG hộp bao vùng giữ ` +
+          `(${keptBoxRaw ? `${keptBoxRaw.w}×${keptBoxRaw.h} tại (${keptBoxRaw.x}, ${keptBoxRaw.y})` : 'không có hộp bao'}), ` +
+          `cách vùng giữ ≥ ${DIRTY_DEEP_MIN_DISTANCE} px = ${(dirtyInsideRatio * 100).toFixed(1)}% diện tích vùng giữ lại — ` +
+          'flood fill đã khoét vào giữa sản phẩm',
       );
     }
 
@@ -213,9 +234,13 @@ export class PureJsMattingProvider extends MattingProvider {
           `${boundary.safe_delta}–${tol.tolerance.toFixed(1)}/255 (Δmax ${boundary.max}, Δp95 ${boundary.p95}) — thường là bóng đổ mềm/viền mờ`,
       );
     }
-    if (!tooDirtyRemoved && dirtyArea > 0) {
+    // N8 (vòng 10): điều kiện dùng SỐ NGUYÊN `dirty_removed > 0` — không phụ thuộc tỉ lệ đã
+    // làm tròn, nên trên khung 16 MP chỉ ~700 pixel bẩn vẫn kích hoạt (không còn lọt thành OK).
+    if (boundary.dirty_removed > 0) {
       ambiguousReasons.push(
-        `${(dirtyArea * 100).toFixed(1)}% ảnh bị coi là nền nhưng không sạch màu nền (dải mỏng quanh sản phẩm)`,
+        `${boundary.dirty_removed} pixel bị coi là nền nhưng lệch màu nền quá ${boundary.safe_delta}/255 ` +
+          `(${(dirtyRatioKept * 100).toFixed(1)}% diện tích vùng giữ lại, ${(dirtyAreaFrame * 100).toFixed(2)}% khung ảnh) — ` +
+          'nằm SÁT vùng giữ lại (nghi bóng đổ mềm/viền mờ), KHÔNG có pixel bẩn nào nằm sâu trong hộp bao',
       );
     }
     // Viền sản phẩm nằm trong dải gần màu nền (sản phẩm trắng/kem 244–248) KHÔNG phải lý do
@@ -261,10 +286,17 @@ export class PureJsMattingProvider extends MattingProvider {
     }
 
     if (ambiguous && !allowAmbiguous) {
+      // N7b (vòng 10): CHỈ nói điều ĐO ĐƯỢC. Không được khẳng định "sản phẩm vẫn được giữ
+      // nguyên" — máy chỉ đo được số liệu tổng hợp, không biết chắc pixel nào là sản phẩm.
       const message =
-        `BIÊN NHẬP NHẰNG nên KHÔNG GHÉP NỀN (sản phẩm vẫn được giữ nguyên): ${ambiguousReasons.join('; ')}. ` +
-        'Ảnh của bạn vẫn được RETOUCH theo tham số; muốn ghép nền hãy dùng ảnh có nền phẳng hơn, ' +
-        'hoặc bật "vẫn ghép nền dù biên nhập nhằng" (matting_allow_ambiguous = true — có ghi vết).';
+        `CHƯA ĐỦ CHẮC để tách nền an toàn: đo được ${boundary.dirty_removed} pixel có thể thuộc sản phẩm ` +
+        `ở sát/trong vùng giữ (${(dirtyRatioKept * 100).toFixed(1)}% diện tích vùng giữ lại; ` +
+        `${(dirtyAreaFrame * 100).toFixed(2)}% khung ảnh). KHÔNG ghép nền. ` +
+        `Số đo: coverage ${coverage}, background_ratio ${backgroundRatio}, kept_bbox ` +
+        `${keptBoxRaw ? `${keptBoxRaw.w}×${keptBoxRaw.h} tại (${keptBoxRaw.x}, ${keptBoxRaw.y})` : 'null'}, ` +
+        `dirty_removed ${boundary.dirty_removed}, dirty_inside_bbox ${dirtyInsideBbox}. ` +
+        'Ảnh của bạn vẫn được RETOUCH theo tham số; hãy mở ảnh TRƯỚC|SAU để kiểm, hoặc dùng ảnh có nền phẳng hơn. ' +
+        'Nếu vẫn muốn ghép nền cho lượt này: bật "vẫn ghép nền dù biên nhập nhằng" (matting_allow_ambiguous = true — có ghi vết).';
       return {
         status: MATTING_STATUS.SEGMENTATION_AMBIGUOUS,
         output: null,

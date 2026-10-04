@@ -374,3 +374,135 @@ Tôi thử đúng câu hỏi của người điều phối — ba đường, đo
 **Điều kiện đi kèm (đề nghị Owner):** (a) xử lý N1 (tách mã/thông điệp “bóng đổ mơ hồ” khỏi “nguy cơ ăn sản phẩm”, và/hoặc thêm chế độ giữ bóng) trước khi quảng bá tính năng; (b) ghi N2 + N5 vào hợp đồng §3.1/§3.5; (c) cho `summarizeMatting` trả 2 khoá đo mới (N3) và bỏ/dùng thật `IMAGESTUDIO_DIR` (N4); (d) khi có service matting thật, chạy lại N6 trước khi bật `MATTING_PROVIDER=http`.
 
 *Script vòng 2 chạy lại được: `cd /tmp/mvp03-atk2 && node <tên script>` — `a2b-white-product`, `d-overlay`, `d2b-variants`, `d3-cjk`, `a3-clamp`, `a5-immut`, `e4-ui`, `r2-boundary-matrix`, `r2-threshold-scan`, `r2-config`, `r2-boot`, `r2-evidence-paths`, `r2-regions-evidence`, `r2-exposed-fields`.*
+
+---
+---
+
+# VÒNG 3 — chấm cuối tại commit `e167fb1`
+
+PHÁN QUYẾT VÒNG 3: **PASS CÓ ĐIỀU KIỆN**
+
+- Commit chấm: `e167fb1` (“fix(mvp03): N1…N6 …”), nhánh `feat/mvp03-imagestudio`, PR #21. Người chấm chạy **13:05–13:30 ngày 04/10/2026**. CI 5/5 xanh là thông tin do người điều phối cung cấp — **tôi không chạy CI**, chỉ chạy bộ kiểm cục bộ.
+- `git status --short` **rỗng** trước và sau khi chấm (HEAD = `e167fb1`): không còn file `test/**` untracked như hai vòng trước; file duy nhất tôi ghi trong repo là báo cáo này.
+- Vòng 1 (FAIL: 1 CRITICAL + 1 MAJOR + 4 MINOR) và vòng 2 (PASS CÓ ĐIỀU KIỆN: 1 MAJOR + 5 MINOR) ở trên **giữ nguyên**.
+- Script vòng 3: `/tmp/mvp03-atk3/r3-n1-attack.mjs`, `r3b-ui-n5-n6.mjs`, `r3c-exposure.mjs`, `r3d-threshold-hole.mjs`, `r3e-ui-claim.mjs`, `r3f-flag-generate.mjs`, `r3g-false-reject.mjs` + bộ cũ (`/tmp/mvp03-atk3/**`, `/tmp/mvp03-atk2/r2-threshold-scan.mjs`). Output thô lưu tại `/tmp/mvp03-atk3/out-r3-*.txt`.
+- **Kết quả: 0 CRITICAL · 1 MAJOR mới (N7) · 2 MINOR mới (N8, N9) · N1/N2/N4/N5/N6 đã xử lý (N1 kèm lỗ mới N7) · N3 CHƯA tới API/UI thật (N9).** Tôi tấn công lại độc lập từng tuyên bố trong commit message, không tin bản mô tả.
+
+## V3.1 — Bảng N1…N6 (đã xử lý thật / chưa / sai cách)
+
+| # | Kết luận | Bằng chứng (lệnh + output thật, 1 dòng) |
+|---|---|---|
+| **N1** (MAJOR vòng 2 — heuristic từ chối oan) | **ĐÃ XỬ LÝ THẬT theo đúng 3 yêu cầu** (tách mã, thông điệp đúng nguyên nhân, cờ opt-in có ghi vết) — **nhưng chính bộ phân loại mới sinh lỗ N7** | `node /tmp/mvp03-atk2/r2-threshold-scan.mjs`: `sản phẩm 244/245/246/247/248 + logo 36×36 → OK/OK | cov=0.4307` (vòng 2: `FAILED/SUSPICIOUS_MASK`); `bóng mềm Δmax 12/20/30/40 → SEGMENTATION_AMBIGUOUS/SEGMENTATION_AMBIGUOUS` + câu *“BIÊN NHẬP NHẰNG … thường là bóng đổ mềm/viền mờ”*; `sản phẩm 249/250 → FAILED/SUSPICIOUS_MASK` với câu đúng nguyên nhân *“NỀN ĐÃ TÁCH KHÔNG SẠCH: 29.8% … nhiều khả năng đã ăn mất một phần sản phẩm”*; `node /tmp/mvp03-atk3/r3-n1-attack.mjs` (d): `249/250 + retouch → job=PARTIAL/SUSPICIOUS_MASK | ảnh ra=CÓ (retouch-only) sha=21fa4a4f60 / 558ccd0819` |
+| **N2** (giới hạn vật lý ≤ 8/255) | **ĐÃ GHI ĐÚNG VÀO HỢP ĐỒNG — nhưng KHÔNG có cảnh báo nào phía người dùng** (vẫn ăn im lặng) | `docs/MVP-03-CONTRACT.md:128–131` ghi rõ “GIỚI HẠN VẬT LÝ… có thể ăn im lặng (đo được: sản phẩm 251 → cov 0.4307 → 0.1329)”; `node /tmp/mvp03-atk3/r3f-flag-generate.mjs`: `sản phẩm 251 → job=succeeded matting=OK composed=true override=false` + `warnings khớp "8/255\|gần màu nền\|không phân biệt": 0` ⇒ người dùng **không được nói gì** |
+| **N3** (số đo mới không tới API/UI) | **CHƯA XỬ LÝ THẬT — chỉ tới `content_meta` trong DB; hợp đồng lại khẳng định ngược lại (xem N9)** | `node /tmp/mvp03-atk3/r3c-exposure.mjs`: `GET data.matting = {"status":"OK","ambiguous_override":false,"boundary_checked":true} \| GET data.matting.mask = undefined \| GET rendered[0].meta.matting = (đúng 3 field đó) \| GET data.job có content_meta? false \| DB content_meta.imagestudio.matting.mask keys = ["coverage",…,"kept_bbox_ratio","boundary_delta","boundary_checked"] \| UI (hàm THẬT) có khối "Số đo vùng tách nền"? false` |
+| **N4** (`IMAGESTUDIO_DIR` chết) | **ĐÃ XỬ LÝ THẬT** | `r3c-exposure.mjs`: `IMAGESTUDIO_DIR=/tmp/…/khac → config.imagestudio = {"enabled":true} \| có khoá dir? false \| storage THẬT = <IMAGELAB_DIR>/images`; `grep -rn "IMAGESTUDIO_DIR\|imagestudio\.dir" src public tools .env.example` → **0 kết quả** (chỉ còn trong `docs/`); `.env.example` chỉ còn `IMAGESTUDIO_ENABLED=true`; `node r2-config.mjs` → `config.imagestudio.dir=undefined` |
+| **N5** (không truy vết nguồn bằng chứng) | **ĐÃ XỬ LÝ THẬT** (nguồn thật, khớp DB, không nhận từ request, tới cả meta + GET + UI) | `r3c-exposure.mjs`: `DB overlay.evidence_used={"sources":["product_name"],"region_ids":[],"chars":17}` = `GET overlay.evidence_used` = `asset.meta.overlay.evidence_used`; UI thật hiện khối *“Bằng chứng dùng để duyệt chữ overlay — Nguồn: tên sản phẩm (đã lưu)”*; `node r3b-ui-n5-n6.mjs`: vùng `user` ⇒ `sources:["user_region"], region_ids:["u1"]` (DB `[["u1","user"]]`), vùng OCR ⇒ `["ocr_region"], ["r1"]`; client gửi `overlay.source_text` ⇒ `HTTP 422 OVERLAY_UNSUPPORTED_CLAIM`; `node d2b-variants.mjs` 9/9 ⇒ **422** |
+| **N6** (provider ngoài `purejs` không đo biên) | **ĐÃ XỬ LÝ THẬT ở tầng provider/meta/API** (đường mạng `http` vẫn chưa đo end-to-end) | `node r3b-ui-n5-n6.mjs`: `mock matting: status=OK boundary_checked=false mask.boundary_checked=false \| warnings có câu "KHÔNG đo được biên"? true`; `r3c-exposure.mjs`: câu đó **hiện trên UI thật** (qua danh sách warnings) — nhưng dòng chuyên biệt *“Provider ngoài (không phải purejs) KHÔNG đo được biên”* **không hiện**, vì nó nằm trong khối chết của N3/N9 |
+
+**Về cờ `matting_allow_ambiguous`** (tuyên bố chính của bản vá — tôi tấn công riêng): mặc định TẮT thật (`r3-n1-attack.mjs` c: không cờ ⇒ `SEGMENTATION_AMBIGUOUS`, không ảnh ra; cờ `false` ⇒ như không cờ); bật ⇒ ghép + ghi vết thật ở **4 nơi** (`mask.ambiguous_override`, `content_meta…matting.ambiguous_override`, `asset.meta.matting.ambiguous_override`, `GET matting.ambiguous_override`) + warning nổi bật trong `warnings` và trên UI (`r3e-ui-claim.mjs`: `UI có câu "ĐÃ BỎ QUA cảnh báo"? true`); **không lách được ca NGUY HIỂM** (`249 + cờ=true → vẫn FAILED/SUSPICIOUS_MASK, rendered=0`); kiểu sai (`'true'`, `1`, `{}`) ⇒ `400 BAD_OPTIONS` ở **cả** route `POST /jobs` và `POST /generate`; `__proto__` một mình **không** bật được cờ và không đầu độc prototype; `matting_options:{…}` do client gửi **không** phải cửa sau (bị bỏ, vẫn `SEGMENTATION_AMBIGUOUS`); `remove_background:false` + cờ ⇒ **không** ghép bằng mask cũ; lượt `generate` thứ 2 không tái dùng mask cũ (`r3f-flag-generate.mjs`, `r3-n1-attack.mjs` c2).
+
+## V3.2 — LỖ HỔNG MỚI (vòng 3)
+
+### N7 (MAJOR) — Ngưỡng `0.15` là tỉ lệ trên **TOÀN KHUNG ẢNH**: ăn 85% sản phẩm mà hệ thống vẫn nói *“sản phẩm vẫn được giữ nguyên”*, và mô tả vùng bị ăn là *“dải mỏng quanh sản phẩm”*
+
+**Dựng ca** (`/tmp/mvp03-atk3/r3d-threshold-hole.mjs`): khung 300×300 (90 000 px), nền trắng 255; **sản phẩm = 2 nẹp tối (20,20,20) ở mép trên/dưới + thân sáng 110×110 màu 249** — thân sáng chiếm 12 100 px = **13.4% khung** (< 15%) và cách nền Δ = 10.39/255 (**vượt hẳn “giới hạn vật lý” 8/255** mà hợp đồng §3.1 viện dẫn cho N2).
+
+```
+$ cd /tmp/mvp03-atk3 && node r3d-threshold-hole.mjs
+thân 220 (tương phản rõ — đối chứng)   | job=succeeded | matting=OK | cov=0.1576 dirty=0 | ảnh ra=CÓ | pixel thân SP đổi màu=0/12100
+thân 249 (Δ=10.4 — BỊ ĂN, 13.4% < 15%) | job=PARTIAL/NO_CHANGES | matting=SEGMENTATION_AMBIGUOUS | cov=0.0231 dirty=0.1344 over=0 | ảnh ra=không
+   ↳ BIÊN NHẬP NHẰNG nên KHÔNG GHÉP NỀN (sản phẩm vẫn được giữ nguyên): 13.4% ảnh bị coi là nền
+     nhưng không sạch màu nền (dải mỏng quanh sản phẩm). …
+thân 249 + CỜ matting_allow_ambiguous  | job=succeeded | matting=OK | cov=0.0231 dirty=0.1344 | ảnh ra=CÓ | pixel thân SP đổi màu=12100/12100
+   ↳ ⚠️ ĐÃ BỎ QUA cảnh báo BIÊN NHẬP NHẰNG … Căn cứ đã bỏ qua: 13.4% ảnh bị coi là nền nhưng
+     không sạch màu nền (dải mỏng quanh sản phẩm). HÃY KIỂM ẢNH TRƯỚC|SAU.
+thân 249 TO HƠN (200×200 = 44% khung)  | job=PARTIAL/NO_CHANGES | matting=FAILED/SUSPICIOUS_MASK | dirty=0.4444
+```
+
+**Đọc số cho đúng:** cùng một hình học, chỉ khác màu thân sản phẩm — 220 (Δ=60) ⇒ ĐẠT, **0/12 100** pixel sản phẩm đổi; 249 (Δ=10.4) ⇒ mask **ăn mất toàn bộ thân** (`coverage` tụt 0.1576 → 0.0231, chỉ còn 2 nẹp), nhưng vì diện tích bẩn **13.4% < 15%** nên hệ thống xếp vào nhánh “NHẬP NHẰNG” và **khẳng định sản phẩm còn nguyên**. Khi thân to hơn (44% khung) thì cùng lượng thiệt hại đó lại bị bắt đúng (`SUSPICIOUS_MASK`) — tức tiêu chí phân biệt “nguy hiểm” với “nhập nhằng” ở đây **không phải mức thiệt hại của sản phẩm mà là tỉ lệ thiệt hại trên khung ảnh**.
+
+**Câu khẳng định sai đi tới tận UI thật** (`r3e-ui-claim.mjs`, chạy `renderIsWarnings` trích từ `public/app.js`):
+
+```
+=== A) KHÔNG cờ — UI THẬT nói gì? ===
+  UI có câu "sản phẩm vẫn được giữ nguyên"? true
+  UI có câu "dải mỏng quanh sản phẩm" (mô tả 13.4% khung)? true
+  UI: KHÔNG GHÉP NỀN vì biên nhập nhằng (bóng đổ mềm / viền mờ / sản phẩm sáng gần màu nền) —
+      sản phẩm vẫn được giữ nguyên. …
+=== B) BẬT cờ — … ===
+  job=succeeded | matting=OK | meta.ambiguous_override=true | mask.ambiguous_override=true
+  UI có câu "ĐÃ BỎ QUA cảnh báo"? true | có "dải mỏng quanh sản phẩm"? true
+  ẢNH RA: pixel thân sản phẩm bị đổi màu = 12100/12100
+```
+
+**Vì sao quan trọng:** đây đúng lớp lỗi mà vòng 1 xếp CRITICAL — *hệ thống khẳng định ngược lại điều nó vừa làm* — chỉ khác là (i) mặc định vẫn fail-closed (không có ảnh sai), (ii) khi người dùng bật cờ thì **có ghi vết** `ambiguous_override`. Nhưng lời mời bật cờ dựa trên mô tả **sai sự thật** (“dải mỏng quanh sản phẩm” trong khi đó là 85% diện tích sản phẩm): người dùng bật cờ vì tưởng chỉ có bóng đổ, và nhận về ảnh **mất sản phẩm** với job `succeeded`. Mức **MAJOR** (không CRITICAL vì mặc định không xuất ảnh sai và cờ có ghi vết).
+
+**Gợi ý sửa (KHÔNG tự sửa):** (a) bỏ mọi câu khẳng định “sản phẩm vẫn được giữ nguyên” — chỉ được nói điều ĐO ĐƯỢC (như M03-01c đã làm với câu “pixel NGOÀI vùng đã tách…”); (b) chuẩn hoá `dirty_removed_ratio` theo **vùng GIỮ LẠI** (hoặc theo hộp bao sản phẩm) chứ không theo khung ảnh, và/hoặc thêm điều kiện “vùng bẩn phải là **dải mỏng kề** vùng giữ lại” (ví dụ `dirty_removed` phải nằm trong bán kính ≤ k pixel quanh `kept`); (c) nhánh NGUY HIỂM nên so `coverage` với ước lượng “vùng không-phải-nền” (ở đây `coverage` tụt 0.1576 → 0.0231 là tín hiệu rõ).
+
+### N8 (MINOR) — `dirty_removed_ratio` bị `toFixed(4)`: trên khung 16 MP, tối đa ~800 px “nền bẩn” bị **làm tròn về 0** ⇒ không nhánh nhập nhằng nào kích hoạt
+
+`measureBoundaryDelta` trả `Number((dirtyRemoved / (width*height)).toFixed(4))`; `dirtyArea > 0` là điều kiện sinh lý do “nhập nhằng”. Với khung 16 000 000 px (đúng trần `IMAGELAB_MAX_PIXELS=16000000`), ngưỡng làm tròn là `0.00005 × 16 000 000 = 800` ⇒ **≤ 799 pixel bẩn bị coi là 0**.
+
+```
+$ cd /tmp/mvp03-atk3 && node r3d-threshold-hole.mjs     (mục B: khung 4000×4000, mảng 25×28 px màu 249)
+  (ảnh 4000×4000, 69 KiB)
+700 px bẩn / 16 000 000 = 0.0000438 | job=succeeded | matting=OK | cov=0.025 dirty=0 over=0 | ảnh ra=CÓ | pixel thân SP đổi màu=700/700
+```
+
+Số đo thật là 0.0000438 nhưng hệ thống báo `dirty=0` và ghép nền, **700/700** pixel “sản phẩm” bị đổi. Quy mô nhỏ (0.004% khung) nên chỉ **MINOR**, nhưng đúng loại “số đo tự làm tròn mất dấu vết”; sửa: giữ nguyên độ chính xác (hoặc so `dirty_removed > 0` thay vì so tỉ lệ đã làm tròn).
+
+### N9 (MINOR) — N3 chỉ tới `content_meta`; hợp đồng và commit nói đã tới `GET`/`asset.meta`/UI — **không đúng**
+
+`summarizeMatting` (pipeline.js:215–231) nay chuyển tiếp `kept_bbox_ratio`/`boundary_delta`/`boundary_checked`/`ambiguous_override` — **phần này thật** (đọc được trong DB). Nhưng:
+
+```
+$ cd /tmp/mvp03-atk3 && node r3c-exposure.mjs
+[ĐẠT (đỏ đặc, có ảnh ra)]
+  GET data.matting            = {"status":"OK","ambiguous_override":false,"boundary_checked":true}
+  GET data.matting.mask       = undefined
+  GET rendered[0].meta.matting= {"status":"OK","ambiguous_override":false,"boundary_checked":true}
+  GET data.job có content_meta? false
+  DB  content_meta.matting.mask keys = ["coverage","background_ratio","uniformity","seed_colors","kept_bbox_ratio","boundary_delta","boundary_checked"]
+  UI  có khối "Số đo vùng tách nền"? false     ← cả 3 ca (ĐẠT / NHẬP NHẰNG / NGHI NGỜ) đều false
+```
+
+Nguyên nhân: `GET` lấy `matting` từ **`meta` của ảnh rendered** (`routes.js:1207–1219`, `imagestudioStepTraces`), mà pipeline chỉ ghi vào `asset.meta.matting` **3 field** `{status, ambiguous_override, boundary_checked}` (`pipeline.js:1093–1102`); `job.content_meta` **không** được trả trong `GET` (`jobJson`), và `last_run` không có `matting`. Khối UI mới (`public/app.js:2812–2840`) mở bằng `if (bd || maskSrc)` với `bd = matting.mask?.boundary_delta || rendered?.meta?.matting?.boundary_delta` ⇒ **luôn null** ⇒ cả khối (kể cả dòng cảnh báo N6 “Provider ngoài … KHÔNG đo được biên” và dòng “ĐÃ BỎ QUA cảnh báo”) **không bao giờ hiện**; N6 vẫn tới người dùng được là nhờ câu warning nằm trong danh sách `warnings`, không nhờ khối này.
+
+Hợp đồng §3.1 (dòng 141–144) khẳng định các số đo “có mặt ở `content_meta…`, **`GET /api/imagestudio/jobs/:id → matting.mask`**, **`asset.meta.matting`** và **UI (khối “Số đo vùng tách nền”)**” — 3/4 vế sau **sai khi đo**. Test mới (`test/imagestudio-round9-hardening.test.js:177–189`, tên test ghi “phải tới được API”) chỉ khẳng định trên `result.matting.mask` — tức bản **trong bộ nhớ của pipeline**, không phải payload HTTP/asset meta/UI. Vì thông tin không bị bịa (số đo thật vẫn nằm trong DB) nên mức **MINOR**, nhưng đây là **N3 lặp lại nguyên vẹn ở tầng API/UI**.
+
+## V3.3 — ĐÃ CỐ PHÁ MÀ **KHÔNG** PHÁ ĐƯỢC (vòng 3)
+
+1. **M03-01 ca gốc**: `node /tmp/mvp03-atk3/a2b-white-product.mjs` → `"áo trắng": còn lại = 2048, đã bị xoá = 0`, `pixel vùng "áo" còn màu áo gốc = 2048`, `mask = {"coverage":0.5625,"background_ratio":0.4375,…,"kept_bbox_ratio":0.5625,"boundary_delta":{…,"dirty_removed":0,…},"boundary_checked":true}`, `kept_bbox = {x:8,y:8,w:48,h:48}`.
+2. **Sản phẩm trắng/kem 244–248 không còn bị chặn oan** (đúng yêu cầu N1) và **thông điệp ca 249/250 đúng nguyên nhân**, người dùng **vẫn có ảnh retouch-only** (`r2-threshold-scan.mjs`, `r3-n1-attack.mjs` mục d).
+3. **Không có ca “bình thường” nào bị từ chối oan nữa** (`r3g-false-reject.mjs`): sản phẩm **nhiều màu** (`OK | pixel SP đổi=0/3360`), **ảnh 2 vật thể rời** (`OK | 864/2880 = đúng bằng diện tích NỀN trong hộp đo (2880−2016); 0 pixel sản phẩm đổi`), **viền mờ mạnh 8px** (`OK | 0/2304`), **bóng cứng đậm** (`OK | 0/2112`), **sản phẩm chạm viền + nền vân ±4** (`OK | 0/2304`); `r2-boundary-matrix.mjs`: A0/A1/A3/A4/A6/A7 đều `OK`, `0` pixel sản phẩm đổi (A1 có 93 px viền AA bị cắt — nằm trong dải viền, `over_ratio=0`).
+4. **Bóng đổ mềm / ảnh kiểu thật** nay nói đúng nguyên nhân và **không tạo ảnh sai**: `A2 bóng đổ mềm`, `A5 gradient+bóng+AA`, `A9 trắng-gradient chạm viền` ⇒ `SEGMENTATION_AMBIGUOUS` + câu “BIÊN NHẬP NHẰNG … bóng đổ mềm/viền mờ”, `rendered=0`.
+5. **Cờ override không có cửa sau**: xem mục cuối V3.1 (kiểu sai ⇒ 400 ở cả 2 route; `matting_options` client bị bỏ; `__proto__` một mình không bật cờ, `Object.prototype bị đầu độc? false`; `remove_background:false` không tái dùng mask cũ; ca NGUY HIỂM vẫn bị chặn dù bật cờ).
+6. **N5 không nhận bằng chứng từ request**: `d-overlay.mjs` D2 → 8/8 câu bịa + `source_text` đều `HTTP 422 (không lọt)`; `d2b-variants.mjs` 9/9 → `422 OVERLAY_UNSUPPORTED_CLAIM`; `d3-cjk.mjs`: `保修`, `保修 12 个月`, `こんにちは`, `한국어` → `422 OVERLAY_NOT_TRANSLATED`.
+7. **Bảo mật/vận hành giữ nguyên**: `e1-security.mjs` → IDOR `404` ở mọi cửa (`GET job`/asset gốc/asset rendered/`POST generate`/route imagelab cũ/`GET /api/jobs/:id`/`/usage`), id không uuid `400`, `body 40MB → 413`, không lộ `password`/path; `e4-ui.mjs` → 4 hàm UI thật, payload XSS **không lọt thẻ thật** (4/4 “có thẻ THẬT chưa escape? false”); `e7-crossjob.mjs` → 3 loại job không lẫn, route chéo `409`, job lỗi có `error_code` + `finished_at`, job kẹt `running` thoát được bằng `force=true`.
+8. **Không hồi quy các bản vá cũ**: `a3-clamp.mjs` (`brightness 99 → NO_CHANGES, effective=0, clamped=["brightness"]`; `NaN/±Infinity/'0.9'/mảng/object/__proto__` ⇒ `rejected[]`, không giá trị nào được áp), `a5-immut.mjs` (`sha đĩa = 48d15e2af9316df7` không đổi sau 3 lượt; `mask status FAILED + buffer → ratio=0, pixel sản phẩm đổi=0`), `c1-matting.mjs` (nền thật/gradient ⇒ `UNIFORM_BACKGROUND_NOT_FOUND` + số đo thật; toàn một màu/1 pixel khác/trong suốt ⇒ `SUSPICIOUS_MASK`), `b-synthetic.mjs` (5/5 template `synthetic:true`, template lạ ⇒ `TEMPLATE_NOT_FOUND`, chỉ retouch ⇒ `synthetic=false`), `a1-distortion.mjs` (1×1/3×7/2000×1/2×2000 ⇒ `PARTIAL/NO_CHANGES`, không ảnh ra; ảnh thường `64×64`; retouch không đổi alpha nền, khối tâm không dịch).
+9. **Hồi quy MVP-02**: `node /tmp/atk5/x1-f01-pixel.mjs` → `pixel đổi \| brand trong ảnh [300,280,20,40]: 0/800`, `pixel đổi NGOÀI mọi hộp đã applied: 0`; `node /tmp/atk-il08b/05-limits-race.mjs` → `PUT /regions: {"status": 409}`; `node /tmp/atk-il08b/r6-01-race2.mjs` → `vùng người dùng CÒN NGUYÊN?: true`, `"skipped_write": true`, cảnh báo “KHÔNG ghi đè (1 vùng nguồn 'user'…)”; `node /tmp/atk-il08b/r6-06-f06gate.mjs` → cổng F-06 vẫn `409 REVIEW_REQUIRED` và khi `force` vẫn cảnh báo dòng `NEEDS_REVIEW` không được vẽ.
+10. **Bộ đo chuẩn (tự đo tại `e167fb1`)**: `npm test` → **708 test · 707 pass · 0 fail · 1 skipped** (20.8 s); `node tools/verify.mjs` → **708 · 707 pass · 0 fail**, `EXIT=0`, in “Kiểm chứng cục bộ hoàn tất…”; `node tools/imagelab-demo.mjs` → xong, `usage 3 event`, nhãn `MOCK_VERIFIED`; `node --test test/imagestudio-*.test.js` → **126 test · 126 pass** (11 file MVP-03 đều **tracked**: `git ls-files 'test/imagestudio*'`), tức F3/M03-03 của vòng 1 vẫn đóng.
+11. **Cấu hình vẫn chỉ SIẾT được**: `r2-config.mjs` → `IMAGESTUDIO_ENABLED=false/FALSE/0/no` đều tắt thật (`templates=503`); `MATTING_PROVIDER=none` ⇒ `NOT_CONFIGURED`; `RETOUCH_MAX_BRIGHTNESS=9.9` **không** nới được (hiệu lực vẫn 0.25); provider tên lạ ⇒ `r2-boot.mjs`: server **vẫn boot**, `imagestudio.available=false`, `templates=503` *(lưu ý: `r2-config.mjs` in “DỰNG APP LỖI: UNKNOWN_PROVIDER” cho ca này vì script dựng provider trực tiếp — cùng hành vi đã đo ở vòng 2 bằng `r2-boot.mjs`, không phải hồi quy)*.
+
+## V3.4 — CHƯA KIỂM ĐƯỢC (vòng 3, vì sao)
+
+1. **Provider tách nền `http` (mạng thật)**: vẫn là khoảng trống lớn nhất. Tôi **đã** kiểm được *cơ chế* N6 bằng provider `mock` (ngoài `purejs`): `boundary_checked=false` + warning tới DB/API/UI. Nhưng đường `http` **chưa đo end-to-end**: `safeFetch` (`src/security/fetcher.js`) tự `resolvePublicAddresses` (DNS thật) rồi dùng `http.request` với `lookup` ghim — không thể thay bằng service giả/stub `fetch` trong phạm vi phòng này. Vì vậy **chưa** đo được: mask thật từ dịch vụ ngoài đi qua `MattingProvider` rồi tới `GET`/UI trông thế nào.
+2. **PostgreSQL**, **trình duyệt thật** (hàm UI chạy THẬT trong Node nhưng chưa có DOM/CSS/poll/kéo-thả), **queue đa tiến trình**, **provider AI/OCR trả tiền** — như vòng 1/2.
+3. **Ảnh chụp thật (JPEG/RAW)**: mọi ca vẫn là ảnh PNG **tổng hợp**; engine chỉ nhận PNG nên **tỉ lệ từ chối oan trên ảnh thật chưa đo được**. N7 đo trên ảnh tổng hợp (nền phẳng tuyệt đối) — trên ảnh chụp thật, `dirty_removed_ratio` sẽ lớn hơn (nhiễu/biến thiên nền), nên **tần suất N7 trên ảnh thật chưa biết**; con số 13.4% là một ca dựng được, không phải tỉ lệ.
+4. **Matting "treo"**: `e7-crossjob.mjs` E8(b) cho thấy provider treo ⇒ job `running` không `finished_at` (không có timeout ở tầng pipeline; `purejs` không treo được, `http` có `timeoutMs`). Có đường thoát bằng `force=true` (đã đo). Đây là ghi nhận, không phải phát hiện mới của vòng 3.
+
+## V3.5 — PASS CÓ ĐIỀU KIỆN nghĩa là gì (và **KHÔNG** nghĩa là gì)
+
+**Nghĩa là:** 5/6 phát hiện vòng 2 (N1, N2-dạng-tài-liệu, N4, N5, N6) đã được xử lý **thật**, đo lại bằng pixel/HTTP/UI thật chứ không tin lời khai; **không còn CRITICAL**; mọi bản vá vòng 1 vẫn đóng (tách nền ăn sản phẩm ca gốc, overlay tự rửa tội, CJK, kẹp retouch, compose fail-closed, cấu hình chỉ siết); bộ đo cục bộ xanh (**708 · 707 pass · 0 fail · 1 skipped**), 126 test MVP-03 tracked đều xanh; cờ `matting_allow_ambiguous` là **đường opt-in thật, có ghi vết 4 nơi, không có cửa sau, không lách được ca nguy hiểm**.
+
+**KHÔNG nghĩa là:**
+- **Không** có nghĩa bộ phân loại NGUY HIỂM/NHẬP NHẰNG đã đúng: ngưỡng 0.15 đo trên **khung ảnh**, nên ca ăn 85% sản phẩm vẫn được gọi là “nhập nhằng” và bị khẳng định sai là “sản phẩm vẫn được giữ nguyên” (**N7, MAJOR** — xử lý trước khi quảng bá tính năng; nếu không, ít nhất phải bỏ câu khẳng định và mô tả đúng căn cứ).
+- **Không** có nghĩa số đo biên đã tới được API/UI: chúng chỉ nằm trong `jobs.content_meta`; `GET → matting.mask`, `asset.meta.matting` và khối UI “Số đo vùng tách nền” **không có** — hợp đồng §3.1 đang **mô tả sai** điều này (**N9**); dòng cảnh báo riêng cho provider ngoài `purejs` cũng nằm trong khối chết đó.
+- **Không** có nghĩa tách nền dùng được cho mọi ảnh: nó chỉ hợp **nền đồng nhất**; ảnh có **bóng đổ mềm / kiểu ảnh thật** vẫn **không cho ra ảnh ghép nền theo mặc định** (phải bật cờ, và theo N7 thì bật cờ có thể mất sản phẩm mà không được mô tả đúng).
+- **Không** có nghĩa “sản phẩm luôn được giữ”: **N2 là giới hạn vật lý** — sản phẩm chỉ khác nền **≤ 8/255** vẫn bị ăn **im lặng** (`r3f-flag-generate.mjs`: ca 251, `job=succeeded`, `0` câu cảnh báo cho người dùng), và **N8** làm tròn số đo khiến tới ~800 px “nền bẩn” trên khung 16 MP bị coi là 0.
+- **Không** có nghĩa đã đo provider thật: đường **`http` chưa đo end-to-end** (DNS + `http.request` thật của `safeFetch`); N6 chỉ được kiểm bằng provider `mock`.
+- **Không** có nghĩa đã nghiệm thu bằng ảnh thật: **mọi ca của cả 3 vòng đều là ảnh PNG tổng hợp**, chưa có ảnh chụp thật (JPEG/RAW) nào đi qua engine.
+
+**Điều kiện đi kèm (đề nghị Owner):** (a) sửa **N7** — bỏ câu “sản phẩm vẫn được giữ nguyên”, chuẩn hoá ngưỡng bẩn theo vùng giữ lại/hộp bao sản phẩm, và mô tả đúng căn cứ khi bật cờ — trước khi quảng bá; (b) sửa **N9** (đưa số đo vào `GET`/`asset.meta`/UI **hoặc** sửa hợp đồng §3.1 + tên test cho đúng sự thật đang có); (c) sửa **N8** (giữ độ chính xác của `dirty_removed_ratio`); (d) khi có service matting thật, chạy lại đường `http` trước khi bật `MATTING_PROVIDER=http`.
+
+*Script vòng 3 chạy lại được: `cd /tmp/mvp03-atk3 && node r3d-threshold-hole.mjs` (N7/N8), `node r3c-exposure.mjs` (N3/N4/N5/N6 + UI), `node r3e-ui-claim.mjs` (N7 trên UI thật), `node r3f-flag-generate.mjs` (cờ + N2), `node r3g-false-reject.mjs`, `node r3-n1-attack.mjs`, `node r3b-ui-n5-n6.mjs`; bộ cũ: `node a2b-white-product.mjs`, `node /tmp/mvp03-atk2/r2-threshold-scan.mjs`, `node r2-boundary-matrix.mjs`.*

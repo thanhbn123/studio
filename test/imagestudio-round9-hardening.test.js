@@ -80,9 +80,17 @@ describe('N1 — biên NHẬP NHẰNG khác hẳn "nghi ngờ ăn mất sản ph
         assert.equal(res.status, MATTING_STATUS.SEGMENTATION_AMBIGUOUS, `bóng Δ${strength} phải là AMBIGUOUS, nhận ${res.status}`);
         assert.equal(res.error_code, MATTING_CODES.SEGMENTATION_AMBIGUOUS);
         assert.equal(res.output, null, 'mặc định KHÔNG ghép nền');
-        assert.match(res.error_message, /BIÊN NHẬP NHẰNG nên KHÔNG GHÉP NỀN/);
+    assert.equal(res.mask.boundary_delta.dirty_removed > 0, true, 'phải đo được số pixel nền bẩn');
+        // N7b (vòng 10): câu chữ đổi sang dạng CHỈ NÓI ĐIỀU ĐO ĐƯỢC — không còn khẳng định
+        // "sản phẩm vẫn được giữ nguyên" (máy không biết chắc pixel nào là sản phẩm).
+        assert.match(res.error_message, /CHƯA ĐỦ CHẮC để tách nền an toàn/);
+        assert.match(res.error_message, /KHÔNG ghép nền/);
         assert.match(res.error_message, /vẫn được RETOUCH/);
         assert.ok(!/ăn mất sản phẩm/i.test(res.error_message), 'KHÔNG được nói "ăn mất sản phẩm" khi mask đúng');
+        assert.ok(
+          !/sản phẩm vẫn được giữ nguyên/.test(res.error_message),
+          'N7b: KHÔNG được khẳng định sản phẩm còn nguyên',
+        );
       }
     })();
   });

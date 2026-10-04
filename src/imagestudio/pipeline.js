@@ -1095,11 +1095,9 @@ export class ImageGenerationPipeline {
         template: { id: template.id, label: template.label, synthetic: template.synthetic === true },
         synthetic_background: syntheticBackground,
         // N1 (vòng 9): vết "người dùng đã bỏ qua cảnh báo biên nhập nhằng" nằm NGAY trên ảnh ra.
-        matting: {
-          status: matting?.status ?? null,
-          ambiguous_override: matting?.mask?.ambiguous_override === true,
-          boundary_checked: matting?.mask?.boundary_checked === true,
-        },
+        // N9 (vòng 10): ghi bản TÓM TẮT ĐẦY ĐỦ (có `mask` + mọi số đo biên) — trước đây chỉ
+        // 3 field nên `GET /api/imagestudio/jobs/:id`, `asset.meta` và UI KHÔNG có số đo nào.
+        matting: summarizeMatting(matting),
         retouch_effective: retouchEffective,
         retouch_clamped: clampedNames,
         retouch_rejected: rejectedNames,

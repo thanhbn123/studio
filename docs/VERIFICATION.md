@@ -915,3 +915,90 @@ mặc định + retouch (không ghép nền)| matting=SEGMENTATION_AMBIGUOUS | r
   ca ăn sản phẩm ~0.30 — ngưỡng nằm giữa hai cụm. Ảnh chụp thật (JPEG→PNG, bóng đổ lớn, nền màu)
   chưa đo ⇒ có thể còn ca rơi vào nhầm nhánh.
 - Vẫn chưa đo: PostgreSQL, provider AI/OCR trả tiền, trình duyệt thật, queue đa tiến trình.
+
+---
+
+## 15. MVP-03 — vòng 10: xử lý N7/N8/N9 của phản biện vòng 3
+
+Phán quyết vòng 3: **PASS CÓ ĐIỀU KIỆN** (1 MAJOR mới + 2 MINOR — `docs/MVP-03-REVIEW.md`).
+Đã xử lý cả 3. `npm test` → **717 test · 716 pass · 0 fail · 1 skipped**; `verify.mjs` EXIT=0;
+`imagelab-demo.mjs` → `succeeded`.
+
+### 15.1 N7 (MAJOR) — mẫu số đúng + tín hiệu “cắt sâu”, và câu chữ chỉ nói điều ĐO ĐƯỢC
+
+Sửa ở `src/imagestudio/matting/background.js` (đo `kept_pixels`, `dirty_ratio_kept`,
+`dirty_inside_bbox(+_ratio)` với BFS khoảng cách tới vùng giữ; `AMBIGUOUS_DIRTY_RATIO_MAX = 1.0`,
+`DIRTY_DEEP_MIN_DISTANCE = 2`), `matting/providers/purejs.js` (phân loại + câu chữ),
+`pipeline.js` + `public/app.js` (N9). Cờ `matting_allow_ambiguous` **không** mở đường cho ca nguy hiểm.
+
+```
+$ cd /tmp/mvp03-atk3 && node r3d-threshold-hole.mjs
+thân 220 (đối chứng)                   | job=succeeded | matting=OK | cov=0.1576 dirty=0 | ảnh ra=CÓ | pixel thân SP đổi màu=0/12100
+thân 249 (BỊ ĂN, 13.4% khung)          | job=PARTIAL/NO_CHANGES | matting=FAILED/SUSPICIOUS_MASK | dirty=0.13444444
+   ↳ TỪ CHỐI … (nghi ngờ ĂN MẤT SẢN PHẨM): NỀN ĐÃ TÁCH KHÔNG SẠCH: 12100 pixel … = 581.7% DIỆN TÍCH
+     VÙNG GIỮ LẠI (ngưỡng 15%…; 13.44% khung ảnh) …  | ảnh ra=không
+thân 249 + CỜ matting_allow_ambiguous  | matting=FAILED/SUSPICIOUS_MASK | ảnh ra=không   (cờ KHÔNG mở đường)
+thân 249 TO HƠN (44% khung)            | matting=FAILED/SUSPICIOUS_MASK | dirty=0.44444444
+(B) 700 px bẩn / 16 000 000 px         | job=PARTIAL/NO_CHANGES | matting=SEGMENTATION_AMBIGUOUS | ảnh ra=không
+
+$ node /tmp/mvp03-atk3/r3e-ui-claim.mjs
+A) UI có câu "sản phẩm vẫn được giữ nguyên"? false
+   UI có câu "dải mỏng quanh sản phẩm" (mô tả 13.4% khung)? false
+B) UI có "Số đo vùng tách nền"? true
+```
+
+Không hồi quy (3 chiều còn lại):
+
+```
+$ node /tmp/mvp03-atk2/r2-threshold-scan.mjs
+sản phẩm 244/245/246/247/248 + logo | OK/OK | cov=0.4307          (mask đúng ⇒ vẫn ĐẠT)
+bóng mềm Δmax 12/20/30/40           | SEGMENTATION_AMBIGUOUS/SEGMENTATION_AMBIGUOUS | "CHƯA ĐỦ CHẮC…"
+viền mờ 1–4px · đỏ đặc không bóng   | OK/OK
+$ node /tmp/mvp03-atk/a2b-white-product.mjs
+matting.status = OK | "áo trắng": XOÁ = 0/2048 · pixel vùng "áo" còn màu áo gốc = 2048
+```
+
+### 15.2 N8 (MINOR) — không làm tròn mất tín hiệu
+
+`dirty_removed_ratio` giữ `toFixed(8)`; phân loại nhập nhằng dùng **SỐ NGUYÊN** `dirty_removed > 0`.
+Test mới: khung 1000×1000 với **42 px** bẩn (0.000042 khung ≈ ngưỡng làm tròn cũ 0.00005) ⇒
+`notEqual(status, OK)` + `output = null` (trước: `toFixed(4)` ⇒ 0 ⇒ `OK` + ảnh ra).
+Bằng chứng script: mục (B) ở trên — `700 px bẩn / 16 000 000` ⇒ **SEGMENTATION_AMBIGUOUS**, không ảnh ra.
+
+### 15.3 N9 (MINOR) — số đo tới được API/UI THẬT
+
+Sửa: `pipeline.js` ghi `meta.matting = summarizeMatting(matting)` (bản ĐẦY ĐỦ, không còn 3 field);
+`routes.js` thêm `matting` vào `last_run`; `public/app.js` đọc mask từ **cả ba** nguồn
+(`data.matting.mask` → `rendered[].meta.matting.mask` → `last_run.matting.mask`).
+
+```
+$ cd /tmp/mvp03-atk3 && node r3c-exposure.mjs
+[ĐẠT] GET data.matting.mask  = {"coverage":0.2397,…,"kept_bbox_ratio":0.2397,
+       "boundary_delta":{"p95":0,"dirty_removed":0,"kept_pixels":2209,"dirty_ratio_kept":0,…},
+       "boundary_checked":true}
+      GET rendered[0].meta.matting = (cùng bản tóm tắt đầy đủ)
+      UI  có khối "Số đo vùng tách nền"? true | Δp95=true dirty=true under=true
+[NHẬP NHẰNG] UI có khối "Số đo vùng tách nền"? true   (lấy từ last_run.matting)
+[N6 mock]  UI có "Provider ngoài (không phải purejs) KHÔNG đo được biên"? true
+```
+
+### 15.4 Test thêm/sửa
+
+- **Thêm** `test/imagestudio-round10-hardening.test.js` (9 test): N7 **ba chiều** (ăn sản phẩm
+  khung 300×300 ⇒ SUSPICIOUS + cờ không mở đường; bóng đổ mềm ⇒ AMBIGUOUS + câu chỉ nói điều đo
+  được; sản phẩm sáng 244–248 ⇒ ĐẠT), N8 (42 px bẩn trên 1000×1000 ⇒ không OK), N9 (GET `matting.mask`
+  + `asset.meta.matting.mask`; UI THẬT hiện khối số đo từ **cả ba** nguồn; mã AMBIGUOUS có câu riêng).
+- **Sửa** `test/imagestudio-round9-hardening.test.js`: kỳ vọng câu chữ của nhánh nhập nhằng đổi theo
+  N7b (`CHƯA ĐỦ CHẮC…` + `KHÔNG ghép nền` + `vẫn được RETOUCH`, và **cấm** câu “sản phẩm vẫn được
+  giữ nguyên”) — ghi rõ trong test.
+
+### 15.5 Còn lại
+
+- **N2 vẫn là giới hạn vật lý** (≤ 8/255): ca `sản phẩm 251 + logo` vẫn `OK` với `cov` tụt
+  0.4307 → 0.1329 (thân bị ăn) — đã ghi hợp đồng + khuyến nghị provider `http`/AI.
+- **`r3e-ui-claim.mjs` crash ở dòng 66** sau bản vá: script giả định “bật cờ ⇒ có ảnh ra”, nhưng
+  ca N7 nay là NGUY HIỂM nên cờ không mở đường và **không có ảnh** ⇒ `rendered` rỗng. Đây là hệ quả
+  ĐÚNG của bản vá (lỗi giả định trong script của phản biện, không phải lỗi repo).
+- **Ngưỡng `1.0` và `DIRTY_DEEP_MIN_DISTANCE = 2` chọn từ ảnh TỔNG HỢP** (bóng mềm 0.061–0.196 vs
+  ăn sản phẩm 2.24–19.23); ảnh chụp thật (JPEG→PNG, nền màu, bóng lớn) chưa đo.
+- Đường `http` vẫn **chưa đo end-to-end**; chưa đo PostgreSQL/trình duyệt thật/queue đa tiến trình.

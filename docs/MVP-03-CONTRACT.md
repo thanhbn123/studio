@@ -111,12 +111,26 @@ Luật:
   mềm, mask ĐÚNG, bị tố là "nghi ngờ ăn mất sản phẩm" — sai nguyên nhân và chặn oan):
   · **NGUY HIỂM** ⇒ `status = 'FAILED'` + `error_code = 'SUSPICIOUS_MASK'`, câu *"TỪ CHỐI kết quả
     tách nền (nghi ngờ ĂN MẤT SẢN PHẨM)…"*: tỉ lệ nền ngoài khoảng an toàn, giữ lại <
-    `SUSPICIOUS_COVERAGE_MIN`, "đảo nhỏ" giữa nền lớn, **hoặc** `dirty_removed_ratio >
-    AMBIGUOUS_DIRTY_AREA_MAX = 0.15` (một MẢNG LỚN không-phải-nền đã bị ăn; đo trên ảnh tổng hợp:
-    bóng đổ mềm ~0.03, ca ăn sản phẩm ~0.30);
-  · **NHẬP NHẰNG** ⇒ `status = 'SEGMENTATION_AMBIGUOUS'` + cùng tên mã, câu *"BIÊN NHẬP NHẰNG nên
-    KHÔNG GHÉP NỀN (sản phẩm vẫn được giữ nguyên)… ảnh của bạn vẫn được RETOUCH…"*: phía NỀN có
-    pixel lưng chừng nhưng diện tích bẩn nhỏ (bóng đổ mềm/viền mờ). Mặc định **KHÔNG ghép nền**;
+    `SUSPICIOUS_COVERAGE_MIN`, "đảo nhỏ" giữa nền lớn, **hoặc** một trong hai tín hiệu N7 dưới đây.
+    **(vòng 10 — N7) MẪU SỐ ĐÚNG + TÍN HIỆU "CẮT SÂU":** vòng 9 đo `dirty_removed / (width*height)`
+    (tỉ lệ trên TOÀN KHUNG) nên trên khung lớn, một sản phẩm nhỏ bị ăn HẾT vẫn ra tỉ lệ nhỏ ⇒ bị
+    xếp vào nhánh "nhập nhằng" kèm câu khẳng định SAI. Nay:
+    · `dirty_ratio_kept = dirty_removed / kept_pixels`, ngưỡng `AMBIGUOUS_DIRTY_RATIO_MAX = 1.0`
+      (phần bị ăn không-phải-nền nhiều hơn TOÀN BỘ phần giữ lại). Đo thật: bóng đổ mềm
+      0.061–0.196; ca ăn sản phẩm 2.24 (96×96) · 5.82 (khung 300×300, thân 13.4% khung) · 19.23;
+    · `dirty_inside_bbox`/`dirty_inside_bbox_ratio`: pixel nền bẩn nằm **SÂU BÊN TRONG hộp bao vùng
+      giữ** (cách biên ≥ 2 px VÀ cách vùng giữ ≥ `DIRTY_DEEP_MIN_DISTANCE = 2` px) với tỉ lệ >
+      `AMBIGUOUS_DIRTY_RATIO_MAX` ⇒ flood fill đã **khoét vào giữa sản phẩm**. (Đo thật: bóng đổ
+      mềm 0.015–0.032 — vài chục pixel lọt vào góc lõm của hộp bao — nên KHÔNG bị coi là nguy hiểm;
+      ca bị ăn 5.8–19.2.)
+  · **NHẬP NHẰNG** ⇒ `status = 'SEGMENTATION_AMBIGUOUS'` + cùng tên mã. **(vòng 10 — N7b) CÂU CHỮ
+    CHỈ NÓI ĐIỀU ĐO ĐƯỢC** — bỏ hẳn khẳng định *"sản phẩm vẫn được giữ nguyên"* (máy chỉ đo được số
+    liệu tổng hợp, không biết chắc pixel nào là sản phẩm): *"CHƯA ĐỦ CHẮC để tách nền an toàn: đo
+    được N pixel có thể thuộc sản phẩm ở sát/trong vùng giữ (x% diện tích vùng giữ lại; y% khung
+    ảnh). KHÔNG ghép nền. Số đo: coverage …, background_ratio …, kept_bbox …, dirty_removed …,
+    dirty_inside_bbox …. Ảnh của bạn vẫn được RETOUCH theo tham số; hãy mở ảnh TRƯỚC|SAU để kiểm…"*.
+    Điều kiện vào nhánh này dùng **SỐ NGUYÊN**: `dirty_removed > 0` (N8) hoặc `over_ratio` cao.
+    Mặc định **KHÔNG ghép nền**;
   · **ĐẠT** ⇒ `OK`. Viền sản phẩm gần màu nền (`kept_under_ratio` cao) **một mình** KHÔNG hạ trạng
     thái (phía nền sạch nghĩa là flood fill giữ ĐÚNG sản phẩm — ca sản phẩm trắng/kem 244–248),
     chỉ thêm một câu *"Lưu ý: … hãy kiểm ảnh TRƯỚC|SAU"*.
@@ -138,10 +152,17 @@ Luật:
   kept_min, kept_p95, kept_under_ratio, decisive_delta, dirty_removed, dirty_removed_ratio,
   suspicious}`, `boundary_checked`, `ambiguous_override` — SỐ ĐO THẬT để người dùng và phản biện
   đọc được căn cứ; provider không đo thì field VẮNG MẶT (không bịa số 0).
-  **(vòng 9 — N3)** `summarizeMatting` chuyển tiếp các số đo này ⇒ có mặt ở
-  `content_meta.imagestudio.matting.mask`, `GET /api/imagestudio/jobs/:id → matting.mask`,
-  `asset.meta.matting` và UI (khối “Số đo vùng tách nền”: Δp95, `over_ratio`, `kept_under_ratio`,
-  `dirty_removed_ratio`, cờ override).
+  **(vòng 9 — N3; sửa cho ĐÚNG ở vòng 10 — N9)** `summarizeMatting` chuyển tiếp **ĐỦ** số đo và bản
+  tóm tắt ĐẦY ĐỦ được ghi vào **cả ba nơi**: `content_meta.imagestudio.matting.mask` (DB);
+  `asset.meta.matting` của ẢNH ĐÃ TẠO (trước đây chỉ 3 field `{status, ambiguous_override,
+  boundary_checked}` ⇒ `GET`/UI không có số đo nào); `GET /api/imagestudio/jobs/:id → matting.mask`
+  (đọc từ meta ảnh; lượt KHÔNG tạo ảnh mới thì nằm ở `last_run.matting.mask`); và UI — khối “Số đo
+  vùng tách nền” đọc CẢ BA nguồn (Δp95, `over_ratio`, `kept_under_ratio`, `dirty_removed`,
+  `dirty_ratio_kept`, `dirty_inside_bbox`, cờ `boundary_checked`/`ambiguous_override`).
+- **(vòng 10 — N8) KHÔNG LÀM TRÒN MẤT TÍN HIỆU:** tỉ lệ giữ 8 chữ số (`toFixed(8)`), số pixel giữ
+  **SỐ NGUYÊN** (`dirty_removed`, `dirty_inside_bbox`, `kept_pixels`), phân loại dựa trên số nguyên
+  (`dirty_removed > 0`). Trên khung 16 MP, ~800 pixel bẩn (0.00005) KHÔNG còn bị làm tròn về 0 ⇒
+  không còn ca "job `succeeded` + ảnh ra + pixel sản phẩm đổi".
 - **(vòng 8 — M03-01c) CÂU CHỮ:** provider KHÔNG được khẳng định "pixel sản phẩm giữ nguyên" (vùng
   "sản phẩm" do máy đoán). Câu đúng: *"Pixel NGOÀI vùng đã tách giữ nguyên từng byte; vùng đã tách
   do máy đoán theo màu nền — hãy mở ảnh TRƯỚC|SAU để kiểm."* UI hiện cảnh báo nổi bật **cho MỌI

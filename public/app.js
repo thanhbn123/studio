@@ -2810,8 +2810,15 @@ function renderIsWarnings(data) {
   for (const w of matting.warnings || []) blocks.push({ cls: 'warn', title: 'Cảnh báo từ bước tách nền', items: [String(w)] });
 
   // (2a) N3 (vòng 9): SỐ ĐO BIÊN phải HIỆN RA, không chỉ nằm trong câu warnings.
-  const bd = matting.mask?.boundary_delta || rendered?.meta?.matting?.boundary_delta || null;
-  const maskSrc = matting.mask || null;
+  // N9 (vòng 10): số đo có thể tới từ `GET data.matting.mask`, `rendered[].meta.matting.mask` hoặc
+  // `last_run.matting.mask` — đọc CẢ BA để khối này không còn "không bao giờ hiện".
+  const maskSrc = matting.mask
+    || rendered?.meta?.matting?.mask
+    || rendered?.meta?.imagestudio?.matting?.mask
+    || lastRun?.matting?.mask
+    || null;
+  const bd = maskSrc?.boundary_delta || null;
+  const mattingMeta = matting && Object.keys(matting).length ? matting : (rendered?.meta?.matting || lastRun?.matting || {});
   if (bd || maskSrc) {
     const items = [];
     if (maskSrc?.kept_bbox_ratio !== undefined && maskSrc?.kept_bbox_ratio !== null) {
@@ -2826,14 +2833,18 @@ function renderIsWarnings(data) {
           `Biên phía GIỮ LẠI: Δmin ${isNumText(bd.kept_min)}/255, tỉ lệ pixel giữ lại chỉ khác nền dưới ngưỡng dứt khoát: ${isNumText(Number(bd.kept_under_ratio) * 100)}%.`,
         );
       }
-      if (bd.dirty_removed_ratio !== undefined) {
-        items.push(`Diện tích bị coi là nền nhưng KHÔNG sạch màu nền: ${isNumText(Number(bd.dirty_removed_ratio) * 100)}%.`);
+      if (bd.dirty_removed !== undefined) {
+        const keptPct = bd.dirty_ratio_kept !== undefined ? ` (${isNumText(Number(bd.dirty_ratio_kept) * 100)}% diện tích vùng giữ lại)` : '';
+        items.push(
+          `Pixel bị coi là nền nhưng KHÔNG sạch màu nền: ${isNumText(bd.dirty_removed)} px${keptPct} — ` +
+            `${isNumText(Number(bd.dirty_removed_ratio ?? 0) * 100)}% khung ảnh; nằm sâu trong hộp bao sản phẩm: ${isNumText(bd.dirty_inside_bbox ?? 0)} px.`,
+        );
       }
     }
-    if (matting.boundary_checked === false || maskSrc?.boundary_checked === false) {
+    if (mattingMeta.boundary_checked === false || maskSrc?.boundary_checked === false) {
       items.push('Provider ngoài (không phải purejs) KHÔNG đo được biên — hãy kiểm ảnh TRƯỚC|SAU.');
     }
-    if (matting.ambiguous_override === true || rendered?.meta?.matting?.ambiguous_override === true) {
+    if (mattingMeta.ambiguous_override === true) {
       items.push('⚠️ Lượt này ĐÃ BỎ QUA cảnh báo biên nhập nhằng theo yêu cầu người dùng (có ghi vết trong meta ảnh).');
     }
     if (items.length) blocks.push({ cls: 'muted', title: 'Số đo vùng tách nền (đọc được, không phải kết luận suông)', items });
