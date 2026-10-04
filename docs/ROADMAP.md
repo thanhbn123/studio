@@ -59,12 +59,38 @@ Quy tắc đã chốt cho rủi ro đạo đức (điều khoản "cần quyết
 
 ## MVP-03 — Image Generation / Retouching
 
-**Mục tiêu:** tạo ảnh marketing từ ảnh sản phẩm thật (nền sạch, ảnh đời sống, ảnh banner).
+**Trạng thái: ĐÃ MERGE VÀO `develop`** (PR [#21](https://github.com/thanhbn123/studio/pull/21),
+merge commit `3caa66b`, 04/10/2026) **— CHỜ OWNER NGHIỆM THU.**
 
-Phạm vi dự kiến:
-- Tách nền sản phẩm, thay nền theo bộ mẫu.
-- Sinh ảnh bối cảnh (lifestyle) từ ảnh sản phẩm thật.
-- Retouch: cân sáng, làm sạch, giữ trung thực với sản phẩm.
+Bằng chứng: **717 test · 716 pass · 0 fail · 1 skipped** · `node tools/verify.mjs` EXIT=0 ·
+**CI 5/5 job xanh** · **3 vòng phản biện độc lập**: vòng 1 **FAIL** (1 CRITICAL — tách nền **ăn mất
+sản phẩm gần màu nền** mà job vẫn `succeeded` và warning khẳng định “pixel sản phẩm giữ nguyên”;
+1 MAJOR — overlay có đường **“tự rửa tội”** qua `overlay.source_text` do client gửi) → đã vá →
+các vòng sau **PASS CÓ ĐIỀU KIỆN** → đã vá nốt (N1…N9). Hồ sơ nghiệm thu:
+[`MVP-03-ACCEPTANCE.md`](MVP-03-ACCEPTANCE.md) · báo cáo phản biện nguyên văn:
+[`MVP-03-REVIEW.md`](MVP-03-REVIEW.md) · hợp đồng: [`MVP-03-CONTRACT.md`](MVP-03-CONTRACT.md).
+
+Đã làm:
+- **Tách nền** (flood fill từ viền, thuần JS, không dịch vụ trả tiền) — **fail-closed**: nền không
+  đồng nhất ⇒ `UNIFORM_BACKGROUND_NOT_FOUND`; biên nhập nhằng / nghi cắt vào sản phẩm ⇒
+  `SEGMENTATION_AMBIGUOUS` / `SUSPICIOUS_MASK` kèm **số đo thật**; cờ `matting_allow_ambiguous`
+  mặc định TẮT và **không** mở đường cho ca nguy hiểm.
+- **5 mẫu nền** (`trang`, `xam-nhat`, `gradient-xanh`, `gradient-hong`, `san-go`) đều
+  `synthetic: true` — nền sinh ra là **MÔ PHỎNG, có khai** ở API/meta/UI.
+- **Retouch** brightness/contrast/saturation/sharpen, **bị kẹp theo ngưỡng** và ghi lại
+  `params_effective`/`clamped`/`rejected`; không resize/warp, không đổi alpha vùng nền đã tách.
+- **Overlay chữ Việt** (dùng font của MVP-02) — bằng chứng **chỉ lấy từ dữ liệu ĐÃ LƯU của job**;
+  khẳng định thiếu bằng chứng ⇒ **422, không vẽ pixel nào**; trả `evidence_used`.
+- `usage_event` mới: `IMAGE_MATTING`, `IMAGE_COMPOSE`, `IMAGE_RETOUCH` (chỉ ghi bước **chạy thật**).
+- UI tab thứ ba **“Tạo ảnh”** + 5 route `/api/imagestudio/*`.
+
+Giới hạn THẬT: chỉ hợp ảnh **nền đồng nhất** (không có matting AI); **chỉ PNG** (JPEG/WebP cần
+provider `http` — **chưa đo**); sản phẩm cách nền ≤ **8/255** là **giới hạn vật lý** không tách được;
+ảnh có bóng đổ mềm bị **từ chối ghép nền** (vẫn retouch) — đúng luật “thà không làm còn hơn làm sai”.
+
+Phạm vi dự kiến ban đầu (còn lại, chưa làm):
+- Sinh ảnh bối cảnh (lifestyle) từ ảnh sản phẩm thật — cần model sinh ảnh (dịch vụ trả tiền).
+- Ảnh banner nhiều tỉ lệ.
 
 **Giới hạn đạo đức bắt buộc:** không tạo ảnh làm sai lệch hình dáng/màu sắc/chất liệu thật của
 sản phẩm; không tạo ảnh giả người thật, thương hiệu thật, hay bằng chứng không có thật.
