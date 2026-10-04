@@ -8,6 +8,9 @@
  * MVP-02: khối ImageLab được nạp PHÒNG THỦ (hợp đồng 4.6) — module anh em do bốn
  * agent khác viết song song nên có thể chưa tồn tại lúc boot. Nạp lỗi thì MVP-01
  * vẫn phải khởi động và chạy bình thường.
+ *
+ * MVP-03: khối ImageStudio (matting/retouch/pipeline tạo ảnh) cũng được nạp PHÒNG THỦ
+ * theo đúng cách đó và độc lập với khối ImageLab — hỏng MVP-03 thì MVP-01/MVP-02 vẫn boot.
  */
 
 import { loadConfig } from './config.js';
@@ -45,6 +48,22 @@ async function importImagelabModule(label, specifier) {
 }
 
 /**
+ * Nạp MỘT module MVP-03 (ImageStudio) và gắn nhãn module vào lỗi — cùng lý do với
+ * `importImagelabModule`: log `imagestudio.wiring_failed` phải nói được module nào hỏng.
+ */
+async function importImagestudioModule(label, specifier) {
+  try {
+    return await import(specifier);
+  } catch (err) {
+    const wrapped = new Error(`Không nạp được module MVP-03 "${specifier}" (${label}): ${scrubPaths(err?.message || err)}`);
+    wrapped.imagestudioModule = specifier;
+    wrapped.imagestudioLabel = label;
+    wrapped.cause = err;
+    throw wrapped;
+  }
+}
+
+/**
  * @param {object} opts
  * @param {object} [opts.config]
  * @param {object} [opts.logger]
@@ -53,8 +72,11 @@ async function importImagelabModule(label, specifier) {
  * @param {object} [opts.ocrProvider]  [MVP-02] provider OCR đã dựng sẵn (test)
  * @param {object} [opts.translator]   [MVP-02] translator đã dựng sẵn (test)
  * @param {object} [opts.renderProvider] [MVP-02] render provider đã dựng sẵn (test)
- * @param {object} [opts.storage]      [MVP-02] image storage đã dựng sẵn (test)
+ * @param {object} [opts.storage]      [MVP-02/MVP-03] image storage đã dựng sẵn (test)
  * @param {object} [opts.imagelabPipeline] [MVP-02] pipeline đã dựng sẵn (test)
+ * @param {object} [opts.mattingProvider]  [MVP-03] provider tách nền đã dựng sẵn (test)
+ * @param {object} [opts.retouchProvider]  [MVP-03] provider retouch đã dựng sẵn (test)
+ * @param {object} [opts.imagestudioPipeline] [MVP-03] pipeline tạo ảnh đã dựng sẵn (test)
  */
 export async function createApp(opts = {}) {
   const config = opts.config || loadConfig();
@@ -152,6 +174,81 @@ export async function createApp(opts = {}) {
     }
   }
 
+  /* ── MVP-03 (ImageStudio) — nạp phòng thủ, KHÔNG được làm chết boot MVP-01/02 ──
+   *
+   * Module anh em (matting/retouch/pipeline) có thể chưa tồn tại hoặc lỗi cú pháp lúc
+   * boot. Nạp lỗi ⇒ cả ba về `null`, ghi log `imagestudio.wiring_failed` mức error và
+   * ghi lý do thật vào `app.imagestudioUnavailableReason` — MVP-01/MVP-02 vẫn chạy.
+   * Storage dùng CHUNG với MVP-02 khi có (cùng `config.imagelab.dir`), nhưng KHÔNG phụ
+   * thuộc vào việc khối ImageLab nạp thành công: hỏng thì tự nạp `imagelab/storage.js`.
+   */
+  const imagestudio = {
+    mattingProvider: null,
+    retouchProvider: null,
+    imagestudioPipeline: null,
+    storage: null,
+    reason: null,
+  };
+
+  if (config?.imagestudio?.enabled === false) {
+    imagestudio.reason = 'Tính năng tạo ảnh đang bị tắt bằng cấu hình (config.imagestudio.enabled = false / IMAGESTUDIO_ENABLED=false).';
+    rootLogger.info('imagestudio.disabled', { reason: imagestudio.reason });
+  } else if (opts.imagestudioPipeline && (opts.storage || imagelab.storage)) {
+    // Đã được bơm sẵn (test hoặc tầng gộp) → dùng luôn, khỏi nạp module anh em.
+    imagestudio.mattingProvider = opts.mattingProvider || null;
+    imagestudio.retouchProvider = opts.retouchProvider || null;
+    imagestudio.storage = opts.storage || imagelab.storage;
+    imagestudio.imagestudioPipeline = opts.imagestudioPipeline;
+  } else {
+    try {
+      const [mattingModule, retouchModule, storageModule, pipelineModule] = await Promise.all([
+        importImagestudioModule('matting', './imagestudio/matting/index.js'),
+        importImagestudioModule('retouch', './imagestudio/retouch/index.js'),
+        importImagestudioModule('storage', './imagelab/storage.js'),
+        importImagestudioModule('pipeline', './imagestudio/pipeline.js'),
+      ]);
+
+      const mattingProvider = opts.mattingProvider || mattingModule.createMattingProvider(config, { logger: rootLogger });
+      const retouchProvider = opts.retouchProvider || retouchModule.createRetouchProvider(config, { logger: rootLogger });
+      const storage = opts.storage || imagelab.storage || storageModule.createImageStorage(config, { logger: rootLogger });
+
+      imagestudio.mattingProvider = mattingProvider;
+      imagestudio.retouchProvider = retouchProvider;
+      imagestudio.storage = storage;
+      imagestudio.imagestudioPipeline = new pipelineModule.ImageGenerationPipeline({
+        config,
+        logger: rootLogger,
+        store,
+        storage,
+        mattingProvider,
+        retouchProvider,
+      });
+      rootLogger.info('imagestudio.wired', {
+        matting: mattingProvider?.name || 'none',
+        matting_mock: Boolean(mattingProvider?.isMock),
+        retouch: retouchProvider?.name || 'none',
+        retouch_mock: Boolean(retouchProvider?.isMock),
+        storage: storage === imagelab.storage ? 'imagelab' : 'rieng',
+      });
+    } catch (err) {
+      // Module anh em chưa tồn tại / lỗi lúc nạp → ImageStudio coi như không có mặt.
+      imagestudio.mattingProvider = null;
+      imagestudio.retouchProvider = null;
+      imagestudio.imagestudioPipeline = null;
+      imagestudio.storage = null;
+      const modulePath = err?.imagestudioModule || '(không xác định)';
+      imagestudio.reason = `Không nạp được module MVP-03 "${modulePath}" — tính năng tạo ảnh bị tắt. Chi tiết ở log máy chủ (imagestudio.wiring_failed).`;
+      rootLogger.error('imagestudio.wiring_failed', {
+        module: modulePath,
+        module_label: err?.imagestudioLabel || null,
+        // Không đưa cả object lỗi vào log: stack/message của Node chứa đường dẫn tuyệt đối.
+        error_name: err?.cause?.name || err?.name || 'Error',
+        error_code: err?.cause?.code || err?.code || null,
+        error_message: scrubPaths(err?.message || err),
+      });
+    }
+  }
+
   const queue = new JobQueue({
     concurrency: config.jobs.concurrency,
     maxAttempts: config.jobs.maxAttempts,
@@ -217,6 +314,12 @@ export async function createApp(opts = {}) {
     // Lý do THẬT (đã lọc đường dẫn) để `/api/health` + `/api/config` nói được vì sao
     // tính năng dịch ảnh không khả dụng. null = khả dụng.
     imagelabUnavailableReason: imagelab.reason,
+    // MVP-03: null nếu khối ImageStudio nạp lỗi (E4 phải kiểm trước khi dùng → 503
+    // IMAGESTUDIO_UNAVAILABLE), kèm lý do thật cho `/api/config`.
+    mattingProvider: imagestudio.mattingProvider,
+    retouchProvider: imagestudio.retouchProvider,
+    imagestudioPipeline: imagestudio.imagestudioPipeline,
+    imagestudioUnavailableReason: imagestudio.reason,
   };
 
   app.router = buildRouter(app);
