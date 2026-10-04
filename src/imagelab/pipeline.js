@@ -17,12 +17,18 @@
  * Module anh em (ocr/translate/render) KHÔNG được import ở đây — chúng được bơm vào
  * qua constructor để pipeline dùng được với provider giả trong test và để 5 agent có
  * thể lắp ráp song song mà không phụ thuộc lúc biên dịch.
+ *
+ * NGOẠI LỆ có kiểm soát (IL-08, hợp đồng §11): `manual-regions.js` là helper THUẦN của
+ * chính tầng này (C4). Nó được import tĩnh vì luật phân loại vùng (`classifyRegion`) và
+ * luật kẹp hộp (`geometry.js`) chỉ được có ĐÚNG MỘT bản trong repo — chép lại luật vào
+ * pipeline là cách chắc chắn nhất để hai bản lệch nhau.
  */
 
 import { createHash, randomUUID } from 'node:crypto';
 import { JOB_STATUS, VERIFICATION_LEVELS } from '../store/index.js';
 import { sniffImageMime } from '../security/sanitize.js';
 import { boxesIntersect, intersectBoxWithImage, strictCoordinate } from './geometry.js';
+import { MANUAL_ID_PREFIX, normalizeManualRegions } from './manual-regions.js';
 
 /** Các bước của một job ImageLab — C5 hiện tiến trình theo `stage` này. */
 export const IMAGELAB_STAGES = Object.freeze([
@@ -38,6 +44,12 @@ export const IMAGELAB_STAGES = Object.freeze([
 
 export const IMAGELAB_CONNECTOR = 'imagelab';
 export const IMAGELAB_EXTRACTION_METHOD = 'upload+render';
+
+/**
+ * IL-08 — cách trích xuất khi vùng chữ do NGƯỜI DÙNG nhập tay (§11.2 luật 9):
+ * giữ nguyên `upload+render` rồi ghi thêm `+manual-regions`. Không có bước OCR nào chạy.
+ */
+export const IMAGELAB_EXTRACTION_METHOD_MANUAL = `${IMAGELAB_EXTRACTION_METHOD}+manual-regions`;
 
 /** Mức bằng chứng DUY NHẤT được phép: ảnh do người dùng tải lên. */
 export const IMAGELAB_VERIFICATION = 'MANUAL_INPUT';
@@ -269,13 +281,15 @@ export class ImageTranslationPipeline {
   /**
    * Ghi `extraction_evidence` cho job imagelab. `verification` LUÔN là MANUAL_INPUT —
    * hàm này cố tình không nhận tham số mức bằng chứng để không ai lỡ truyền LIVE vào.
+   * `extractionMethod` mặc định `upload+render`; đường nhập vùng tay (§11.2 luật 9)
+   * truyền `upload+render+manual-regions` để dấu vết nói đúng nguồn vùng chữ.
    */
-  async #evidence(jobId, { bytes = 0, foundFields = [], missingFields = [], blockedReason = '', ocrProvider = '', contentProvider = '' } = {}) {
+  async #evidence(jobId, { bytes = 0, foundFields = [], missingFields = [], blockedReason = '', ocrProvider = '', contentProvider = '', extractionMethod = IMAGELAB_EXTRACTION_METHOD } = {}) {
     try {
       await this.store.recordEvidence({
         jobId,
         connector: IMAGELAB_CONNECTOR,
-        extractionMethod: IMAGELAB_EXTRACTION_METHOD,
+        extractionMethod,
         verification: imagelabVerification(),
         httpStatus: 200,
         bytes: Math.max(0, Math.trunc(Number(bytes) || 0)),
@@ -490,8 +504,25 @@ export class ImageTranslationPipeline {
       blockedReason: '',
       ocrProvider: this.ocrProvider?.name || '',
     });
-    // Ảnh đã lưu xong, chờ worker OCR — stage 'queued' để UI biết đang chờ.
-    await this.#setJob(jobId, { status: JOB_STATUS.QUEUED, stage: 'queued' });
+    // IL08-04 (vòng 6): LƯU trần theo JOB để mọi bước sau (nhập vùng tay, render) áp CÙNG
+    // trần mà client đã khai lúc tạo job — trước đây `options.max_regions` chỉ có tác dụng
+    // trong đúng lượt `runOcr` rồi biến mất.
+    const jobCaps = {};
+    const optMaxRegions = Number(options?.maxRegions ?? options?.max_regions);
+    if (Number.isFinite(optMaxRegions) && optMaxRegions > 0) jobCaps.max_regions = Math.trunc(optMaxRegions);
+    const latestJob = await this.store.getJob(jobId);
+    await this.#setJob(jobId, {
+      status: JOB_STATUS.QUEUED,
+      stage: 'queued',
+      ...(Object.keys(jobCaps).length > 0
+        ? {
+            content_meta: {
+              ...(latestJob?.content_meta || {}),
+              imagelab: { ...(latestJob?.content_meta?.imagelab || {}), limits: jobCaps },
+            },
+          }
+        : {}),
+    });
 
     log?.info('imagelab.ingest_done', { asset_id: assetId, mime, bytes: saved.bytes, width, height, warnings: warnings.length });
     return { asset_id: assetId, asset, width, height, sha256: saved.sha256, mime, warnings };
@@ -607,6 +638,59 @@ export class ImageTranslationPipeline {
       return failedResult(code, message, { ocr, warnings });
     }
 
+    // ── IL08-01(b) (vòng 6): ĐỌC LẠI job NGAY TRƯỚC KHI GHI ──────────────
+    // (a) đã chặn đường vào thường, nhưng vẫn còn KHE giữa lúc kiểm tra và lúc ghi (đúng
+    // lớp lỗi TOCTOU). Lớp này bảo đảm: vùng do NGƯỜI DÙNG nhập KHÔNG BAO GIỜ bị OCR xoá
+    // im lặng — thà bỏ kết quả OCR còn hơn mất dữ liệu người dùng.
+    const freshJob = await this.store.getJob(jobId);
+    const freshMeta = freshJob?.content_meta?.imagelab || {};
+    const freshRegions = (await this.store.listOcrRegions(jobId)) || [];
+    const userRegions = freshRegions.filter((r) => String(r?.source ?? '') === 'user');
+    if (freshMeta.manual_regions === true || userRegions.length > 0) {
+      const guardWarning =
+        `Vùng do NGƯỜI DÙNG nhập tay đã thay kết quả OCR — KHÔNG ghi đè (${userRegions.length} vùng nguồn 'user'` +
+        `${freshMeta.manual_regions === true ? ', dấu vết manual_regions = true' : ''}). Kết quả OCR lần này bị BỎ.`;
+      const prevWarnings = Array.isArray(freshMeta.warnings) ? freshMeta.warnings.map(String) : [];
+      await this.#setJob(jobId, {
+        status: JOB_STATUS.AWAITING_REVIEW,
+        stage: 'awaiting_review',
+        finished_at: null,
+        content_meta: {
+          ...(freshJob?.content_meta || {}),
+          imagelab: {
+            ...freshMeta,
+            manual_regions: true,
+            regions_source: 'user',
+            // Dấu vết: lần OCR này có chạy nhưng KHÔNG được ghi vào DB.
+            ocr_superseded: {
+              at: new Date().toISOString(),
+              provider: ocr?.provider || '',
+              status: ocrStatus,
+              skipped_write: true,
+              user_regions: userRegions.length,
+            },
+            warnings: [...prevWarnings, guardWarning],
+            updated_at: new Date().toISOString(),
+          },
+        },
+      });
+      const keptLines = (await this.store.listTranslationLines(jobId)) || [];
+      log?.warn('imagelab.ocr_skipped_manual_regions', { user_regions: userRegions.length });
+      return {
+        status: JOB_STATUS.AWAITING_REVIEW,
+        stage: 'awaiting_review',
+        asset,
+        regions: freshRegions,
+        lines: keptLines,
+        ocr,
+        translate: null,
+        skipped_ocr_write: true,
+        mock_steps: Array.isArray(freshMeta.mock_steps) ? freshMeta.mock_steps.map(String) : [],
+        warnings: [...warnings, guardWarning],
+        duration_ms: Date.now() - started,
+      };
+    }
+
     // ── Lưu vùng OCR (idempotent theo job) ────────────────────────────────
     try {
       await this.store.saveOcrRegions(jobId, asset.id, regions);
@@ -709,6 +793,10 @@ export class ImageTranslationPipeline {
       content_meta: {
         ...(job.content_meta || {}),
         imagelab: {
+          // IL08-04 (vòng 6): GIỮ các field đã có của `imagelab` (vd `limits.max_regions`
+          // do `ingest` ghi, `manual_regions`) — dựng lại từ đầu là cách làm mất dấu vết
+          // và làm trần theo job biến mất sau bước OCR.
+          ...(job.content_meta?.imagelab || {}),
           mock_steps: mockSteps,
           ocr: {
             provider: ocr?.provider || '',
@@ -776,6 +864,336 @@ export class ImageTranslationPipeline {
       translate,
       mock_steps: mockSteps,
       warnings: warningsAll,
+      duration_ms: Date.now() - started,
+    };
+  }
+
+  /* ═══════════════════ 2b. VÙNG CHỮ NHẬP TAY (IL-08) ═══════════════════ */
+
+  /**
+   * IL-08 — người dùng tự nhập vùng chữ (thay thế hoặc ghi thêm vùng OCR) rồi dịch.
+   *
+   * Vì sao có đường này: `OCR_PROVIDER=mock` trả về fixture cố định, KHÔNG liên quan tới
+   * ảnh người dùng dán vào — nên trên ảnh THẬT tính năng không dùng được cho tới khi cắm
+   * OCR thật. Đường nhập tay gỡ đúng điểm chết đó (“OCR không được là điểm chết duy nhất”).
+   *
+   * Mười luật của hợp đồng §11.2 nằm ở ĐÚNG hàm này:
+   *   1. `text` bắt buộc, làm sạch ≤ 500 ký tự; rỗng ⇒ vào `rejected` (không im lặng).
+   *   2. hộp: 4 số hữu hạn (`strictCoordinate`) rồi GIAO với khung ảnh
+   *      (`intersectBoxWithImage`); giao rỗng ⇒ `BOX_OUTSIDE_IMAGE`; hộp bị cắt thì ghi
+   *      lại hộp ĐÃ CẮT (không giữ hộp tràn ra ngoài).
+   *   3. `kind` hợp lệ thì dùng, không thì `classifyRegion(text)`; bất biến
+   *      `translatable === (kind === 'descriptive')`.
+   *   4. `confidence` mặc định 1 (người dùng tự nhập, không phải máy đoán), clamp 0..1.
+   *   5. `source = 'user'`; id `u1..uN` (giữ id client gửi nếu an toàn và chưa trùng).
+   *   6. `replace = true` ⇒ xoá vùng + dòng cũ rồi ghi lại; có dòng `edited_by_user` mà
+   *      chưa xác nhận ⇒ `MANUAL_EDITS_WOULD_BE_LOST` và KHÔNG xoá gì.
+   *      `replace = false` ⇒ ghi thêm, id tiếp tục dãy `u…`.
+   *   7. Dịch qua `translator.translateRegions` (§4.2) rồi ghi lines; job về
+   *      `awaiting_review`, `stage = 'awaiting_review'`, `finished_at = null`.
+   *   8. KHÔNG ghi `OCR_DETECT` (không có OCR nào chạy — ghi vào là BỊA usage);
+   *      `TRANSLATION` ghi như bình thường khi thật sự có vùng cần dịch.
+   *   9. Dấu vết: `content_meta.imagelab.manual_regions = true`,
+   *      `content_meta.imagelab.regions_source = 'user'`,
+   *      `extraction_evidence.extraction_method = 'upload+render+manual-regions'`;
+   *      job vẫn `MANUAL_INPUT` ở tầng evidence — KHÔNG BAO GIỜ `LIVE_VERIFIED`.
+   *  10. Mọi vùng bị bỏ đều nằm trong `rejected` kèm `index` (vị trí trong mảng client
+   *      gửi) + `code` máy đọc được + câu tiếng Việt.
+   *
+   * Lỗi translator KHÔNG làm job treo: kết quả `FAILED`/`NOT_CONFIGURED` của C2 vẫn được
+   * ghi thành lines (FAILED) rồi job về `awaiting_review` — người dùng thấy đúng sự thật.
+   */
+  async setManualRegions(jobId, {
+    sessionId = '',
+    regions = [],
+    replace = true,
+    confirmReplaceEdited = false,
+    // IL08-01(a): `true` = job đang CHỜ trong hàng đợi OCR; `false` = chắc chắn KHÔNG có
+    // lượt OCR nào đang chờ (vd công cụ demo cố ý bỏ qua OCR); `null`/bỏ trống = suy từ
+    // trạng thái job (an toàn: `queued` coi như đang chờ).
+    ocrPending = null,
+  } = {}) {
+    const started = Date.now();
+    const log = this.#log(jobId);
+    const cfg = this.imagelabConfig;
+
+    if (!jobId) throw new ImageLabError('INVALID_INPUT', 'Thiếu jobId.');
+    if (!this.store) throw new ImageLabError('NOT_CONFIGURED', 'Thiếu store — không ghi được DB.');
+
+    const job = await this.store.getJob(jobId);
+    if (!job) throw new ImageLabError('JOB_NOT_FOUND', `Không tìm thấy job ${jobId}.`);
+    const sid = sessionId || job.session_id || '';
+
+    // ── Luật 11.2 (tiền điều kiện): phải có ẢNH GỐC ───────────────────────
+    // Không có ảnh gốc thì không có khung để kẹp hộp và cũng không có gì để render sau.
+    // Đây là lỗi TIỀN ĐIỀU KIỆN (C5 map 409): KHÔNG đánh job `failed` — job chưa hỏng,
+    // người dùng còn phải tải ảnh lên rồi gọi lại.
+    const asset = await this.#originalAsset(jobId);
+    if (!asset) {
+      throw new ImageLabError(
+        'IMAGELAB_NO_ORIGINAL',
+        'Job chưa có ảnh gốc — hãy tải ảnh lên trước khi nhập vùng chữ bằng tay.',
+      );
+    }
+
+    // ── IL08-01(a) (vòng 6): job ĐANG chạy ⇒ TỪ CHỐI, KHÔNG ghi gì ───────
+    // Khe thời gian THẬT: người dùng mở khối nhập tay trong lúc OCR còn chạy (OCR mock
+    // nhanh, OCR THẬT chậm vài giây) rồi bấm lưu; nếu cho ghi thì khi OCR xong,
+    // `saveOcrRegions` sẽ xoá vùng người dùng và dấu vết `manual_regions` biến mất —
+    // mất dữ liệu im lặng (luật #4). Trả 409 có mã riêng + câu tiếng Việt để UI nói rõ.
+    const pending = ocrPending === null || ocrPending === undefined
+      ? job.status === JOB_STATUS.QUEUED // không ai nói rõ ⇒ mặc định an toàn: đang chờ
+      : ocrPending === true;
+    if (job.status === JOB_STATUS.RUNNING || (job.status === JOB_STATUS.QUEUED && pending)) {
+      throw new ImageLabError(
+        'IMAGELAB_JOB_RUNNING',
+        `Job đang chạy OCR/dịch (status = ${job.status}, stage = ${job.stage || '—'}) — chờ xong rồi hãy nhập vùng chữ bằng tay. KHÔNG có gì bị ghi.`,
+        { status: job.status, stage: job.stage ?? null, ocr_pending: pending },
+      );
+    }
+
+    // ── Module dịch phải có TRƯỚC khi ghi bất cứ thứ gì ────────────────────
+    // Thiếu module ⇒ dừng tay: không để lại vùng chữ mà không bao giờ có dòng dịch.
+    if (!this.translator || typeof this.translator.translateRegions !== 'function') {
+      throw new ImageLabError('NOT_CONFIGURED', 'Chưa cấu hình module dịch — chưa thể nhập vùng chữ bằng tay (chưa ghi gì).');
+    }
+
+    // ── Luật 6: cổng bảo vệ bản sửa tay của người dùng ────────────────────
+    const currentLines = (await this.store.listTranslationLines(jobId)) || [];
+    const editedLines = currentLines.filter((l) => l?.edited_by_user === true);
+    if (replace === true && editedLines.length > 0 && confirmReplaceEdited !== true) {
+      throw new ImageLabError(
+        'MANUAL_EDITS_WOULD_BE_LOST',
+        `Job đang có ${editedLines.length} dòng người dùng đã sửa tay (${editedLines
+          .slice(0, 10)
+          .map((l) => l.region_id)
+          .join(', ')}) — thay toàn bộ vùng sẽ làm MẤT các bản sửa đó. Gửi lại với confirm_replace_edited = true nếu vẫn muốn thay.`,
+        { edited_region_ids: editedLines.map((l) => l.region_id).slice(0, 100), edited_lines: editedLines.length },
+      );
+    }
+
+    const existingRegions = (await this.store.listOcrRegions(jobId)) || [];
+    const usedIds = replace === true
+      ? []
+      : existingRegions.map((r) => String(r.id ?? r.region_key ?? '')).filter(Boolean);
+
+    // ── Luật 1..5: chuẩn hoá vùng nhập tay (hàm THUẦN `manual-regions.js`) ─
+    // Trần vùng tính theo SỐ CHỖ CÒN LẠI khi ghi thêm, để tổng không vượt trần HIỆU LỰC.
+    // IL08-04 (vòng 6): trần hiệu lực = min(trần cấu hình, trần RIÊNG của job nếu có).
+    const cfgMax = Number(cfg.maxRegions) > 0 ? Math.trunc(Number(cfg.maxRegions)) : 0;
+    const jobMaxRaw = Number(job.content_meta?.imagelab?.limits?.max_regions);
+    const jobMax = Number.isFinite(jobMaxRaw) && jobMaxRaw > 0 ? Math.trunc(jobMaxRaw) : 0;
+    const maxRegions = cfgMax > 0 && jobMax > 0 ? Math.min(cfgMax, jobMax) : (cfgMax || jobMax);
+    const cap = maxRegions > 0 ? Math.max(0, maxRegions - usedIds.length) : undefined;
+    const normalizedResult = normalizeManualRegions(regions, {
+      width: asset.width,
+      height: asset.height,
+      ...(cap === undefined ? {} : { maxRegions: cap }),
+      idPrefix: MANUAL_ID_PREFIX,
+      usedIds,
+    });
+    const normalized = normalizedResult.regions;
+    const rejected = normalizedResult.rejected;
+    const warnings = [...normalizedResult.warnings];
+
+    // Người dùng xác nhận thay dù có bản sửa tay ⇒ ghi vết rõ, không im lặng.
+    if (replace === true && editedLines.length > 0 && confirmReplaceEdited === true) {
+      warnings.push(`⚠️ Đã thay thế toàn bộ vùng theo xác nhận của người dùng: ${editedLines.length} bản sửa tay đã bị xoá.`);
+    }
+    if (replace === true && normalized.length === 0 && existingRegions.length > 0) {
+      warnings.push(
+        `⚠️ KHÔNG vùng nhập tay nào dùng được nhưng vẫn thay thế theo yêu cầu (replace = true): đã XOÁ ${existingRegions.length} vùng cũ của job. Xem "rejected" để biết lý do từng vùng.`,
+      );
+    }
+
+    // ── Ghi vùng: thay thế (mặc định) hoặc ghi thêm ───────────────────────
+    const toSave = replace === true ? normalized : [...existingRegions, ...normalized];
+    try {
+      await this.store.saveOcrRegions(jobId, asset.id, toSave);
+    } catch (err) {
+      const wrapped = new ImageLabError('DB_WRITE_FAILED', `Không lưu được vùng nhập tay: ${err.message}`);
+      await this.#failJob(jobId, wrapped);
+      throw wrapped;
+    }
+
+    await this.#setJob(jobId, {
+      status: JOB_STATUS.RUNNING,
+      stage: 'translating',
+      error_code: null,
+      error_message: null,
+      finished_at: null,
+    });
+
+    // ── Luật 7: dịch vùng MỚI (không đụng bản sửa tay ở chế độ ghi thêm) ──
+    const translatableCount = normalized.filter((r) => r.translatable === true).length;
+    let translate = null;
+    let providerLines = [];
+    try {
+      // Luật §4.2 nằm ở C2: vùng `translatable === false` KHÔNG BAO GIỜ được gửi provider.
+      translate = await this.translator.translateRegions(normalized, {});
+    } catch (err) {
+      const wrapped = new ImageLabError(String(err?.code || 'TRANSLATE_FAILED'), `Dịch vùng nhập tay thất bại: ${err?.message || err}`);
+      log?.error('imagelab.manual_regions_translate_failed', { error: err });
+      // Chế độ thay thế: vùng cũ đã bị xoá ⇒ không để lại dòng mồ côi trỏ vào vùng không còn.
+      if (replace === true) await this.store.saveTranslationLines(jobId, []).catch(() => {});
+      await this.#failJob(jobId, wrapped);
+      throw wrapped;
+    }
+
+    const translateStatus = String(translate?.status || 'FAILED');
+    providerLines = Array.isArray(translate?.lines) ? translate.lines : [];
+    const translateWarnings = Array.isArray(translate?.warnings) ? translate.warnings.map(String).slice(0, 50) : [];
+    const translateFailed = translateStatus === 'NOT_CONFIGURED' || translateStatus === 'FAILED';
+
+    // ── Luật 8: usage — TUYỆT ĐỐI KHÔNG `OCR_DETECT` ───────────────────────
+    // Không có OCR nào chạy cho vùng nhập tay; ghi `OCR_DETECT` vào là BỊA usage (và làm
+    // hỏng mọi thống kê chi phí OCR sau này). Chỉ `TRANSLATION`, và chỉ khi thật sự có
+    // vùng cần dịch (không có vùng translatable thì C2 còn không gọi provider).
+    if (translateStatus === 'OK' && translatableCount > 0) {
+      await this.#usage(jobId, sid, 'TRANSLATION', {
+        provider: translate?.provider || '',
+        model: translate?.model || '',
+        inputUnits: providerLines.reduce((n, l) => n + String(l?.text_original ?? '').length, 0),
+        outputUnits: providerLines.reduce((n, l) => n + String(l?.text_vi ?? '').length, 0),
+        estimatedCost: this.config?.cost?.TRANSLATION ?? 0,
+        meta: {
+          is_mock: Boolean(translate?.is_mock),
+          status: translateStatus,
+          ms: Date.now() - started,
+          lines: providerLines.length,
+          translatable_regions: translatableCount,
+          regions_source: 'user',
+          manual_regions: true,
+        },
+      });
+    }
+
+    // ── Ghi lines: thay thế, hoặc GIỮ bản sửa tay rồi thêm dòng mới ────────
+    const mergedLines = replace === true ? providerLines : [...currentLines, ...providerLines];
+    try {
+      await this.store.saveTranslationLines(jobId, mergedLines);
+    } catch (err) {
+      const wrapped = new ImageLabError('DB_WRITE_FAILED', `Không lưu được dòng dịch của vùng nhập tay: ${err.message}`);
+      await this.#failJob(jobId, wrapped);
+      throw wrapped;
+    }
+
+    // Đọc lại từ DB: thứ trả về phải là thứ ĐÃ LƯU, không phải lời hứa của provider.
+    const lines = await this.store.listTranslationLines(jobId);
+    const persistedRegions = await this.store.listOcrRegions(jobId);
+
+    // ── Luật 9: dấu vết + trạng thái chờ duyệt ────────────────────────────
+    const prevMeta = job.content_meta?.imagelab || {};
+    const mockSteps = Array.from(
+      new Set([
+        ...(Array.isArray(prevMeta.mock_steps) ? prevMeta.mock_steps.map(String) : []),
+        ...(translate?.is_mock ? ['translate'] : []),
+      ]),
+    );
+    const warningsAll = [...warnings, ...translateWarnings];
+    if (translateFailed) {
+      warningsAll.push(
+        `Dịch vùng nhập tay không chạy được (status = ${translateStatus}) — các dòng cần dịch đang ở trạng thái FAILED; job vẫn ở "chờ duyệt", KHÔNG bị treo.`,
+      );
+    }
+
+    const mockNote = mockSteps.length > 0
+      ? `Có bước chạy provider MOCK (${mockSteps.join(', ')}) — kết quả là dữ liệu minh hoạ, KHÔNG phải kết quả thật.`
+      : '';
+    const manualNote = `Vùng chữ do NGƯỜI DÙNG nhập tay (source = user): ${normalized.length} vùng được nhận, ${rejected.length} vùng bị bỏ — KHÔNG có bước OCR nào chạy cho các vùng này.`;
+
+    const jobUpdate = await this.#setJob(jobId, {
+      status: JOB_STATUS.AWAITING_REVIEW,
+      stage: 'awaiting_review',
+      finished_at: null,
+      error_code: translateFailed
+        ? String(translate?.error_code || (translateStatus === 'NOT_CONFIGURED' ? 'TRANSLATE_NOT_CONFIGURED' : 'TRANSLATE_FAILED'))
+        : null,
+      error_message: translateFailed
+        ? String(translate?.error_message || `Dịch không chạy được (status = ${translateStatus}).`).slice(0, 500)
+        : null,
+      content_meta: {
+        ...(job.content_meta || {}),
+        imagelab: {
+          ...prevMeta,
+          // Hai field C5 đọc thẳng (hợp đồng §11.2 luật 9).
+          manual_regions: true,
+          regions_source: 'user',
+          regions: persistedRegions.length,
+          lines: lines.length,
+          manual: {
+            at: new Date().toISOString(),
+            requested: Array.isArray(regions) ? regions.length : 0,
+            accepted: normalized.length,
+            rejected: rejected.length,
+            replace: replace === true,
+            confirm_replace_edited: confirmReplaceEdited === true,
+          },
+          mock_steps: mockSteps,
+          translate: {
+            provider: translate?.provider || '',
+            model: translate?.model || '',
+            is_mock: Boolean(translate?.is_mock),
+            status: translateStatus,
+            lines: providerLines.length,
+          },
+          warnings: warningsAll,
+          updated_at: new Date().toISOString(),
+        },
+      },
+    });
+    if (!jobUpdate) log?.warn('imagelab.manual_regions_job_update_empty', { job_id: jobId });
+
+    await this.#evidence(jobId, {
+      bytes: asset.bytes,
+      extractionMethod: IMAGELAB_EXTRACTION_METHOD_MANUAL,
+      foundFields: ['image_asset:original', 'regions_source:user', `ocr_regions:${persistedRegions.length}`, `translation_lines:${lines.length}`],
+      missingFields: lines.length > 0 ? [] : ['translation_lines'],
+      blockedReason: [mockNote, manualNote].filter(Boolean).join(' '),
+      // KHÔNG truyền OCR provider: bước này KHÔNG chạy OCR. Dấu vết OCR (nếu có) nằm ở
+      // bản ghi evidence trước đó + `content_meta.imagelab.ocr`.
+      ocrProvider: '',
+      contentProvider: translate?.provider || '',
+    });
+
+    // Meta ẢNH GỐC còn giữ bản ghi OCR cũ (`asset.meta.ocr` — C5 đọc để hiện "vùng OCR bị
+    // bỏ"). Sau khi THAY bằng vùng người dùng nhập, thông tin đó là LỊCH SỬ, không còn mô
+    // tả vùng đang có ⇒ ghi dấu đã bị thay (không xoá, không sửa số liệu cũ).
+    const prevOcrMeta = asset.meta && typeof asset.meta === 'object' && asset.meta.ocr && typeof asset.meta.ocr === 'object'
+      ? asset.meta.ocr
+      : null;
+    if (replace === true && prevOcrMeta) {
+      await this.#updateAssetMeta(jobId, asset.id, {
+        ocr: { ...prevOcrMeta, superseded_by_manual_regions: true, superseded_at: new Date().toISOString() },
+      });
+    }
+
+    log?.info('imagelab.manual_regions_done', {
+      accepted: normalized.length,
+      rejected: rejected.length,
+      regions: persistedRegions.length,
+      lines: lines.length,
+      replace: replace === true,
+      translate_status: translateStatus,
+      ms: Date.now() - started,
+    });
+
+    return {
+      job_id: jobId,
+      status: JOB_STATUS.AWAITING_REVIEW,
+      stage: 'awaiting_review',
+      asset,
+      regions: persistedRegions,
+      lines,
+      rejected,
+      warnings: warningsAll,
+      translate,
+      manual: {
+        requested: Array.isArray(regions) ? regions.length : 0,
+        accepted: normalized.length,
+        rejected: rejected.length,
+        replace: replace === true,
+      },
       duration_ms: Date.now() - started,
     };
   }

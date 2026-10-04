@@ -38,6 +38,16 @@ export class JobQueue extends EventEmitter {
     return this.queue.length + this.running;
   }
 
+  /**
+   * Job có đang CHỜ hoặc ĐANG CHẠY trong hàng đợi không? (IL08-01, vòng 6)
+   * Khác `active.has(id)`: mục đã chạy XONG vẫn nằm trong `active` để tra cứu kết quả,
+   * nên phải loại `done`/`failed` — nếu không, mọi job cũ sẽ bị coi là "đang chạy".
+   */
+  isPending(id) {
+    const entry = this.active.get(String(id));
+    return Boolean(entry && (entry.state === JOB_STATE.PENDING || entry.state === JOB_STATE.RUNNING));
+  }
+
   stats() {
     return {
       queued: this.queue.length,

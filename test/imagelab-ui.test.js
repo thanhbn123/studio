@@ -14,9 +14,13 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  loadRenderIlJob,
+  loadRenderIlManual,
   loadRenderIlWarnings,
+  loadSaveIlManualRegions,
   loadUiConst,
   loadUiFunction,
+  makeIlState,
   uiDeps,
 } from './imagelab-ui-helpers.js';
 
@@ -215,5 +219,176 @@ describe('MVP-02 UI · renderIlWarnings — cảnh báo thật, không giấu', 
     const renderIlWarnings = loadRenderIlWarnings();
     assert.equal(typeof renderIlWarnings({}), 'string');
     assert.equal(typeof renderIlWarnings(null), 'string');
+  });
+});
+
+/* ═══════════════════════ IL-08 — NHẬP VÙNG CHỮ BẰNG TAY (§11.3) ═══════════════════════
+ *
+ * Vì sao phủ riêng: đây là đường dùng được trên ẢNH THẬT khi OCR còn là mock. Chữ trong
+ * bảng do NGƯỜI DÙNG gõ (dữ liệu không tin cậy) nên phải escape; và khi job đã có bản sửa
+ * tay thì UI phải cảnh báo trước khi thay vùng, không được thay im lặng.
+ *
+ * Mọi hàm dưới đây được TRÍCH từ `public/app.js` (xem `imagelab-ui-helpers.js`) — không chép tay.
+ */
+
+/** Job imagelab tối thiểu đúng hình dạng API trả về, có sẵn 1 vùng nhập tay. */
+const manualJob = (over = {}) => ({
+  job: { id: 'job-1', status: 'awaiting_review', stage: 'awaiting_review' },
+  asset: { id: 'a1', width: 320, height: 320 },
+  regions: [
+    { id: 'u1', box: { x: 10, y: 20, w: 100, h: 30 }, text: '纯棉短袖T恤', kind: 'descriptive', translatable: true, source: 'user' },
+  ],
+  lines: [
+    {
+      region_id: 'u1',
+      text_original: '纯棉短袖T恤',
+      text_vi: 'Áo thun cotton',
+      status: 'GLOSSARY',
+      provenance: 'glossary',
+      edited_by_user: false,
+      violations: [],
+    },
+  ],
+  ...over,
+});
+
+/** `state` + bảng nhập tay đã có 1 dòng hợp lệ (đúng thứ người dùng gõ). */
+const il08State = ({ manual = {}, ...over } = {}) =>
+  makeIlState({
+    job: manualJob(),
+    manual: {
+      open: true,
+      rows: [{ x: '10', y: '20', w: '100', h: '30', text: '纯棉短袖T恤', kind: 'descriptive' }],
+      ...manual,
+    },
+    ...over,
+  });
+
+describe('IL-08 UI · bảng nhập vùng chữ — escape toàn bộ chữ người dùng gõ (XSS)', () => {
+  test('(a) chữ trong ô nhập KHÔNG tạo thẻ HTML thật, chỉ có dạng đã escape', () => {
+    const state = il08State({
+      manual: { rows: [{ x: '1', y: '2', w: '10', h: '20', text: XSS, kind: 'descriptive' }] },
+    });
+    const html = loadRenderIlManual(state)(state.il.job);
+
+    assert.match(html, /id="il-manual"/, 'phải render khối nhập tay');
+    assert.ok(!html.includes('<img'), `KHÔNG được có thẻ <img> nguyên văn:\n${html.slice(0, 500)}`);
+    assert.ok(!html.includes(XSS), 'payload XSS nguyên văn không được lọt vào HTML');
+    assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/, 'phải thấy dạng ĐÃ escape');
+  });
+
+  test('(a2) lý do `rejected` do máy chủ trả cũng bị escape', () => {
+    const state = il08State({
+      manual: { rejected: { items: [{ index: 0, row: 1, reason: `${XSS2} lý do thật` }] } },
+    });
+    const html = loadRenderIlManual(state)(state.il.job);
+
+    assert.ok(!html.includes('<script'), 'lý do từ chối không được tạo thẻ script');
+    assert.ok(!html.includes(XSS2), 'payload nguyên văn không được lọt vào HTML');
+    assert.match(html, /&lt;script&gt;/);
+  });
+});
+
+describe('IL-08 UI · 409 MANUAL_EDITS_WOULD_BE_LOST — cảnh báo rõ + nút xác nhận', () => {
+  test('(b1) có xung đột ⇒ hiện cảnh báo và nút "Vẫn thay (mất bản sửa tay)"', () => {
+    const state = il08State({
+      manual: { conflict: { message: 'Job đang có 1 dòng người dùng đã sửa tay (u1) — thay toàn bộ vùng sẽ làm MẤT bản sửa đó.' } },
+    });
+    const html = loadRenderIlManual(state)(state.il.job);
+
+    assert.match(html, /MANUAL_EDITS_WOULD_BE_LOST/);
+    assert.match(html, /Vẫn thay \(mất bản sửa tay\)/);
+    assert.match(html, /data-action="ilmanualforce"/, 'nút xác nhận phải có hành động thật');
+    assert.match(html, /1 dòng người dùng đã sửa tay/, 'phải hiện câu máy chủ giải thích');
+  });
+
+  test('(b2) lần lưu đầu gặp 409 ⇒ ghi `conflict` (KHÔNG phải lỗi chung) và KHÔNG tự xác nhận thay', async () => {
+    const state = il08State();
+    const err = Object.assign(new Error('Job đang có 1 dòng người dùng đã sửa tay'), { code: 'MANUAL_EDITS_WOULD_BE_LOST' });
+    const { save, apiCalls } = loadSaveIlManualRegions(state, { apiError: err });
+
+    await save(false);
+
+    assert.equal(apiCalls.length, 1);
+    assert.equal(apiCalls[0].url, '/api/imagelab/jobs/job-1/regions');
+    assert.equal(apiCalls[0].opts.method, 'PUT');
+    assert.equal(apiCalls[0].opts.body.replace, true, 'lưu vùng là thay toàn bộ (replace: true)');
+    assert.equal(apiCalls[0].opts.body.confirm_replace_edited, undefined, 'lần đầu KHÔNG được tự xác nhận thay');
+    assert.equal(state.il.manual.error, null, 'xung đột không phải lỗi chung');
+    assert.match(state.il.manual.conflict.message, /sửa tay/);
+
+    const html = loadRenderIlManual(state)(state.il.job);
+    assert.match(html, /data-action="ilmanualforce"/);
+  });
+
+  test('(b3) bấm "Vẫn thay" ⇒ gửi confirm_replace_edited: true và xoá xung đột', async () => {
+    const state = il08State();
+    const err = Object.assign(new Error('mất bản sửa tay'), { code: 'MANUAL_EDITS_WOULD_BE_LOST' });
+    await loadSaveIlManualRegions(state, { apiError: err }).save(false);
+    assert.ok(state.il.manual.conflict, 'phải đang ở trạng thái xung đột');
+
+    const second = loadSaveIlManualRegions(state, {
+      apiResult: { regions: [{ id: 'u9', box: { x: 10, y: 20, w: 100, h: 30 }, text: '纯棉短袖T恤', kind: 'descriptive', source: 'user' }], lines: [], rejected: [], warnings: [] },
+    });
+    await second.save(true);
+
+    assert.equal(second.apiCalls[0].opts.body.confirm_replace_edited, true, 'phải gửi xác nhận thay');
+    assert.equal(second.apiCalls[0].opts.body.replace, true);
+    assert.equal(state.il.manual.conflict, null, 'thành công thì xoá cảnh báo xung đột');
+    assert.match(state.il.manual.notice, /nguồn = người dùng/);
+  });
+});
+
+describe('IL-08 UI · `rejected` — hiện "dòng N" + lý do từ chối', () => {
+  test('(c) index 0-based của máy chủ được đổi thành số dòng 1-based và hiện kèm lý do', async () => {
+    const state = il08State({
+      manual: {
+        rows: [
+          { x: '10', y: '20', w: '100', h: '30', text: '纯棉短袖T恤', kind: 'descriptive' },
+          { x: '900', y: '900', w: '50', h: '50', text: '外景', kind: 'descriptive' },
+        ],
+      },
+    });
+    const { save } = loadSaveIlManualRegions(state, {
+      apiResult: {
+        regions: [{ id: 'u1', box: { x: 10, y: 20, w: 100, h: 30 }, text: '纯棉短袖T恤', kind: 'descriptive', source: 'user' }],
+        lines: [],
+        rejected: [{ index: 1, reason: 'BOX_OUTSIDE_IMAGE: hộp nằm ngoài khung ảnh (giao rỗng sau khi cắt)' }],
+        warnings: ['Vùng #2 bị cắt vào biên ảnh.'],
+      },
+    });
+
+    await save(false);
+
+    assert.equal(state.il.manual.rejected.items.length, 1);
+    assert.equal(state.il.manual.rejected.items[0].index, 1);
+    assert.equal(state.il.manual.rejected.items[0].row, 2, 'index 1 (0-based) = dòng 2 trong bảng');
+    assert.match(state.il.manual.notice, /1 vùng bị máy chủ từ chối/);
+
+    const html = loadRenderIlManual(state)(state.il.job);
+    assert.match(html, /dòng 2/, 'phải nói rõ dòng nào trong bảng');
+    assert.match(html, /BOX_OUTSIDE_IMAGE/, 'phải hiện mã lý do');
+    assert.match(html, /hộp nằm ngoài khung ảnh/, 'phải hiện câu tiếng Việt cho người dùng');
+    assert.match(html, /Vùng #2 bị cắt vào biên ảnh/, 'cảnh báo của máy chủ cũng phải hiện');
+  });
+});
+
+describe('IL-08 UI · renderIlJob — khối nhập tay nằm trong màn job và nói THẬT về nguồn/khoá', () => {
+  test('(d) renderIlJob thật có khối nhập tay + câu nguồn = người dùng + nhãn hiệu/chứng nhận/giá vẫn bị KHOÁ', () => {
+    const state = il08State();
+    const html = loadRenderIlJob(state)();
+
+    assert.match(html, /Nhập vùng chữ bằng tay/);
+    assert.match(html, /nguồn = người dùng/);
+    assert.match(html, /nhãn hiệu \/ chứng nhận \/ giá vẫn bị KHOÁ/);
+    assert.match(html, /LƯU VÙNG &amp; DỊCH/);
+  });
+
+  test('(d2) job chưa có vùng nào ⇒ khối mở sẵn và nói rõ vì sao mở', () => {
+    const state = makeIlState({ job: manualJob({ regions: [], lines: [] }) });
+    const html = loadRenderIlJob(state)();
+
+    assert.match(html, /Chưa có dòng nào/, 'bảng phải mở sẵn để người dùng nhập ngay');
+    assert.match(html, /job chưa có vùng chữ nào/, 'phải nói rõ vì sao khối mở sẵn');
   });
 });

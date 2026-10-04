@@ -71,10 +71,52 @@ dịch hay xoá · không vừa hộp thì bỏ qua chứ không vẽ tràn.
 | 9 | Server thật + UI | `npm start` → mở tab “Dịch ảnh Trung → Việt” | kéo-thả ảnh → bảng duyệt từng dòng → Render → ảnh trước/sau | ☐ |
 | 10 | Không rò rỉ bí mật | `curl -s localhost:3000/api/config \| grep -i key` | không có khoá nào trong response | ☐ |
 | 11 | Tài liệu trung thực | đọc [`VERIFICATION.md`](VERIFICATION.md) §12 | có mục “còn thiếu / chưa đo” nói thẳng | ☐ |
+| 12 | **Dùng được trên ẢNH THẬT** (không cần OCR trả tiền) | xem §4 dưới đây | nhập vùng tay → dịch → render ra ảnh có chữ Việt | ☐ |
 
 ---
 
-## 4. Những gì nghiệm thu này **KHÔNG** bao gồm (nói thẳng)
+## 4. Dùng trên **ẢNH THẬT** ngay hôm nay (chưa cần dịch vụ OCR)
+
+**Vì sao cần mục này:** `OCR_PROVIDER=mock` (mặc định) trả về vùng chữ của một **fixture cố định** —
+không liên quan tới ảnh anh dán vào. Nên muốn thử trên ảnh sản phẩm thật, anh **tự nhập vùng chữ**
+(IL-08) — cùng tinh thần với “manual fallback” của MVP-01: OCR không được là điểm chết duy nhất.
+
+**Cách A — trên giao diện:**
+
+1. `npm start` → mở `http://127.0.0.1:3000` → tab **“Dịch ảnh Trung → Việt”** → kéo-thả ảnh PNG của anh.
+2. Mở khối **“Nhập vùng chữ bằng tay”** (tự mở khi OCR đang là mock) → nhập từng vùng:
+   `x` · `y` · `w` · `h` (pixel trên ảnh gốc, gốc toạ độ ở **góc trên-trái**) · **chữ Trung** · **loại**
+   (`descriptive` = chữ mô tả → sẽ được dịch; `brand` / `certification` / `price` → **bị khoá**).
+3. Bấm **“LƯU VÙNG & DỊCH”** → bảng duyệt hiện từng dòng → sửa nếu cần → **“RENDER ẢNH”**.
+4. Xem ảnh **trước/sau** ngay trong trang.
+
+**Cách B — bằng dòng lệnh** (nhanh, không cần mở trình duyệt):
+
+```bash
+cat > /tmp/vung.json <<'JSON'
+[
+  { "box": { "x": 40,  "y": 40,  "w": 200, "h": 40 }, "text": "品牌旗舰店", "kind": "brand" },
+  { "box": { "x": 40,  "y": 120, "w": 360, "h": 60 }, "text": "纯棉短袖T恤 厂家直销", "kind": "descriptive" },
+  { "box": { "x": 40,  "y": 700, "w": 180, "h": 44 }, "text": "¥39.9 包邮", "kind": "price" }
+]
+JSON
+
+node tools/imagelab-demo.mjs --image "/đường/dẫn/ảnh-của-anh.png" --regions /tmp/vung.json
+# → in bằng chứng + ghi ảnh TRƯỚC|SAU vào data/imagelab-demo/
+```
+
+Điều đúng đắn cần thấy ở đường này:
+
+- Dòng `[2] Vùng chữ → N vùng do người dùng nhập — ĐÃ BỎ QUA OCR` (không có bước OCR nào chạy).
+- `USAGE_EVENT` **không** có `OCR_DETECT` — vì không hề OCR, ghi vào là bịa.
+- Nhãn kiểm chứng chỉ liệt kê các bước **thật sự** dùng provider giả.
+- Vùng nằm ngoài ảnh / chữ rỗng ⇒ bị **từ chối kèm lý do** (`BOX_OUTSIDE_IMAGE`, `TEXT_EMPTY`),
+  không im lặng bỏ.
+- Vùng `brand` / `certification` / `price` vẫn **bị khoá** đúng như khi OCR đọc ra.
+
+---
+
+## 5. Những gì nghiệm thu này **KHÔNG** bao gồm (nói thẳng)
 
 1. **Chất lượng provider THẬT chưa đo.** OCR mặc định là **mock** (fixture dựng tay, `is_mock = true`);
    dịch và render cũng chạy mock/nội bộ. **Chưa có kết luận nào về model thật.** Muốn đo: cắm
@@ -95,7 +137,7 @@ dịch hay xoá · không vừa hộp thì bỏ qua chứ không vẽ tràn.
 
 ---
 
-## 5. Ký nghiệm thu
+## 6. Ký nghiệm thu
 
 | | |
 |---|---|

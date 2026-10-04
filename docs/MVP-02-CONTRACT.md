@@ -749,3 +749,102 @@ MINOR (N-12/N-13). Đã vá nốt.
   (PNG palette/1-bit/interlaced, hoặc định dạng khác PNG) ⇒ mã lỗi mới
   `RENDER_OUTPUT_UNVERIFIED`: giữ `PARTIAL` + cảnh báo “KHÔNG kiểm chứng được pixel…” thay vì
   `OK`. Trường hợp CÓ vùng bảo vệ vẫn giữ nguyên `PROTECTED_PIXELS_UNVERIFIED` như §8.
+
+---
+
+## 11. IL-08 — NHẬP VÙNG CHỮ BẰNG TAY (manual OCR fallback)
+
+**Vì sao phải có:** với `OCR_PROVIDER=mock` (mặc định), vùng chữ trả về là **fixture cố định** —
+KHÔNG liên quan tới ảnh người dùng dán vào. Nghĩa là trên ảnh THẬT, tính năng hiện **không dùng
+được** cho tới khi cắm OCR thật. Đường nhập tay gỡ đúng điểm chết đó — cùng nguyên tắc với
+G11 manual fallback của MVP-01 (“các sàn không được là điểm chết duy nhất” → “OCR không được là
+điểm chết duy nhất”). Hợp đồng §3.2 đã chừa sẵn `Region.source: 'user'`; mục này hiện thực nó.
+
+### 11.1 API (đóng băng)
+
+```
+PUT /api/imagelab/jobs/:id/regions
+body: {
+  regions: [{ id?, box: {x,y,w,h}, text, kind?, confidence? }],
+  replace?: boolean,                 // mặc định true
+  confirm_replace_edited?: boolean   // bắt buộc true nếu job đã có dòng edited_by_user
+}
+→ 200 { job_id, status, regions: Region[], lines: TranslatedLine[],
+        rejected: [{ index, reason }], warnings: string[] }
+```
+
+Lỗi (dùng `HttpError.safe` để giữ câu tiếng Việt):
+`400 NO_REGIONS` (mảng rỗng/không phải mảng) · `413 TOO_MANY_REGIONS` (quá `imagelab.maxRegions`) ·
+`409 IMAGELAB_NO_ORIGINAL` (job chưa có asset gốc) ·
+`409 MANUAL_EDITS_WOULD_BE_LOST` (có dòng `edited_by_user` mà chưa xác nhận) ·
+`503 IMAGELAB_UNAVAILABLE` (như các route khác).
+
+### 11.2 Luật xử lý (C-A hiện thực)
+
+1. Mỗi vùng: `text` bắt buộc, `sanitizeText(..., maxLength 500)`; rỗng sau khi làm sạch ⇒ **vào
+   `rejected`** với `reason`, KHÔNG im lặng bỏ.
+2. `box`: 4 số hữu hạn theo `geometry.strictCoordinate`; hộp được **giao với khung ảnh**
+   (`intersectBoxWithImage`); giao rỗng ⇒ `rejected` lý do `BOX_OUTSIDE_IMAGE`; hộp bị cắt thì
+   ghi lại hộp ĐÃ CẮT (không giữ hộp tràn ra ngoài).
+3. `kind` **(sửa ở vòng 6 — IL08-02)**: **luôn** chạy `classifyRegion(text)` rồi hợp nhất với
+   kind client khai theo luật **CHỈ LEO THANG BẢO VỆ** — đúng bản luật của `ocr/normalize.js`:
+   thứ tự `brand | certification | price > unknown > descriptive` (dùng chung `dedupePriority`).
+   - Client khai **cao hơn hoặc bằng** mức máy phân loại ⇒ dùng kind client khai.
+   - Client khai **thấp hơn** ⇒ **GIỮ mức cao hơn** + ghi `warnings` nói rõ đã nâng lên mức nào
+     và vì sao (chống lách luật #3: khai `descriptive` cho chữ giá/nhãn hiệu/chứng nhận).
+   - Muốn hạ THẬT: gửi `allow_kind_downgrade: true` **cho từng vùng** ⇒ dùng kind client khai
+     và **bắt buộc ghi vết** `kind_downgraded: true` + `kind_declared_by_user` + warning nổi bật.
+     Không có cờ thì **không bao giờ** hạ.
+   - Không khai `kind` (hoặc khai giá trị không hợp lệ) ⇒ như cũ: dùng `classifyRegion(text)`.
+   **Bất biến:** `translatable === (kind === 'descriptive')` — luôn giữ.
+4. `confidence`: mặc định `1` (người dùng tự nhập, không phải máy đoán), clamp `0..1`.
+5. `source: 'user'` cho mọi vùng nhập tay; `id` do server gán `u1..uN` nếu client không gửi.
+6. `replace === true` (mặc định): xoá regions + lines cũ của job rồi ghi lại. Nếu có **bất kỳ**
+   dòng `edited_by_user === true` và `confirm_replace_edited !== true` ⇒ `409 MANUAL_EDITS_WOULD_BE_LOST`.
+   `replace === false` ⇒ **ghi thêm** vào danh sách hiện có (id tiếp tục `u…`).
+7. Sau khi ghi regions: chạy `Translator.translateRegions` (đúng luật §4.2 — vùng không
+   `translatable` KHÔNG được gửi cho provider) → ghi lines → `status = awaiting_review`,
+   `stage = 'awaiting_review'`, `finished_at = null`.
+8. **Usage:** KHÔNG ghi `OCR_DETECT` cho vùng nhập tay (không có OCR nào chạy — ghi vào là bịa);
+   `TRANSLATION` ghi như bình thường khi có gọi dịch.
+9. **Dấu vết:** `content_meta.imagelab.manual_regions = true`,
+   `content_meta.imagelab.regions_source = 'user'`, và `extraction_evidence.extraction_method`
+   giữ nguyên/ghi thêm `+manual-regions`. Job vẫn là `MANUAL_INPUT` ở tầng evidence — **không bao
+   giờ** `LIVE_VERIFIED`.
+10. `rejected` phải liệt kê **mọi** vùng bị bỏ kèm `index` (vị trí trong mảng client gửi) và lý do
+    tiếng Việt; UI phải hiện ra.
+11. **(vòng 6 — IL08-01)** Job đang `running`, hoặc đang `queued` **và thật sự có lượt OCR nằm
+    trong hàng đợi** ⇒ `409 IMAGELAB_JOB_RUNNING` + câu tiếng Việt (“job đang chạy OCR/dịch —
+    chờ xong rồi hãy nhập vùng”), **KHÔNG ghi gì**. Lớp chặn thứ hai nằm ở `runOcr`: trước khi
+    ghi vùng OCR, nó **đọc lại job**; nếu đã có `content_meta.imagelab.manual_regions === true`
+    hoặc tồn tại vùng `source = 'user'` ⇒ **DỪNG, không ghi đè**, giữ `awaiting_review`, ghi
+    `content_meta.imagelab.ocr_superseded` + cảnh báo “KHÔNG ghi đè”. UI **disable** nút lưu khi
+    job đang chạy và hiện ghi chú “đang OCR, chờ xong”.
+12. **(vòng 6 — IL08-04)** Trần vùng hiệu lực = `min(imagelab.maxRegions, options.max_regions
+    của job nếu có)`; trần theo job được lưu ở `content_meta.imagelab.limits.max_regions` lúc
+    `ingest` và **không được mất** ở các bước sau. Vượt trần ⇒ `413 TOO_MANY_REGIONS`.
+
+### 11.3 UI (C-B hiện thực)
+
+- Trong màn job dịch ảnh, thêm khối **“Nhập vùng chữ bằng tay”** (mở/đóng được, mặc định mở khi
+  OCR đang là mock hoặc khi job chưa có vùng nào):
+  - Bảng dòng: `x` · `y` · `w` · `h` · `chữ Trung` · `loại` (select 5 loại) · nút xoá; nút “Thêm vùng”.
+  - Nút **“LƯU VÙNG & DỊCH”** → gọi API trên với `replace: true`.
+  - Nếu 409 `MANUAL_EDITS_WOULD_BE_LOST` ⇒ hiện cảnh báo rõ + nút “Vẫn thay (mất bản sửa tay)”
+    gửi `confirm_replace_edited: true`.
+  - Hiện danh sách `rejected` kèm lý do.
+  - Ghi rõ bằng chữ: “Vùng nhập tay có nguồn = người dùng; vùng nhãn hiệu / chứng nhận / giá vẫn
+    bị KHOÁ như khi OCR đọc ra.”
+  - Escape toàn bộ text người dùng nhập (XSS) — dùng `esc()` như các chỗ khác.
+- Khi job `queued`/`running`: nút **“LƯU VÙNG & DỊCH”** ở trạng thái `disabled` + ghi chú
+  “Job đang chạy OCR/dịch — chờ xong rồi hãy lưu vùng”; gặp `409 IMAGELAB_JOB_RUNNING` thì hiện
+  đúng câu của máy chủ (không nuốt lỗi) và giữ nguyên bảng người dùng vừa nhập.
+
+### 11.4 Dấu vết lịch sử sau khi vùng nhập tay THAY vùng OCR (vòng 6 — IL08-03)
+
+`GET /api/imagelab/jobs/:id` trả khối `ocr` kèm:
+`superseded_by_manual_regions: true`, `superseded_at`, và `note` nói rõ
+“Dấu vết OCR TRƯỚC ĐÓ — đã bị thay bởi vùng nhập tay; các con số/danh sách dưới đây KHÔNG mô tả
+vùng chữ đang có của job.” UI vẫn hiện khối “vùng chữ bị bỏ khi OCR” để truy vết nhưng đổi tiêu đề
+thành *“Dấu vết OCR TRƯỚC ĐÓ — … (đã bị thay bởi vùng nhập tay)”* và không tô đỏ như cảnh báo
+hiện hành.

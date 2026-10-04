@@ -652,6 +652,76 @@ export function buildRouter(app) {
     sendJson(res, 200, { lines: result.lines, rejected: result.rejected, warnings: result.warnings });
   });
 
+  /* ── IL-08: vùng chữ do NGƯỜI DÙNG nhập tay (hợp đồng §11.1) ── */
+
+  router.put('/api/imagelab/jobs/:id/regions', async (req, res, params) => {
+    // Thiếu module/phương thức ⇒ 503 IMAGELAB_UNAVAILABLE như mọi route imagelab khác.
+    requirePipelineMethod('setManualRegions');
+    requireStoreMethod('listImageAssets');
+    requireStoreMethod('listOcrRegions');
+    requireStoreMethod('saveOcrRegions');
+    requireStoreMethod('listTranslationLines');
+    requireStoreMethod('saveTranslationLines');
+    requireStoreMethod('updateJob');
+
+    const sid = sessionId(req, res);
+    enforce(rateLimiters.jobs, `imagelab-regions:${sid}`);
+    const job = await requireImagelabJob(params.id, sid);
+
+    const body = await readJson(req, { maxBytes: 512 * 1024 });
+    const limits = imagelabLimits();
+
+    // Luật §11.1 — mảng rỗng/không phải mảng ⇒ 400; quá trần ⇒ 413 (chặn trước khi chuẩn hoá).
+    if (!Array.isArray(body?.regions) || body.regions.length === 0) {
+      throw HttpError.safe(400, 'NO_REGIONS', 'Danh sách `regions` phải là mảng có ít nhất 1 vùng chữ (x, y, w, h, chữ Trung).');
+    }
+    // IL08-04 (vòng 6): trần theo JOB (nếu job có khai `options.max_regions` lúc tạo) phải
+    // được áp CÙNG trần cấu hình — trước đây đường nhập tay chỉ đọc trần toàn cục nên job
+    // khai `max_regions: 1` vẫn nhận 5 vùng.
+    const jobCap = Number(job?.content_meta?.imagelab?.limits?.max_regions);
+    const effectiveMaxRegions = Number.isFinite(jobCap) && jobCap > 0
+      ? Math.min(limits.max_regions, Math.trunc(jobCap))
+      : limits.max_regions;
+    if (body.regions.length > effectiveMaxRegions) {
+      throw HttpError.safe(
+        413,
+        'TOO_MANY_REGIONS',
+        `Quá nhiều vùng chữ (${body.regions.length}) — tối đa ${effectiveMaxRegions} vùng mỗi lần nhập` +
+          `${effectiveMaxRegions !== limits.max_regions ? ' (trần riêng của job này)' : ''}.`,
+        { max_regions: effectiveMaxRegions, job_max_regions: Number.isFinite(jobCap) && jobCap > 0 ? Math.trunc(jobCap) : null },
+      );
+    }
+
+    const regions = sanitizeManualRegionsInput(body.regions);
+    // `replace` mặc định true (§11.1): chỉ đổi hành vi khi client gửi ĐÚNG `false`.
+    const replace = body?.replace !== false;
+    const confirmReplaceEdited = body?.confirm_replace_edited === true;
+
+    let result;
+    try {
+      result = await app.imagelabPipeline.setManualRegions(job.id, {
+        sessionId: sid,
+        regions,
+        replace,
+        confirmReplaceEdited,
+        // IL08-01(a): chỉ chặn khi có lượt OCR THẬT đang chờ/đang chạy trong hàng đợi.
+        ocrPending: typeof queue?.isPending === 'function' ? queue.isPending(job.id) : null,
+      });
+    } catch (err) {
+      throw mapImagelabError(err, 'Không lưu được vùng chữ nhập tay.');
+    }
+
+    sendJson(res, 200, {
+      job_id: job.id,
+      status: result?.status ?? JOB_STATUS.AWAITING_REVIEW,
+      regions: asArray(result?.regions).map(regionJson),
+      lines: asArray(result?.lines).map(lineJson),
+      // Vùng bị bỏ: `{ index, code, reason, text? }` — UI phải hiện ra (§11.2 luật 10).
+      rejected: asArray(result?.rejected),
+      warnings: asArray(result?.warnings).map(String),
+    });
+  });
+
   /* ── Render ảnh đã duyệt (chạy qua queue) ── */
 
   router.post('/api/imagelab/jobs/:id/render', async (req, res, params) => {
@@ -1029,6 +1099,9 @@ function collectWarnings(...assets) {
 function collectOcrMeta(asset) {
   const meta = asset?.meta && typeof asset.meta === 'object' ? asset.meta : {};
   const ocr = meta.ocr && typeof meta.ocr === 'object' ? meta.ocr : null;
+  // IL08-03 (vòng 6): nếu vùng nhập tay đã THAY vùng OCR thì khối này là LỊCH SỬ, không
+  // phải số liệu hiện hành — phải nói rõ, không được trình bày như đang hiện hành.
+  const superseded = ocr?.superseded_by_manual_regions === true;
   return {
     status: ocr?.status ?? null,
     provider: ocr?.provider ?? null,
@@ -1036,6 +1109,14 @@ function collectOcrMeta(asset) {
     is_mock: ocr?.is_mock ?? null,
     dropped: asArray(ocr?.dropped ?? meta.dropped),
     warnings: asArray(ocr?.warnings ?? meta.warnings).map(String),
+    superseded_by_manual_regions: superseded,
+    superseded_at: ocr?.superseded_at ?? null,
+    ...(superseded
+      ? {
+          note:
+            'Dấu vết OCR TRƯỚC ĐÓ — đã bị thay bởi vùng nhập tay; các con số/danh sách dưới đây KHÔNG mô tả vùng chữ đang có của job.',
+        }
+      : {}),
   };
 }
 
@@ -1202,6 +1283,46 @@ function sanitizeEdits(raw) {
   return out;
 }
 
+/** Trần ký tự chữ mỗi vùng nhập tay (§11.2 luật 1) — mức API, khớp `manual-regions.js`. */
+const MANUAL_REGION_TEXT_MAX = 500;
+
+/**
+ * Body `PUT /api/imagelab/jobs/:id/regions`: giữ các trường hợp lệ và làm sạch `text`.
+ *
+ * GIỮ NGUYÊN VỊ TRÍ, kể cả mục rác: `rejected[].index` là vị trí trong mảng CLIENT GỬI
+ * (§11.2 luật 10), nên lọc bỏ mục rác ở đây sẽ làm lệch index mà UI đang đối chiếu.
+ * Luật hình học / `kind` / `confidence` / khử trùng id KHÔNG được chép lại ở đây —
+ * chúng nằm ở ĐÚNG MỘT chỗ: `src/imagelab/manual-regions.js`.
+ */
+function sanitizeManualRegionsInput(raw) {
+  return (Array.isArray(raw) ? raw : []).map((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry; // để C4 báo NOT_OBJECT
+    const rawText = entry.text;
+    return {
+      id: entry.id,
+      box:
+        entry.box && typeof entry.box === 'object' && !Array.isArray(entry.box)
+          ? {
+              x: entry.box.x,
+              y: entry.box.y,
+              w: entry.box.w ?? entry.box.width,
+              h: entry.box.h ?? entry.box.height,
+            }
+          : null,
+      // Chỉ làm sạch khi là chuỗi/số; object/mảng để C4 báo TEXT_EMPTY thay vì hoá thành '[object Object]'.
+      text:
+        typeof rawText === 'string' || typeof rawText === 'number'
+          ? sanitizeText(rawText, { maxLength: MANUAL_REGION_TEXT_MAX })
+          : rawText,
+      kind: typeof entry.kind === 'string' ? sanitizeText(entry.kind, { maxLength: 32 }) : entry.kind,
+      confidence: entry.confidence,
+      // IL08-02: cờ HẠ MỨC bảo vệ phải đi tới `manual-regions.js` theo TỪNG vùng; thiếu cờ
+      // thì kind do client khai chỉ được LEO THANG (không bao giờ hạ).
+      ...(entry.allow_kind_downgrade === true ? { allow_kind_downgrade: true } : {}),
+    };
+  });
+}
+
 function sanitizeRegionIds(raw) {
   if (raw === undefined || raw === null) return [];
   if (!Array.isArray(raw)) throw new HttpError(400, 'BAD_REGION_IDS', '`only_region_ids` phải là một mảng.');
@@ -1220,6 +1341,18 @@ function mapImagelabError(err, fallbackMessage = 'Không xử lý được yêu 
   const message = typeof err?.message === 'string' && err.message ? err.message : fallbackMessage;
   if (code === 'REVIEW_REQUIRED') return HttpError.safe(409, code, message);
   if (code === 'IMAGELAB_NO_LINES') return HttpError.safe(409, code, message);
+  // IL-08 (§11.1): lỗi có câu tiếng Việt do repo viết ⇒ `HttpError.safe` để client thấy
+  // ĐÚNG câu đó (kể cả khi pipeline chạy qua tầng khác). `details` giữ danh sách vùng đã
+  // sửa tay để UI cảnh báo trước khi người dùng bấm "Vẫn thay".
+  if (code === 'IMAGELAB_NO_ORIGINAL' || code === 'MANUAL_EDITS_WOULD_BE_LOST') {
+    return HttpError.safe(409, code, message, err?.details && typeof err.details === 'object' ? err.details : {});
+  }
+  // IL08-01(a) (vòng 6): job đang chạy OCR/dịch ⇒ 409 + câu tiếng Việt (UI hiện "chờ xong").
+  if (code === 'IMAGELAB_JOB_RUNNING') {
+    return HttpError.safe(409, code, message, err?.details && typeof err.details === 'object' ? err.details : {});
+  }
+  if (code === 'NO_REGIONS') return HttpError.safe(400, code, message);
+  if (code === 'TOO_MANY_REGIONS') return HttpError.safe(413, code, message);
   // Lỗi do CHÍNH ảnh người dùng gửi lên (ingest chạy trong request) — phải trả đúng
   // loại lỗi 4xx kèm lý do thật, không gộp vào "provider báo lỗi 502".
   if (code === 'UNSUPPORTED_IMAGE') return new HttpError(415, code, message);

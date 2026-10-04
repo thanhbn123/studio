@@ -128,6 +128,9 @@ const IL_LINE_STATUS = {
 
 const IL_KIND_LABEL = { descriptive: 'Mô tả', brand: 'Nhãn hiệu', certification: 'Chứng nhận', price: 'Giá', unknown: 'Không rõ' };
 
+// IL-08: 5 loại vùng hợp lệ của hợp đồng §3.2 — dùng cho select của bảng nhập tay.
+const IL_MANUAL_KINDS = ['descriptive', 'brand', 'certification', 'price', 'unknown'];
+
 // Luật 3: vùng nhãn hiệu / chứng nhận / giá KHÔNG BAO GIỜ tự dịch — chỉ override có vết.
 const IL_LOCKED_KINDS = new Set(['brand', 'certification', 'price']);
 const IL_LOCKED_STATUSES = new Set(['SKIPPED_BRAND', 'SKIPPED_CERTIFICATION', 'SKIPPED_PRICE', 'SKIPPED_BY_USER']);
@@ -166,6 +169,20 @@ const state = {
     overrides: new Set(),
     lastSave: null,
     renderBlocked: null,
+    // IL-08 — nhập vùng chữ bằng tay. `open: null` = theo mặc định (mock OCR hoặc job chưa có
+    // vùng); `rows: null` = chưa đổ từ job; `touched` = người dùng đã sửa tay bảng này.
+    manual: {
+      open: null,
+      rows: null,
+      touched: false,
+      busy: false,
+      error: null,
+      notice: null,
+      warnings: [],
+      rejected: null,
+      conflict: null,
+      dirtyPaint: false,
+    },
   },
 };
 
@@ -219,6 +236,7 @@ function route() {
       stopIlPolling();
       state.il.job = null;
       state.il.jobId = null;
+      ilManualReset();
       renderImagelab();
     }
     return;
@@ -287,6 +305,26 @@ function onGlobalClick(ev) {
     ilrender: () => renderImagelabImage(false),
     ilforce: () => renderImagelabImage(true),
     iloverride: () => toggleIlOverride(btn.dataset.region),
+    // ── IL-08: nhập vùng chữ bằng tay ──
+    ilmanualtoggle: () => {
+      const data = state.il.job || {};
+      state.il.manual.open = !ilManualOpen(data);
+      if (state.il.manual.open) ilManualRows(data); // mở ra là đổ sẵn vùng hiện có của job
+      renderImagelab();
+    },
+    ilmanualadd: () => addIlManualRow(),
+    ilmanualdel: () => removeIlManualRow(Number.parseInt(btn.dataset.row ?? '', 10)),
+    ilmanualreload: () => {
+      state.il.manual.rows = null;
+      state.il.manual.touched = false;
+      state.il.manual.rejected = null;
+      state.il.manual.error = null;
+      state.il.manual.notice = null;
+      ilManualRows(state.il.job || {});
+      renderImagelab();
+    },
+    ilmanualsave: () => saveIlManualRegions(false),
+    ilmanualforce: () => saveIlManualRegions(true),
     ilnew: () => {
       stopIlPolling();
       state.il.job = null;
@@ -295,6 +333,7 @@ function onGlobalClick(ev) {
       state.il.overrides = new Set();
       state.il.lastSave = null;
       state.il.renderBlocked = null;
+      ilManualReset();
       location.hash = '#/imagelab';
       renderImagelab();
     },
@@ -990,6 +1029,17 @@ function wireImagelabGlobal() {
   document.addEventListener('change', (ev) => {
     const t = ev.target;
     if (t instanceof HTMLInputElement && t.id === 'il-file') pickImagelabFiles(t.files);
+    ilManualSyncField(t);
+  });
+  // Giữ bản nháp bảng nhập tay trong `state` để render lại KHÔNG mất chữ đang gõ.
+  document.addEventListener('input', (ev) => ilManualSyncField(ev.target));
+  // Trong lúc người dùng đang gõ trong bảng nhập tay, vòng poll KHÔNG vẽ lại (mất focus/chữ);
+  // khi rời khỏi bảng thì vẽ bù đúng một lần.
+  document.addEventListener('focusout', (ev) => {
+    if (!state.il.manual.dirtyPaint) return;
+    if (ev.relatedTarget?.closest?.('#il-manual')) return;
+    state.il.manual.dirtyPaint = false;
+    if (state.view === 'imagelab') renderImagelab();
   });
   for (const name of ['dragenter', 'dragover']) {
     document.addEventListener(name, (ev) => {
@@ -1066,6 +1116,7 @@ async function submitImagelabJob() {
     state.il.overrides = new Set();
     state.il.lastSave = null;
     state.il.renderBlocked = null;
+    ilManualReset();
     state.il.jobId = res.job_id;
     state.il.job = null;
     location.hash = `#/imagelab/${res.job_id}`;
@@ -1089,6 +1140,8 @@ async function openImagelabJob(id) {
   if (state.il.loading === id) return;
   state.il.loading = id;
   state.il.jobId = id;
+  // Job KHÁC ⇒ bảng nhập tay phải bắt đầu lại từ vùng của job mới (không giữ bản nháp job cũ).
+  ilManualReset();
   app.innerHTML = '<section class="panel"><div class="status"><span class="spinner"></span> Đang tải job dịch ảnh…</div></section>';
   try {
     state.il.job = await api(`/api/imagelab/jobs/${id}`);
@@ -1122,7 +1175,9 @@ function startIlPolling() {
       state.il.job = data;
       const st = data.job?.status;
       if (st !== 'queued' && st !== 'running') stopIlPolling();
-      renderImagelab();
+      // Đang gõ trong bảng nhập tay ⇒ hoãn vẽ lại (không cướp focus/không mất chữ đang gõ).
+      if (ilManualHasFocus()) state.il.manual.dirtyPaint = true;
+      else renderImagelab();
     } catch (err) {
       stopIlPolling();
       state.il.error = `Mất kết nối khi theo dõi tiến trình: ${err.message}`;
@@ -1252,6 +1307,7 @@ function renderIlJob() {
     </section>
     ${data.asset ? renderIlCompare(data) : ''}
     ${lines.length > 0 ? renderIlReview(data) : renderIlNoLines(data)}
+    ${renderIlManual(data)}
     ${renderIlWarnings(data)}
   `;
 }
@@ -1482,10 +1538,27 @@ function renderIlWarnings(data) {
   if (ocr.status === 'UNSUPPORTED_IMAGE') blocks.push({ cls: 'error', title: 'Ảnh không giải mã được', items: [] });
   if (ocr.status === 'FAILED') blocks.push({ cls: 'error', title: 'OCR thất bại', items: [] });
 
+  // IL08-03 (vòng 6): nếu vùng nhập tay đã THAY vùng OCR thì khối này là LỊCH SỬ. Vẫn hiện
+  // (truy vết) nhưng nói RÕ nó không mô tả vùng chữ đang có — không trình bày như số liệu
+  // hiện hành, và không doạ người dùng bằng "N vùng bị bỏ" của một lần OCR đã bị thay.
+  const ocrSuperseded = ocr.superseded_by_manual_regions === true;
   const dropped = (ocr.dropped || []).map(
     (d) => `${d?.text ? `“${d.text}” — ` : ''}${d?.reason || 'không rõ lý do'}`,
   );
-  if (dropped.length) blocks.push({ cls: 'warn', title: `${dropped.length} vùng chữ bị bỏ khi OCR`, items: dropped });
+  if (dropped.length) {
+    blocks.push({
+      cls: ocrSuperseded ? '' : 'warn',
+      title: ocrSuperseded
+        ? `Dấu vết OCR TRƯỚC ĐÓ — ${dropped.length} vùng chữ đã bị bỏ (đã bị thay bởi vùng nhập tay)`
+        : `${dropped.length} vùng chữ bị bỏ khi OCR`,
+      items: [
+        ...(ocrSuperseded
+          ? [ocr.note || 'Dấu vết OCR trước đó — đã bị thay bởi vùng nhập tay; KHÔNG phải vùng chữ đang có của job.']
+          : []),
+        ...dropped,
+      ],
+    });
+  }
 
   if (summary) {
     if (summary.status === 'PARTIAL') {
@@ -1533,6 +1606,384 @@ function renderIlWarnings(data) {
       )
       .join('')}
   </section>`;
+}
+
+/* ── IL-08 — nhập vùng chữ bằng tay (manual OCR fallback) ───────────────
+   Vì sao có: `OCR_PROVIDER=mock` (mặc định) trả vùng của một fixture cố định, KHÔNG liên quan
+   tới ảnh người dùng — nên trên ảnh THẬT đường nhập tay là lối dùng được. Mọi chữ người dùng
+   nhập đi qua `esc()` (XSS), kể cả `value=""` của input. */
+
+/** Dấu vết OCR MOCK của CHÍNH JOB (ưu tiên), rồi mới tới provider đang chạy — luật như §F-03. */
+function ilOcrMockTrace(data) {
+  data = data || {};
+  const steps = Array.isArray(data.mock_steps) ? data.mock_steps.map(String) : [];
+  return Boolean(steps.includes('ocr') || data.ocr?.is_mock || data.asset?.meta?.ocr?.is_mock || data.providers?.ocr?.is_mock);
+}
+
+/** Mặc định mở khối nhập tay: OCR đang mock HOẶC job chưa có vùng chữ nào (§11.3). */
+function ilManualDefaultOpen(data) {
+  const regions = Array.isArray(data?.regions) ? data.regions : [];
+  return regions.length === 0 || ilOcrMockTrace(data);
+}
+
+/** Người dùng đã tự bấm mở/đóng thì tôn trọng lựa chọn đó. */
+function ilManualOpen(data) {
+  const open = state.il.manual.open;
+  return open === null || open === undefined ? ilManualDefaultOpen(data) : Boolean(open);
+}
+
+const ilNumText = (v) => (v === null || v === undefined ? '' : String(v).trim());
+
+/** Bản nháp bảng nhập tay = nguồn chân lý, để render lại KHÔNG mất chữ đang gõ. */
+function ilManualRows(data) {
+  const m = state.il.manual;
+  if (Array.isArray(m.rows) && (m.rows.length > 0 || m.touched)) return m.rows;
+  const regions = Array.isArray(data?.regions) ? data.regions : [];
+  m.rows = regions.map((r) => {
+    const box = r?.box && typeof r.box === 'object' ? r.box : {};
+    return {
+      x: ilNumText(box.x),
+      y: ilNumText(box.y),
+      w: ilNumText(box.w),
+      h: ilNumText(box.h),
+      text: String(r?.text ?? ''),
+      kind: IL_MANUAL_KINDS.includes(r?.kind) ? r.kind : 'unknown',
+    };
+  });
+  return m.rows;
+}
+
+/** Giới hạn vùng theo `/api/config` (imagelab.limits.max_regions); không có ⇒ null (máy chủ tự kiểm). */
+function ilMaxRegions() {
+  const cfg = state?.config || {};
+  const raw = cfg?.imagelab?.limits?.max_regions ?? cfg?.limits?.max_regions ?? cfg?.imagelab?.max_regions;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : null;
+}
+
+/** Bảng nhập tay bắt đầu lại từ đầu (đổi job / job mới / rời khu imagelab). */
+function ilManualReset() {
+  state.il.manual = {
+    open: null,
+    rows: null,
+    touched: false,
+    busy: false,
+    error: null,
+    notice: null,
+    warnings: [],
+    rejected: null,
+    conflict: null,
+    dirtyPaint: false,
+  };
+}
+
+/** Người dùng có đang gõ trong khối nhập tay không (để vòng poll không cướp focus). */
+function ilManualHasFocus() {
+  const el = document.activeElement;
+  return Boolean(el && typeof el.closest === 'function' && el.closest('#il-manual'));
+}
+
+/** Đồng bộ giá trị vừa gõ vào bản nháp trong `state`. */
+function ilManualSyncField(target) {
+  const ds = target?.dataset;
+  if (!ds || ds.mfield === undefined) return;
+  const idx = Number.parseInt(ds.mrow ?? '', 10);
+  const rows = state.il.manual.rows;
+  if (!Number.isInteger(idx) || !Array.isArray(rows) || !rows[idx]) return;
+  const field = String(ds.mfield);
+  if (!['x', 'y', 'w', 'h', 'text', 'kind'].includes(field)) return;
+  rows[idx][field] = String(target.value ?? '');
+  state.il.manual.touched = true;
+}
+
+/**
+ * Dựng `regions` để gửi lên từ bảng nhập tay.
+ * Trả về `{ regions, error }`: `error` khác null ⇒ CHẶN TRƯỚC, KHÔNG gọi API (nói rõ dòng nào sai).
+ */
+function ilManualPayload(rows, limit) {
+  const list = Array.isArray(rows) ? rows : [];
+  const fields = ['x', 'y', 'w', 'h'];
+  const regions = [];
+  for (let i = 0; i < list.length; i += 1) {
+    const row = list[i] || {};
+    const n = i + 1;
+    const text = String(row.text ?? '').trim();
+    const raw = fields.map((f) => String(row[f] ?? '').trim());
+    if (!text && raw.every((v) => v === '')) {
+      return { regions: [], error: `Dòng ${n} đang trống hoàn toàn — điền toạ độ + chữ Trung, hoặc bấm “Xoá” ở dòng đó.` };
+    }
+    const nums = [];
+    for (let k = 0; k < fields.length; k += 1) {
+      if (raw[k] === '') {
+        return { regions: [], error: `Dòng ${n}: thiếu “${fields[k]}” — cần đủ x, y, w, h (pixel trên ảnh gốc).` };
+      }
+      const v = Number(raw[k]);
+      if (!Number.isFinite(v)) {
+        return { regions: [], error: `Dòng ${n}: ${fields[k]} = “${raw[k]}” không phải là số.` };
+      }
+      nums.push(v);
+    }
+    if (!(nums[2] > 0) || !(nums[3] > 0)) {
+      return { regions: [], error: `Dòng ${n}: w và h phải lớn hơn 0 — hộp không có diện tích sẽ bị máy chủ từ chối.` };
+    }
+    // `text` để nguyên (kể cả rỗng): máy chủ làm sạch rồi báo vào `rejected` kèm lý do — UI không tự bỏ im lặng.
+    regions.push({
+      box: { x: nums[0], y: nums[1], w: nums[2], h: nums[3] },
+      text,
+      kind: IL_MANUAL_KINDS.includes(row.kind) ? row.kind : 'unknown',
+    });
+  }
+  if (!regions.length) {
+    return { regions: [], error: 'Chưa có vùng nào để lưu — bấm “Thêm vùng” rồi điền toạ độ và chữ Trung.' };
+  }
+  if (limit !== null && regions.length > limit) {
+    return {
+      regions: [],
+      error: `Đang gửi ${regions.length} vùng, vượt giới hạn ${limit} vùng của máy chủ (413 TOO_MANY_REGIONS) — xoá bớt rồi lưu lại.`,
+    };
+  }
+  return { regions, error: null };
+}
+
+/** Khối IL-08 — bảng nhập vùng chữ bằng tay (mặc định mở khi OCR mock / job chưa có vùng). */
+function renderIlManual(data) {
+  data = data || {};
+  const m = state.il.manual;
+  const open = ilManualOpen(data);
+  const limit = ilMaxRegions();
+  // IL08-01(c) (vòng 6): job đang queued/running (OCR/dịch chưa xong) ⇒ KHOÁ nút lưu.
+  // Máy chủ cũng từ chối (409 IMAGELAB_JOB_RUNNING) để vùng nhập tay không bị OCR ghi đè;
+  // UI không được mời người dùng làm một việc chắc chắn thất bại.
+  const jobStatus = String(data.job?.status || '');
+  const jobRunning = jobStatus === 'queued' || jobStatus === 'running';
+  // Nhãn viết tại chỗ (không mượn hằng số khác) để khối này chạy được cả khi hàm UI được
+  // trích ra chạy riêng trong test/script kiểm chứng.
+  const jobStatusLabel = jobStatus === 'queued' ? 'đang xếp hàng chờ OCR' : 'đang chạy OCR/dịch';
+  const asset = data.asset || null;
+  const rows = open ? ilManualRows(data) : [];
+  const over = limit !== null && rows.length > limit;
+  const reasons = [];
+  if (!(Array.isArray(data.regions) && data.regions.length)) reasons.push('job chưa có vùng chữ nào');
+  if (ilOcrMockTrace(data)) reasons.push('OCR đang chạy bằng dữ liệu MOCK');
+  const rejected = m.rejected || null;
+  const badRow = new Map();
+  for (const it of rejected?.items || []) if (Number.isInteger(it.row)) badRow.set(it.row, it.reason);
+  const dims = Number.isFinite(Number(asset?.width)) && Number.isFinite(Number(asset?.height))
+    ? `Ảnh gốc ${asset.width}×${asset.height} px — x trong 0…${asset.width}, y trong 0…${asset.height}.`
+    : 'Chưa rõ kích thước ảnh gốc — toạ độ là pixel trên ảnh gốc.';
+
+  const body = !open
+    ? ''
+    : `
+    <p class="muted small" style="margin:10px 0 0">
+      ${esc(dims)} Hộp tràn ra ngoài ảnh sẽ bị máy chủ cắt lại; hộp nằm hoàn toàn ngoài ảnh sẽ bị từ chối.
+    </p>
+    <p class="muted small" style="margin:6px 0 0">
+      <strong>Mô tả</strong> = sẽ dịch · <strong>Nhãn hiệu / Chứng nhận / Giá</strong> = KHOÁ, không dịch
+      (giống hệt khi OCR đọc ra).${reasons.length ? ` Khối này mặc định mở vì ${esc(reasons.join(' và '))}.` : ''}
+    </p>
+    <p class="muted small" style="margin:6px 0 0">
+      ${limit !== null ? `Giới hạn máy chủ: tối đa ${esc(limit)} vùng — bảng đang có ${esc(rows.length)} dòng.` : 'Máy chủ không công bố giới hạn số vùng — máy chủ vẫn kiểm tra khi lưu.'}
+    </p>
+    ${over
+      ? `<div class="notice warn"><strong>Vượt giới hạn ${esc(limit)} vùng của máy chủ.</strong>
+           <p style="margin:6px 0 0">Xoá bớt ${esc(rows.length - limit)} dòng rồi lưu — nếu không, máy chủ sẽ từ chối cả lượt lưu (413 TOO_MANY_REGIONS).</p>
+         </div>`
+      : ''}
+    <div class="il-tablewrap" style="margin-top:10px">
+      <table class="evidence il-table il-manual-table">
+        <thead>
+          <tr><th>x</th><th>y</th><th>w</th><th>h</th><th>Chữ Trung</th><th>Loại</th><th></th></tr>
+        </thead>
+        <tbody>
+          ${rows
+            .map((row, i) => {
+              const why = badRow.get(i + 1);
+              return `<tr${why ? ` class="il-row-bad" title="${esc(why)}"` : ''}>
+                ${['x', 'y', 'w', 'h']
+                  .map(
+                    (f) =>
+                      `<td><input class="il-input il-mini" data-mrow="${i}" data-mfield="${f}" inputmode="decimal" value="${esc(row[f])}" aria-label="Dòng ${i + 1} cột ${f}" /></td>`,
+                  )
+                  .join('')}
+                <td><input class="il-input il-manual-zh" data-mrow="${i}" data-mfield="text" value="${esc(row.text)}" aria-label="Dòng ${i + 1} chữ Trung" /></td>
+                <td>
+                  <select class="il-input il-mini" data-mrow="${i}" data-mfield="kind" aria-label="Dòng ${i + 1} loại vùng">
+                    ${IL_MANUAL_KINDS.map((k) => `<option value="${esc(k)}"${row.kind === k ? ' selected' : ''}>${esc(IL_KIND_LABEL[k] || k)}</option>`).join('')}
+                  </select>
+                </td>
+                <td><button class="btn ghost tiny danger" data-action="ilmanualdel" data-row="${i}" title="Xoá dòng ${i + 1}">Xoá</button></td>
+              </tr>`;
+            })
+            .join('') || '<tr><td colspan="7" class="muted small">Chưa có dòng nào — bấm “Thêm vùng”.</td></tr>'}
+        </tbody>
+      </table>
+    </div>
+    ${m.conflict
+      ? `<div class="notice warn">
+           <strong>MANUAL_EDITS_WOULD_BE_LOST — bạn đã sửa tay các dòng dịch của job này.</strong>
+           <p style="margin:6px 0 0">Thay vùng chữ sẽ <strong>XOÁ</strong> những bản sửa tay đó rồi dịch lại từ đầu.
+             Máy chủ báo: ${esc(m.conflict.message || 'chưa xác nhận thay thế')}</p>
+           <button class="btn tiny danger" data-action="ilmanualforce" style="margin-top:8px"${m.busy ? ' disabled' : ''}>Vẫn thay (mất bản sửa tay)</button>
+         </div>`
+      : ''}
+    ${rejected
+      ? `<div class="notice ${rejected.items.length ? 'warn' : 'ok'}">
+           <strong>${rejected.items.length ? `Máy chủ đã từ chối ${esc(rejected.items.length)} vùng` : 'Không có vùng nào bị máy chủ từ chối'}</strong>
+           ${rejected.items.length
+             ? `<ul>${rejected.items
+                 .map(
+                   (it) =>
+                     `<li><span class="mono">index ${esc(it.index)}</span>${Number.isInteger(it.row) ? ` — dòng ${esc(it.row)} trong bảng` : ''}: ${esc(it.reason)}</li>`,
+                 )
+                 .join('')}</ul>
+                <p style="margin:6px 0 0">Các dòng bị từ chối VẪN nằm trong bảng để bạn sửa; sửa xong bấm “LƯU VÙNG &amp; DỊCH” lần nữa.</p>`
+             : ''}
+         </div>`
+      : ''}
+    ${m.warnings.length ? `<div class="notice warn"><strong>Cảnh báo từ lần lưu vùng</strong><ul>${m.warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div>` : ''}
+    ${m.error ? `<div class="notice error">${esc(m.error)}</div>` : ''}
+    ${m.notice ? `<div class="notice ok">${esc(m.notice)}</div>` : ''}
+    ${jobRunning
+      ? `<div class="notice warn"><strong>Job ${esc(jobStatusLabel)} — chờ OCR/dịch xong rồi hãy lưu vùng.</strong>
+           <p style="margin:6px 0 0">Bạn vẫn nhập/sửa bảng được; nút lưu sẽ mở lại khi job xong. Máy chủ từ chối lưu lúc này
+           (409 <span class="mono">IMAGELAB_JOB_RUNNING</span>) để vùng bạn nhập không bị bước OCR ghi đè.</p></div>`
+      : ''}
+    <div class="row" style="margin-top:12px">
+      <button class="btn primary" data-action="ilmanualsave"${m.busy || jobRunning ? ' disabled' : ''}>${
+        jobRunning ? 'ĐANG OCR — CHỜ XONG' : m.busy ? 'ĐANG LƯU…' : 'LƯU VÙNG &amp; DỊCH'
+      }</button>
+      <button class="btn ghost" data-action="ilmanualadd">Thêm vùng</button>
+      <button class="btn ghost tiny" data-action="ilmanualreload">Nạp lại vùng của job</button>
+      <span class="muted small">Lưu sẽ THAY toàn bộ vùng của job (replace: true) rồi dịch lại.</span>
+    </div>
+    ${m.rejected
+      ? '<p class="muted small" style="margin:8px 0 0">Bảng vẫn giữ đúng những gì bạn đã gửi. Bấm “Nạp lại vùng của job” để xem bản máy chủ đã lưu (toạ độ có thể đã bị cắt theo khung ảnh).</p>'
+      : ''}`;
+
+  return `
+    <section class="panel" id="il-manual">
+      <div class="spread">
+        <h2 style="margin:0">Nhập vùng chữ bằng tay</h2>
+        <button class="btn ghost tiny" data-action="ilmanualtoggle">${open ? 'Thu gọn' : 'Mở ra'}</button>
+      </div>
+      <p class="muted small" style="margin:8px 0 0">
+        Dùng khi OCR đọc sai hoặc không đọc được chữ trên ảnh thật.
+        Vùng nhập tay có <strong>nguồn = người dùng</strong>; vùng <strong>nhãn hiệu / chứng nhận / giá vẫn bị KHOÁ</strong> như khi OCR đọc ra.
+      </p>
+      ${body}
+    </section>`;
+}
+
+/** Thêm một dòng trống vào bảng nhập tay (chặn trước nếu vượt `max_regions`). */
+function addIlManualRow() {
+  const data = state.il.job || {};
+  const m = state.il.manual;
+  const rows = ilManualRows(data);
+  const limit = ilMaxRegions();
+  if (limit !== null && rows.length >= limit) {
+    m.open = true;
+    m.error = `Chỉ được tối đa ${limit} vùng (giới hạn máy chủ). Bảng đang có ${rows.length} vùng — xoá bớt rồi thêm.`;
+    renderImagelab();
+    toast(`Tối đa ${limit} vùng.`);
+    return;
+  }
+  m.open = true;
+  m.touched = true;
+  m.error = null;
+  m.rejected = null; // số dòng đổi ⇒ chỉ số của lần lưu trước không còn đúng
+  rows.push({ x: '', y: '', w: '', h: '', text: '', kind: 'descriptive' });
+  renderImagelab();
+  const el = document.querySelector(`#il-manual input[data-mrow="${rows.length - 1}"][data-mfield="x"]`);
+  if (el) el.focus();
+}
+
+/** Xoá một dòng khỏi bảng nhập tay. */
+function removeIlManualRow(index) {
+  const rows = state.il.manual.rows;
+  if (!Number.isInteger(index) || !Array.isArray(rows) || !rows[index]) return;
+  rows.splice(index, 1);
+  state.il.manual.touched = true;
+  state.il.manual.error = null;
+  state.il.manual.rejected = null; // chỉ số của lần lưu trước không còn đúng sau khi xoá dòng
+  renderImagelab();
+}
+
+/**
+ * IL-08 — `PUT /api/imagelab/jobs/:id/regions` với `{ regions, replace: true }`.
+ * 409 `MANUAL_EDITS_WOULD_BE_LOST` ⇒ hiện cảnh báo rõ + nút xác nhận (`confirm_replace_edited`).
+ */
+async function saveIlManualRegions(confirmReplace) {
+  const data = state.il.job || {};
+  const jobId = data.job?.id;
+  const m = state.il.manual;
+  if (!jobId || m.busy) return;
+  const built = ilManualPayload(ilManualRows(data), ilMaxRegions());
+  m.open = true;
+  if (built.error) {
+    m.error = built.error;
+    m.conflict = null;
+    m.notice = null;
+    renderImagelab();
+    toast('Chưa lưu được — xem lý do trong khối “Nhập vùng chữ bằng tay”.');
+    return;
+  }
+  m.busy = true;
+  m.error = null;
+  m.conflict = null;
+  renderImagelab();
+  try {
+    const res = await api(`/api/imagelab/jobs/${jobId}/regions`, {
+      method: 'PUT',
+      body: confirmReplace
+        ? { regions: built.regions, replace: true, confirm_replace_edited: true }
+        : { regions: built.regions, replace: true },
+    });
+    // `rejected[].index` = vị trí trong mảng vùng ĐÃ GỬI; bảng gửi đủ mọi dòng theo đúng thứ tự
+    // nên dòng trong bảng = index + 1.
+    const items = (Array.isArray(res.rejected) ? res.rejected : []).map((r) => {
+      const i = Number(r?.index);
+      return {
+        index: r?.index,
+        row: Number.isInteger(i) && i >= 0 ? i + 1 : null,
+        reason: String(r?.reason || 'không rõ lý do'),
+      };
+    });
+    const savedRegions = Array.isArray(res.regions) ? res.regions : null;
+    m.busy = false;
+    m.rejected = { items };
+    m.warnings = (Array.isArray(res.warnings) ? res.warnings : []).map(String);
+    m.notice = items.length
+      ? `Lần lưu gần nhất: đã lưu ${(savedRegions || []).length} vùng nhập tay (nguồn = người dùng) và dịch lại; ${items.length} vùng bị máy chủ từ chối.`
+      : `Lần lưu gần nhất: đã lưu ${(savedRegions || []).length} vùng nhập tay (nguồn = người dùng) và dịch lại.`;
+    state.il.lastSave = null; // kết quả lưu vùng hiện ngay trong khối này, không trộn với bảng duyệt
+    // Vùng cũ đã bị thay ⇒ "cho phép dịch vùng này" của vùng cũ KHÔNG được dính sang vùng mới.
+    state.il.overrides = new Set();
+    state.il.job = {
+      ...data,
+      job: { ...(data.job || {}), status: res.status || data.job?.status },
+      regions: savedRegions || data.regions,
+      lines: Array.isArray(res.lines) ? res.lines : data.lines,
+    };
+    state.il.error = null;
+    toast(items.length ? 'Đã lưu vùng (một số vùng bị từ chối — xem chi tiết)' : 'Đã lưu vùng & dịch lại');
+    renderImagelab();
+  } catch (err) {
+    m.busy = false;
+    if (err.code === 'MANUAL_EDITS_WOULD_BE_LOST') {
+      m.conflict = { message: err.message || '' };
+      m.error = null;
+    } else if (err.code === 'IMAGELAB_JOB_RUNNING') {
+      // IL08-01(c): KHÔNG nuốt lỗi — nói rõ vì sao chưa lưu được và phải làm gì.
+      m.error = `Chưa lưu được: ${err.message || 'job đang chạy OCR/dịch.'} Bảng bạn vừa nhập vẫn còn nguyên trên màn hình — bấm “LƯU VÙNG & DỊCH” lại sau khi job xong.`;
+      m.conflict = null;
+      toast('Job đang chạy — chờ xong rồi lưu vùng.');
+    } else {
+      m.error = ilErrorText(err);
+      m.conflict = null;
+    }
+    renderImagelab();
+  }
 }
 
 function paintIlError() {

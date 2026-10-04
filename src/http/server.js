@@ -165,15 +165,22 @@ export function readBody(req, { maxBytes = MAX_BODY_BYTES_DEFAULT } = {}) {
       done = true;
       reject(err);
     };
-    req.on('data', (c) => {
+    // IL08-05 (vòng 6): vượt trần thì DỪNG ĐỌC và để tầng route trả JSON 413 — KHÔNG
+    // `req.destroy()` ngay như trước, vì destroy trước khi response kịp ghi làm client
+    // nhận ECONNRESET thay vì câu JSON mà chính máy chủ đã dựng. Phần body còn lại được
+    // XẢ bỏ (`resume()` không còn listener `data`) nên không tốn bộ nhớ, và kết nối vẫn
+    // đủ sống để gửi lỗi.
+    const onData = (c) => {
       size += c.length;
       if (size > maxBytes) {
+        req.removeListener('data', onData);
+        req.resume();
         fail(new HttpError(413, 'PAYLOAD_TOO_LARGE', `Body vượt giới hạn ${maxBytes} byte.`));
-        req.destroy();
         return;
       }
       chunks.push(c);
-    });
+    };
+    req.on('data', onData);
     req.on('end', () => {
       if (done) return;
       done = true;

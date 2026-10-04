@@ -32,6 +32,7 @@ function parseArgs(argv) {
     // `null` ⇒ tự dựng ảnh mẫu 800×800 khớp ĐÚNG hộp của fixture OCR mock, để bản demo
     // là thứ mở ra XEM ĐƯỢC (chữ Việt nằm gọn trong hộp, không bị cắt).
     image: null,
+    regions: null,
     out: 'data/imagelab-demo/rendered.png',
     side: 'data/imagelab-demo/truoc-sau.png',
     db: ':memory:',
@@ -40,14 +41,16 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--image') args.image = argv[++i];
+    else if (a === '--regions') args.regions = argv[++i];
     else if (a === '--out') args.out = argv[++i];
     else if (a === '--side-by-side') args.side = argv[++i];
     else if (a === '--no-side-by-side') args.side = null;
     else if (a === '--db') args.db = argv[++i];
     else if (a === '--verbose' || a === '-v') args.verbose = true;
     else if (a === '--help' || a === '-h') {
-      console.log('node tools/imagelab-demo.mjs [--image <png>] [--out <png>] [--side-by-side <png>] [--db <path|:memory:>] [--verbose]');
-      console.log('  (không có --image ⇒ tự dựng ảnh mẫu 800×800 khớp hộp của fixture OCR mock)');
+      console.log('node tools/imagelab-demo.mjs [--image <png>] [--regions <vung.json>] [--out <png>] [--side-by-side <png>] [--db <path|:memory:>] [--verbose]');
+      console.log('  (không có --image   ⇒ tự dựng ảnh mẫu 800×800 khớp hộp của fixture OCR mock)');
+      console.log('  (có --regions       ⇒ BỎ QUA OCR, dùng vùng chữ do người dùng nhập — cách dùng ảnh THẬT)');
       process.exit(0);
     }
   }
@@ -218,15 +221,54 @@ async function main() {
   });
   console.log(`\n[1] Nạp ảnh   → asset ${ingest.asset_id} · ${ingest.width}×${ingest.height}px`);
 
-  /* ── 2. OCR + dịch ──────────────────────────────────────────────────── */
-  const ocrRun = await pipeline.runOcr(jobId, { sessionId, options: {} });
+  /* ── 2. Vùng chữ + dịch ────────────────────────────────────────────────
+   * Hai đường, cùng một kết quả phía sau:
+   *   · mặc định      → OCR (provider theo `OCR_PROVIDER`; mặc định là mock);
+   *   · `--regions`   → vùng do NGƯỜI DÙNG nhập (IL-08) ⇒ **bỏ qua OCR hoàn toàn**.
+   * Đường thứ hai là cách dùng được tính năng trên ẢNH THẬT ngay hôm nay, khi chưa cắm
+   * dịch vụ OCR trả tiền (mock trả hộp của fixture, không liên quan tới ảnh của anh). */
+  let manualNote = '';
+  if (args.regions) {
+    const regionsPath = path.resolve(ROOT, args.regions);
+    if (!fs.existsSync(regionsPath)) {
+      console.error(`Không thấy file vùng chữ: ${regionsPath}`);
+      process.exit(2);
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(fs.readFileSync(regionsPath, 'utf8'));
+    } catch (err) {
+      console.error(`File vùng chữ không phải JSON hợp lệ: ${err.message}`);
+      process.exit(2);
+    }
+    const list = Array.isArray(parsed) ? parsed : parsed?.regions;
+    if (!Array.isArray(list) || list.length === 0) {
+      console.error('File vùng chữ phải là mảng [{box:{x,y,w,h}, text, kind?}] (hoặc {"regions": [...]}).');
+      process.exit(2);
+    }
+    // IL08-01(a): đường này CỐ Ý không xếp lượt OCR nào vào hàng đợi, nên phải nói rõ
+    // `ocrPending: false` — mặc định của pipeline là coi job `queued` như đang chờ OCR.
+    const manual = await pipeline.setManualRegions(jobId, { sessionId, regions: list, replace: true, ocrPending: false });
+    manualNote = `người dùng nhập${args.regions ? ` (${path.relative(ROOT, regionsPath)})` : ''}`;
+    if ((manual.rejected || []).length > 0) {
+      console.log(`\n[2] Vùng chữ  → ${manual.rejected.length} vùng bị TỪ CHỐI (nói thẳng, không im lặng):`);
+      for (const r of manual.rejected) console.log(`      · chỉ số ${r.index}: ${r.reason}`);
+    }
+  } else {
+    await pipeline.runOcr(jobId, { sessionId, options: {} });
+  }
   const regions = await store.listOcrRegions(jobId);
   const linesAfterOcr = await store.listTranslationLines(jobId);
 
-  console.log(`\n[2] OCR       → ${regions.length} vùng chữ (provider: ${ocrProvider.name}${ocrProvider.isMock ? ' — MOCK' : ''})`);
+  console.log(
+    manualNote
+      ? `\n[2] Vùng chữ  → ${regions.length} vùng do ${manualNote} — ĐÃ BỎ QUA OCR`
+      : `\n[2] OCR       → ${regions.length} vùng chữ (provider: ${ocrProvider.name}${ocrProvider.isMock ? ' — MOCK' : ''})`,
+  );
   for (const r of regions) {
     const lock = r.translatable ? '  ' : '🔒';
-    console.log(`    ${lock} ${String(r.region_key || r.id).padEnd(4)} [${String(r.kind).padEnd(13)}] ${r.text_original}`);
+    const src = r.source === 'user' ? 'người dùng' : 'ocr';
+    console.log(`    ${lock} ${String(r.region_key || r.id).padEnd(4)} [${String(r.kind).padEnd(13)}] (${src}) ${r.text_original}`);
   }
 
   const skipped = linesAfterOcr.filter((l) => String(l.status || '').startsWith('SKIPPED'));
@@ -327,7 +369,9 @@ async function main() {
   console.log(`   Tổng: ${summary.events} event · ${summary.input_units} input · ${summary.output_units} output · ${summary.estimated_cost} ${config.cost?.currency || 'USD'}`);
 
   const mockSteps = [];
-  if (ocrProvider.isMock) mockSteps.push('OCR_DETECT');
+  // Chỉ liệt kê OCR khi OCR THẬT SỰ chạy: dùng `--regions` thì bước OCR bị bỏ qua hoàn toàn,
+  // ghi vào đây là nói sai về việc đã làm.
+  if (!args.regions && ocrProvider.isMock) mockSteps.push('OCR_DETECT');
   if (renderProvider.isMock) mockSteps.push('IMAGE_RENDER');
   if (translator?.isMock) mockSteps.push('TRANSLATION');
 
@@ -337,6 +381,9 @@ async function main() {
       ? `NHÃN KIỂM CHỨNG: MOCK_VERIFIED — các bước dùng provider giả: ${mockSteps.join(', ')}.`
       : 'NHÃN KIỂM CHỨNG: ảnh do người dùng tải lên (MANUAL_INPUT); không bước nào dùng provider giả.',
   );
+  if (args.regions) {
+    console.log('Vùng chữ do NGƯỜI DÙNG nhập ⇒ KHÔNG có bước OCR nào chạy (không ghi usage_event OCR_DETECT).');
+  }
   console.log('Đây KHÔNG phải nghiệm thu bằng dữ liệu thật: OCR thật cần cắm provider qua OCR_PROVIDER.');
   line();
 

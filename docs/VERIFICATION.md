@@ -569,3 +569,96 @@ Tổng sau vòng 6d: `npm test` → **510 test · 509 pass · 0 fail · 1 skippe
 phần lớn nhánh là định dạng không hỗ trợ), `render/png.js` 81.42% (nhánh lỗi hiếm),
 `translate/util.js` 81.60%. Ba chỗ này không phải đường nghiệp vụ, nhưng **đã ghi lại** thay vì
 để người đọc tự suy là "đã phủ hết".
+
+---
+
+## 11. IL-08 — vòng 6: vá 5 phát hiện của phản biện (IL08-01…IL08-05)
+
+Phán quyết vòng 5: **FAIL** (`docs/MVP-02-REVIEW.md`, mục “VÒNG 5 — IL-08 — phản biện”).
+Đã vá hết. `npm test` → **578 test · 577 pass · 0 fail · 1 skipped** (skip duy nhất vẫn là
+PostgreSQL của MVP-01); `node tools/verify.mjs` EXIT=0; `node tools/imagelab-demo.mjs` →
+`succeeded`; `node tools/imagelab-demo.mjs --regions /tmp/vung-that.json` → `succeeded`.
+
+### 11.1 IL08-01 (CRITICAL) — OCR đang chạy không được xoá vùng nhập tay
+
+Sửa **hai tầng** (đúng như phản biện yêu cầu), cộng UI:
+
+- **(a) `src/imagelab/pipeline.js` + `src/http/routes.js`:** job `running`, hoặc `queued` **và
+  thật sự có lượt OCR trong hàng đợi** (`JobQueue.isPending` — mục đã chạy xong vẫn nằm trong
+  `active`, nên phải loại `done/failed`) ⇒ `409 IMAGELAB_JOB_RUNNING`, KHÔNG ghi gì.
+- **(b) `runOcr`:** trước `saveOcrRegions` **đọc lại job + danh sách vùng**; nếu
+  `manual_regions === true` hoặc có vùng `source='user'` ⇒ **DỪNG**, giữ `awaiting_review`, ghi
+  `content_meta.imagelab.ocr_superseded` + cảnh báo “KHÔNG ghi đè…” (lớp chặn khe TOCTOU).
+- **(c) `public/app.js`:** job `queued/running` ⇒ nút “LƯU VÙNG & DỊCH” **disabled** + ghi chú
+  “Job đang chạy OCR/dịch — chờ xong…”; gặp 409 thì hiện đúng câu máy chủ (không nuốt lỗi).
+
+Bằng chứng (`node test/il08-manual-regions-race.probe.mjs` — XANH):
+
+```
+✅ lưu vùng trong lúc OCR đang chạy ⇒ 409 IMAGELAB_JOB_RUNNING (nhận: IMAGELAB_JOB_RUNNING)
+✅ bị từ chối thì KHÔNG được ghi vùng nào vào DB
+   vùng trong DB sau khi OCR chạy lại: [["u1","user","纯棉短袖T恤"]]
+   content_meta.imagelab: true awaiting_review awaiting_review
+   có cảnh báo "KHÔNG ghi đè"? true
+```
+
+`cd /tmp/atk-il08 && node 05-limits-race.mjs` (mục B1 — 40 job dồn hàng đợi, PUT vào job cuối):
+`job CUỐI lúc PUT: {"status":"running","stage":"ocr"}` → `PUT /regions: {"status":409}` → DB giữ
+nguyên vùng OCR, không có vùng `user` nào bị ghi rồi bị xoá.
+`node 15-ui-race-window.mjs`: `có nút disabled vì job đang chạy? true`, `có câu cảnh báo "chờ OCR"? true`.
+
+### 11.2 IL08-02 (MAJOR) — `kind` client khai chỉ được LEO THANG bảo vệ
+
+- `src/imagelab/manual-regions.js`: **luôn** chạy `classifyRegion`, rồi hợp nhất bằng
+  `dedupePriority` (`brand|certification|price > unknown > descriptive`) — **một bản luật** với
+  `ocr/normalize.js`. Khai thấp hơn ⇒ giữ mức cao + `warnings`; muốn hạ phải có
+  `allow_kind_downgrade: true` **theo từng vùng** ⇒ mới dùng kind client khai và ghi vết
+  `kind_downgraded` + `kind_declared_by_user` + warning.
+- `src/http/routes.js`: `sanitizeManualRegionsInput` chuyển tiếp cờ này (không tự quyết định).
+
+`cd /tmp/atk-il08 && node 14-asymmetry.mjs` — cột “NHẬP TAY (client khai descriptive)” nay khớp
+C1 và đường OCR ở MỌI dòng:
+
+```
+免运费  | price/false        | … | price/false        | price/false
+旗舰    | brand/false        | … | brand/false        | brand/false
+检测    | certification/false | … | certification/false | certification/false
+１９９元 | price/false        | … | price/false        | price/false
+```
+
+`node 03-render-gap.mjs` ca G1 (`免运费` khai `descriptive`): `DB lines: "status":"SKIPPED_PRICE"`,
+`KẾT LUẬN PIXEL: không có ảnh render` (trước vá: dòng `GLOSSARY`, `pixel đã đổi 8000/8000`,
+`chữ gốc còn nguyên? false`, KHÔNG có cảnh báo override).
+
+### 11.3 IL08-03, IL08-04, IL08-05
+
+| # | Sửa gì | Bằng chứng |
+|---|---|---|
+| IL08-03 | `collectOcrMeta` (`routes.js`) trả thêm `superseded_by_manual_regions`, `superseded_at`, `note`; `public/app.js` đổi tiêu đề khối “vùng bị bỏ khi OCR” thành *“Dấu vết OCR TRƯỚC ĐÓ — đã bị thay bởi vùng nhập tay”* và không tô đỏ như cảnh báo hiện hành | `node 09-trace.mjs` (T2): `"superseded_by_manual_regions": true`, `"note": "Dấu vết OCR TRƯỚC ĐÓ — đã bị thay bởi vùng nhập tay; … KHÔNG mô tả vùng chữ đang có của job."`, `GET response có trường superseded nào không?: true` |
+| IL08-04 | `ingest` lưu `content_meta.imagelab.limits.max_regions`; `runOcr` **giữ** các field `imagelab` cũ (trước đây dựng lại từ đầu ⇒ trần theo job biến mất); route + `setManualRegions` áp `min(trần cấu hình, trần job)` ⇒ `413 TOO_MANY_REGIONS` | `node 11-abuse.mjs` (mục D): `vùng OCR sau job: 1` → `PUT 5 vùng nhập tay: {"status":413}` → `vùng trong DB: 1` |
+| IL08-05 | `readBody` (`src/http/server.js`): vượt trần ⇒ **bỏ listener + `resume()` xả bỏ** rồi để route trả JSON `413 PAYLOAD_TOO_LARGE`; KHÔNG `req.destroy()` trước khi response kịp ghi | `node 12b-body.mjs`: `HTTP: {"status":413,"code":"PAYLOAD_TOO_LARGE","message":"Body vượt giới hạn 524288 byte."}`, `vùng trong DB (không thêm gì): 1`, `server còn sống: 200` (trước vá: `CLIENT_ECONNRESET`) |
+
+### 11.4 Test thêm/sửa (nói rõ, không giấu)
+
+- **Thêm** `test/imagelab-manual-hardening.test.js` — 10 test hồi quy cho IL08-01(a,b),
+  IL08-02 (4 ca đơn vị + 1 ca API), IL08-03, IL08-04, IL08-05.
+- **Sửa** `test/il08-manual-regions-race.probe.mjs`: khẳng định 1 của bản gốc là
+  “lưu vùng trong lúc OCR đang chạy ⇒ **200**” — đúng hành vi mà IL08-01 phải chặn. Nay probe
+  khẳng định **409 + không ghi gì**, và thêm bước cho OCR chạy LẠI để chứng minh tầng (b)
+  (vùng người dùng còn nguyên + cảnh báo). Tính chất gốc giữ nguyên: không xoá im lặng.
+- **Sửa** `test/imagelab-manual-api.test.js` (test rate limit): thêm `await waitJob(...)` trước
+  lượt PUT đầu — test này đo **hạn mức request**, nhưng lại PUT ngay sau khi tạo job (job còn
+  `queued`), nên tiền đề “lượt đầu 200” mâu thuẫn với luật IL08-01(a).
+
+### 11.5 Còn lại / chưa đo được
+
+- **UI chưa có nút hạ mức bảo vệ.** Cờ `allow_kind_downgrade` mới chỉ có ở tầng API (theo từng
+  vùng) — cố ý: hạ mức bảo vệ của vùng giá/nhãn hiệu không nên là thao tác một cú bấm. Người
+  dùng vẫn thấy `warnings` giải thích vì sao vùng bị giữ ở mức cao hơn.
+- **`JobQueue.isPending` là trạng thái TRONG BỘ NHỚ.** Nếu máy chủ khởi động lại giữa lúc OCR,
+  job còn `queued` mà không còn mục trong hàng đợi ⇒ lượt lưu vùng tay được phép; khi đó lớp (b)
+  (`runOcr` đọc lại job) vẫn là lưới chặn — không mất dữ liệu, nhưng cửa sổ 409 hẹp hơn.
+- **OCR provider THẬT (chậm) chưa đo được**: mọi bằng chứng dùng provider mock + cổng promise
+  tất định. Cửa sổ race với OCR thật rộng hơn, nhưng cả hai tầng đều không phụ thuộc thời gian.
+- Chưa đo: PostgreSQL, trình duyệt thật, `data/studio.db` thật, nhiều máy chủ chạy song song
+  (hàng đợi trong bộ nhớ không chia sẻ giữa các tiến trình).

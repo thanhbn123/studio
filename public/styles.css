@@ -247,6 +247,16 @@ ul.bullets li { margin-bottom: 5px; }
 .il-overridden { background: rgba(79, 140, 255, .07); }
 .il-lock-note { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 7px; font-size: 12px; color: #ffe0a8; }
 
+/* IL-08 — nhập vùng chữ bằng tay */
+.il-manual-table { min-width: 900px; }
+.il-manual-table td { vertical-align: middle; }
+.il-manual-table .il-input { min-width: 0; }
+.il-input.il-mini { width: 100%; min-width: 62px; padding: 6px 8px; font-family: var(--mono); font-size: 13px; }
+.il-manual-table select.il-mini { min-width: 118px; font-family: inherit; }
+.il-input.il-manual-zh { width: 100%; min-width: 300px; padding: 6px 8px; }
+.il-manual-table tr.il-row-bad { background: rgba(255, 107, 107, .07); }
+.il-manual-table tr.il-row-bad td:first-child { box-shadow: inset 3px 0 0 var(--danger); }
+
 @media (max-width: 760px) {
   .il-compare { grid-template-columns: 1fr; }
 }
