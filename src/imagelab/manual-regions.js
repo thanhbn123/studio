@@ -18,6 +18,50 @@ import { sanitizeText } from '../security/sanitize.js';
 import { intersectBoxWithImage, strictCoordinate } from './geometry.js';
 import { REGION_KINDS, classifyRegion, containsCjk, dedupePriority, reasonForKind } from './ocr/classify.js';
 
+/**
+ * IL08-06 (vòng 7) — VẾT HẠ MỨC bảo vệ phải BỀN và ĐỌC LẠI ĐƯỢC.
+ *
+ * Vì sao: `kind_downgraded`/`kind_declared_by_user` chỉ sống trong mảng in-memory của hàm
+ * thuần ⇒ lần lưu sau là mất, và vùng trong DB đọc lên như thể MÁY phân loại (dù máy đã nói
+ * `price`). Vết được ghi vào CHÍNH bản ghi vùng qua `kind_reason` (bền, không cần đổi schema)
+ * và vào `content_meta.imagelab.manual.kind_downgrades` (có cấu trúc, đọc lại được).
+ */
+export const KIND_DOWNGRADE_MARK = '[NGƯỜI DÙNG HẠ MỨC từ';
+
+/** Câu vết gắn vào `kind_reason` của vùng bị hạ mức. */
+export function kindDowngradeNote(classifiedByMachine) {
+  return `${KIND_DOWNGRADE_MARK} ${classifiedByMachine}]`;
+}
+
+/**
+ * Đọc vết hạ mức từ `kind_reason` đã lưu.
+ * @returns {{downgraded: true, classified_by_machine: string}|null}
+ */
+export function parseKindDowngrade(kindReason) {
+  const text = String(kindReason ?? '');
+  const i = text.indexOf(KIND_DOWNGRADE_MARK);
+  if (i < 0) return null;
+  const rest = text.slice(i + KIND_DOWNGRADE_MARK.length);
+  const m = /^\s*([A-Za-z_]+)\s*\]/.exec(rest);
+  return { downgraded: true, classified_by_machine: m ? m[1].toLowerCase() : 'unknown' };
+}
+
+/**
+ * Trang trí một `Region` (đã đọc từ DB) bằng vết hạ mức — dùng CHUNG cho PUT và GET
+ * (cả hai đều đi qua `regionJson` của C5) nên không có chỗ nào quên.
+ */
+export function withKindDowngradeTrace(region) {
+  if (!region || typeof region !== 'object') return region;
+  const trace = parseKindDowngrade(region.kind_reason);
+  if (!trace) return region;
+  return {
+    ...region,
+    kind_downgraded: true,
+    kind_declared_by_user: region.kind || null,
+    kind_classified_by_machine: trace.classified_by_machine,
+  };
+}
+
 /** Tiền tố id do server gán (§11.2 luật 5): `u1..uN`. */
 export const MANUAL_ID_PREFIX = 'u';
 
@@ -225,7 +269,8 @@ export function normalizeManualRegions(input, { width, height, maxRegions, idPre
       kindReason = reasonForKind(kind);
     } else if (declaredValid && allowDowngrade) {
       kind = declaredKind;
-      kindReason = reasonForKind(kind);
+      // Vết BỀN nằm ngay trong `kind_reason` của bản ghi vùng (không chỉ trong mảng in-memory).
+      kindReason = `${reasonForKind(kind)} ${kindDowngradeNote(auto.kind)}`;
       kindDowngraded = true;
       kindDeclaredByUser = declaredKind;
       warnings.push(
@@ -273,7 +318,9 @@ export function normalizeManualRegions(input, { width, height, maxRegions, idPre
       translatable,
       source: 'user',
       // IL08-02: vết CHỈ có khi người dùng thật sự hạ mức bảo vệ (có cờ từng vùng).
-      ...(kindDowngraded ? { kind_downgraded: true, kind_declared_by_user: kindDeclaredByUser } : {}),
+      ...(kindDowngraded
+        ? { kind_downgraded: true, kind_declared_by_user: kindDeclaredByUser, kind_classified_by_machine: auto.kind }
+        : {}),
     };
     regions.push(entry);
   });

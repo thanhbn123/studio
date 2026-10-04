@@ -581,6 +581,8 @@ export function buildRouter(app) {
       store.listOcrRegions(job.id),
       store.listTranslationLines(job.id),
     ]);
+    // IL08-06: decorator vết hạ mức (module thuần của tầng imagelab, nạp qua loader).
+    const traceDowngrade = await loadImagelabFunction('../imagelab/manual-regions.js', 'withKindDowngradeTrace');
 
     const list = Array.isArray(assets) ? assets : [];
     const originals = list.filter((a) => a.role === 'original');
@@ -592,7 +594,12 @@ export function buildRouter(app) {
       job: jobJson(job),
       asset: assetJson(asset),
       rendered: rendered.map(assetJson),
-      regions: (rawRegions || []).map(regionJson),
+      regions: (rawRegions || []).map((r) => regionJson(r, traceDowngrade)),
+      // IL08-06 (vòng 7): vết hạ mức có cấu trúc — MỞ LẠI TRANG vẫn đọc được (không phải
+      // trạng thái in-memory của lần lưu trước). Mỗi vùng cũng mang vết riêng ở `regions[]`.
+      kind_downgrades: Array.isArray(job.content_meta?.imagelab?.manual?.kind_downgrades)
+        ? job.content_meta.imagelab.manual.kind_downgrades
+        : [],
       lines: (rawLines || []).map(lineJson),
       render_summary: buildRenderSummary(lastRendered),
       warnings: collectWarnings(asset, lastRendered),
@@ -711,10 +718,11 @@ export function buildRouter(app) {
       throw mapImagelabError(err, 'Không lưu được vùng chữ nhập tay.');
     }
 
+    const traceDowngrade = await loadImagelabFunction('../imagelab/manual-regions.js', 'withKindDowngradeTrace');
     sendJson(res, 200, {
       job_id: job.id,
       status: result?.status ?? JOB_STATUS.AWAITING_REVIEW,
-      regions: asArray(result?.regions).map(regionJson),
+      regions: asArray(result?.regions).map((r) => regionJson(r, traceDowngrade)),
       lines: asArray(result?.lines).map(lineJson),
       // Vùng bị bỏ: `{ index, code, reason, text? }` — UI phải hiện ra (§11.2 luật 10).
       rejected: asArray(result?.rejected),
@@ -947,14 +955,30 @@ function assetJson(asset) {
  * Chuẩn hoá vùng OCR: store có thể trả cột phẳng (x, y, w, h, text_original)
  * hoặc object lồng (box, box_normalized, text) — nhận cả hai, không bịa field.
  */
-function regionJson(r) {
+/**
+ * `Region` → JSON cho client. `withKindDowngradeTrace` được TRUYỀN VÀO (không static-import
+ * module imagelab ở đây): routes.js nạp module imagelab qua loader để còn trả 503 khi module
+ * thiếu, thay vì làm sập cả app.
+ *
+ * IL08-06 (vòng 7): vùng bị NGƯỜI DÙNG hạ mức bảo vệ phải mang vết ra tới client (PUT và GET
+ * dùng chung hàm này) — vết đọc lại từ `kind_reason` ĐÃ LƯU, không phải trạng thái in-memory.
+ */
+function regionJson(r, withKindDowngradeTrace = null) {
   const box = r.box && typeof r.box === 'object'
     ? r.box
     : { x: r.x, y: r.y, w: r.w, h: r.h };
   const norm = r.box_normalized && typeof r.box_normalized === 'object'
     ? r.box_normalized
     : { x: r.x_norm, y: r.y_norm, w: r.w_norm, h: r.h_norm };
+  const traced = typeof withKindDowngradeTrace === 'function' ? withKindDowngradeTrace(r) : r;
   return {
+    ...(traced?.kind_downgraded
+      ? {
+          kind_downgraded: true,
+          kind_declared_by_user: traced.kind_declared_by_user ?? null,
+          kind_classified_by_machine: traced.kind_classified_by_machine ?? null,
+        }
+      : {}),
     id: r.region_key || r.id,
     box,
     box_normalized: norm,

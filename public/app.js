@@ -1758,7 +1758,16 @@ function renderIlManual(data) {
   const jobRunning = jobStatus === 'queued' || jobStatus === 'running';
   // Nhãn viết tại chỗ (không mượn hằng số khác) để khối này chạy được cả khi hàm UI được
   // trích ra chạy riêng trong test/script kiểm chứng.
-  const jobStatusLabel = jobStatus === 'queued' ? 'đang xếp hàng chờ OCR' : 'đang chạy OCR/dịch';
+  // IL08-07: nhãn nêu ĐÚNG bước đang chạy (`job.stage`) — job có thể đang RENDER, không phải OCR.
+  const IL_STAGE_LABEL = {
+    queued: 'đang xếp hàng chờ xử lý',
+    storing: 'đang lưu ảnh gốc',
+    ocr: 'đang nhận dạng chữ (OCR)',
+    translating: 'đang dịch chữ',
+    rendering: 'đang render ảnh',
+  };
+  const jobStage = String(data.job?.stage || '');
+  const jobStatusLabel = IL_STAGE_LABEL[jobStage] || (jobStatus === 'queued' ? 'đang xếp hàng chờ xử lý' : 'đang xử lý ảnh');
   const asset = data.asset || null;
   const rows = open ? ilManualRows(data) : [];
   const over = limit !== null && rows.length > limit;
@@ -1845,13 +1854,13 @@ function renderIlManual(data) {
     ${m.error ? `<div class="notice error">${esc(m.error)}</div>` : ''}
     ${m.notice ? `<div class="notice ok">${esc(m.notice)}</div>` : ''}
     ${jobRunning
-      ? `<div class="notice warn"><strong>Job ${esc(jobStatusLabel)} — chờ OCR/dịch xong rồi hãy lưu vùng.</strong>
+      ? `<div class="notice warn"><strong>Job ${esc(jobStatusLabel)} — chờ bước này xong rồi hãy lưu vùng.</strong>
            <p style="margin:6px 0 0">Bạn vẫn nhập/sửa bảng được; nút lưu sẽ mở lại khi job xong. Máy chủ từ chối lưu lúc này
            (409 <span class="mono">IMAGELAB_JOB_RUNNING</span>) để vùng bạn nhập không bị bước OCR ghi đè.</p></div>`
       : ''}
     <div class="row" style="margin-top:12px">
       <button class="btn primary" data-action="ilmanualsave"${m.busy || jobRunning ? ' disabled' : ''}>${
-        jobRunning ? 'ĐANG OCR — CHỜ XONG' : m.busy ? 'ĐANG LƯU…' : 'LƯU VÙNG &amp; DỊCH'
+        jobRunning ? 'JOB ĐANG CHẠY — CHỜ XONG' : m.busy ? 'ĐANG LƯU…' : 'LƯU VÙNG &amp; DỊCH'
       }</button>
       <button class="btn ghost" data-action="ilmanualadd">Thêm vùng</button>
       <button class="btn ghost tiny" data-action="ilmanualreload">Nạp lại vùng của job</button>

@@ -51,6 +51,30 @@ export const IMAGELAB_EXTRACTION_METHOD = 'upload+render';
  */
 export const IMAGELAB_EXTRACTION_METHOD_MANUAL = `${IMAGELAB_EXTRACTION_METHOD}+manual-regions`;
 
+/**
+ * Nhãn tiếng Việt của từng `stage` — dùng cho câu chặn IL08-07 ("Job đang chạy bước render…")
+ * và cho cảnh báo job mồ côi. Một chỗ duy nhất, không hardcode rải rác.
+ */
+export const IMAGELAB_STAGE_LABEL = Object.freeze({
+  queued: 'chờ trong hàng đợi',
+  storing: 'lưu ảnh gốc',
+  ocr: 'nhận dạng chữ (OCR)',
+  translating: 'dịch chữ',
+  rendering: 'render ảnh',
+  awaiting_review: 'chờ bạn duyệt',
+  done: 'hoàn tất',
+  failed: 'đã lỗi',
+});
+
+/** Cảnh báo job ở trạng thái đang-chạy nhưng hàng đợi KHÔNG còn việc nào (IL08-07). */
+export function orphanRunningWarning(job) {
+  const label = IMAGELAB_STAGE_LABEL[job?.stage] || 'không rõ';
+  return (
+    `⚠️ Job đang ở trạng thái "${job?.status}" (bước "${job?.stage || '—'}" — ${label}) nhưng HÀNG ĐỢI không còn việc nào cho job này ` +
+    '(tiến trình có thể đã chết hoặc máy chủ vừa khởi động lại). Vẫn cho lưu vùng chữ bạn nhập — dữ liệu của bạn KHÔNG bị chặn vĩnh viễn.'
+  );
+}
+
 /** Mức bằng chứng DUY NHẤT được phép: ảnh do người dùng tải lên. */
 export const IMAGELAB_VERIFICATION = 'MANUAL_INPUT';
 
@@ -942,13 +966,16 @@ export class ImageTranslationPipeline {
     // `saveOcrRegions` sẽ xoá vùng người dùng và dấu vết `manual_regions` biến mất —
     // mất dữ liệu im lặng (luật #4). Trả 409 có mã riêng + câu tiếng Việt để UI nói rõ.
     const pending = ocrPending === null || ocrPending === undefined
-      ? job.status === JOB_STATUS.QUEUED // không ai nói rõ ⇒ mặc định an toàn: đang chờ
+      ? job.status === JOB_STATUS.QUEUED || job.status === JOB_STATUS.RUNNING // không ai nói rõ ⇒ mặc định an toàn
       : ocrPending === true;
-    if (job.status === JOB_STATUS.RUNNING || (job.status === JOB_STATUS.QUEUED && pending)) {
+    if (pending) {
+      // IL08-07 (vòng 7): câu chặn phải nêu ĐÚNG BƯỚC đang chạy (`jobs.stage`), không
+      // hardcode "OCR/dịch" — job có thể đang RENDER.
+      const stepLabel = IMAGELAB_STAGE_LABEL[job.stage] || 'xử lý ảnh';
       throw new ImageLabError(
         'IMAGELAB_JOB_RUNNING',
-        `Job đang chạy OCR/dịch (status = ${job.status}, stage = ${job.stage || '—'}) — chờ xong rồi hãy nhập vùng chữ bằng tay. KHÔNG có gì bị ghi.`,
-        { status: job.status, stage: job.stage ?? null, ocr_pending: pending },
+        `Job đang chạy bước ${stepLabel} (status = ${job.status}, stage = ${job.stage || '—'}) — chờ bước này xong rồi hãy nhập vùng chữ bằng tay. KHÔNG có gì bị ghi.`,
+        { status: job.status, stage: job.stage ?? null, queue_pending: true },
       );
     }
 
@@ -1090,10 +1117,50 @@ export class ImageTranslationPipeline {
         ...(translate?.is_mock ? ['translate'] : []),
       ]),
     );
+    // ── IL08-06 (vòng 7): VẾT HẠ MỨC có cấu trúc + BỀN qua các lần lưu ────────
+    // Trước đây vết chỉ là một câu trong `warnings` (bị ghi đè ở lần lưu sau) ⇒ vùng hạ mức
+    // nằm lại trong DB mà đọc lên như thể MÁY phân loại. Nay: (1) `kind_reason` của vùng mang
+    // dấu vết (bền theo bản ghi), (2) `content_meta.imagelab.manual.kind_downgrades` giữ danh
+    // sách có cấu trúc, KHÔNG dựng lại từ đầu, và (3) mỗi vùng còn hiệu lực được nhắc lại
+    // bằng một câu cảnh báo.
+    const prevManual = prevMeta.manual && typeof prevMeta.manual === 'object' ? prevMeta.manual : {};
+    const keptIds = new Set(persistedRegions.map((r) => String(r.region_id ?? r.region_key ?? r.id ?? '')));
+    const prevDowngrades = Array.isArray(prevManual.kind_downgrades)
+      ? prevManual.kind_downgrades.filter((d) => d && keptIds.has(String(d.region_id)))
+      : [];
+    const savedDowngrades = normalized
+      .filter((r) => r.kind_downgraded === true)
+      .map((r) => ({
+        // `kind_downgraded: true` nằm NGAY TRONG từng mục để bất kỳ ai grep `content_meta`
+        // cũng thấy vết (không phải suy từ tên mảng), và để mục tự mô tả đủ nghĩa.
+        kind_downgraded: true,
+        region_id: String(r.id),
+        declared_by_user: String(r.kind_declared_by_user ?? r.kind ?? ''),
+        classified_by_machine: String(r.kind_classified_by_machine ?? 'unknown'),
+        applied_kind: String(r.kind),
+        at: new Date().toISOString(),
+      }));
+    const savedIds = new Set(savedDowngrades.map((d) => d.region_id));
+    const kindDowngrades = [...prevDowngrades.filter((d) => !savedIds.has(String(d.region_id))), ...savedDowngrades];
     const warningsAll = [...warnings, ...translateWarnings];
     if (translateFailed) {
       warningsAll.push(
         `Dịch vùng nhập tay không chạy được (status = ${translateStatus}) — các dòng cần dịch đang ở trạng thái FAILED; job vẫn ở "chờ duyệt", KHÔNG bị treo.`,
+      );
+    }
+
+    // IL08-07 (vòng 7): hàng đợi KHÔNG còn việc nào cho job này nhưng cột `jobs.status` vẫn
+    // nói đang chạy ⇒ job "MỒ CÔI" (tiến trình chết / máy chủ vừa khởi động lại). Cổng chặn
+    // ở trên đã cho qua; ở đây phải NÓI THẬT, không im lặng — nếu không người dùng tưởng job
+    // vẫn đang chạy và không hiểu vì sao mọi thứ đứng yên.
+    if (ocrPending === false && (job.status === JOB_STATUS.QUEUED || job.status === JOB_STATUS.RUNNING)) {
+      warningsAll.push(orphanRunningWarning(job));
+    }
+
+    for (const d of kindDowngrades) {
+      if (savedIds.has(d.region_id)) continue; // lượt lưu này đã có câu cảnh báo riêng
+      warningsAll.push(
+        `⚠️ Vùng ${d.region_id} vẫn đang ở mức "${d.applied_kind}" do NGƯỜI DÙNG HẠ MỨC từ "${d.classified_by_machine}" (ghi vết lúc ${d.at}) — vết nằm ở content_meta.imagelab.manual.kind_downgrades và ở kind_reason của vùng.`,
       );
     }
 
@@ -1122,12 +1189,15 @@ export class ImageTranslationPipeline {
           regions: persistedRegions.length,
           lines: lines.length,
           manual: {
+            ...prevManual,
             at: new Date().toISOString(),
             requested: Array.isArray(regions) ? regions.length : 0,
             accepted: normalized.length,
             rejected: rejected.length,
             replace: replace === true,
             confirm_replace_edited: confirmReplaceEdited === true,
+            // IL08-06: vết hạ mức ĐỌC LẠI ĐƯỢC, giữ qua các lần lưu (lọc theo vùng còn tồn tại).
+            kind_downgrades: kindDowngrades,
           },
           mock_steps: mockSteps,
           translate: {

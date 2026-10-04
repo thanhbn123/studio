@@ -662,3 +662,89 @@ C1 và đường OCR ở MỌI dòng:
   tất định. Cửa sổ race với OCR thật rộng hơn, nhưng cả hai tầng đều không phụ thuộc thời gian.
 - Chưa đo: PostgreSQL, trình duyệt thật, `data/studio.db` thật, nhiều máy chủ chạy song song
   (hàng đợi trong bộ nhớ không chia sẻ giữa các tiến trình).
+
+---
+
+## 12. IL-08 — vòng 7: IL08-06 (vết hạ mức bền) + IL08-07 (chẩn đoán đúng bước, mở đường cho job kẹt)
+
+Phán quyết vòng 6: **PASS CÓ ĐIỀU KIỆN** (2 MINOR mới). Đã vá. `npm test` →
+**582 test · 581 pass · 0 fail · 1 skipped**; `node tools/verify.mjs` EXIT=0;
+`node tools/imagelab-demo.mjs --regions <file>` → `succeeded`; probe race → XANH.
+
+### 12.1 IL08-06 — vết hạ mức bảo vệ: BỀN + ĐỌC LẠI ĐƯỢC
+
+Sửa ở `src/imagelab/manual-regions.js` (hằng `KIND_DOWNGRADE_MARK`, `kindDowngradeNote`,
+`parseKindDowngrade`, `withKindDowngradeTrace`), `src/imagelab/pipeline.js`
+(`content_meta.imagelab.manual.kind_downgrades` + nhắc lại cảnh báo cho vết còn hiệu lực),
+`src/http/routes.js` (`regionJson` gắn vết cho **cả PUT và GET** + `kind_downgrades` cấp job).
+
+`node /tmp/atk-il08b/r6-02b-trace.mjs` (sau khi vá):
+
+```
+response regions[0]: {"kind_downgraded":true,"kind_declared_by_user":"descriptive",
+                      "kind_classified_by_machine":"price", … ,
+                      "kind_reason":"chữ mô tả thông thường [NGƯỜI DÙNG HẠ MỨC từ price]"}
+DB region row: kind_reason "chữ mô tả thông thường [NGƯỜI DÙNG HẠ MỨC từ price]", source "user"
+toàn bộ content_meta.imagelab có chuỗi "kind_downgraded" không?: true
+[T2 — lưu lần kế tiếp] content_meta warnings còn "HẠ MỨC"? ["⚠️ Vùng u1 vẫn đang ở mức "descriptive"
+                      do NGƯỜI DÙNG HẠ MỨC từ "price" (ghi vết lúc …) …"], vùng u1 còn nguyên
+```
+
+`node /tmp/gop7/verify-trace.mjs` (tự kiểm, trả lời câu “mở lại trang có thấy vết không”):
+
+```
+GET regions[0] (vết) {"id":"u1","kind":"descriptive","kind_downgraded":true,
+                      "declared":"descriptive","machine":"price"}
+GET kind_downgrades  [{"kind_downgraded":true,"region_id":"u1","declared_by_user":"descriptive",
+                       "classified_by_machine":"price","applied_kind":"descriptive","at":"…"}]
+[G2 — lưu lần 2] GET kind_downgrades: vẫn còn u1 (cùng `at`) · vùng u1 còn vết?: ["u1"]
+[G3 — không bịa vết] các vùng có kind_downgraded: [["u1", true], ["u2", false]]
+```
+
+### 12.2 IL08-07 — chẩn đoán đúng bước + job kẹt không bị chặn vĩnh viễn
+
+- `src/imagelab/pipeline.js`: `IMAGELAB_STAGE_LABEL` + `orphanRunningWarning`; cổng chặn dùng
+  `ocrPending` (đến từ `queue.isPending`) làm nguồn chân lý, câu 409 nêu đúng `stage`;
+  hàng đợi rỗng mà job vẫn `queued`/`running` ⇒ **cho lưu** + cảnh báo mồ côi.
+- `src/http/routes.js`: đã truyền `queue.isPending(job.id)` (từ vòng 6) — không đổi thêm.
+- `public/app.js`: nhãn chờ việc theo `job.stage` (“đang render ảnh”, “đang nhận dạng chữ (OCR)”…).
+
+`node /tmp/atk-il08b/r6-05-render-busy.mjs`:
+
+```
+job row lúc này: {"status":"running","stage":"rendering"}
+PUT /regions khi RENDER đang chạy: {"status":409,"code":"IMAGELAB_JOB_RUNNING",
+  "message":"Job đang chạy bước render ảnh (status = running, stage = rendering) — chờ bước này xong …",
+  "details":{"status":"running","stage":"rendering","queue_pending":true}}
+sau khi render xong, job row: {"status":"succeeded","stage":"done"} · PUT lại: {"status":200,"regions":1}
+```
+
+Job **mồ côi** (hàng đợi rỗng, mô phỏng tiến trình chết) — `node /tmp/gop7/orphan.mjs`:
+
+```
+queue có việc cho job này?: false
+PUT /regions: {"status":200,"regions":1}
+warnings: ["… ⚠️ Job đang ở trạng thái "running" (bước "ocr" — nhận dạng chữ (OCR)) nhưng HÀNG ĐỢI
+            không còn việc nào cho job này (tiến trình có thể đã chết hoặc máy chủ vừa khởi động lại).
+            Vẫn cho lưu vùng chữ bạn nhập — dữ liệu của bạn KHÔNG bị chặn vĩnh viễn."]
+vùng trong DB: [{"region_key":"u1","source":"user","text_original":"纯棉短袖T恤"}]
+job row sau khi lưu: {"status":"awaiting_review","stage":"awaiting_review"}
+```
+
+### 12.3 Test thêm/sửa
+
+- **Thêm 4 test** vào `test/imagelab-manual-hardening.test.js`: IL08-06 (hàm thuần đọc lại vết từ
+  `kind_reason`; API: vết ra response + `content_meta`, còn sau lần lưu kế tiếp, GET trả vết và
+  vùng sạch KHÔNG bị gắn cờ) và IL08-07 (409 nêu đúng bước `render ảnh`; job mồ côi ⇒ 200 +
+  cảnh báo + dữ liệu được ghi + job thoát trạng thái kẹt).
+- **Sửa 1 test cũ**: `test/imagelab-manual-hardening.test.js` (tầng (a) của IL08-01) — câu chặn
+  nay nêu đúng bước, nên kỳ vọng đổi từ `/chờ xong rồi…/` sang
+  `/chạy bước nhận dạng chữ \(OCR\)/` + `/chờ bước này xong rồi…/`. Không nới lỏng gì khác.
+
+### 12.4 Còn lại
+
+- UI **chưa** có nút gửi `allow_kind_downgrade` (cố ý — hạ mức bảo vệ không nên là một cú bấm);
+  vết chỉ hiện khi client gửi cờ, và vẫn hiện đủ ở `warnings`/`kind_reason`/`kind_downgrades`.
+- `JobQueue.isPending` là trạng thái TRONG BỘ NHỚ: nhiều tiến trình chạy song song thì tiến trình
+  này không thấy việc của tiến trình kia ⇒ có thể coi job là “mồ côi” và cho lưu (lớp chặn (b)
+  của `runOcr` vẫn bảo vệ dữ liệu). Chưa đo với PostgreSQL/nhiều máy chủ.
