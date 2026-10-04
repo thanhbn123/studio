@@ -2797,6 +2797,30 @@ function renderIsWarnings(data) {
   }
   for (const w of matting.warnings || []) blocks.push({ cls: 'warn', title: 'Cảnh báo từ bước tách nền', items: [String(w)] });
 
+  // (2b) M03-01c (vòng 8): CẢNH BÁO NỔI BẬT cho MỌI lượt có tách nền — vùng "sản phẩm" do
+  // MÁY ĐOÁN theo màu nền, không phải sự thật đã kiểm. Trước đây UI chỉ hiện khi có lỗi,
+  // nên một mask ăn mất sản phẩm vẫn đi kèm lời khẳng định "pixel giữ nguyên từng byte".
+  const mattingRan = Boolean(
+    matting.status === 'OK'
+    || failOf('matting')
+    || rendered?.meta?.generator?.matting_status
+    || rendered?.meta?.matting
+    || lastRun?.matting
+    || lastRun?.matting_status,
+  );
+  if (mattingRan) {
+    blocks.push({
+      cls: 'warn',
+      title: 'Vùng tách nền do MÁY ĐOÁN theo màu nền — hãy kiểm ảnh TRƯỚC|SAU',
+      items: [
+        'Phần "sản phẩm giữ lại" là kết quả đoán của thuật toán (flood fill từ viền), KHÔNG phải vùng đã được xác nhận.',
+        'Hãy mở ảnh TRƯỚC|SAU và soi kỹ: viền sản phẩm, bóng đổ, chi tiết cùng màu nền (đồ trắng trên nền trắng).',
+        'Máy chỉ khẳng định được: pixel NGOÀI vùng đã tách giữ nguyên từng byte.',
+        ...(isMaskItems(matting.mask).length ? isMaskItems(matting.mask) : []),
+      ],
+    });
+  }
+
   // (3) Tham số bị KẸP: hiện TÊN + GIÁ TRỊ HIỆU LỰC (không có đường vượt ngưỡng mà im lặng).
   // Nguồn: trace của ảnh đã tạo, nếu chưa có thì lấy của LƯỢT CHẠY MỚI NHẤT (`last_run`).
   const clampedSrc = (Array.isArray(retouch.clamped) && retouch.clamped.length ? retouch.clamped : lastRun?.retouch_clamped) || [];

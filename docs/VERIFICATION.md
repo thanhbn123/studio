@@ -748,3 +748,102 @@ job row sau khi lưu: {"status":"awaiting_review","stage":"awaiting_review"}
 - `JobQueue.isPending` là trạng thái TRONG BỘ NHỚ: nhiều tiến trình chạy song song thì tiến trình
   này không thấy việc của tiến trình kia ⇒ có thể coi job là “mồ côi” và cho lưu (lớp chặn (b)
   của `runOcr` vẫn bảo vệ dữ liệu). Chưa đo với PostgreSQL/nhiều máy chủ.
+
+---
+
+## 13. MVP-03 — vòng 8: vá 6 phát hiện của phản biện (M03-01…M03-06)
+
+Phán quyết vòng MVP-03: **FAIL** (1 CRITICAL · 1 MAJOR · 4 MINOR — `docs/MVP-03-REVIEW.md`).
+Đã vá hết. `npm test` → **698 test · 697 pass · 0 fail · 1 skipped** (baseline 683 + 15 test mới);
+`node tools/verify.mjs` EXIT=0; `node test/imagestudio-config-gap.probe.mjs` → **XANH 6/6**.
+
+### 13.1 M03-01 (CRITICAL) — sản phẩm gần màu nền không còn bị ăn
+
+Sửa ở `src/imagestudio/matting/background.js` (tolerance 12, `measureBoundaryDelta` hai phía,
+các hằng ngưỡng), `matting/providers/purejs.js` (soi biên + siết nghi ngờ + câu chữ),
+`matting/provider.js` + `matting/result.js` (giữ số đo mở rộng của `mask`),
+`compose/compose.js` (câu chữ), `public/app.js` (cảnh báo nổi bật cho MỌI lượt tách nền).
+
+```
+$ cd /tmp/mvp03-atk && node a2b-white-product.mjs
+matting.status = OK | mask = {"coverage":0.5625,"background_ratio":0.4375,…}
+warnings: • Soi biên vùng đã tách: phía NỀN 192 pixel kề sản phẩm (Δmax 0/255, Δp95 0/255,
+            vượt 8/255: 0.0%); phía GIỮ LẠI 188 pixel kề nền (Δmin 25.98/255, dưới ngưỡng
+            dứt khoát 20/255: 0.0%).
+          • Pixel NGOÀI vùng đã tách giữ nguyên từng byte; vùng đã tách do máy đoán theo màu
+            nền — hãy mở ảnh TRƯỚC|SAU để kiểm.
+"áo trắng": XOÁ = 0/2048, còn lại = 2048 · pixel vùng "áo" còn màu áo gốc = 2048,
+            đã bị đổi thành màu nền mô phỏng = 0 · mẫu pixel (10,10) → [240,240,240,255]
+```
+
+Ba ca biên (script tự kiểm `/tmp/gop8/m1-boundary.mjs`):
+
+```
+kem 248 (Δ≈12.1, sát nền)  → FAILED  boundary={"kept_under_ratio":1,"kept_min":12.12,"suspicious":true}
+trắng 250 (Δ≈8.7)          → FAILED  boundary={"over_ratio":1,"max":8.66,"suspicious":true}
+trắng 240 (ca M03-01 gốc)  → OK      0 pixel sản phẩm bị đổi (kept 48×48)
+xám 200 (khác rõ)          → OK      0 pixel sản phẩm bị đổi
+```
+
+Hồi quy không vỡ: `node a1-distortion.mjs` → `pixel giữ nguyên=1024, pixel SẢN PHẨM đổi=0`;
+`node c1-matting.mjs` → nền gradient vẫn `UNIFORM_BACKGROUND_NOT_FOUND` (uniformity 0.0266/0.3989/
+0.5426), ảnh toàn nền/1 pixel khác vẫn `SUSPICIOUS_MASK`.
+`node e4-ui.mjs` (B3b, hàm UI THẬT): `UI có hiện lời khẳng định "Pixel sản phẩm … giữ nguyên
+từng byte"? **false**` + UI hiện *“Vùng tách nền do MÁY ĐOÁN theo màu nền — hãy kiểm ảnh
+TRƯỚC|SAU”*.
+
+### 13.2 M03-02 (MAJOR) — overlay hết đường “tự rửa tội”
+
+Sửa ở `src/imagestudio/pipeline.js` (`#evidenceText` chỉ đọc dữ liệu ĐÃ LƯU),
+`compose/overlay.js` (`resolveSourceText` chỉ nhận `params.source_text` của server; thêm
+`CLIENT_EVIDENCE_KEYS`/`clientEvidenceKeysIn`), `src/http/routes.js` (bỏ `overlayHasClientEvidence`
++ bỏ chuyển tiếp 16 khoá bằng chứng; preflight LUÔN chạy).
+
+```
+$ node d-overlay.mjs        # D2 — CÙNG khẳng định đó + client tự khai `source_text`
+"Bảo hành 12 tháng" → 422 | "BH 12 tháng" → 422 | "chống nước IP68" → 422 |
+"hơn 10 nghìn người mua" → 422 | "①② tháng" → 422 | "ｂảo hành 12 tháng" → 422 |
+"bảo hànһ 12 tháng" → 422 | "bao hanh 12 thang" → 422      (trước vá: 202 + 152 pixel được vẽ)
+
+$ node d2b-variants.mjs     # cả 9 biến thể đều 422, KHÔNG biến thể nào vẽ pixel
+1. không bằng chứng → 422 · 2. source_text → 422 · 3. notes → 422 · 4. source_text=[…] → 422 ·
+5. evidence ngoài overlay → 422 · 6. evidence={text} → 422 · 7. chỉ "Bảo hành" → 422 ·
+8. chỉ "12 tháng" → 422 · 9. bằng chứng chữ Hán → 422
+```
+
+Đối chứng DƯƠNG (khẳng định CÓ thật trong dữ liệu đã lưu ⇒ vẫn vẽ): xem `test/imagestudio-round8-
+hardening.test.js` — `drawOverlay` với `source_text` do server truyền ⇒ `applied: true` + có pixel
+vẽ; và qua pipeline: `jobs.product_name = "Bảo hành 12 tháng chính hãng"` ⇒ `overlay.applied = true`
+kèm cảnh báo *“BỎ QUA bằng chứng do client tự khai (source_text)”*.
+
+### 13.3 M03-04, M03-05, M03-06
+
+| # | Sửa gì | Bằng chứng |
+|---|---|---|
+| M03-04 | `overlay.js` + preflight của route dùng `hasUntranslatedScript` (Hán + kana + Hangul) và kiểm **trước** danh sách vi phạm ⇒ trả đúng `OVERLAY_NOT_TRANSLATED` | `node d3-cjk.mjs`: `"こんにちは" → 422 OVERLAY_NOT_TRANSLATED`, `"한국어" → 422 OVERLAY_NOT_TRANSLATED`, `"保修 12 个月" → 422 OVERLAY_NOT_TRANSLATED` (trước: 202 `OVERLAY_NO_GLYPH` và `OVERLAY_UNSUPPORTED_CLAIM`) |
+| M03-05 | `retouch_effective` = 0 khi `NO_CHANGES`/`FAILED` (giữ `retouch_clamped`); `composeImage` chỉ ghép khi `matting.status === 'OK'`; mask alpha một phần được ĐẾM + cảnh báo | `node a3-clamp.mjs` (A3.2): `retouch="NO_CHANGES" effective={"brightness":0,…} clamped=["brightness"]`, `meta.retouch_effective = {0,0,0,0}`. `node a5-immut.mjs` (A4b): `mask status FAILED + có buffer → ratio=0 | giống ảnh vào=true | byte pixel SẢN PHẨM đổi=0` (trước: ratio=1, 27 byte đổi); `mask alpha MỘT PHẦN → cảnh báo "Mask nền có 1 pixel alpha MỘT PHẦN…"` |
+| M03-06 | `src/config.js` thêm khối `imagestudio`/`matting`/`retouch` + `COST_IMAGE_*`; `.env.example` ghi kèm chú thích tiếng Việt | `node test/imagestudio-config-gap.probe.mjs` → **6/6 XANH** (`IMAGESTUDIO_ENABLED=false` ⇒ 503 + `/api/config` `enabled:false`; `MATTING_PROVIDER=none/http` chọn đúng provider; `RETOUCH_PROVIDER=none`) |
+
+### 13.4 Test thêm/sửa
+
+- **Thêm** `test/imagestudio-round8-hardening.test.js` (15 test): M03-01 (6 ca, gồm 248/250/240/200
+  + "đảo nhỏ" + câu cảnh báo), M03-02 (3 ca, gồm **đối chứng dương**), M03-04, M03-05 (2 ca),
+  M03-06 (3 ca, gồm "trần retouch chỉ siết được").
+- **Sửa** `test/imagestudio-matting.test.js`: khẳng định `Object.keys(mask)` deep-equal 4 field
+  đóng băng ⇒ nay kiểm 4 field đứng đầu + phần mở rộng phải nằm trong `MATTING_MASK_EXTRA_FIELDS`
+  (M03-01a yêu cầu `mask.boundary_delta`; đây là **mở rộng hợp đồng có chủ đích**, đã ghi §3.1).
+- **Commit** 9 file test MVP-03 (101 test) + `test/imagestudio-config-gap.probe.mjs` — trước vòng 8
+  chúng còn untracked nên commit `ac8efa9` không có test nào cho MVP-03 (M03-03/F3).
+
+### 13.5 Còn lại / chưa sửa được
+
+- **Mask alpha MỘT PHẦN vẫn được ghép** (có cảnh báo + số đếm): dịch vụ tách nền thật hay trả alpha
+  mềm, từ chối hết sẽ chặn cả đường `http` hợp lệ. Ngưỡng "alpha mềm bao nhiêu thì từ chối" cần
+  một provider thật để hiệu chỉnh — chưa đo được (không có service thật, `safeFetch` chặn mạng nội bộ).
+- **Ngưỡng biên (8/20/5%) là lựa chọn có ghi lý do, không phải số đo từ ảnh thật**: bộ dữ liệu đo
+  chỉ gồm ảnh tổng hợp. Ảnh chụp thật có bóng đổ mềm có thể bị TỪ CHỐI (đúng luật #3 fail-closed,
+  người dùng vẫn nhận ảnh chỉ-retouch + lý do tiếng Việt) — cần đo lại khi có ảnh thật.
+- **`tolerance`/`minUniformity`/ngưỡng biên không đưa ra biến môi trường** (cố ý): nới chúng qua
+  env là đổi luật fail-closed mà không qua hợp đồng.
+- Vẫn chưa đo: PostgreSQL, provider `http` thật, trình duyệt thật, nhiều job đồng thời (như §4 của
+  báo cáo phản biện đã ghi).

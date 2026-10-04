@@ -48,6 +48,16 @@ export const MATTING_RESULT_FIELDS = Object.freeze([
 export const MATTING_MASK_FIELDS = Object.freeze(['coverage', 'background_ratio', 'uniformity', 'seed_colors']);
 
 /**
+ * Số đo MỞ RỘNG của `mask` (thêm ở vòng 8 — M03-01a). KHÔNG thay 4 field đóng băng ở trên;
+ * đây là SỐ ĐO THẬT của vùng biên, chỉ provider nào đo được mới trả:
+ *   - `kept_bbox_ratio`: diện tích hộp bao phần giữ lại / diện tích ảnh;
+ *   - `boundary_delta` : `{max, p95, over_ratio, safe_delta, kept_count, kept_min, kept_p95,
+ *     kept_under_ratio, decisive_delta, suspicious}` — căn cứ để TỪ CHỐI khi đường cắt
+ *     không dứt khoát. Provider không đo ⇒ field VẮNG MẶT (không bịa số 0).
+ */
+export const MATTING_MASK_EXTRA_FIELDS = Object.freeze(['kept_bbox_ratio', 'boundary_delta']);
+
+/**
  * `MattingResult` — KHUÔN ĐÓNG BĂNG của kết quả (hợp đồng §3.1, giá trị trung tính).
  *
  * Đây là hình dạng dữ liệu, KHÔNG phải lớp: mọi kết quả thật do `createMattingResult()`
@@ -84,12 +94,16 @@ export function createMattingResult(partial = {}) {
     model: partial.model ?? '',
     is_mock: Boolean(partial.is_mock),
     output: partial.output ?? null,
-    // Chỉ 4 field đóng băng; field lạ do provider nhét vào bị bỏ (không phá hợp đồng).
+    // 4 field đóng băng + số đo MỞ RỘNG (chỉ khi provider thật sự đo được); field lạ khác
+    // vẫn bị bỏ để không ai nhét dữ liệu tuỳ ý vào hợp đồng.
     mask: {
       coverage: mask.coverage ?? null,
       background_ratio: mask.background_ratio ?? null,
       uniformity: mask.uniformity ?? null,
       seed_colors: mask.seed_colors ?? null,
+      ...Object.fromEntries(
+        MATTING_MASK_EXTRA_FIELDS.filter((key) => mask[key] !== undefined && mask[key] !== null).map((key) => [key, mask[key]]),
+      ),
     },
     kept_bbox: partial.kept_bbox ?? null,
     warnings: Array.isArray(partial.warnings) ? partial.warnings.filter((w) => typeof w === 'string') : [],

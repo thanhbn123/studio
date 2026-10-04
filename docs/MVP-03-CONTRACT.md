@@ -119,6 +119,10 @@ export function drawOverlay({ image, overlay, font }) → { buffer, applied, war
 background_ratio, warnings, elapsed_ms }`.
 Luật: ảnh vào và ảnh ra **cùng kích thước**; pixel **giữ lại** (mask = 0) phải **y hệt** ảnh gốc
 (so từng byte RGBA) trừ khi có retouch; nền chỉ được vẽ vào vùng mask > 0.
+**(vòng 8 — M03-05)** `composeImage` **chỉ ghép khi `matting.status === 'OK'`**; mọi trạng thái khác
+(kể cả khi vẫn kèm buffer) ⇒ trả BẢN SAO y nguyên + lý do tiếng Việt (trước đây mask của lượt
+matting ĐÃ THẤT BẠI vẫn đi vào ảnh ra). Mask có **alpha một phần** (0 < alpha < 255) vẫn được ghép
+nhưng phải ĐẾM và cảnh báo nổi bật (pixel đó ra bán trong suốt).
 
 **Overlay** (`drawOverlay`): `overlay = { text, x, y, size?, color?, align? }` — dùng font/layout của
 `src/imagelab/render`. Trả `{ buffer, applied: boolean, reason?, warnings }`. Overlay **không** được
@@ -166,6 +170,9 @@ export const RETOUCH_LIMITS = Object.freeze({ brightness: 0.25, contrast: 0.25, 
 âm thầm, KHÔNG bỏ qua). Tham số không phải số hữu hạn ⇒ vào `rejected[]`, coi như không truyền.
 `RetouchResult = { status: 'OK'|'NO_CHANGES'|'UNSUPPORTED_IMAGE'|'FAILED', output, params_effective,
 clamped: string[], rejected: string[], warnings, elapsed_ms, error_code }`.
+**(vòng 8 — M03-05)** `retouch_effective` (và `meta.retouch_effective`) chỉ được ghi khi THẬT SỰ có
+tham số hiệu lực: `status = 'NO_CHANGES'` hoặc `FAILED`/`UNSUPPORTED_IMAGE` ⇒ **= 0 ở cả 4 tham
+số**; `retouch_clamped`/`retouch_rejected` vẫn giữ nguyên để không mất vết kẹp.
 Retouch **không** được: đổi kích thước, dịch chuyển pixel, đổi kênh alpha của vùng trong suốt (nền đã
 tách phải giữ alpha = 0), hay thay màu theo kiểu “đổi chất liệu”.
 
@@ -176,7 +183,21 @@ tách phải giữ alpha = 0), hay thay màu theo kiểu “đổi chất liệu
   `422 OVERLAY_UNSUPPORTED_CLAIM` kèm danh sách vi phạm. `textGốcCủaJob` = ghép các vùng chữ OCR +
   tên sản phẩm + ghi chú người dùng (nếu có); rỗng ⇒ coi như không có bằng chứng ⇒ mọi khẳng định
   bị chặn.
-- Overlay **không** được chứa chữ Hán (chưa dịch) — dùng `hasCjk`.
+- **(vòng 8 — M03-02) BẰNG CHỨNG CHỈ ĐƯỢC LẤY TỪ DỮ LIỆU ĐÃ LƯU CỦA JOB:**
+  `jobs.product_name`, vùng chữ trong DB (`store.listOcrRegions` — gồm vùng `source='user'` của
+  MVP-02 IL-08) và ghi chú người dùng ĐÃ LƯU trong `content_meta` của job. **Bỏ hoàn toàn** việc
+  nhận `overlay.source_text|sourceText|source|notes|evidence|ocr_text|product_name…` (16 khoá) từ
+  client — kể cả trong `drawOverlay` (nay chỉ nhận `params.source_text` do SERVER truyền). Client
+  gửi khoá nào thì tên khoá đó được ghi lại (`client_evidence_ignored`) và **nói ra** trong
+  `warnings`; quyết định vẽ/không vẽ vẫn theo bằng chứng ĐÃ LƯU. Lý do: đúng lỗ "bằng chứng vòng"
+  đã bị bắt ở MVP-01 (`docs/VERIFICATION.md §7.1`) — client vừa phát ngôn vừa tự cấp bằng chứng
+  thì guardrail chỉ còn là thủ tục hình thức. Hệ quả: **không còn** nhánh "thấy client khai bằng
+  chứng thì bỏ qua 422" (F7) — preflight luôn chạy trên bằng chứng đã lưu nên MỌI biến thể client
+  khai bằng chứng đều **422**, 0 pixel chữ được vẽ.
+- Overlay **không** được chứa chữ CHƯA DỊCH — dùng `hasUntranslatedScript` (Hán + **kana +
+  Hangul**, thay `hasCjk` từ vòng 8 — M03-04) và kiểm **TRƯỚC** danh sách vi phạm số liệu để trả
+  đúng mã `OVERLAY_NOT_TRANSLATED` (trước đây `保修 12 个月` trả sai `OVERLAY_UNSUPPORTED_CLAIM`,
+  còn kana/Hangul chỉ không được vẽ vì bộ font 5×7 thiếu glyph — may mắn của font, không phải luật).
 
 ### 3.6 E4 — API (`src/http/routes.js`)
 
@@ -193,6 +214,25 @@ Luật: quyền sở hữu theo session (khác ⇒ **404**); validate ảnh bằ
 `maxImageBytes` + `maxPixels`; rate limit `rateLimiters.jobs`; lỗi qua `HttpError.safe` với câu
 tiếng Việt; thiếu module ⇒ `503 IMAGESTUDIO_UNAVAILABLE`; `GET /api/config` thêm khối
 `imagestudio: { available, templates, retouch_limits, matting:{name,is_mock,configured}, retouch:{...} }`.
+
+### 3.6b CẤU HÌNH (bổ sung vòng 8 — M03-06)
+
+`src/config.js` có ba khối mới (trước vòng 8 **không** có khoá nào ⇒ `IMAGESTUDIO_ENABLED=false`
+bị bỏ qua và `MATTING_PROVIDER`/`RETOUCH_PROVIDER` luôn rơi về `purejs`):
+
+| Biến môi trường | Khoá config | Mặc định | Ghi chú |
+|---|---|---|---|
+| `IMAGESTUDIO_ENABLED` | `imagestudio.enabled` | `true` | `false` ⇒ cả 5 route `/api/imagestudio/*` trả **503** + `/api/config.imagestudio.available=false` + `reason` |
+| `IMAGESTUDIO_DIR` | `imagestudio.dir` | `./data/imagestudio` | thư mục ảnh tạo ra |
+| `MATTING_PROVIDER` | `matting.provider` | `purejs` | `purejs`/`mock`/`http`/`none`; tên lạ ⇒ `UNKNOWN_PROVIDER` (fail-closed) |
+| `MATTING_BASE_URL`/`_API_KEY`/`_MODEL`/`_TIMEOUT_MS` | `matting.*` | rỗng / 60000 | `http` thiếu `baseUrl` ⇒ `NOT_CONFIGURED` |
+| `RETOUCH_PROVIDER` | `retouch.provider` | `purejs` | `purejs`/`mock`/`none` (không có `http`) |
+| `RETOUCH_MAX_BRIGHTNESS`/`_CONTRAST`/`_SATURATION`/`_SHARPEN` | `retouch.limits.*` | 0.25/0.25/0.30/0.50 | ⚠️ **CHỈ SIẾT ĐƯỢC**: ngưỡng hiệu lực = `min(cấu hình, RETOUCH_LIMITS §3.4)` |
+
+`COST_IMAGE_MATTING`/`COST_IMAGE_COMPOSE`/`COST_IMAGE_RETOUCH` thêm vào khối `cost`. Toàn bộ biến
+được ghi kèm chú thích tiếng Việt trong `.env.example`. Ngưỡng CHẤT LƯỢNG của thuật toán
+(`tolerance`, `minUniformity`, các ngưỡng biên) **không** đưa ra môi trường: siết/nới chúng qua env
+là đổi luật fail-closed.
 
 ### 3.7 E5 — UI (`public/**`)
 

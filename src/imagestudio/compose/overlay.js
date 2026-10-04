@@ -8,7 +8,8 @@
  *     `checkClaimWords(nguồn, overlay.text)` + `checkNumericClaims(nguồn, overlay.text)`.
  *     Có vi phạm ⇒ **KHÔNG vẽ một pixel nào**, trả ảnh gốc (bản sao) + `reason = 'OVERLAY_UNSUPPORTED_CLAIM'`.
  *     `nguồn` rỗng ⇒ không có bằng chứng ⇒ mọi khẳng định bị chặn (guardrail tự bắt).
- *     `overlay.text` còn chữ Hán chưa dịch (`hasCjk`) ⇒ `reason = 'OVERLAY_NOT_TRANSLATED'`.
+ *     `overlay.text` còn chữ chưa dịch (`hasUntranslatedScript`: Hán/kana/Hangul)
+ *     ⇒ `reason = 'OVERLAY_NOT_TRANSLATED'` (kiểm TRƯỚC danh sách vi phạm).
  *  3. **Trong biên ảnh**: hộp chữ được kẹp bằng `clampBox`/`intersectBoxWithImage` của
  *     `src/imagelab/geometry.js`; bị kẹp thì ghi `warnings`, không bao giờ tràn khung.
  *  4. **Bất biến ảnh gốc**: buffer ảnh vào không bao giờ bị sửa — mọi thao tác vẽ đều trên bản sao.
@@ -40,7 +41,7 @@ import {
 } from '../../imagelab/render/index.js';
 import { decodePng } from '../../imagelab/render/png.js';
 import { strictCoordinate } from '../../imagelab/geometry.js';
-import { checkClaimWords, checkNumericClaims, hasCjk } from '../../imagelab/translate/guardrails.js';
+import { checkClaimWords, checkNumericClaims, hasUntranslatedScript } from '../../imagelab/translate/guardrails.js';
 import { asBuffer, isBufferLike, readInputBuffer, readRawRgba } from './image-input.js';
 
 /** Mã lý do không vẽ — đóng băng để E3/E4/E5 và test không đoán sai chuỗi. */
@@ -99,40 +100,54 @@ function evidenceFrom(candidate) {
 }
 
 /**
- * Gom "text gốc của job" (mục 3.5) = OCR + tên sản phẩm + ghi chú người dùng.
+ * "Text gốc của job" (mục 3.5) — CHỈ nhận bằng chứng do SERVER truyền vào (`params.source_text`).
  *
- * Nhận nhiều cách gọi khác nhau (E3 chỉ cần truyền MỘT trong số đó) và **NỐI** tất cả
- * nguồn tìm được, đúng định nghĩa "ghép các vùng chữ OCR + tên sản phẩm + ghi chú".
- * Không tìm được nguồn nào ⇒ trả `''` = KHÔNG có bằng chứng ⇒ guardrail chặn mọi khẳng định.
+ * ⚠️ M03-02 (vòng 8): trước đây hàm này quét 16 khoá bằng chứng NGAY TRONG `overlay` của
+ * request (`source_text`, `notes`, `evidence`, `ocr_text`…). Nghĩa là client vừa phát ngôn
+ * vừa tự cấp bằng chứng cho phát ngôn đó ⇒ guardrail thành thủ tục hình thức. Đây đúng lỗ
+ * "bằng chứng vòng" mà `docs/VERIFICATION.md §7.1` gọi là lỗ hổng nặng nhất của MVP-01.
+ *
+ * Bằng chứng hợp lệ chỉ đến từ DỮ LIỆU ĐÃ LƯU của job (tên sản phẩm, vùng OCR, vùng do
+ * người dùng nhập, ghi chú đã lưu) và do tầng pipeline (server) gom rồi truyền xuống đây.
+ * Không tìm được nguồn nào ⇒ `''` = KHÔNG có bằng chứng ⇒ guardrail chặn mọi khẳng định.
  */
-function resolveSourceText(overlay, params) {
-  const keys = [
-    'source_text',
-    'sourceText',
-    'source',
-    'text_source',
-    'text_original',
-    'job_text',
-    'job_source',
-    'evidence',
-    'evidence_text',
-    'evidence_texts',
-    'original_text',
-    'ocr_text',
-    'product_name',
-    'user_note',
-    'note',
-    'notes',
-  ];
-  const parts = [];
-  for (const holder of [params, overlay]) {
-    if (!holder || typeof holder !== 'object') continue;
-    for (const key of keys) {
-      const text = evidenceFrom(holder[key]);
-      if (text) parts.push(text);
-    }
+function resolveSourceText(params) {
+  const holder = params && typeof params === 'object' ? params : {};
+  return evidenceFrom(holder.source_text);
+}
+
+/** Khoá bằng chứng client từng gửi được — chỉ để NÓI RA là đã bỏ qua, không dùng làm bằng chứng. */
+export const CLIENT_EVIDENCE_KEYS = Object.freeze([
+  'source_text',
+  'sourceText',
+  'source',
+  'text_source',
+  'text_original',
+  'job_text',
+  'job_source',
+  'evidence',
+  'evidence_text',
+  'evidence_texts',
+  'original_text',
+  'ocr_text',
+  'product_name',
+  'user_note',
+  'note',
+  'notes',
+]);
+
+/** Liệt kê khoá bằng chứng client gửi kèm trong `overlay` (để cảnh báo, KHÔNG để dùng). */
+export function clientEvidenceKeysIn(overlay) {
+  if (!overlay || typeof overlay !== 'object') return [];
+  const out = [];
+  for (const key of CLIENT_EVIDENCE_KEYS) {
+    const value = overlay[key];
+    if (typeof value === 'string' && value.trim()) out.push(key);
+    else if (Array.isArray(value) && value.some((line) => typeof line === 'string' && line.trim())) out.push(key);
+    // Vật thể `{ text: … }` cũng là "client khai bằng chứng" — không dùng, nhưng phải NÓI RA.
+    else if (value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0) out.push(key);
   }
-  return parts.join('\n');
+  return out;
 }
 
 /** Nhận font dưới 3 dạng: đối tượng font đã nạp, tên font ('5x7'), hoặc `{ name }`. */
@@ -179,16 +194,25 @@ export function drawOverlay({ image, overlay, font, ...params } = {}) {
   }
 
   // (1) Chống bịa — chữ CHƯA DỊCH bị chặn tuyệt đối (không phụ thuộc bằng chứng).
-  if (hasCjk(text)) {
+  //     M03-04 (vòng 8): dùng `hasUntranslatedScript` (Hán + kana + Hangul) thay `hasCjk` —
+  //     trước đây kana/Hangul chỉ không được vẽ vì bộ font 5×7 THIẾU GLYPH, tức là may mắn
+  //     của font chứ không phải luật. Đổi font là chữ chưa dịch sẽ được vẽ.
+  if (hasUntranslatedScript(text)) {
     return blocked(
       input,
       OVERLAY_REASONS.NOT_TRANSLATED,
-      'Overlay còn chữ Hán chưa dịch — KHÔNG vẽ (mục 3.5).',
+      'Overlay còn chữ Hán/kana/Hangul chưa dịch — KHÔNG vẽ (mục 3.5).',
     );
   }
 
-  // (2) Chống bịa — khẳng định/số liệu phải có trong text gốc của job.
-  const source = resolveSourceText(overlay, params);
+  // (2) Chống bịa — khẳng định/số liệu phải có trong text gốc ĐÃ LƯU của job.
+  const ignoredEvidenceKeys = clientEvidenceKeysIn(overlay);
+  if (ignoredEvidenceKeys.length > 0) {
+    warnings.push(
+      `BỎ QUA bằng chứng do client tự khai trong overlay (${ignoredEvidenceKeys.join(', ')}) — bằng chứng chỉ được lấy từ dữ liệu ĐÃ LƯU của job.`,
+    );
+  }
+  const source = resolveSourceText(params);
   const violations = [...checkClaimWords(source, text), ...checkNumericClaims(source, text)];
   if (violations.length > 0) {
     return blocked(

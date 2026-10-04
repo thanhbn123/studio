@@ -347,19 +347,6 @@ export function buildRouter(app) {
     return parts.join('\n');
   };
 
-  /** Client có tự khai bằng chứng không? (đúng những khoá mà `drawOverlay` coi là bằng chứng) */
-  const overlayHasClientEvidence = (options) => {
-    for (const holder of [options, options?.overlay]) {
-      if (!holder || typeof holder !== 'object') continue;
-      for (const key of IMAGESTUDIO_EVIDENCE_KEYS) {
-        const value = holder[key];
-        if (typeof value === 'string' && value.trim()) return true;
-        if (Array.isArray(value) && value.some((line) => typeof line === 'string' && line.trim())) return true;
-      }
-    }
-    return false;
-  };
-
   /**
    * Kiểm overlay TRƯỚC khi xếp hàng (§3.5) — để trả HTTP **422** ngay thay vì 202 rồi
    * người dùng ngồi chờ một tấm ảnh không bao giờ có chữ.
@@ -375,17 +362,23 @@ export function buildRouter(app) {
     const text = typeof overlay?.text === 'string' ? overlay.text.trim() : '';
     if (!text) return null; // không có chữ overlay ⇒ không có gì để chặn
 
-    // Client tự khai bằng chứng ⇒ để tầng VẼ phán quyết (route không phải nơi gom bằng
-    // chứng cuối cùng, chặn ở đây sẽ là 422 oan); `drawOverlay` vẫn kiểm và vẫn chặn.
-    if (overlayHasClientEvidence(options)) return null;
-
-    const [checkClaimWords, checkNumericClaims, hasCjk] = await Promise.all([
+    const [checkClaimWords, checkNumericClaims, hasUntranslatedScript] = await Promise.all([
       loadImagelabFunction('../imagelab/translate/guardrails.js', 'checkClaimWords'),
       loadImagelabFunction('../imagelab/translate/guardrails.js', 'checkNumericClaims'),
-      loadImagelabFunction('../imagelab/translate/guardrails.js', 'hasCjk'),
+      loadImagelabFunction('../imagelab/translate/guardrails.js', 'hasUntranslatedScript'),
     ]);
-    if (!checkClaimWords || !checkNumericClaims || !hasCjk) {
+    if (!checkClaimWords || !checkNumericClaims || !hasUntranslatedScript) {
       throw HttpError.safe(503, 'IMAGESTUDIO_UNAVAILABLE', 'Thiếu module kiểm chống bịa (guardrails) — chưa thể nhận chữ overlay.');
+    }
+
+    // M03-04: "chưa dịch" kiểm TRƯỚC danh sách vi phạm — cùng một câu vừa có chữ Hán vừa có
+    // số liệu thì lý do đúng là CHƯA DỊCH, không phải "khẳng định không có bằng chứng".
+    if (hasUntranslatedScript(text)) {
+      return {
+        code: 'OVERLAY_NOT_TRANSLATED',
+        message: 'Chữ overlay còn chữ Hán/kana/Hangul chưa dịch — KHÔNG vẽ (mục 3.5).',
+        violations: [],
+      };
     }
 
     let violations = [];
@@ -407,13 +400,6 @@ export function buildRouter(app) {
         code: 'OVERLAY_UNSUPPORTED_CLAIM',
         message: `Chữ overlay “${shown}” chứa khẳng định/số liệu không có bằng chứng trong chữ gốc của job — KHÔNG vẽ (mục 3.5).`,
         violations,
-      };
-    }
-    if (hasCjk(text)) {
-      return {
-        code: 'OVERLAY_NOT_TRANSLATED',
-        message: 'Chữ overlay còn chữ Hán/kana/Hangul chưa dịch — KHÔNG vẽ (mục 3.5).',
-        violations: [],
       };
     }
     return null;
@@ -2008,15 +1994,19 @@ function sanitizeImagestudioOverlay(raw) {
   const align = sanitizeText(raw.align, { maxLength: 16 });
   if (align) out.align = align;
 
-  // Bằng chứng do client khai: chuyển tiếp nguyên văn để tầng vẽ dùng ĐÚNG bằng chứng đó.
+  // M03-02 (vòng 8): bằng chứng do CLIENT khai bị BỎ HOÀN TOÀN — không chuyển xuống tầng vẽ,
+  // không dùng làm "chữ gốc của job". Bằng chứng chỉ lấy từ dữ liệu ĐÃ LƯU của job (tên sản
+  // phẩm, vùng OCR, vùng người dùng nhập, ghi chú đã lưu) — bài học "bằng chứng vòng" §7.1.
+  // Khoá nào client có gửi thì GHI LẠI TÊN để câu trả lời nói rõ là đã bỏ qua (không im lặng).
+  const ignored = [];
   for (const key of IMAGESTUDIO_EVIDENCE_KEYS) {
     const value = raw[key];
-    if (typeof value === 'string' && value.trim()) out[key] = sanitizeText(value, { maxLength: 2000 });
-    else if (Array.isArray(value)) {
-      const lines = value.filter((l) => typeof l === 'string' && l.trim()).map((l) => sanitizeText(l, { maxLength: 2000 }));
-      if (lines.length > 0) out[key] = lines;
-    }
+    const hasText = typeof value === 'string' && value.trim();
+    const hasLines = Array.isArray(value) && value.some((l) => typeof l === 'string' && l.trim());
+    const hasObject = value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0;
+    if (hasText || hasLines || hasObject) ignored.push(key);
   }
+  if (ignored.length > 0) out.client_evidence_ignored = ignored;
   return out;
 }
 

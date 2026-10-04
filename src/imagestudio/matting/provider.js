@@ -175,6 +175,15 @@ export class MattingProvider {
           error_message: message,
         });
       }
+      // M03-01a (vòng 8): GIỮ các số đo MỞ RỘNG mà provider trả (số đo thật của vùng biên,
+      // tỉ lệ hộp bao…) — chúng là căn cứ để người dùng/phản biện đọc, không phải lời khai
+      // về ảnh. Chỉ 4 số đo hợp đồng ở trên mới bị kiểm kiểu; phần mở rộng đi nguyên.
+      for (const [key, value] of Object.entries(mask)) {
+        if (key in stats) continue;
+        if (value === null || value === undefined) continue;
+        if (key === 'kept_bbox_ratio' && !isRatio(value)) continue;
+        stats[key] = value;
+      }
       mask = stats;
       if (Object.values(stats).some((v) => v === null)) {
         partialWarnings.push(

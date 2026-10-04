@@ -41,9 +41,14 @@ function readMask(matting, reasons) {
     reasons.push('Job không có kết quả tách nền (matting = null).');
     return null;
   }
+  // M03-05 (vòng 8): CHỈ ghép khi matting `OK`. Trước đây hàm này chỉ GHI LÝ DO rồi vẫn đọc
+  // mask nếu có buffer — mask của một lượt matting ĐÃ THẤT BẠI (hoặc provider tự khai FAILED
+  // mà vẫn kèm ảnh) đi thẳng vào ảnh ra. Nay: mọi trạng thái khác `OK` ⇒ trả `null` NGAY
+  // (passthrough + lý do), kể cả khi có buffer.
   const status = matting.status;
   if (typeof status === 'string' && status !== 'OK') {
-    reasons.push(`Tách nền không thành công (matting.status = ${status}).`);
+    reasons.push(`Tách nền không thành công (matting.status = ${status}) — KHÔNG ghép nền.`);
+    return null;
   }
   // Chấp nhận cả `matting.output.buffer` (hợp đồng 3.1) lẫn mask thô (`matting` chính là buffer).
   const raw = readInputBuffer(matting.output) ?? readInputBuffer(matting);
@@ -133,7 +138,23 @@ export function composeImage({ image, matting, template, options } = {}) {
     return passthroughResult({ imageBuffer, imageInfo, maskInfo, template: resolvedTemplate, warnings, started });
   }
 
-  // (2) Ghép: nền MÔ PHỎNG chỉ ghi vào pixel alpha === 0; pixel giữ lại giữ nguyên từng byte.
+  // (2) Ghép: nền MÔ PHỎNG chỉ ghi vào pixel alpha === 0; pixel NGOÀI vùng đã tách giữ
+  //     nguyên từng byte. (Vùng "đã tách" là do MÁY đoán theo màu nền — xem cảnh báo bên dưới.)
+  //
+  // M03-05 (vòng 8): mask có alpha MỘT PHẦN (0 < alpha < 255) nghĩa là pixel sản phẩm sẽ ra
+  // bán trong suốt. Vẫn ghép (dịch vụ matting thật hay trả alpha mềm) nhưng phải ĐO và NÓI RA.
+  let partialAlpha = 0;
+  for (let i = 3; i < maskInfo.pixels.length; i += 4) {
+    const a = maskInfo.pixels[i];
+    if (a !== 0 && a !== 255) partialAlpha += 1;
+  }
+  if (partialAlpha > 0) {
+    warnings.push(
+      `Mask nền có ${partialAlpha} pixel alpha MỘT PHẦN (0 < alpha < 255) — vùng đó sẽ ra bán trong suốt; ` +
+        'hãy kiểm ảnh TRƯỚC|SAU (mask mềm thường đến từ dịch vụ tách nền ngoài).',
+    );
+  }
+
   const width = maskInfo.width;
   const height = maskInfo.height;
   const total = width * height;
@@ -158,7 +179,10 @@ export function composeImage({ image, matting, template, options } = {}) {
   }
 
   warnings.push(
-    `Đã ghép nền MÔ PHỎNG "${resolvedTemplate.label}" vào ${backgroundPixels}/${total} pixel nền (tỉ lệ ${backgroundRatio}); pixel giữ lại giữ nguyên từng byte.`,
+    // M03-01c (vòng 8): KHÔNG khẳng định "pixel sản phẩm giữ nguyên" — vùng giữ lại do MÁY
+    // đoán theo màu nền; chỉ nói điều ĐO ĐƯỢC (pixel NGOÀI vùng đã tách) và mời người dùng kiểm.
+    `Đã ghép nền MÔ PHỎNG "${resolvedTemplate.label}" vào ${backgroundPixels}/${total} pixel nền (tỉ lệ ${backgroundRatio}); ` +
+      'pixel NGOÀI vùng đã tách giữ nguyên từng byte — vùng đã tách do máy đoán theo màu nền, hãy mở ảnh TRƯỚC|SAU để kiểm.',
     'Nền do hệ thống sinh ra là MÔ PHỎNG (không phải ảnh thật).',
   );
 

@@ -39,7 +39,7 @@ import { JOB_STATUS, VERIFICATION_LEVELS } from '../store/index.js';
 import { sniffImageMime } from '../security/sanitize.js';
 import { probeImage } from '../imagelab/render/image.js';
 import { TEMPLATE_IDS, composeImage, drawOverlay, findTemplate } from './compose/index.js';
-import { RETOUCH_LIMITS, RETOUCH_PARAM_NAMES, clampRetouchParams } from './retouch/index.js';
+import { RETOUCH_LIMITS, RETOUCH_PARAM_NAMES, clampRetouchParams, zeroRetouchParams } from './retouch/index.js';
 
 /** Các bước của một job MVP-03 (hợp đồng §3.3 — ĐÓNG BĂNG, C5/E5 hiện tiến trình theo đây). */
 export const IMAGESTUDIO_STAGES = Object.freeze([
@@ -414,11 +414,17 @@ export class ImageGenerationPipeline {
   }
 
   /**
-   * "Text gốc của job" để chống bịa overlay (hợp đồng §3.5):
-   * tên sản phẩm + các vùng chữ đã có trong DB (người dùng nhập tay hoặc OCR) + nguồn client gửi.
+   * "Text gốc của job" để chống bịa overlay (hợp đồng §3.5) — CHỈ từ DỮ LIỆU ĐÃ LƯU:
+   *   · `jobs.product_name` (tên sản phẩm của chính job);
+   *   · vùng chữ trong DB (`store.listOcrRegions`) — gồm cả vùng do NGƯỜI DÙNG nhập tay
+   *     của MVP-02 IL-08 (`source = 'user'`);
+   *   · ghi chú người dùng ĐÃ LƯU trong `content_meta` của job.
+   *
+   * ⚠️ M03-02 (vòng 8): KHÔNG nhận `overlay.source_text|notes|evidence|ocr_text…` từ request
+   * nữa — client vừa phát ngôn vừa tự cấp bằng chứng là lỗ "bằng chứng vòng" (§7.1).
    * Rỗng ⇒ KHÔNG có bằng chứng ⇒ guardrail chặn mọi khẳng định (fail-closed).
    */
-  async #evidenceText(jobId, job, overlay) {
+  async #evidenceText(jobId, job) {
     const parts = [];
     const productName = String(job?.product_name ?? '').trim();
     if (productName) parts.push(productName);
@@ -435,9 +441,14 @@ export class ImageGenerationPipeline {
       .join('\n');
     if (regionText) parts.push(regionText);
 
-    for (const key of ['source_text', 'sourceText', 'source', 'notes', 'note', 'user_note', 'text_original', 'ocr_text', 'product_name']) {
-      const text = textFrom(overlay?.[key]);
-      if (text) parts.push(text);
+    // Ghi chú người dùng ĐÃ LƯU trong job (không phải ghi chú client gửi kèm lượt này).
+    const meta = job?.content_meta && typeof job.content_meta === 'object' ? job.content_meta : {};
+    for (const holder of [meta.imagestudio, meta.imagelab]) {
+      if (!holder || typeof holder !== 'object') continue;
+      for (const key of ['notes', 'note', 'user_note', 'source_text']) {
+        const text = textFrom(holder[key]);
+        if (text) parts.push(text);
+      }
     }
     return parts.join('\n');
   }
@@ -916,10 +927,21 @@ export class ImageGenerationPipeline {
             },
           });
         } else if (retouch.status === 'NO_CHANGES') {
-          warnings.push('Retouch KHÔNG đổi gì (NO_CHANGES) — không tính là đã làm, không ghi usage IMAGE_RETOUCH.');
+          // M03-05 (vòng 8): KHÔNG pixel nào đổi ⇒ KHÔNG được ghi `retouch_effective` như thể
+          // đã retouch (dấu vết nói sai — cùng lớp lỗi F-03/N-3 của MVP-02). Tham số bị KẸP
+          // vẫn giữ nguyên trong `params_clamped`/`params_rejected` để không mất vết.
+          retouchEffective = zeroRetouchParams();
+          retouch = { ...retouch, params_effective: retouchEffective };
+          warnings.push(
+            'Retouch KHÔNG đổi gì (NO_CHANGES) — không tính là đã làm, không ghi usage IMAGE_RETOUCH, ' +
+              'và `retouch_effective` để 0 (tham số bị kẹp vẫn nằm trong `retouch_clamped`).',
+          );
         } else {
           const code = String(retouch.error_code || `RETOUCH_${retouch.status}`);
           const message = `Retouch không chạy được (${retouch.status}/${code}) — ảnh giữ nguyên bước trước đó.`;
+          // Không áp được tham số nào ⇒ `retouch_effective` = 0 (không bịa là đã retouch).
+          retouchEffective = zeroRetouchParams();
+          retouch = { ...retouch, params_effective: retouchEffective };
           warnings.push(message);
           failures.push({ step: 'retouch', code, message });
         }
@@ -931,7 +953,15 @@ export class ImageGenerationPipeline {
     let overlay = null;
     let overlayApplied = false;
     if (overlayInput && String(overlayInput.text ?? '').trim() !== '') {
-      const sourceText = await this.#evidenceText(jobId, job, overlayInput);
+      const sourceText = await this.#evidenceText(jobId, job);
+      // Nói THẲNG nếu client gửi kèm "bằng chứng" — nó bị bỏ qua, không được dùng để biện minh.
+      const ignoredEvidence = Array.isArray(overlayInput?.client_evidence_ignored) ? overlayInput.client_evidence_ignored : [];
+      if (ignoredEvidence.length > 0) {
+        warnings.push(
+          `BỎ QUA bằng chứng do client tự khai trong overlay (${ignoredEvidence.map(String).join(', ')}) — ` +
+            'bằng chứng chỉ được lấy từ dữ liệu ĐÃ LƯU của job (tên sản phẩm, vùng chữ, ghi chú đã lưu).',
+        );
+      }
       let drawn = null;
       try {
         drawn = drawOverlay({

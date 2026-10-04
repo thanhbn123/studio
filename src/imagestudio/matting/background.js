@@ -18,8 +18,45 @@
 
 import { Buffer } from 'node:buffer';
 
-/** Ngưỡng màu mặc định trên thang 0..255 (≈ 28/255 như hợp đồng §3.1). */
-export const DEFAULT_TOLERANCE = 28;
+/**
+ * Ngưỡng màu mặc định trên thang 0..255.
+ *
+ * ⚠️ M03-01 (vòng 8): hạ 28 → **12**. Với 28, sản phẩm TRẮNG/KEM trên nền trắng (đồ trắng
+ * chụp trên nền trắng — kiểu ảnh TMĐT phổ biến nhất) có khoảng cách màu ≈ 26 ≤ 28 nên bị
+ * flood fill coi là NỀN ⇒ xoá sạch sản phẩm mà job vẫn báo `succeeded`. 12/255 vẫn đủ rộng
+ * cho nhiễu nén/nhiễu cảm biến nhẹ của nền studio, nhưng chặn được ca "sản phẩm gần màu nền".
+ */
+export const DEFAULT_TOLERANCE = 12;
+
+/**
+ * Ngưỡng SIẾT để soi BIÊN vùng đã tách (M03-01a).
+ *
+ * Sau khi loang, mọi pixel bị coi là nền đều có Δ ≤ `tolerance` (theo định nghĩa). Pixel nền
+ * NẰM SÁT biên (kề với pixel được giữ lại) là pixel QUYẾT ĐỊNH đường cắt. Nếu chúng có
+ * Δ > ngưỡng siết này, đường cắt đang được quyết định bởi những pixel "lưng chừng" — dấu
+ * hiệu mask đang cắt ngang qua sản phẩm (viền mờ, bóng đổ, hoặc sản phẩm quá gần màu nền)
+ * ⇒ TỪ CHỐI, không lưu ảnh.
+ */
+export const BOUNDARY_DELTA_SAFE = 8;
+
+/**
+ * Tỉ lệ pixel biên vượt `BOUNDARY_DELTA_SAFE` được phép coi là "còn sạch".
+ * 0.05 = 5%: đủ chỗ cho vài pixel lẻ (nhiễu nén) nhưng bắt được vùng biên mờ/bóng đổ.
+ */
+export const BOUNDARY_OVER_RATIO_MAX = 0.05;
+
+/**
+ * Ngưỡng "DỨT KHOÁT" phía pixel ĐƯỢC GIỮ LẠI (M03-01a, vòng 8).
+ *
+ * Pixel được giữ lại mà nằm SÁT vùng nền đã tách chính là pixel QUYẾT ĐỊNH đường cắt. Nếu
+ * nó chỉ khác màu nền chút xíu (Δ < 20/255) thì đường cắt nằm giữa vùng "lưng chừng": ta
+ * KHÔNG biết đó là sản phẩm hay chỉ là bóng đổ/nền tối dần ⇒ không được đoán. Δ ≥ 20/255
+ * mới coi là "khác nền rõ ràng" (sản phẩm thật).
+ *
+ * Vì sao 20: sản phẩm TMĐT thật (kể cả đồ trắng) thường cách nền ≥ 20/255 ở BIÊN có đèn;
+ * dưới ngưỡng đó, thà trả ảnh chỉ-retouch (luật #3 fail-closed) còn hơn cắt vào sản phẩm.
+ */
+export const BOUNDARY_DECISIVE_DELTA = 20;
 /** Tỉ lệ pixel viền tối thiểu thuộc cụm màu chủ đạo để coi nền là "đồng nhất". */
 export const DEFAULT_MIN_UNIFORMITY = 0.75;
 /** Số ô lượng tử màu cho mỗi kênh khi gom cụm (16 ⇒ 16×16×16 = 4096 ô). */
@@ -258,6 +295,70 @@ export function applyAlphaMask(pixels, similar, { width, height }) {
     if (similar[i] === 2) out[i * 4 + 3] = 0;
   }
   return out;
+}
+
+/**
+ * ĐO BIÊN vùng đã tách (M03-01a) — "số đo thật", không đoán. Đo CẢ HAI PHÍA của đường cắt:
+ *
+ *   • phía NỀN ĐÃ TÁCH, kề pixel được giữ lại (`removed_*`): pixel quyết định đường cắt mà
+ *     vẫn "lưng chừng" (Δ > `safeDelta`) ⇒ đường cắt mờ, dễ cắt lẹm sản phẩm;
+ *   • phía ĐƯỢC GIỮ LẠI, kề pixel nền đã tách (`kept_*`): nếu nó chỉ khác nền chút xíu
+ *     (Δ < `decisiveDelta`) ⇒ đường cắt rơi vào vùng nước đôi (bóng đổ/nền tối dần/sản phẩm
+ *     gần màu nền) ⇒ KHÔNG được đoán.
+ *
+ * Đầu ra giữ ĐÚNG các khoá hợp đồng `{max, p95, over_ratio}` (đo phía nền đã tách) và thêm
+ * các khoá đo phía giữ lại để câu kết luận nói được căn cứ.
+ *
+ * @returns {{count:number, max:number, p95:number, over_ratio:number, safe_delta:number,
+ *            kept_count:number, kept_min:number, kept_p95:number, kept_under_ratio:number,
+ *            decisive_delta:number, suspicious:boolean}}
+ */
+export function measureBoundaryDelta(pixels, similar, {
+  width,
+  height,
+  target,
+  safeDelta = BOUNDARY_DELTA_SAFE,
+  decisiveDelta = BOUNDARY_DECISIVE_DELTA,
+}) {
+  const removed = [];
+  const kept = [];
+  const deltaAt = (i) => {
+    const p = i * 4;
+    return colorDistance(pixels[p], pixels[p + 1], pixels[p + 2], target.r, target.g, target.b);
+  };
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const i = y * width + x;
+      const here = similar[i] === 2 ? 2 : 0;
+      let touchesOther = false;
+      if (x > 0 && (similar[i - 1] === 2 ? 2 : 0) !== here) touchesOther = true;
+      if (!touchesOther && x + 1 < width && (similar[i + 1] === 2 ? 2 : 0) !== here) touchesOther = true;
+      if (!touchesOther && y > 0 && (similar[i - width] === 2 ? 2 : 0) !== here) touchesOther = true;
+      if (!touchesOther && y + 1 < height && (similar[i + width] === 2 ? 2 : 0) !== here) touchesOther = true;
+      if (!touchesOther) continue;
+      (here === 2 ? removed : kept).push(deltaAt(i));
+    }
+  }
+
+  const p95Of = (list) => (list.length === 0 ? 0 : list[Math.min(list.length - 1, Math.floor(list.length * 0.95))]);
+  removed.sort((a, b) => a - b);
+  kept.sort((a, b) => a - b);
+  const overRatio = removed.length === 0 ? 0 : removed.filter((d) => d > safeDelta).length / removed.length;
+  const underRatio = kept.length === 0 ? 0 : kept.filter((d) => d < decisiveDelta).length / kept.length;
+
+  return {
+    count: removed.length,
+    max: Number((removed[removed.length - 1] ?? 0).toFixed(2)),
+    p95: Number(p95Of(removed).toFixed(2)),
+    over_ratio: Number(overRatio.toFixed(4)),
+    safe_delta: safeDelta,
+    kept_count: kept.length,
+    kept_min: Number((kept[0] ?? 0).toFixed(2)),
+    kept_p95: Number(p95Of(kept).toFixed(2)),
+    kept_under_ratio: Number(underRatio.toFixed(4)),
+    decisive_delta: decisiveDelta,
+    suspicious: overRatio > BOUNDARY_OVER_RATIO_MAX || underRatio > BOUNDARY_OVER_RATIO_MAX,
+  };
 }
 
 /**

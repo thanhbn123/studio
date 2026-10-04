@@ -24,6 +24,7 @@ export {
   BACKGROUND_RATIO_BOUNDS,
   MATTING_RESULT_FIELDS,
   MATTING_MASK_FIELDS,
+  MATTING_MASK_EXTRA_FIELDS,
   MattingResult,
   createMattingResult,
   emptyMask,
