@@ -97,6 +97,55 @@ Luật:
   (mặc định 0.75) ⇒ `status = 'UNIFORM_BACKGROUND_NOT_FOUND'`, `output = null`, kèm số đo thật.
 - `background_ratio` < 0.05 hoặc > 0.98 ⇒ nghi ngờ (ảnh toàn nền / không tách được) ⇒ fail-closed
   với `error_code = 'SUSPICIOUS_MASK'`.
+- **(vòng 8 — M03-01a)** `tolerance` mặc định = **12/255** (trước là 28: sản phẩm trắng/kem trên
+  nền trắng có Δ≈26 ≤ 28 nên bị coi là NỀN ⇒ xoá sạch sản phẩm mà job vẫn báo `succeeded`).
+  Sau khi loang phải **SOI BIÊN hai phía**: `measureBoundaryDelta` đo phía NỀN
+  (`max`/`p95`/`over_ratio` so với `BOUNDARY_DELTA_SAFE = 8/255`) và phía GIỮ LẠI
+  (`kept_min`/`kept_under_ratio` so với `BOUNDARY_DECISIVE_DELTA = 20/255`).
+- **(vòng 8 — M03-01b) SIẾT `SUSPICIOUS_MASK`** — thêm hai ngưỡng, ghi rõ vì sao:
+  `SUSPICIOUS_COVERAGE_MIN = 0.02` (giữ lại < 2% ảnh ⇒ gần như đã xoá sạch sản phẩm) và cặp
+  `SUSPICIOUS_BACKGROUND_RATIO = 0.80` + `SUSPICIOUS_KEPT_BBOX_RATIO = 0.10` (nền đã tách > 80% mà
+  hộp bao phần giữ lại < 10% khung ⇒ dấu hiệu "chỉ còn logo sống sót"). Ảnh TMĐT thật có sản phẩm
+  chiếm ≥ 10% khung; dưới ngưỡng đó thà trả ảnh chỉ-retouch (luật #3).
+- **(vòng 9 — N1) PHÂN LOẠI BA NHÁNH** (vòng 8 gộp cả hai vào `SUSPICIOUS_MASK` ⇒ ảnh có bóng đổ
+  mềm, mask ĐÚNG, bị tố là "nghi ngờ ăn mất sản phẩm" — sai nguyên nhân và chặn oan):
+  · **NGUY HIỂM** ⇒ `status = 'FAILED'` + `error_code = 'SUSPICIOUS_MASK'`, câu *"TỪ CHỐI kết quả
+    tách nền (nghi ngờ ĂN MẤT SẢN PHẨM)…"*: tỉ lệ nền ngoài khoảng an toàn, giữ lại <
+    `SUSPICIOUS_COVERAGE_MIN`, "đảo nhỏ" giữa nền lớn, **hoặc** `dirty_removed_ratio >
+    AMBIGUOUS_DIRTY_AREA_MAX = 0.15` (một MẢNG LỚN không-phải-nền đã bị ăn; đo trên ảnh tổng hợp:
+    bóng đổ mềm ~0.03, ca ăn sản phẩm ~0.30);
+  · **NHẬP NHẰNG** ⇒ `status = 'SEGMENTATION_AMBIGUOUS'` + cùng tên mã, câu *"BIÊN NHẬP NHẰNG nên
+    KHÔNG GHÉP NỀN (sản phẩm vẫn được giữ nguyên)… ảnh của bạn vẫn được RETOUCH…"*: phía NỀN có
+    pixel lưng chừng nhưng diện tích bẩn nhỏ (bóng đổ mềm/viền mờ). Mặc định **KHÔNG ghép nền**;
+  · **ĐẠT** ⇒ `OK`. Viền sản phẩm gần màu nền (`kept_under_ratio` cao) **một mình** KHÔNG hạ trạng
+    thái (phía nền sạch nghĩa là flood fill giữ ĐÚNG sản phẩm — ca sản phẩm trắng/kem 244–248),
+    chỉ thêm một câu *"Lưu ý: … hãy kiểm ảnh TRƯỚC|SAU"*.
+- **`options.matting_allow_ambiguous = true`** (API; UI có checkbox “Vẫn ghép nền dù biên nhập
+  nhằng”): với ca NHẬP NHẰNG, người dùng chấp nhận ghép nền ⇒ `status = OK`,
+  `mask.ambiguous_override = true`, `content_meta.imagestudio.matting.ambiguous_override = true`,
+  `asset.meta.matting.ambiguous_override = true` + warning nổi bật *"⚠️ ĐÃ BỎ QUA cảnh báo BIÊN
+  NHẬP NHẰNG theo yêu cầu người dùng…"*. **Mặc định vẫn là KHÔNG ghép.**
+- **(vòng 9 — N2) GIỚI HẠN VẬT LÝ:** sản phẩm chỉ khác nền **≤ 8/255** (`BOUNDARY_DELTA_SAFE`)
+  KHÔNG THỂ phân biệt với nền bằng phương pháp đo màu ⇒ flood fill coi là nền và có thể ăn im lặng
+  (đo được: `sản phẩm 251 + logo → OK, cov tụt 0.4307 → 0.1329`). Đây là giới hạn của phương pháp
+  (không phải lỗi lập luận); cần tách được ca đó thì phải dùng provider `http`/AI.
+- **(vòng 9 — N6) PROVIDER NGOÀI KHÔNG ĐO BIÊN:** chỉ `purejs` gọi `measureBoundaryDelta`; mọi
+  provider khác ⇒ `mask.boundary_checked = false` + warning *"Provider … KHÔNG đo được biên vùng
+  tách (chỉ provider "purejs" đo được) — hãy kiểm ảnh TRƯỚC|SAU trước khi dùng."* Đường `http`
+  **chưa đo end-to-end** (xem `docs/VERIFICATION.md §14.4`).
+- **(vòng 8 + 9) `mask` có thêm số đo MỞ RỘNG** (không thay 4 field đóng băng):
+  `kept_bbox_ratio`, `boundary_delta = {count, max, p95, over_ratio, safe_delta, kept_count,
+  kept_min, kept_p95, kept_under_ratio, decisive_delta, dirty_removed, dirty_removed_ratio,
+  suspicious}`, `boundary_checked`, `ambiguous_override` — SỐ ĐO THẬT để người dùng và phản biện
+  đọc được căn cứ; provider không đo thì field VẮNG MẶT (không bịa số 0).
+  **(vòng 9 — N3)** `summarizeMatting` chuyển tiếp các số đo này ⇒ có mặt ở
+  `content_meta.imagestudio.matting.mask`, `GET /api/imagestudio/jobs/:id → matting.mask`,
+  `asset.meta.matting` và UI (khối “Số đo vùng tách nền”: Δp95, `over_ratio`, `kept_under_ratio`,
+  `dirty_removed_ratio`, cờ override).
+- **(vòng 8 — M03-01c) CÂU CHỮ:** provider KHÔNG được khẳng định "pixel sản phẩm giữ nguyên" (vùng
+  "sản phẩm" do máy đoán). Câu đúng: *"Pixel NGOÀI vùng đã tách giữ nguyên từng byte; vùng đã tách
+  do máy đoán theo màu nền — hãy mở ảnh TRƯỚC|SAU để kiểm."* UI hiện cảnh báo nổi bật **cho MỌI
+  lượt có tách nền**.
 - Không được sửa `image.buffer` tại chỗ; `output.sha256` là hash ảnh ĐẦU RA; ảnh vào phải giữ nguyên.
 - Provider `mock`: trả mask giả cố định, `is_mock = true`, `output` = bản sao ảnh vào (KHÔNG tách thật).
 - `http`/`none`: như các provider khác của dự án (POST `{image_base64, options}` → `{image_base64, mask}`;
@@ -194,6 +243,16 @@ tách phải giữ alpha = 0), hay thay màu theo kiểu “đổi chất liệu
   thì guardrail chỉ còn là thủ tục hình thức. Hệ quả: **không còn** nhánh "thấy client khai bằng
   chứng thì bỏ qua 422" (F7) — preflight luôn chạy trên bằng chứng đã lưu nên MỌI biến thể client
   khai bằng chứng đều **422**, 0 pixel chữ được vẽ.
+- **(vòng 9 — N5) TRUY VẾT BẰNG CHỨNG:** kết quả overlay (kể cả khi BỊ CHẶN) mang
+  `evidence_used = { sources: ['product_name'|'ocr_region'|'user_region'|'job_notes'], region_ids:
+  [...], chars: N }` — có ở `content_meta.imagestudio.overlay`, trong kết quả `POST /generate`,
+  `asset.meta.overlay` và UI (*“Bằng chứng dùng để duyệt chữ overlay: tên sản phẩm (đã lưu); vùng
+  chữ do người dùng nhập (đã lưu) — vùng: #u1…”*). **Nguyên tắc:** dữ liệu NGƯỜI DÙNG ĐÃ LƯU vào
+  job (`product_name` qua `PUT /api/jobs/:id/content`, vùng chữ qua
+  `PUT /api/imagelab/jobs/:id/regions` với `source='user'`, ghi chú đã lưu trong `content_meta`)
+  **là bằng chứng HỢP LỆ** — khác hẳn "client khai bằng chứng trong chính request", thứ đã bị CẤM
+  ở M03-02: dữ liệu đó phải đi qua một route riêng, ghi BỀN vào DB, có dấu vết (`source`,
+  `edited_by_user`), không phải field dùng-một-lần.
 - Overlay **không** được chứa chữ CHƯA DỊCH — dùng `hasUntranslatedScript` (Hán + **kana +
   Hangul**, thay `hasCjk` từ vòng 8 — M03-04) và kiểm **TRƯỚC** danh sách vi phạm số liệu để trả
   đúng mã `OVERLAY_NOT_TRANSLATED` (trước đây `保修 12 个月` trả sai `OVERLAY_UNSUPPORTED_CLAIM`,
@@ -223,7 +282,7 @@ bị bỏ qua và `MATTING_PROVIDER`/`RETOUCH_PROVIDER` luôn rơi về `purejs`
 | Biến môi trường | Khoá config | Mặc định | Ghi chú |
 |---|---|---|---|
 | `IMAGESTUDIO_ENABLED` | `imagestudio.enabled` | `true` | `false` ⇒ cả 5 route `/api/imagestudio/*` trả **503** + `/api/config.imagestudio.available=false` + `reason` |
-| `IMAGESTUDIO_DIR` | `imagestudio.dir` | `./data/imagestudio` | thư mục ảnh tạo ra |
+| ~~`IMAGESTUDIO_DIR`~~ | ~~`imagestudio.dir`~~ | — | **BỎ ở vòng 9 (N4)**: không dòng mã nào đọc ⇒ config chết. Ảnh gốc VÀ ảnh tạo ra dùng CHUNG kho `IMAGELAB_DIR` (`src/imagelab/storage.js`) |
 | `MATTING_PROVIDER` | `matting.provider` | `purejs` | `purejs`/`mock`/`http`/`none`; tên lạ ⇒ `UNKNOWN_PROVIDER` (fail-closed) |
 | `MATTING_BASE_URL`/`_API_KEY`/`_MODEL`/`_TIMEOUT_MS` | `matting.*` | rỗng / 60000 | `http` thiếu `baseUrl` ⇒ `NOT_CONFIGURED` |
 | `RETOUCH_PROVIDER` | `retouch.provider` | `purejs` | `purejs`/`mock`/`none` (không có `http`) |

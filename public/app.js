@@ -210,6 +210,8 @@ const state = {
     options: {
       template: 'trang',
       remove_background: true,
+      // N1 (vòng 9): mặc định KHÔNG bỏ qua cảnh báo biên nhập nhằng.
+      matting_allow_ambiguous: false,
       retouch: { brightness: 0, contrast: 0, saturation: 0, sharpen: 0 },
       overlay_text: '',
     },
@@ -2213,7 +2215,9 @@ const IS_OVERLAY_CLAIM_NOTE = 'Chữ có khẳng định (bảo hành, chứng n
 
 const IS_MATTING_FAIL_TEXT = {
   UNIFORM_BACKGROUND_NOT_FOUND: 'Không tách được nền: nền không đủ đồng nhất nên hệ thống TỪ CHỐI cắt (fail-closed). Ảnh chỉ được retouch, nền gốc giữ nguyên.',
-  SUSPICIOUS_MASK: 'Không tách được nền: mặt nạ bị nghi ngờ (tỉ lệ nền quá lớn hoặc quá nhỏ) nên hệ thống TỪ CHỐI cắt. Ảnh chỉ được retouch, nền gốc giữ nguyên.',
+  SUSPICIOUS_MASK: 'TỪ CHỐI tách nền vì NGHI NGỜ ĐÃ ĂN MẤT SẢN PHẨM (một mảng lớn không-phải-nền bị cắt, hoặc phần giữ lại quá nhỏ). Ảnh chỉ được retouch, nền gốc giữ nguyên.',
+  // N1 (vòng 9): KHÁC hẳn "nghi ngờ ăn mất sản phẩm" — mask bao ĐÚNG sản phẩm, chỉ mờ ở viền.
+  SEGMENTATION_AMBIGUOUS: 'KHÔNG GHÉP NỀN vì biên nhập nhằng (bóng đổ mềm / viền mờ / sản phẩm sáng gần màu nền) — sản phẩm vẫn được giữ nguyên. Ảnh của bạn vẫn được retouch theo tham số; muốn ghép nền hãy dùng ảnh có nền phẳng hơn, hoặc bật “Vẫn ghép nền dù biên nhập nhằng” (có ghi vết).',
   SEGMENTATION_FAILED: 'Không tách được nền: hệ thống không đủ tự tin nên TỪ CHỐI cắt (fail-closed). Ảnh chỉ được retouch, nền gốc giữ nguyên.',
   UNSUPPORTED_IMAGE: 'Ảnh không giải mã được ở bước tách nền. Ảnh chỉ được retouch, nền gốc giữ nguyên.',
   NOT_CONFIGURED: 'Không tách được nền: provider tách nền chưa được cấu hình. Ảnh chỉ được retouch, nền gốc giữ nguyên.',
@@ -2379,6 +2383,8 @@ function isJobOptions() {
   }
   const overlayText = String(o.overlay_text ?? '').trim();
   const options = { template: o.template || null, remove_background: o.remove_background !== false };
+  // N1: chỉ gửi khi người dùng THẬT SỰ bật (mặc định máy chủ từ chối ghép nền khi biên nhập nhằng).
+  if (o.matting_allow_ambiguous === true) options.matting_allow_ambiguous = true;
   if (Object.keys(retouch).length) options.retouch = retouch;
   if (overlayText) options.overlay = { text: overlayText };
   return options;
@@ -2576,6 +2582,12 @@ function renderIsOptions(mode) {
       <label class="is-check">
         <input type="checkbox" data-is-bg ${removeBg ? 'checked' : ''} ${busy ? 'disabled' : ''} />
         <span><strong>Tách nền</strong> (<span class="mono">remove_background</span>) — không đủ tự tin thì hệ thống TỪ CHỐI cắt, ảnh chỉ được retouch.</span>
+      </label>
+      <label class="is-check">
+        <input type="checkbox" data-is-ambiguous ${o.matting_allow_ambiguous === true ? 'checked' : ''} ${busy || !removeBg ? 'disabled' : ''} />
+        <span><strong>Vẫn ghép nền dù biên nhập nhằng</strong> (<span class="mono">matting_allow_ambiguous</span>) —
+          dùng khi ảnh có bóng đổ mềm/viền mờ. Mặc định hệ thống <strong>KHÔNG ghép nền</strong> trong ca này
+          (ảnh vẫn được retouch); bật lên thì vẫn ghép nhưng <strong>có ghi vết</strong> và phải tự kiểm ảnh TRƯỚC|SAU.</span>
       </label>
       ${removeBg
         ? ''
@@ -2796,6 +2808,48 @@ function renderIsWarnings(data) {
     });
   }
   for (const w of matting.warnings || []) blocks.push({ cls: 'warn', title: 'Cảnh báo từ bước tách nền', items: [String(w)] });
+
+  // (2a) N3 (vòng 9): SỐ ĐO BIÊN phải HIỆN RA, không chỉ nằm trong câu warnings.
+  const bd = matting.mask?.boundary_delta || rendered?.meta?.matting?.boundary_delta || null;
+  const maskSrc = matting.mask || null;
+  if (bd || maskSrc) {
+    const items = [];
+    if (maskSrc?.kept_bbox_ratio !== undefined && maskSrc?.kept_bbox_ratio !== null) {
+      items.push(`Hộp bao phần giữ lại chiếm ${isNumText(Number(maskSrc.kept_bbox_ratio) * 100)}% khung ảnh.`);
+    }
+    if (bd) {
+      items.push(
+        `Biên phía NỀN: Δp95 ${isNumText(bd.p95)}/255, tỉ lệ pixel nền sát sản phẩm vượt ngưỡng an toàn: ${isNumText(Number(bd.over_ratio) * 100)}%.`,
+      );
+      if (bd.kept_under_ratio !== undefined) {
+        items.push(
+          `Biên phía GIỮ LẠI: Δmin ${isNumText(bd.kept_min)}/255, tỉ lệ pixel giữ lại chỉ khác nền dưới ngưỡng dứt khoát: ${isNumText(Number(bd.kept_under_ratio) * 100)}%.`,
+        );
+      }
+      if (bd.dirty_removed_ratio !== undefined) {
+        items.push(`Diện tích bị coi là nền nhưng KHÔNG sạch màu nền: ${isNumText(Number(bd.dirty_removed_ratio) * 100)}%.`);
+      }
+    }
+    if (matting.boundary_checked === false || maskSrc?.boundary_checked === false) {
+      items.push('Provider ngoài (không phải purejs) KHÔNG đo được biên — hãy kiểm ảnh TRƯỚC|SAU.');
+    }
+    if (matting.ambiguous_override === true || rendered?.meta?.matting?.ambiguous_override === true) {
+      items.push('⚠️ Lượt này ĐÃ BỎ QUA cảnh báo biên nhập nhằng theo yêu cầu người dùng (có ghi vết trong meta ảnh).');
+    }
+    if (items.length) blocks.push({ cls: 'muted', title: 'Số đo vùng tách nền (đọc được, không phải kết luận suông)', items });
+  }
+
+  // (2b) N5 (vòng 9): BẰNG CHỨNG đã dùng để duyệt chữ overlay — truy vết được nguồn.
+  const ev = overlay?.evidence_used || lastRun?.overlay?.evidence_used || rendered?.meta?.overlay?.evidence_used || null;
+  if (ev && (Array.isArray(ev.sources) ? ev.sources.length : 0) > 0) {
+    const label = { product_name: 'tên sản phẩm (đã lưu)', ocr_region: 'vùng chữ OCR (đã lưu)', user_region: 'vùng chữ do người dùng nhập (đã lưu)', job_notes: 'ghi chú đã lưu trong job' };
+    const regions = Array.isArray(ev.region_ids) && ev.region_ids.length ? ` — vùng: ${ev.region_ids.map((r) => `#${r}`).join(', ')}` : '';
+    blocks.push({
+      cls: 'muted',
+      title: 'Bằng chứng dùng để duyệt chữ overlay',
+      items: [`Nguồn: ${ev.sources.map((x) => label[x] || x).join('; ')}${regions}. Tổng ${isNumText(ev.chars)} ký tự.`],
+    });
+  }
 
   // (2b) M03-01c (vòng 8): CẢNH BÁO NỔI BẬT cho MỌI lượt có tách nền — vùng "sản phẩm" do
   // MÁY ĐOÁN theo màu nền, không phải sự thật đã kiểm. Trước đây UI chỉ hiện khi có lỗi,
@@ -3237,6 +3291,11 @@ function isSyncField(target) {
   }
   if (target.dataset.isBg !== undefined) {
     state.is.options.remove_background = Boolean(target.checked);
+    renderImagestudio();
+    return;
+  }
+  if (target.dataset.isAmbiguous !== undefined) {
+    state.is.options.matting_allow_ambiguous = Boolean(target.checked);
     renderImagestudio();
     return;
   }

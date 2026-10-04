@@ -81,14 +81,20 @@ describe('M03-01 — sản phẩm gần màu nền KHÔNG được bị ăn (CRI
     assert.ok(res.mask.boundary_delta.kept_min >= res.mask.boundary_delta.decisive_delta, 'biên phải dứt khoát');
   });
 
-  test('kem 248 (Δ≈12.1, sát nền) ⇒ FAILED/SUSPICIOUS_MASK, không lưu ảnh', async () => {
+  test('kem 248 (Δ≈12.1, sát nền) ⇒ ĐẠT: mask giữ ĐÚNG sản phẩm (sửa theo N1 vòng 9)', async () => {
+    // Vòng 8 chặn ca này vì phía GIỮ LẠI có viền gần màu nền. Phản biện vòng 2 (N1) chỉ ra đó
+    // là chặn OAN: flood fill giữ đúng sản phẩm, chỗ "nhập nhằng" chỉ là viền của CHÍNH sản
+    // phẩm, còn phía NỀN sạch (không pixel nền bẩn) ⇒ không có căn cứ nói "ăn mất sản phẩm".
+    // Nay: ĐẠT + một câu LƯU Ý (không hạ trạng thái) + 0 pixel sản phẩm bị đổi.
     const png = whiteProductImage(248);
     const res = await purejs().removeBackground({ image: { buffer: png, mime: 'image/png' }, options: {} });
 
-    assert.equal(res.status, MATTING_STATUS.FAILED);
-    assert.equal(res.error_code, MATTING_CODES.SUSPICIOUS_MASK);
-    assert.equal(res.output, null, 'từ chối thì KHÔNG được kèm ảnh ra');
-    assert.ok(res.mask.boundary_delta.kept_under_ratio > 0.05, 'phải đo được là biên KHÔNG dứt khoát');
+    assert.equal(res.status, MATTING_STATUS.OK, `kem 248 phải ĐẠT, nhận ${res.status}/${res.error_code}`);
+    assert.ok(res.output?.buffer, 'phải có ảnh ra');
+    assert.equal(productPixelsChanged(png, res.output.buffer, 248), 0, 'KHÔNG pixel sản phẩm nào được đổi');
+    assert.ok(res.mask.boundary_delta.kept_under_ratio > 0.05, 'vẫn phải ĐO được viền gần màu nền');
+    assert.match(res.warnings.join(' '), /Lưu ý: .*sát nền/);
+    assert.equal(res.mask.boundary_checked, true, 'purejs phải khai đã kiểm biên');
   });
 
   test('trắng 250 (trong ngưỡng cũ) ⇒ FAILED, không có ảnh ra', async () => {

@@ -23,6 +23,8 @@ export class MattingError extends Error {
 
 /** Danh mục mã lỗi — đóng băng để agent khác (E3/E4/test) không đoán sai tên. */
 export const MATTING_CODES = Object.freeze({
+  /** N1 (vòng 9): biên nhập nhằng (mask bao đúng sản phẩm) — KHÔNG ghép nền mặc định. */
+  SEGMENTATION_AMBIGUOUS: 'SEGMENTATION_AMBIGUOUS',
   // Đầu vào / cấu hình
   BAD_INPUT: 'BAD_INPUT',
   NOT_CONFIGURED: 'NOT_CONFIGURED',

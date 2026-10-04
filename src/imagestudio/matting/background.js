@@ -57,6 +57,18 @@ export const BOUNDARY_OVER_RATIO_MAX = 0.05;
  * dưới ngưỡng đó, thà trả ảnh chỉ-retouch (luật #3 fail-closed) còn hơn cắt vào sản phẩm.
  */
 export const BOUNDARY_DECISIVE_DELTA = 20;
+
+/**
+ * N1 (vòng 9) — TRẦN DIỆN TÍCH "NỀN BẨN" để phân biệt NGUY HIỂM với NHẬP NHẰNG.
+ *
+ * `dirty_removed_ratio` = tỉ lệ pixel ảnh bị coi là nền mà lệch màu nền quá `BOUNDARY_DELTA_SAFE`.
+ *   · ≤ 0.15 (mặc định): phần bị ăn gần như là nền sạch, chỉ có viền mờ/bóng đổ lẻ ⇒ NHẬP NHẰNG
+ *     (`SEGMENTATION_AMBIGUOUS`) — sản phẩm còn nguyên, chỉ thiếu tự tin để ghép nền;
+ *   · > 0.15: một MẢNG LỚN không-phải-nền đã bị ăn ⇒ NGUY HIỂM (`SUSPICIOUS_MASK`).
+ * Vì sao 0.15: bóng đổ mềm/viền mờ chỉ tạo dải mỏng vài pixel quanh sản phẩm (đo trên ảnh 96×96:
+ * ~0.03), còn ca "ăn mất sản phẩm" chiếm trọn thân sản phẩm (≥ 0.30). Ngưỡng nằm giữa hai cụm đó.
+ */
+export const AMBIGUOUS_DIRTY_AREA_MAX = 0.15;
 /** Tỉ lệ pixel viền tối thiểu thuộc cụm màu chủ đạo để coi nền là "đồng nhất". */
 export const DEFAULT_MIN_UNIFORMITY = 0.75;
 /** Số ô lượng tử màu cho mỗi kênh khi gom cụm (16 ⇒ 16×16×16 = 4096 ô). */
@@ -340,6 +352,16 @@ export function measureBoundaryDelta(pixels, similar, {
     }
   }
 
+  // N1 (vòng 9): tổng diện tích pixel nền đã tách mà Δ > safeDelta — tức phần bị ăn KHÔNG
+  // phải nền sạch. Vài pixel lẻ = viền mờ/bóng đổ (nhập nhằng); một mảng LỚN = đã ăn mất
+  // một vật thể (khả năng cao là sản phẩm) ⇒ nguy hiểm thật.
+  let dirtyRemoved = 0;
+  for (let i = 0; i < width * height; i += 1) {
+    if (similar[i] !== 2) continue;
+    const p = i * 4;
+    if (colorDistance(pixels[p], pixels[p + 1], pixels[p + 2], target.r, target.g, target.b) > safeDelta) dirtyRemoved += 1;
+  }
+
   const p95Of = (list) => (list.length === 0 ? 0 : list[Math.min(list.length - 1, Math.floor(list.length * 0.95))]);
   removed.sort((a, b) => a - b);
   kept.sort((a, b) => a - b);
@@ -357,6 +379,8 @@ export function measureBoundaryDelta(pixels, similar, {
     kept_p95: Number(p95Of(kept).toFixed(2)),
     kept_under_ratio: Number(underRatio.toFixed(4)),
     decisive_delta: decisiveDelta,
+    dirty_removed: dirtyRemoved,
+    dirty_removed_ratio: Number((dirtyRemoved / (width * height)).toFixed(4)),
     suspicious: overRatio > BOUNDARY_OVER_RATIO_MAX || underRatio > BOUNDARY_OVER_RATIO_MAX,
   };
 }

@@ -239,7 +239,12 @@ describe('MVP-03 matting — provider mock KHÔNG tách thật', () => {
     assert.equal(result.is_mock, true);
     assert.equal(result.provider, 'mock');
     assert.equal(sha256(result.output.buffer), sha256(buffer), 'mock trả bản sao ⇒ sha256 y hệt ảnh vào');
-    assert.deepEqual(result.mask, { ...MOCK_MASK });
+    // N6 (vòng 9): provider KHÔNG đo biên (mock/http) phải tự khai `boundary_checked: false`.
+    assert.deepEqual(result.mask, { ...MOCK_MASK, boundary_checked: false });
+    assert.ok(
+      result.warnings.some((w) => w.includes('KHÔNG đo được biên')),
+      'provider ngoài purejs phải NÓI RA là chưa kiểm biên',
+    );
     assert.ok(
       result.warnings.some((w) => w.includes('KHÔNG tách nền thật')),
       'mock phải tự khai là không tách thật',

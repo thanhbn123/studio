@@ -1945,6 +1945,15 @@ function sanitizeImagestudioOptions(raw) {
     options.overlay = sanitizeImagestudioOverlay(raw.overlay);
   }
 
+  // N1 (vòng 9): người dùng CHẤP NHẬN ghép nền dù biên nhập nhằng (bóng đổ mềm/viền mờ).
+  // Mặc định KHÔNG bật; bật thì tầng matting vẫn ghép nhưng ghi vết nổi bật.
+  if (raw.matting_allow_ambiguous !== undefined && raw.matting_allow_ambiguous !== null) {
+    if (typeof raw.matting_allow_ambiguous !== 'boolean') {
+      throw HttpError.safe(400, 'BAD_OPTIONS', '`options.matting_allow_ambiguous` phải là true hoặc false.');
+    }
+    options.matting_options = { ...(options.matting_options || {}), matting_allow_ambiguous: raw.matting_allow_ambiguous === true };
+  }
+
   return options;
 }
 

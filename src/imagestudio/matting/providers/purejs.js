@@ -32,6 +32,7 @@ export const SUSPICIOUS_KEPT_BBOX_RATIO = 0.1;
 import { clampBox, detectImageMime, toRgba } from '../../../imagelab/render/image.js';
 import { decodePng, encodePng, sha256 } from '../../../imagelab/render/png.js';
 import {
+  AMBIGUOUS_DIRTY_AREA_MAX,
   BOUNDARY_OVER_RATIO_MAX,
   DEFAULT_TOLERANCE,
   applyAlphaMask,
@@ -170,48 +171,75 @@ export class PureJsMattingProvider extends MattingProvider {
     });
     const keptBoxRaw = keptBoundingBox(similar, dims);
     const keptBoxRatio = keptBoxRaw ? Number(((keptBoxRaw.w * keptBoxRaw.h) / total).toFixed(4)) : 0;
-
-    const boundarySuspicious = boundary.suspicious === true;
+    // Ba dấu hiệu NGUY HIỂM (M03-01b) — giữ nguyên ngưỡng đã ghi trong hợp đồng §3.1.
     const tooLittleKept = coverage < SUSPICIOUS_COVERAGE_MIN;
     const tinyKeptIsland = backgroundRatio > SUSPICIOUS_BACKGROUND_RATIO && keptBoxRatio < SUSPICIOUS_KEPT_BBOX_RATIO;
 
-    warnings.push(
-      `Soi biên vùng đã tách: phía NỀN ${boundary.count} pixel kề sản phẩm (Δmax ${boundary.max}/255, Δp95 ${boundary.p95}/255, ` +
-        `vượt ${boundary.safe_delta}/255: ${(boundary.over_ratio * 100).toFixed(1)}%); phía GIỮ LẠI ${boundary.kept_count} pixel kề nền ` +
-        `(Δmin ${boundary.kept_min}/255, dưới ngưỡng dứt khoát ${boundary.decisive_delta}/255: ${(boundary.kept_under_ratio * 100).toFixed(1)}%).`,
-    );
+    // ── PHÂN LOẠI (N1, vòng 9): NGUY HIỂM vs NHẬP NHẰNG vs ĐẠT ────────────────
+    // Trước đây cả hai bị gộp vào `SUSPICIOUS_MASK` ⇒ ảnh có bóng đổ mềm (mask ĐÚNG) bị tố
+    // là "nghi ngờ ăn mất sản phẩm" — sai nguyên nhân và chặn oan ảnh bình thường.
+    //   · NGUY HIỂM (đã ăn mất thứ gì đó): tỉ lệ nền ngoài khoảng an toàn, giữ lại < 2%,
+    //     "đảo nhỏ" giữa nền lớn, hoặc DIỆN TÍCH NỀN BẨN > 15% (ăn mất một mảng không-phải-nền);
+    //   · NHẬP NHẰNG (mask bao đúng sản phẩm, chỉ mờ ở viền): có pixel nền bẩn nhưng ít
+    //     (bóng đổ/viền mờ) ⇒ không ghép nền mặc định, VẪN cho retouch.
+    const dirtyArea = Number(boundary.dirty_removed_ratio ?? 0);
+    const tooDirtyRemoved = dirtyArea > AMBIGUOUS_DIRTY_AREA_MAX;
+    const boundaryFuzzy =
+      boundary.count > 0 && boundary.over_ratio > BOUNDARY_OVER_RATIO_MAX;
 
-    if (boundarySuspicious || tooLittleKept || tinyKeptIsland) {
-      const reasons = [];
-      if (boundarySuspicious) {
-        const parts = [];
-        if (boundary.over_ratio > BOUNDARY_OVER_RATIO_MAX) {
-          parts.push(
-            `${(boundary.over_ratio * 100).toFixed(1)}% pixel nền sát sản phẩm lệch màu nền quá ${boundary.safe_delta}/255 ` +
-              `(Δmax ${boundary.max}, Δp95 ${boundary.p95})`,
-          );
-        }
-        if (boundary.kept_under_ratio > BOUNDARY_OVER_RATIO_MAX) {
-          parts.push(
-            `${(boundary.kept_under_ratio * 100).toFixed(1)}% pixel ĐƯỢC GIỮ LẠI nằm sát nền mà chỉ khác nền dưới ` +
-              `${boundary.decisive_delta}/255 (Δmin ${boundary.kept_min}) — không phân biệt được sản phẩm với nền/bóng đổ`,
-          );
-        }
-        reasons.push(`BIÊN KHÔNG DỨT KHOÁT: ${parts.join('; ')}`);
-      }
-      if (tooLittleKept) {
-        reasons.push(
-          `GIỮ LẠI QUÁ ÍT: chỉ ${(coverage * 100).toFixed(2)}% pixel được giữ (ngưỡng ${(SUSPICIOUS_COVERAGE_MIN * 100).toFixed(0)}%)`,
-        );
-      }
-      if (tinyKeptIsland) {
-        reasons.push(
-          `VÙNG GIỮ LẠI QUÁ NHỎ SO VỚI NỀN: hộp bao phần giữ lại chỉ chiếm ${(keptBoxRatio * 100).toFixed(2)}% khung ảnh ` +
-            `(ngưỡng ${(SUSPICIOUS_KEPT_BBOX_RATIO * 100).toFixed(0)}%) trong khi nền đã tách ${(backgroundRatio * 100).toFixed(1)}%`,
-        );
-      }
+    const dangerReasons = [];
+    if (tooLittleKept) {
+      dangerReasons.push(
+        `GIỮ LẠI QUÁ ÍT: chỉ ${(coverage * 100).toFixed(2)}% pixel được giữ (ngưỡng ${(SUSPICIOUS_COVERAGE_MIN * 100).toFixed(0)}%)`,
+      );
+    }
+    if (tinyKeptIsland) {
+      dangerReasons.push(
+        `VÙNG GIỮ LẠI QUÁ NHỎ SO VỚI NỀN: hộp bao phần giữ lại chỉ chiếm ${(keptBoxRatio * 100).toFixed(2)}% khung ảnh ` +
+          `(ngưỡng ${(SUSPICIOUS_KEPT_BBOX_RATIO * 100).toFixed(0)}%) trong khi nền đã tách ${(backgroundRatio * 100).toFixed(1)}%`,
+      );
+    }
+    if (tooDirtyRemoved) {
+      dangerReasons.push(
+        `NỀN ĐÃ TÁCH KHÔNG SẠCH: ${(dirtyArea * 100).toFixed(1)}% ảnh bị coi là nền mà lệch màu nền quá ` +
+          `${boundary.safe_delta}/255 (ngưỡng ${(AMBIGUOUS_DIRTY_AREA_MAX * 100).toFixed(0)}%) — nhiều khả năng đã ăn mất một phần sản phẩm`,
+      );
+    }
+
+    const ambiguousReasons = [];
+    if (boundaryFuzzy) {
+      ambiguousReasons.push(
+        `${(boundary.over_ratio * 100).toFixed(1)}% pixel nền nằm sát vùng giữ lại lệch màu nền trong dải ` +
+          `${boundary.safe_delta}–${tol.tolerance.toFixed(1)}/255 (Δmax ${boundary.max}, Δp95 ${boundary.p95}) — thường là bóng đổ mềm/viền mờ`,
+      );
+    }
+    if (!tooDirtyRemoved && dirtyArea > 0) {
+      ambiguousReasons.push(
+        `${(dirtyArea * 100).toFixed(1)}% ảnh bị coi là nền nhưng không sạch màu nền (dải mỏng quanh sản phẩm)`,
+      );
+    }
+    // Viền sản phẩm nằm trong dải gần màu nền (sản phẩm trắng/kem 244–248) KHÔNG phải lý do
+    // để chặn: phía NỀN vẫn sạch (không pixel nền bẩn) nghĩa là flood fill đã giữ ĐÚNG sản
+    // phẩm — chỉ là viền của nó gần màu nền. Ghi nhận để người dùng kiểm, KHÔNG hạ trạng thái.
+    if (boundary.kept_under_ratio > BOUNDARY_OVER_RATIO_MAX) {
+      warnings.push(
+        `Lưu ý: ${(boundary.kept_under_ratio * 100).toFixed(1)}% pixel ĐƯỢC GIỮ LẠI nằm sát nền mà chỉ khác nền dưới ` +
+          `${boundary.decisive_delta}/255 (Δmin ${boundary.kept_min}) — sản phẩm/vùng sáng gần màu nền; ` +
+          'hãy kiểm ảnh TRƯỚC|SAU kỹ ở viền sản phẩm.',
+      );
+    }
+
+    // CHỈ coi là nhập nhằng khi phía NỀN có dấu hiệu bẩn (đã ăn vào dải lưng chừng). Nếu phía
+    // nền sạch mà chỉ viền sản phẩm gần màu nền ⇒ mask ĐÚNG ⇒ để ĐẠT (có ghi lưu ý ở trên).
+    const ambiguous = dangerReasons.length === 0 && ambiguousReasons.length > 0;
+    const allowAmbiguous = options.matting_allow_ambiguous === true
+      || options.mattingAllowAmbiguous === true
+      || options.allowAmbiguous === true
+      || options.allow_ambiguous === true;
+
+    if (dangerReasons.length > 0) {
       const message =
-        `TỪ CHỐI kết quả tách nền (nghi ngờ ăn mất sản phẩm): ${reasons.join('; ')}. ` +
+        `TỪ CHỐI kết quả tách nền (nghi ngờ ĂN MẤT SẢN PHẨM): ${dangerReasons.join('; ')}. ` +
         'Ảnh gốc giữ nguyên — không lưu ảnh đã cắt bừa (fail-closed, luật #3 của MVP-03).';
       return {
         status: MATTING_STATUS.FAILED,
@@ -223,12 +251,46 @@ export class PureJsMattingProvider extends MattingProvider {
           seed_colors: stats.seed_colors,
           kept_bbox_ratio: keptBoxRatio,
           boundary_delta: boundary,
+          boundary_checked: true,
         },
         kept_bbox: null,
         warnings: [...warnings, message],
         error_code: MATTING_CODES.SUSPICIOUS_MASK,
         error_message: message,
       };
+    }
+
+    if (ambiguous && !allowAmbiguous) {
+      const message =
+        `BIÊN NHẬP NHẰNG nên KHÔNG GHÉP NỀN (sản phẩm vẫn được giữ nguyên): ${ambiguousReasons.join('; ')}. ` +
+        'Ảnh của bạn vẫn được RETOUCH theo tham số; muốn ghép nền hãy dùng ảnh có nền phẳng hơn, ' +
+        'hoặc bật "vẫn ghép nền dù biên nhập nhằng" (matting_allow_ambiguous = true — có ghi vết).';
+      return {
+        status: MATTING_STATUS.SEGMENTATION_AMBIGUOUS,
+        output: null,
+        mask: {
+          coverage,
+          background_ratio: backgroundRatio,
+          uniformity,
+          seed_colors: stats.seed_colors,
+          kept_bbox_ratio: keptBoxRatio,
+          boundary_delta: boundary,
+          boundary_checked: true,
+        },
+        // Dùng hộp bao TRƯỚC khi kẹp biên (biến `keptBox` chỉ được tính ở bước (7)) — vẫn là
+        // số đo thật, và `clampBox` là hàm dùng chung của imagelab nên không lệch luật.
+        kept_bbox: clampBox(keptBoxRaw, dims),
+        warnings: [...warnings, message],
+        error_code: MATTING_CODES.SEGMENTATION_AMBIGUOUS,
+        error_message: message,
+      };
+    }
+
+    if (ambiguous && allowAmbiguous) {
+      warnings.push(
+        `⚠️ ĐÃ BỎ QUA cảnh báo BIÊN NHẬP NHẰNG theo yêu cầu người dùng (matting_allow_ambiguous = true) — ` +
+          `vẫn ghép nền. Căn cứ đã bỏ qua: ${ambiguousReasons.join('; ')}. HÃY KIỂM ẢNH TRƯỚC|SAU.`,
+      );
     }
 
     // (6) Ghi alpha = 0 cho vùng nền; pixel giữ lại y nguyên (không đổi màu sản phẩm).
@@ -280,6 +342,8 @@ export class PureJsMattingProvider extends MattingProvider {
         seed_colors: stats.seed_colors,
         kept_bbox_ratio: keptBoxRatio,
         boundary_delta: boundary,
+        boundary_checked: true,
+        ...(ambiguous && allowAmbiguous ? { ambiguous_override: true } : {}),
       },
       kept_bbox: keptBox,
       warnings,

@@ -847,3 +847,71 @@ kèm cảnh báo *“BỎ QUA bằng chứng do client tự khai (source_text)�
   env là đổi luật fail-closed mà không qua hợp đồng.
 - Vẫn chưa đo: PostgreSQL, provider `http` thật, trình duyệt thật, nhiều job đồng thời (như §4 của
   báo cáo phản biện đã ghi).
+
+---
+
+## 14. MVP-03 — vòng 9: xử lý N1…N6 của phản biện vòng 2
+
+Phán quyết vòng 2: **PASS CÓ ĐIỀU KIỆN** (1 MAJOR mới + 5 MINOR — `docs/MVP-03-REVIEW.md`).
+Đã xử lý cả 6. `npm test` → **708 test · 707 pass · 0 fail · 1 skipped**; `verify.mjs` EXIT=0;
+`imagelab-demo.mjs` → `succeeded`.
+
+### 14.1 N1 (MAJOR) — tách “NHẬP NHẰNG” khỏi “NGHI NGỜ ĂN MẤT SẢN PHẨM”
+
+Sửa: `src/imagestudio/matting/background.js` (đo `dirty_removed_ratio` = diện tích bị coi là nền mà
+KHÔNG sạch màu nền; `AMBIGUOUS_DIRTY_AREA_MAX = 0.15`), `matting/result.js` +
+`matting/errors.js` (`status`/`error_code` mới `SEGMENTATION_AMBIGUOUS`), `matting/providers/purejs.js`
+(phân loại 3 nhánh + cờ `matting_allow_ambiguous`), `matting/provider.js` (N6), `pipeline.js`
+(`matting_options` + `meta.matting.ambiguous_override`), `http/routes.js`
+(`options.matting_allow_ambiguous`), `public/app.js` (checkbox + câu giải thích).
+
+```
+$ cd /tmp/mvp03-atk2 && node r2-threshold-scan.mjs
+sản phẩm 240/243 + logo                 | OK/OK | cov=0.4307
+sản phẩm 244/245/246/247/248 + logo     | OK/OK | cov=0.4307      <-- HẾT chặn oan
+sản phẩm 249/250 + logo                 | FAILED/SUSPICIOUS_MASK | cov=0.1329 "…NGHI NGỜ ĂN MẤT SẢN PHẨM:
+                                          NỀN ĐÃ TÁCH KHÔNG SẠCH: 29.8% ảnh bị coi là nền mà lệch màu nền quá 8/255…"
+bóng mềm Δmax 12/20/30/40               | SEGMENTATION_AMBIGUOUS/SEGMENTATION_AMBIGUOUS | "BIÊN NHẬP NHẰNG
+                                          nên KHÔNG GHÉP NỀN (sản phẩm vẫn được giữ nguyên)… vẫn được RETOUCH…"
+viền mờ 1–4px · đỏ đặc không bóng       | OK/OK
+```
+
+`node /tmp/gop9/n1-override.mjs` (HTTP thật, 3 lượt trên cùng một ảnh bóng mềm):
+
+```
+mặc định (không override)          | matting=SEGMENTATION_AMBIGUOUS | ambiguous_override=false | rendered=0
+override + retouch                 | matting=OK/OK | ambiguous_override=true | meta.matting.ambiguous_override=true | rendered=1
+mặc định + retouch (không ghép nền)| matting=SEGMENTATION_AMBIGUOUS | rendered=1  (ảnh RETOUCH vẫn ra)
+```
+
+### 14.2 N2…N6
+
+| # | Sửa gì | Bằng chứng |
+|---|---|---|
+| N2 | Ghi **giới hạn vật lý** vào hợp đồng §3.1: sản phẩm cách nền ≤ 8/255 không thể phân biệt bằng đo màu ⇒ phải dùng provider `http`/AI | `r2-threshold-scan`: `sản phẩm 251 + logo → OK/OK cov=0.1329` (thân bị ăn — giới hạn đã biết, KHÔNG còn im lặng vì hợp đồng nói rõ) |
+| N3 | `summarizeMatting` chuyển tiếp `kept_bbox_ratio` + `boundary_delta` + `boundary_checked` + `ambiguous_override`; UI thêm khối “Số đo vùng tách nền” (Δp95, over_ratio, kept_under_ratio, dirty_removed_ratio, cờ override) | `node /tmp/mvp03-atk/a2b-white-product.mjs`: `mask = {"coverage":0.5625,…,"kept_bbox_ratio":0.5625,"boundary_delta":{"p95":0,"over_ratio":0,"kept_min":25.98,"dirty_removed_ratio":0,…},"boundary_checked":true}` |
+| N4 | **BỎ** `IMAGESTUDIO_DIR`/`imagestudio.dir` khỏi `src/config.js` + `.env.example` + hợp đồng; ghi rõ ảnh MVP-03 dùng CHUNG kho `IMAGELAB_DIR` | `node r2-config.mjs`: `IMAGESTUDIO_DIR=/tmp/khac (có tác dụng?) → config.imagestudio.dir=undefined | storage THẬT dùng = <IMAGELAB_DIR>/images` |
+| N5 | `#evidenceText` trả `evidence_used {sources, region_ids, chars}`; đi vào `overlay` của kết quả (kể cả khi bị chặn), `content_meta`, `asset.meta.overlay` và UI (“Bằng chứng dùng để duyệt chữ overlay: …”) | test `N5: overlay trả evidence_used với nguồn thật` → `sources: ["product_name","user_region"]`, `region_ids: ["u1"]` |
+| N6 | Provider ngoài `purejs` ⇒ `mask.boundary_checked = false` + warning; ghi vào VERIFICATION là **chưa đo end-to-end** | `node -e` với provider `mock`: `mask keys [...,"boundary_checked"] = false` + câu *"Provider "mock" KHÔNG đo được biên vùng tách (chỉ provider "purejs" đo được)…"* |
+
+### 14.3 Test thêm/sửa
+
+- **Thêm** `test/imagestudio-round9-hardening.test.js` (10 test): N1 hai chiều (bóng mềm ⇒
+  AMBIGUOUS + câu đúng; 244–248 ⇒ ĐẠT; 249/250 và tolerance cũ 28 ⇒ vẫn SUSPICIOUS), cờ override
+  (unit + HTTP + `meta.matting.ambiguous_override`), N3, N6, N4, N5.
+- **Sửa 2 test cũ** (chúng đang khẳng định hành vi mà N1 xác định là SAI/chưa đủ):
+  `imagestudio-round8-hardening.test.js` — “kem 248 ⇒ FAILED/SUSPICIOUS_MASK” đổi thành “kem 248 ⇒
+  ĐẠT + lưu ý viền gần màu nền + 0 pixel sản phẩm đổi” (ghi rõ lý do trong test);
+  `imagestudio-matting.test.js` — mask của provider `mock` nay có thêm `boundary_checked: false`
+  (N6) nên khẳng định `deepEqual(MOCK_MASK)` được bổ sung field đó + kiểm câu cảnh báo.
+
+### 14.4 Chưa sửa được
+
+- **N2 vẫn là giới hạn thật**: sản phẩm ≤ 8/255 so với nền vẫn có thể bị ăn im lặng (đã ghi hợp
+  đồng + khuyến nghị dùng provider `http`/AI). Không thể vá bằng heuristic màu.
+- **N6/đường `http` chưa đo end-to-end**: `safeFetch` chặn mạng nội bộ và không có service thật ⇒
+  chỉ khẳng định được “provider ngoài TỰ KHAI là chưa kiểm biên”, chưa đo mask thật của một dịch vụ.
+- **Ngưỡng `AMBIGUOUS_DIRTY_AREA_MAX = 0.15` chọn từ ảnh TỔNG HỢP** (96×96): bóng đổ mềm ~0.03,
+  ca ăn sản phẩm ~0.30 — ngưỡng nằm giữa hai cụm. Ảnh chụp thật (JPEG→PNG, bóng đổ lớn, nền màu)
+  chưa đo ⇒ có thể còn ca rơi vào nhầm nhánh.
+- Vẫn chưa đo: PostgreSQL, provider AI/OCR trả tiền, trình duyệt thật, queue đa tiến trình.

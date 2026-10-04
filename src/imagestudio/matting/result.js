@@ -16,6 +16,13 @@ export const MATTING_STATUS = Object.freeze({
   UNSUPPORTED_IMAGE: 'UNSUPPORTED_IMAGE',
   NOT_CONFIGURED: 'NOT_CONFIGURED',
   FAILED: 'FAILED',
+  /**
+   * N1 (vòng 9): BIÊN NHẬP NHẰNG — mask bao ĐÚNG sản phẩm nhưng đường cắt không dứt khoát
+   * (bóng đổ mềm, viền mờ, sản phẩm sáng gần màu nền). KHÁC hẳn `FAILED` + `SUSPICIOUS_MASK`
+   * (nghi ngờ ĐÃ ĂN mất sản phẩm): ở đây sản phẩm còn nguyên, chỉ là không đủ tự tin để GHÉP
+   * NỀN. Mặc định vẫn KHÔNG ghép; người dùng có thể bật `matting_allow_ambiguous`.
+   */
+  SEGMENTATION_AMBIGUOUS: 'SEGMENTATION_AMBIGUOUS',
 });
 
 /**
@@ -55,7 +62,14 @@ export const MATTING_MASK_FIELDS = Object.freeze(['coverage', 'background_ratio'
  *     kept_under_ratio, decisive_delta, suspicious}` — căn cứ để TỪ CHỐI khi đường cắt
  *     không dứt khoát. Provider không đo ⇒ field VẮNG MẶT (không bịa số 0).
  */
-export const MATTING_MASK_EXTRA_FIELDS = Object.freeze(['kept_bbox_ratio', 'boundary_delta']);
+export const MATTING_MASK_EXTRA_FIELDS = Object.freeze([
+  'kept_bbox_ratio',
+  'boundary_delta',
+  // N6 (vòng 9): `true` = provider này CÓ đo biên; `false` = provider ngoài (http) không đo được.
+  'boundary_checked',
+  // N1: `true` = người dùng đã bật `matting_allow_ambiguous` cho lượt này (có ghi vết).
+  'ambiguous_override',
+]);
 
 /**
  * `MattingResult` — KHUÔN ĐÓNG BĂNG của kết quả (hợp đồng §3.1, giá trị trung tính).

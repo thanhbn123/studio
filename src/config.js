@@ -121,7 +121,9 @@ export function loadConfig(env = process.env) {
     imagestudio: {
       // Bật mặc định vì provider mặc định là purejs: chạy offline, không cần key.
       enabled: toBool(env.IMAGESTUDIO_ENABLED, true),
-      dir: toStr(env.IMAGESTUDIO_DIR, './data/imagestudio'),
+      // ⚠️ N4 (vòng 9): KHÔNG có `dir` riêng. Ảnh gốc VÀ ảnh tạo ra dùng CHUNG kho ảnh
+      // `IMAGELAB_DIR` (`src/imagelab/storage.js`) — khai một biến thư mục riêng mà không
+      // dòng mã nào đọc là config chết, dễ làm vận hành tin sai chỗ lưu ảnh.
     },
 
     // Tách nền. Mặc định an toàn: purejs (flood fill từ viền, chạy offline).

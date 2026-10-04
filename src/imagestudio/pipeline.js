@@ -39,6 +39,7 @@ import { JOB_STATUS, VERIFICATION_LEVELS } from '../store/index.js';
 import { sniffImageMime } from '../security/sanitize.js';
 import { probeImage } from '../imagelab/render/image.js';
 import { TEMPLATE_IDS, composeImage, drawOverlay, findTemplate } from './compose/index.js';
+import { MATTING_MASK_EXTRA_FIELDS } from './matting/index.js';
 import { RETOUCH_LIMITS, RETOUCH_PARAM_NAMES, clampRetouchParams, zeroRetouchParams } from './retouch/index.js';
 
 /** Các bước của một job MVP-03 (hợp đồng §3.3 — ĐÓNG BĂNG, C5/E5 hiện tiến trình theo đây). */
@@ -211,12 +212,20 @@ function summarizeMatting(result) {
           bytes: Buffer.isBuffer(output.buffer) ? output.buffer.length : null,
         }
       : null,
+    // N3 (vòng 9): chuyển tiếp CẢ số đo MỞ RỘNG (trước đây bị bỏ ⇒ `GET matting.mask` chỉ có
+    // 4 field đóng băng, còn `kept_bbox_ratio`/`boundary_delta` thì mất hút ở mọi đường API).
     mask: {
       coverage: mask.coverage ?? null,
       background_ratio: mask.background_ratio ?? null,
       uniformity: mask.uniformity ?? null,
       seed_colors: mask.seed_colors ?? null,
+      ...Object.fromEntries(
+        MATTING_MASK_EXTRA_FIELDS.filter((key) => mask[key] !== undefined && mask[key] !== null).map((key) => [key, mask[key]]),
+      ),
     },
+    // N1: cờ "người dùng đã bỏ qua cảnh báo biên nhập nhằng" — đọc được ở `asset.meta.matting`.
+    ambiguous_override: mask.ambiguous_override === true,
+    boundary_checked: mask.boundary_checked === true,
     kept_bbox: result.kept_bbox ?? null,
     warnings: Array.isArray(result.warnings) ? result.warnings.map(String).slice(0, 50) : [],
     elapsed_ms: Number.isFinite(Number(result.elapsed_ms)) ? Number(result.elapsed_ms) : 0,
@@ -426,8 +435,15 @@ export class ImageGenerationPipeline {
    */
   async #evidenceText(jobId, job) {
     const parts = [];
+    /** N5 (vòng 9): NGUỒN của từng mẩu bằng chứng — để kết quả overlay truy vết được. */
+    const sources = [];
+    const usedRegions = [];
+
     const productName = String(job?.product_name ?? '').trim();
-    if (productName) parts.push(productName);
+    if (productName) {
+      parts.push(productName);
+      sources.push('product_name');
+    }
 
     let regions = [];
     try {
@@ -435,22 +451,37 @@ export class ImageGenerationPipeline {
     } catch (err) {
       this.logger?.warn('imagestudio.ocr_regions_read_failed', { job_id: jobId, error: err });
     }
-    const regionText = regions
-      .map((r) => String(r?.text ?? r?.text_original ?? '').trim())
-      .filter(Boolean)
-      .join('\n');
-    if (regionText) parts.push(regionText);
+    let sawOcr = false;
+    let sawUser = false;
+    for (const r of regions) {
+      const text = String(r?.text ?? r?.text_original ?? '').trim();
+      if (!text) continue;
+      parts.push(text);
+      const id = String(r?.region_key ?? r?.id ?? '');
+      if (id) usedRegions.push(id);
+      if (String(r?.source ?? '') === 'user') sawUser = true;
+      else sawOcr = true;
+    }
+    if (sawOcr) sources.push('ocr_region');
+    if (sawUser) sources.push('user_region');
 
     // Ghi chú người dùng ĐÃ LƯU trong job (không phải ghi chú client gửi kèm lượt này).
     const meta = job?.content_meta && typeof job.content_meta === 'object' ? job.content_meta : {};
+    let sawNotes = false;
     for (const holder of [meta.imagestudio, meta.imagelab]) {
       if (!holder || typeof holder !== 'object') continue;
       for (const key of ['notes', 'note', 'user_note', 'source_text']) {
         const text = textFrom(holder[key]);
-        if (text) parts.push(text);
+        if (text) {
+          parts.push(text);
+          sawNotes = true;
+        }
       }
     }
-    return parts.join('\n');
+    if (sawNotes) sources.push('job_notes');
+
+    const text = parts.join('\n');
+    return { text, evidence_used: { sources, region_ids: usedRegions.slice(0, 50), chars: text.length } };
   }
 
   /* ══════════════════════════════ 1. INGEST ══════════════════════════════ */
@@ -756,6 +787,8 @@ export class ImageGenerationPipeline {
     } else {
       try {
         const mattingOptions = opts.matting_options && typeof opts.matting_options === 'object' ? opts.matting_options : {};
+        // N1: người dùng cho phép ghép nền dù biên nhập nhằng (mặc định KHÔNG).
+        if (opts.matting_allow_ambiguous === true) mattingOptions.matting_allow_ambiguous = true;
         matting = await this.mattingProvider.removeBackground({
           image: { buffer: originalBuffer, mime: originalMime },
           options: mattingOptions,
@@ -953,7 +986,8 @@ export class ImageGenerationPipeline {
     let overlay = null;
     let overlayApplied = false;
     if (overlayInput && String(overlayInput.text ?? '').trim() !== '') {
-      const sourceText = await this.#evidenceText(jobId, job);
+      const evidence = await this.#evidenceText(jobId, job);
+      const sourceText = evidence.text;
       // Nói THẲNG nếu client gửi kèm "bằng chứng" — nó bị bỏ qua, không được dùng để biện minh.
       const ignoredEvidence = Array.isArray(overlayInput?.client_evidence_ignored) ? overlayInput.client_evidence_ignored : [];
       if (ignoredEvidence.length > 0) {
@@ -968,6 +1002,7 @@ export class ImageGenerationPipeline {
           image: { buffer: currentBuffer, mime: currentMime },
           overlay: overlayInput,
           source_text: sourceText,
+          evidence_used: evidence.evidence_used,
         });
       } catch (err) {
         const message = `Vẽ overlay lỗi (${err?.code || 'OVERLAY_FAILED'}): ${err?.message || err}`;
@@ -981,19 +1016,21 @@ export class ImageGenerationPipeline {
           currentBuffer = drawn.buffer;
           currentMime = 'image/png';
           overlayApplied = true;
-          overlay = { applied: true, reason: null, violations: [] };
+          overlay = { applied: true, reason: null, violations: [], evidence_used: evidence.evidence_used };
         } else {
           // KHÔNG lưu ảnh overlay: giữ nguyên ảnh của bước trước đó (fail-closed).
           overlay = {
             applied: false,
             reason: String(drawn.reason || 'OVERLAY_FAILED'),
             violations: Array.isArray(drawn.violations) ? drawn.violations.map(String).slice(0, 50) : [],
+            // N5: nói rõ bằng chứng ĐÃ DÙNG (kể cả khi bị chặn) để người duyệt tra được vì sao.
+            evidence_used: evidence.evidence_used,
           };
           warnings.push(`KHÔNG vẽ overlay (${overlay.reason}) — giữ nguyên ảnh trước đó.`);
           failures.push({ step: 'overlay', code: overlay.reason, message: warnings[warnings.length - 1] });
         }
       } else if (!overlay) {
-        overlay = { applied: false, reason: 'OVERLAY_FAILED', violations: [] };
+        overlay = { applied: false, reason: 'OVERLAY_FAILED', violations: [], evidence_used: evidence.evidence_used };
       }
     } else if (overlayInput) {
       warnings.push('Overlay không có nội dung (text rỗng) — bỏ qua, KHÔNG vẽ.');
@@ -1057,6 +1094,12 @@ export class ImageGenerationPipeline {
         kind: IMAGESTUDIO_KIND,
         template: { id: template.id, label: template.label, synthetic: template.synthetic === true },
         synthetic_background: syntheticBackground,
+        // N1 (vòng 9): vết "người dùng đã bỏ qua cảnh báo biên nhập nhằng" nằm NGAY trên ảnh ra.
+        matting: {
+          status: matting?.status ?? null,
+          ambiguous_override: matting?.mask?.ambiguous_override === true,
+          boundary_checked: matting?.mask?.boundary_checked === true,
+        },
         retouch_effective: retouchEffective,
         retouch_clamped: clampedNames,
         retouch_rejected: rejectedNames,

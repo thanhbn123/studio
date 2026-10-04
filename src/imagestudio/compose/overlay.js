@@ -157,7 +157,7 @@ const resolveFontObject = (font) => {
   return loadFont(font == null ? '5x7' : String(font));
 };
 
-export function drawOverlay({ image, overlay, font, ...params } = {}) {
+export function drawOverlay({ image, overlay, font, evidence_used: evidenceUsed, ...params } = {}) {
   const warnings = [];
   const text = String(overlay?.text ?? '');
 
@@ -167,7 +167,8 @@ export function drawOverlay({ image, overlay, font, ...params } = {}) {
     const buffer = input?.originalBuffer
       ? Buffer.from(input.originalBuffer) // bản sao y nguyên byte ảnh vào
       : encodePng({ width: input.width, height: input.height, data: input.pixels, channels: 4 });
-    return { buffer, applied: false, reason, violations, warnings };
+    // N5 (vòng 9): kết quả (kể cả khi BỊ CHẶN) mang theo BẰNG CHỨNG ĐÃ DÙNG để truy vết.
+    return { buffer, applied: false, reason, violations, warnings, evidence_used: evidenceUsed ?? null };
   };
 
   let input;
@@ -308,6 +309,8 @@ export function drawOverlay({ image, overlay, font, ...params } = {}) {
     reason: null,
     violations: [],
     warnings,
+    // N5: bằng chứng ĐÃ DÙNG để duyệt câu này (do SERVER gom từ dữ liệu đã lưu của job).
+    evidence_used: evidenceUsed ?? null,
   };
 }
 

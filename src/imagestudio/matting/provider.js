@@ -175,6 +175,18 @@ export class MattingProvider {
           error_message: message,
         });
       }
+      // N6 (vòng 9): provider nào KHÔNG đo biên (mọi provider ngoài `purejs`: http/mock/…)
+      // phải NÓI THẲNG là chưa kiểm biên, thay vì im lặng để người dùng tin là đã kiểm.
+      if (mask.boundary_delta === undefined) {
+        partialWarnings.push(
+          `Provider "${this.name}" KHÔNG đo được biên vùng tách (chỉ provider "purejs" đo được) — ` +
+            'hãy kiểm ảnh TRƯỚC|SAU trước khi dùng.',
+        );
+        mask = { ...mask, boundary_checked: false };
+      } else {
+        mask = { ...mask, boundary_checked: true };
+      }
+
       // M03-01a (vòng 8): GIỮ các số đo MỞ RỘNG mà provider trả (số đo thật của vùng biên,
       // tỉ lệ hộp bao…) — chúng là căn cứ để người dùng/phản biện đọc, không phải lời khai
       // về ảnh. Chỉ 4 số đo hợp đồng ở trên mới bị kiểm kiểu; phần mở rộng đi nguyên.
