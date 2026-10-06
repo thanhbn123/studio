@@ -447,3 +447,38 @@ Phán quyết vòng 3: **PASS CÓ ĐIỀU KIỆN** (2 lỗ mới trước khi me
   `billing.settle_usage_unavailable` (thà thu thiếu còn hơn thu thừa).
 - Hệ quả chấp nhận: usage đến MUỘN của một lượt đã khép **không** được truy thu (đo: `u6` —
   tổng thu 0,4 trên tổng usage thật 0,6).
+
+---
+
+# VÒNG 5 — SỬA THEO CẢNH BÁO VÒNG 4 (BR-10, BR-11)
+
+Phán quyết vòng 4: **PASS**, kèm 2 cảnh báo không chặn (sửa cho sạch).
+
+## 8.1 BR-10 — reconcile KHÔNG được cắt ngang lượt ĐANG CHẠY
+
+- `reconcileStuckRuns({ userId?, olderThanMs?, limit?, isJobActive?, force? = false })`:
+  · `isJobActive(jobId) → boolean` (**mặc định do tầng app bơm**: `queue.isPending(jobId)` **hoặc**
+    `store.getJob(jobId).status ∈ {queued, running}`; đọc lỗi ⇒ coi như ĐANG chạy). Lượt của job
+    đang hoạt động ⇒ **BỎ QUA** (không hoàn, không đóng) dù đã quá ngưỡng; đếm vào `skipped_active`.
+  · `force: true` (chỉ owner/admin qua `POST /api/admin/billing/reconcile { force: true }`) ⇒ ép thu
+    hồi; dòng hoàn mang `meta.forced = true`.
+- **Đáy an toàn** `billing.minStuckRunMs` (env `BILLING_MIN_STUCK_RUN_MS`, mặc định `60_000` ms):
+  ngưỡng TREO **chỉ** bị nâng lên đáy khi đường gọi **KHÔNG** kiểm được job nào đang chạy
+  (không có `isJobActive`, không `force`) — kèm WARN `billing.stuck_run_ms_raised`. Đường có kiểm
+  tra (`app`/route/boot) dùng ĐÚNG ngưỡng cấu hình, nhờ vậy vận hành vẫn phục hồi job chết nhanh.
+  `GET /api/config.billing` công bố `stuck_run_ms` + `min_stuck_run_ms`.
+- `app.reconcileStuckRuns(opts)` là đường DUY NHẤT dùng trong app (đã bơm `isJobActive`);
+  route bảo trì trả thêm `skipped_active` + `forced`.
+
+## 8.2 BR-11 — dấu vết NGUỒN usage khi settle
+
+- Mọi dòng `job_settle` ghi `meta.usage_source` ∈:
+  · `request` — chi phí do tầng gọi truyền (`actualCost`);
+  · `run` — có `usage_events` gắn đúng `run_key` của lượt;
+  · `legacy` — chỉ có dòng usage KHÔNG gắn lượt (DB cũ) được quy về lượt này;
+  · `none` — job KHÔNG có dòng usage nào (thật sự không tốn gì);
+  · `unavailable` — có dòng usage nhưng KHÔNG quy được về lượt này (đã hoàn/lượt khác) hoặc không
+    đọc được usage ⇒ thu 0 + `meta.usage_unavailable = true` + WARN `billing.usage_unavailable`
+    (`{user_id, job_id, run_key, reason}`).
+- Nhờ vậy đọc sổ là phân biệt được "job không tốn gì" (`none`) với "không quy được usage"
+  (`unavailable`) — không còn dòng `actual_cost = 0` im lặng.

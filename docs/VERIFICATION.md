@@ -1272,3 +1272,76 @@ $ node /tmp/mvp05-atk2/t7-regression.mjs §T7.1   → lượt 4 HTTP 429 · "⇒
   · Usage đến muộn của lượt đã khép bị **bỏ** (thu thiếu) — cố ý, đã ghi trong hợp đồng §7.2.
   · Chưa đo: PostgreSQL thật cho `listOpenJobHolds` (NOT EXISTS + partial index) và cho
     `reconcileStuckRuns`; chưa có job định kỳ (cron) gọi reconcile — hiện chỉ boot/409/route tay.
+
+---
+
+## 19. MVP-05 — vòng 5: BR-10 (không cắt ngang lượt đang chạy) + BR-11 (dấu vết usage)
+
+Phán quyết vòng 4: **PASS** + 2 cảnh báo. Đã sửa cả hai.
+`npm test` → **849 test · 848 pass · 0 fail · 1 skipped**; `verify.mjs` EXIT=0; `imagelab-demo.mjs`
+→ `succeeded`.
+
+### 19.1 BR-10 — reconcile không cắt ngang lượt ĐANG CHẠY
+
+`reconcileStuckRuns` nhận `isJobActive` (app bơm: `queue.isPending` hoặc status `queued|running`)
+⇒ bỏ qua lượt của job đang chạy; `force` cho admin; đáy an toàn `minStuckRunMs` chỉ áp cho đường
+KHÔNG kiểm được trạng thái job.
+
+```
+$ node /tmp/mvp05-atk4/v2-br09-boot.mjs   §V2.4 (hạ ngưỡng 300ms, job chậm 2s, bắn 2 request)
+  HTTP: A=202 B=409
+  sổ: hold/settle cho 2 lượt (KHÔNG có job_refund nào)
+  chi phí THẬT tổng=0.0036 · ĐÃ THU=0.0036 ⇒ không hụt
+        (vòng 4: 3 lượt chạy thật, chi phí 0.0054 mà chỉ thu 0.0036 = THU THIẾU 0.0018)
+  §V2.3 boot reconcile: "trước restart: balance=1.9899 · lượt MỞ=1" → "sau restart: balance=1.9982
+        (trước 1.9899) · lượt MỞ=0" ⇒ boot đã thu hồi ✔
+
+$ node /tmp/mvp05-atk4/v1-br08.mjs
+  §V1.1: dòng refund: [{"run_key":"#2","amount":0.0083,"reconciled":true,"stuck_ms":28937}] ⇒ PHỤC HỒI ĐƯỢC ✔
+  §V1.2 (đối chứng âm, ngưỡng mặc định): "có dòng refund nào mới không? không ✔" (vẫn 409)
+  §V1.3 route admin: owner → 200 {"reconciled":1,"refunded":0.0083,"older_than_ms":1000,
+        "skipped_active":0,"forced":false}; gọi lần 2 → {"reconciled":0} (idempotent)
+        (member 403 · ẩn danh 401)
+
+$ node /tmp/mvp05-atk4/v3-negative-regression.mjs
+  §V3.2 admin ép reconcile (older_than_ms=0) cho lượt MỚI ⇒ "retry → 409" (KHÔNG cắt lượt mới),
+        sau đó "admin reconcile older_than_ms=0 → 200 {reconciled:1, refunded:0.0083}" ⇒
+        "chạy lại sau khi ép reconcile → 202"
+  §V3.4 BR-07: TỔNG THẬT=0.0072 · ĐÃ THU=0.0072 ⇒ khớp ✔
+```
+
+### 19.2 BR-11 — dấu vết nguồn usage
+
+```
+$ node /tmp/mvp05-atk4/v3-negative-regression.mjs   §V3.3
+  usage_unavailable: KHÔNG đọc được usage ⇒ thu 0 + meta + WARN · balance=1 (thu 0 ⇒ hoàn hết)
+
+$ node --test test/mvp05-round5-hardening.test.js
+  ✔ job KHÔNG tốn gì ⇒ meta.usage_source = 'none' (không phải 'unavailable')
+  ✔ usage có nhưng KHÔNG thuộc lượt ⇒ usage_source='unavailable' + usage_unavailable + WARN
+  ✔ usage của chính lượt ⇒ 'run'; usage DB cũ (không run_key) ⇒ 'legacy'
+```
+
+### 19.3 Không hồi quy (script vòng 3 + vòng 4)
+
+```
+$ node /tmp/mvp05-atk3/u1-br07.mjs  → U1.1: 0.3 = 0.3 ✔ · U1.2: 0.0072 = 0.0072 ✔
+                                       U1.4: "lượt #2 (KHÔNG usage riêng): thu 0 ⇒ không thu lại ✔"
+$ node /tmp/mvp05-atk3/u3b-stuck.mjs → lượt CÒN MỚI + ngưỡng mặc định: vẫn 409 (đối chứng âm)
+$ node /tmp/mvp05-atk2/t13,t12,t9,t7 → mỗi lượt thu đúng phần của lượt; A=202 B=409; trần 429
+```
+
+### 19.4 Test thêm & phần chưa sửa được
+
+- **Thêm** `test/mvp05-round5-hardening.test.js` (**7 test**: BR-10 bốn chiều — bỏ qua job đang
+  chạy, đáy an toàn + WARN, ca HTTP "tổng thu = tổng thật", `force` + `meta.forced`; BR-11 ba ca —
+  `none`, `unavailable` + WARN, `run`/`legacy`).
+- **Chưa sửa được / còn đo được:**
+  · `isJobActive` dựa vào trạng thái job: một tiến trình **chết** để lại job `running` vĩnh viễn ⇒
+    reconciliation bỏ qua mãi (phải dùng `force: true`); chưa có heartbeat/TTL cho trạng thái job.
+  · Đáy an toàn chỉ áp cho đường KHÔNG kiểm được trạng thái job — nghĩa là vẫn có thể cấu hình
+    ngưỡng rất ngắn cho đường có `isJobActive`; rào thật ở đó là `queue.isPending` + status, chưa
+    đo với hàng đợi **đa tiến trình**.
+  · `/tmp/mvp05-atk4/v1-br08.mjs` §V1.4 crash trong **script của phản biện** (`no such table:
+    wallet_ledger`) khi họ thử dựng lại boot trên store in-memory — không phải lỗi repo; ca boot
+    được chứng minh bằng `v2 §V2.3` (DB file thật, restart thật).

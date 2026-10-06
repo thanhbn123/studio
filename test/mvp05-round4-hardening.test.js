@@ -75,7 +75,10 @@ describe('BR-08 — thu hồi lượt TREO (reconcile)', () => {
   });
 
   test('HTTP: lượt treo quá hạn ⇒ request sau KHÔNG còn 409, tiền được hoàn, lượt mới bị thu', async () => {
-    const ctx = await startMvp05App({ configOverrides: { BILLING_STUCK_RUN_MS: '50' } });
+    // BR-10: phải hạ CẢ đáy an toàn (`minStuckRunMs`) thì ngưỡng ngắn mới có hiệu lực.
+    const ctx = await startMvp05App({
+      configOverrides: { BILLING_STUCK_RUN_MS: '50', BILLING_MIN_STUCK_RUN_MS: '50' },
+    });
     try {
       const jar = newJar();
       const reg = await register(ctx.base, { email: 'br08@example.com', jar });
@@ -128,7 +131,9 @@ describe('BR-08 — thu hồi lượt TREO (reconcile)', () => {
   });
 
   test('route bảo trì: member ⇒ 403, owner ⇒ 200 kèm {reconciled, refunded}', async () => {
-    const ctx = await startMvp05App({ configOverrides: { BILLING_STUCK_RUN_MS: '0' } });
+    const ctx = await startMvp05App({
+      configOverrides: { BILLING_STUCK_RUN_MS: '0', BILLING_MIN_STUCK_RUN_MS: '0' },
+    });
     try {
       const memberJar = newJar();
       await register(ctx.base, { email: 'br08-member@example.com', jar: memberJar });

@@ -580,9 +580,43 @@ export async function createApp(opts = {}) {
   // BR-08 (vòng 4) — THU HỒI LƯỢT TREO lúc khởi động (best-effort): lượt có `job_hold` mà không
   // có dòng đóng (tiến trình chết trước `afterJob`, settle lỗi…) sẽ được HOÀN tiền và đóng lại,
   // nếu không job đó khoá vĩnh viễn bằng 409 và tiền nằm đọng.
+  /**
+   * BR-10 (vòng 5) — JOB CÓ ĐANG HOẠT ĐỘNG KHÔNG? Dùng làm rào cho reconciliation:
+   * hàng đợi còn việc cho job đó (`queue.isPending`) HOẶC trạng thái `queued|running`.
+   * Đọc trạng thái lỗi ⇒ trả `true` (an toàn: KHÔNG cắt ngang lượt đang chạy).
+   */
+  const isJobActive = async (jobId) => {
+    try {
+      if (typeof queue?.isPending === 'function' && queue.isPending(jobId)) return true;
+    } catch { /* không đọc được hàng đợi ⇒ kiểm tiếp theo trạng thái */ }
+    try {
+      const job = await store?.getJob?.(jobId);
+      const status = String(job?.status || '');
+      return status === 'queued' || status === 'running';
+    } catch {
+      return true; // không kiểm được ⇒ coi như đang chạy (không thu hồi)
+    }
+  };
+
+  /** BR-08/BR-10 — thu hồi lượt treo với ĐẦY ĐỦ ngữ cảnh của app (hàng đợi + trạng thái job). */
+  const reconcileStuckRunsApp = async (opts = {}) => {
+    if (!billing.service || typeof billing.service.reconcileStuckRuns !== 'function') {
+      return { reconciled: 0, refunded: 0, runs: [], skipped_active: 0 };
+    }
+    return billing.service.reconcileStuckRuns({ isJobActive, ...opts });
+  };
+
+  if (config?.billing?.stuckRunMsRaised) {
+    rootLogger.warn('billing.stuck_run_ms_raised', {
+      applied_ms: config?.billing?.stuckRunMs ?? null,
+      min_stuck_run_ms: config?.billing?.minStuckRunMs ?? null,
+      reason: 'BILLING_STUCK_RUN_MS ngắn hơn đáy an toàn — đã nâng lên để KHÔNG cắt ngang job đang chạy thật.',
+    });
+  }
+
   if (billing.service && typeof billing.service.reconcileStuckRuns === 'function') {
     try {
-      const reconciled = await billing.service.reconcileStuckRuns({});
+      const reconciled = await reconcileStuckRunsApp({});
       if (reconciled?.reconciled > 0) {
         rootLogger.warn('billing.stuck_runs_reconciled_at_boot', {
           reconciled: reconciled.reconciled,
@@ -653,6 +687,8 @@ export async function createApp(opts = {}) {
         // MVP-05: hook tính tiền (chỉ chạy khi job có `user_id`; null ⇒ bỏ qua hoàn toàn).
         billingService: billing.service,
         billingHook,
+    // BR-10: thu hồi lượt treo CÓ ngữ cảnh (hàng đợi + trạng thái job) — route/admin dùng hàm này.
+    reconcileStuckRuns: reconcileStuckRunsApp,
       });
       rootLogger.info('imagelab.wired', {
         ocr: ocrProvider?.name || 'none',
@@ -734,6 +770,8 @@ export async function createApp(opts = {}) {
         // MVP-05: hook tính tiền (chỉ chạy khi job có `user_id`; null ⇒ bỏ qua hoàn toàn).
         billingService: billing.service,
         billingHook,
+    // BR-10: thu hồi lượt treo CÓ ngữ cảnh (hàng đợi + trạng thái job) — route/admin dùng hàm này.
+    reconcileStuckRuns: reconcileStuckRunsApp,
       });
       rootLogger.info('imagestudio.wired', {
         matting: mattingProvider?.name || 'none',
@@ -797,6 +835,8 @@ export async function createApp(opts = {}) {
     // MVP-05: hook tính tiền (chỉ chạy khi job có `user_id`; null ⇒ bỏ qua hoàn toàn).
     billingService: billing.service,
     billingHook,
+    // BR-10: thu hồi lượt treo CÓ ngữ cảnh (hàng đợi + trạng thái job) — route/admin dùng hàm này.
+    reconcileStuckRuns: reconcileStuckRunsApp,
   });
 
   const rateLimiters = {
@@ -844,6 +884,8 @@ export async function createApp(opts = {}) {
     // NGAY TRONG REQUEST (sau `createJob`, trước `queue.enqueue`); pipeline gọi `afterJob`
     // ở cuối mỗi lượt chạy thật. Object HẰNG, không bao giờ là null.
     billingHook,
+    // BR-10: thu hồi lượt treo CÓ ngữ cảnh (hàng đợi + trạng thái job) — route/admin dùng hàm này.
+    reconcileStuckRuns: reconcileStuckRunsApp,
     // Lý do THẬT (đã lọc đường dẫn) để `/api/health` + `/api/config` nói được VÌ SAO tính
     // năng tắt — im lặng là kiểu thất bại bị cấm. `null` = khả dụng.
     accountsUnavailableReason: accounts.reason,

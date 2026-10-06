@@ -247,7 +247,18 @@ export function loadConfig(env = process.env) {
       // BR-08 (vòng 4): ngưỡng coi một lượt chạy là TREO (có `job_hold` mà không có dòng đóng).
       // Quá ngưỡng ⇒ `reconcileStuckRuns` HOÀN 100% khoản giữ và đóng lượt (job chạy lại được).
       // Mặc định 15 phút — đủ dài để không cắt ngang job đang chạy thật.
+      //
+      // BR-10 (vòng 5): ĐÁY AN TOÀN `minStuckRunMs` — cấu hình ngưỡng NGẮN HƠN thời gian chạy job
+      // có thể cắt ngang job thật (đo được: 3 lượt chạy thật mà chỉ thu 2). Cấu hình chỉ được
+      // NỚI, không được hạ dưới đáy; hạ xuống thì bị nâng lên + log WARN (`stuckRunMsRaised`).
+      // Ngưỡng CẤU HÌNH (không kẹp ở đây): nó vẫn có hiệu lực cho các đường CÓ kiểm tra job
+      // đang chạy hay không (`isJobActive` — xem §7.3), nhờ vậy vận hành vẫn phục hồi được job
+      // chết nhanh. Đáy `minStuckRunMs` chỉ áp cho đường KHÔNG kiểm được trạng thái job.
       stuckRunMs: Math.max(0, toNum(env.BILLING_STUCK_RUN_MS, 15 * 60 * 1000)),
+      minStuckRunMs: Math.max(0, toNum(env.BILLING_MIN_STUCK_RUN_MS, 60 * 1000)),
+      stuckRunMsRaised:
+        Math.max(0, toNum(env.BILLING_STUCK_RUN_MS, 15 * 60 * 1000)) <
+        Math.max(0, toNum(env.BILLING_MIN_STUCK_RUN_MS, 60 * 1000)),
       // Seed bảng `pricing` từ `config.cost.*` của MVP-01 (nguồn giá mặc định).
       pricingFromCost: toBool(env.BILLING_PRICING_FROM_COST, true),
     },

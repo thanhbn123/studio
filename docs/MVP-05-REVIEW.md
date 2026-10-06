@@ -647,3 +647,99 @@ node /tmp/mvp05-atk3/u7-postgres.mjs        # POSTGRESQL THẬT: migration, thu 
 for f in /tmp/mvp05-atk/t*.mjs /tmp/mvp05-atk2/t*.mjs; do node "$f"; done   # chạy lại toàn bộ vòng 1+2
 npm test && node tools/verify.mjs && node tools/imagelab-demo.mjs
 ```
+
+---
+---
+
+# VÒNG 4 — XÁC NHẬN ĐIỀU KIỆN TẠI COMMIT `63d3a20`
+
+*Phản biện viên độc lập (không sửa mã nguồn, không sửa `test/**`) · commit chấm: `63d3a20` · script:
+`/tmp/mvp05-atk4/v1…v4`, output `out-v*.txt` · chạy lại hồi quy vòng 1–3 trên mã mới.*
+
+## PHÁN QUYẾT CUỐI: **PASS**
+
+Hai điều kiện của vòng 3 **đã được xử lý thật**, tôi tự dựng lại ca lỗi và đo được đường phục hồi
+(**cả trên PostgreSQL thật**). Hai điểm còn lại chỉ là **cảnh báo vận hành** (BR-10: ngưỡng treo phải lớn
+hơn thời gian chạy job dài nhất; BR-11: dấu vết "thu thiếu" chưa hiện trong ca không có usage nào) —
+không phải lỗi tiền ở đường mặc định.
+
+## 1. BR-08 — lượt treo: ĐÃ XỬ LÝ THẬT
+
+| Đường phục hồi | Bằng chứng (lệnh · output thật) |
+|---|---|
+| **Ngưỡng treo** (`BILLING_STUCK_RUN_MS=1500`): request kế tiếp sau ngưỡng ⇒ hoàn 100% + chạy lại được | `v1 §V1.1`: `job_refund@#2 amount=0.0083, meta={"reconciled":true,"stuck_ms":8202}` · balance `1.9964 → 1.9946` · **retry sau đó = 202**, job `succeeded` |
+| **Lúc BOOT** (restart thật trên DB file) | `v2 §V2.3`: log `billing.stuck_runs_reconciled_at_boot {reconciled:1, refunded:0.0083, older_than_ms:1000}` · balance `1.9899 → 1.9982` · lượt MỞ `1 → 0` · refund `meta.reason=STUCK_RUN_RECONCILE` · chạy lại sau restart **202** |
+| **Route admin** `POST /api/admin/billing/reconcile` | `v1 §V1.3`: ẩn danh **401** · member **403** · owner **200** `{"reconciled":1,"refunded":0.0083,"older_than_ms":1000}`; gọi lần 2 → `{"reconciled":0}` (idempotent); `v3 §V3.2` ép `older_than_ms:0` cho lượt MỚI ⇒ thu hồi ngay rồi chạy lại **202** |
+| **Đối chứng ÂM — lượt còn mới KHÔNG bị cắt** | `v1 §V1.2` (ngưỡng mặc định 15 phút): retry ⇒ **409 `JOB_ALREADY_RUNNING`**, **không** phát sinh dòng hoàn, lượt vẫn mở; `v3b/v3d`: `listOpenJobHolds` + `reconcileStuckRuns({userId})` với lượt 0,4–0,6 s tuổi ⇒ **0**, retry ⇒ **409**; `u7`/`v4` trên **PG**: cutoff 1 s với lượt mới ⇒ 0, sau 1,2 s ⇒ 1 ⇒ thu hồi `refunded=0.5`, gọi lại ⇒ 0 |
+| **Cách dùng thật** | Mặc định `stuckRunMs = 15 phút` (`/api/config.billing.stuck_run_ms = 900000`): người dùng **phải chờ**, và việc thu hồi xảy ra ở **lần thử chạy lại kế tiếp của chính job đó**, **lúc boot**, hoặc khi owner gọi route admin. **Không có cron/scheduler** — nếu không ai chạm tới job và server không restart, khoản giữ vẫn nằm đó (chỉ được ghi log khi reconcile chạy). |
+
+## 2. BR-09 — không thu lại usage đã hoàn: ĐÃ XỬ LÝ THẬT
+
+| Nội dung | Bằng chứng (lệnh · output thật) |
+|---|---|
+| Lượt #1 lỗi (usage 0.3) → hoàn 100%; lượt #2 **không có usage riêng** ⇒ **thu 0** | `v2 §V2.1`: `refund 0.5` rồi `settle #{2} amount=+0.5, meta={"actual_cost":0,"legacy_usage_counted":0}` → **thu 0** (trước vòng 4 là thu 0.3) · `audit: grant 1, hold −1, refund +0.5, settle +0.5 → balance 1` |
+| Usage đến **muộn** của lượt đã khép ⇒ **bỏ** (thu thiếu có chủ ý) | `v2 §V2.2`: lượt #1 thu 0.1, ghi thêm 0.2 sau settle; lượt #2 (usage riêng 0.3) thu **0.3** (không dính 0.2); lượt #3 (không usage) thu **0**; tổng thật `0.6`, đã thu `0.4` ⇒ **thu thiếu 0.2** — đúng thiết kế "thà thu thiếu còn hơn thu thừa" |
+| Không đọc được usage ⇒ thu 0 + `meta.usage_unavailable` + WARN | `v3 §V3.3`: `listUsage` lỗi ⇒ `settle amount=+0.5, meta={"actual_cost":0,"usage_unavailable":true}` · log `billing.settle_usage_unavailable` **có** · balance về đủ 1 |
+| Rủi ro của việc "thà thu thiếu" | Doanh thu bị bỏ khi (a) usage đến sau khi lượt đã settle, (b) pipeline không ghi usage cho lượt đó. Không ảnh hưởng tiền người dùng; cần theo dõi log/`meta` để biết mức hụt. |
+
+## 3. Lỗ hổng/cảnh báo mới (không chặn PASS)
+
+| # | Mức | Nội dung | Bằng chứng |
+|---|---|---|---|
+| **BR-10** | **THẤP–TB (theo cấu hình)** | **Ngưỡng treo phải LỚN HƠN thời gian chạy job dài nhất.** Nếu không, một request thứ hai có thể thu hồi **lượt ĐANG CHẠY** ⇒ lượt đó thành miễn phí (thu thiếu). `reconcileStuckRuns` chỉ nhìn sổ, **không** kiểm job có đang chạy thật hay không (`queue.isPending(jobId)`/`jobs.status='running'`). | `v2 §V2.4` (ngưỡng 300 ms, job chậm 2 s): 3 lượt chạy thật, chi phí thật `0.0054`, **đã thu `0.0036`** ⇒ hụt `0.0018`; sổ có `job_refund@#2` cho lượt vừa bị cắt |
+| **BR-11** | **THẤP (dấu vết)** | Ca "lượt không có usage nào" ghi `settle actual_cost=0` **không** kèm `meta.usage_unavailable` và **không** có WARN (chỉ có `legacy_usage_counted`) ⇒ khoản thu thiếu im lặng trong log; dấu vết chỉ hiện khi *không đọc được* usage. | `v2 §V2.1/§V2.2` (`meta={"actual_cost":0,"legacy_usage_counted":0}`, không có `usage_unavailable`) so với `v3 §V3.3` (có) |
+
+## 4. Đã cố phá ở vòng 4 mà KHÔNG phá được (hồi quy)
+
+- `npm test` = **842 · 841 pass · 0 fail · 1 skipped** (exit 0) · `node tools/verify.mjs` = **842 · 841 pass ·
+  0 fail · 1 skipped** (exit 0) · `node tools/imagelab-demo.mjs` exit 0 (`job succeeded`).
+- **BR-07 vẫn đúng**: `t12-r4` 4 lượt content ⇒ `TỔNG THẬT = TỔNG ĐÃ THU = 0.0072` (settle mỗi lượt `+0.0065`);
+  `t13-r4` 5 lượt × 0.1 ⇒ thu `0.5` (mỗi lượt `settle=0.4`) — **không thu thừa**.
+- **Bất biến sổ**: `atk1-r4` 100 thao tác đồng thời = `103.75` đúng kỳ vọng, `MIN(balance_after)=0`,
+  `grant(1e308)` ⇒ `INVALID_AMOUNT`; SQLite `u5`/`v3 §V3.4`: 0 nhảy cóc, 0 âm; **PostgreSQL** `u7-pg-r4`:
+  48 dòng/12 user — 0 nhảy cóc, 0 âm, 0 lệch; 2 tiến trình PG vẫn chỉ 1 dòng đóng (`23505`).
+- **Ẩn danh** 3 loại job (0 cookie) ⇒ 202/`succeeded`/`awaiting_review` + **0 dòng sổ** (`v3 §V3.4`).
+- **IDOR** 21 đường bị chặn 404/403 (2 "LỌT" là dữ liệu của chính B) (`atk2-idor-r4`).
+- **Reconcile trên PostgreSQL thật** (`v4-pg-reconcile.mjs`): lượt mới ⇒ 0; lượt cũ ⇒ `reconciled=1,
+  refunded=0.5`, `meta.reconciled=true`; gọi lại ⇒ 0; số dư về đủ.
+
+## 5. Chưa kiểm được (vòng 4)
+
+1. **Cron/scheduler** — không có trong repo: tôi chỉ chứng minh 3 đường thu hồi **thụ động** (request kế
+   tiếp · boot · route admin). Chưa đo hành vi khi hệ thống chạy dài **không restart và không ai chạm job**.
+2. **Đa tiến trình ở tầng HTTP** và **reverse proxy** (`trustProxy`) — vẫn chưa dựng.
+3. **Provider thật / UI trình duyệt thật / tải lớn** — như các vòng trước; ngưỡng treo thật nên đặt bao
+   nhiêu phụ thuộc thời gian chạy job thật (chưa đo).
+4. **Cổng thanh toán, hoá đơn, webhook (MVP-06)** — ngoài phạm vi.
+
+## 6. PASS nghĩa là gì — và KHÔNG nghĩa là gì
+
+**CÓ nghĩa:** toàn bộ 9 lỗ hổng của 3 vòng trước (PB-01…PB-08, BR-01…BR-09) đã được vá **và tôi tự đo lại
+được**, trên SQLite **và PostgreSQL thật**: không còn đường chạy miễn phí, thu thừa, thu lại phần đã hoàn,
+âm ví, đọc chéo tài khoản, fail-open khi sổ lỗi, hay job kẹt 409 vĩnh viễn vì lượt treo. Có 3 đường thu hồi
+lượt treo (ngưỡng · boot · admin) với đối chứng âm đầy đủ. `npm test`/`verify`/`demo` xanh.
+
+**KHÔNG có nghĩa:**
+- **Không** phải "an toàn khi mở rộng ngang": khoá tiền theo user vẫn là `#locks` **trong bộ nhớ 1 tiến
+  trình**; các ràng buộc DB chỉ chặn *ghi trùng một lượt*, không thay thế mutex liên tiến trình.
+- **Không** miễn nhiễm với BR-10: đặt `BILLING_STUCK_RUN_MS` **ngắn hơn** thời gian chạy job dài nhất thì
+  reconcile có thể cắt ngang lượt đang chạy (lượt đó thành miễn phí). Mặc định 15 phút là hợp lý cho MVP.
+- **Không** có cơ chế tự động theo thời gian: **không cron** — thu hồi chỉ xảy ra ở request kế tiếp của job
+  đó, lúc boot, hoặc khi owner gọi route admin; nếu không, tiền vẫn nằm đọng (dù có log khi reconcile chạy).
+- **Không** nói mọi khoản đều thu đủ: usage đến muộn hoặc không ghi được bị **bỏ có chủ ý** (thu thiếu, BR-11
+  chỉ ghi dấu vết một phần) — cần theo dõi để biết mức hụt.
+- **Không** xác nhận provider thật, proxy thật, UI thật, tải lớn, và **chưa có cổng thanh toán/th hoá đơn**
+  (MVP-06).
+
+## 7. Phụ lục — lệnh tái lập vòng 4
+
+```bash
+cd "/Users/viporder/Library/CloudStorage/SynologyDrive-Macbook/Thành bộ não/production/vip-product-studio"
+node /tmp/mvp05-atk4/v1-br08.mjs            # BR-08: phục hồi theo ngưỡng, đối chứng âm, route admin
+node /tmp/mvp05-atk4/v3b-debug.mjs          # BR-08: đo trực tiếp listOpenJobHolds/reconcileStuckRuns
+node /tmp/mvp05-atk4/v2-br09-boot.mjs       # BR-09 + reconcile lúc BOOT + BR-10 (cắt lượt đang chạy)
+node /tmp/mvp05-atk4/v3-negative-regression.mjs  # đối chứng âm + usage_unavailable + hồi quy
+node /tmp/mvp05-atk4/v4-pg-reconcile.mjs    # reconcile trên POSTGRESQL thật
+node /tmp/mvp05-atk3/u7-postgres.mjs        # PG: thu theo lượt + 2 tiến trình đua + bất biến sổ
+npm test && node tools/verify.mjs && node tools/imagelab-demo.mjs
+```

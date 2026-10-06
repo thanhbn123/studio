@@ -888,11 +888,17 @@ export function buildRouter(app) {
    * BR-08 — thu hồi các lượt TREO (chỉ những lượt cũ hơn `config.billing.stuckRunMs`).
    * Trả về SỐ lượt đã thu hồi; nuốt lỗi (đây là đường phục hồi, không được làm hỏng request).
    */
-  const reconcileStuckRunsFor = async (req, { userId = null } = {}) => {
-    const service = app?.billingService;
-    if (!service || typeof service.reconcileStuckRuns !== 'function' || !billingEnabled()) return 0;
+  const reconcileStuckRunsFor = async (req, { userId = null, force = false } = {}) => {
+    const runner = typeof app?.reconcileStuckRuns === 'function'
+      ? app.reconcileStuckRuns
+      : (app?.billingService && typeof app.billingService.reconcileStuckRuns === 'function'
+        ? app.billingService.reconcileStuckRuns.bind(app.billingService)
+        : null);
+    if (!runner || !billingEnabled()) return 0;
     try {
-      const res = await service.reconcileStuckRuns({ userId: userId || req?.user?.id || null });
+      // `app.reconcileStuckRuns` đã bơm `isJobActive` (hàng đợi + trạng thái job) ⇒ KHÔNG cắt ngang
+      // lượt đang chạy thật (BR-10).
+      const res = await runner({ userId: userId || req?.user?.id || null, force });
       const n = Number(res?.reconciled) || 0;
       if (n > 0) logger?.warn?.('billing.stuck_runs_reconciled', { reconciled: n, refunded: res?.refunded ?? 0 });
       return n;
@@ -1204,17 +1210,24 @@ export function buildRouter(app) {
     const body = await readJson(req, { maxBytes: 8 * 1024 }).catch(() => ({}));
     const rawMs = Number(body?.older_than_ms);
     const olderThanMs = Number.isFinite(rawMs) && rawMs >= 0 ? rawMs : null;
+    // BR-10: `force: true` ⇒ ÉP thu hồi dù job đang hoạt động (chỉ owner/admin, khi biết chắc job
+    // đã chết) — dòng hoàn sẽ mang `meta.forced = true`.
+    const force = body?.force === true;
     let out;
     try {
-      out = await service.reconcileStuckRuns({ olderThanMs });
+      out = typeof app?.reconcileStuckRuns === 'function'
+        ? await app.reconcileStuckRuns({ olderThanMs, force })
+        : await service.reconcileStuckRuns({ olderThanMs, force });
     } catch (err) {
       throw mapBillingError(err) || err;
     }
-    logger?.warn?.('billing.reconcile_requested', { reconciled: out?.reconciled ?? 0 });
+    logger?.warn?.('billing.reconcile_requested', { reconciled: out?.reconciled ?? 0, force, skipped_active: out?.skipped_active ?? 0 });
     sendJson(res, 200, {
       reconciled: Number(out?.reconciled) || 0,
       refunded: Number(out?.refunded) || 0,
       older_than_ms: out?.older_than_ms ?? null,
+      skipped_active: Number(out?.skipped_active) || 0,
+      forced: force,
     });
   });
 
@@ -1363,6 +1376,7 @@ export function buildRouter(app) {
         max_amount: Number.isFinite(Number(billingConfig().maxAmount)) ? Number(billingConfig().maxAmount) : null,
         // BR-08: ngưỡng coi một lượt chạy là TREO (ms) — quá ngưỡng thì được thu hồi tự động.
         stuck_run_ms: Number.isFinite(Number(billingConfig().stuckRunMs)) ? Number(billingConfig().stuckRunMs) : null,
+        min_stuck_run_ms: Number.isFinite(Number(billingConfig().minStuckRunMs)) ? Number(billingConfig().minStuckRunMs) : null,
       },
       // §3.4 — trạng thái thật của dịch vụ tài khoản/ví để người vận hành biết VÌ SAO tắt.
       accounts: { available: accountsAvailable(), reason: accountsAvailable() ? null : AUTH_UNAVAILABLE_MESSAGE },

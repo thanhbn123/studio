@@ -260,16 +260,26 @@ export class BillingService {
    */
   #locks = new Map();
 
+  /** BR-10: đã cảnh báo "ngưỡng bị nâng lên đáy an toàn" cho đường không kiểm được job chưa. */
+  #floorWarned = false;
+
   constructor(deps = {}) {
     const { store, logger, config } = normalizeDeps(deps);
     this.store = store;
+    // ⚠️ Gán logger NGAY: các cảnh báo cấu hình bên dưới (đáy an toàn BR-10) phải ra được log.
+    this.logger = logger;
     // PB-06: trần credit cho một thao tác cấp/điều chỉnh (mặc định 1e9 — xem `money.js`).
     const cap = toFiniteNumber(config?.billing?.maxAmount);
     this.maxAmount = cap !== null && cap > 0 ? cap : DEFAULT_MAX_AMOUNT;
     // BR-08 (vòng 4): ngưỡng TREO của một lượt chạy (mặc định 15 phút) — xem `reconcileStuckRuns`.
     const stuck = toFiniteNumber(config?.billing?.stuckRunMs);
+    const floor = toFiniteNumber(config?.billing?.minStuckRunMs);
+    this.minStuckRunMs = floor !== null && floor >= 0 ? floor : 60 * 1000;
+    // BR-10: ngưỡng TREO không bao giờ được thấp hơn đáy an toàn — nếu không, một cấu hình sai
+    // có thể thu hồi (hoàn tiền + đóng) một lượt ĐANG CHẠY THẬT, biến nó thành miễn phí.
     this.stuckRunMs = stuck !== null && stuck >= 0 ? stuck : 15 * 60 * 1000;
-    this.logger = logger;
+    /** Đáy an toàn chỉ áp cho đường KHÔNG kiểm được job đang chạy hay không (xem §7.3). */
+    this.#floorWarned = false;
     this.config = config;
   }
 
@@ -788,18 +798,33 @@ export class BillingService {
       let actual = toFiniteNumber(actualCost);
       let usageUnavailable = false;
       let legacyCounted = null; // BR-09: số dòng usage KHÔNG gắn lượt đã tính (tích luỹ)
+      // BR-11: nguồn chi phí — 'request' (caller truyền) | 'run' | 'legacy' | 'none' | 'unavailable'
+      let usageSource = toFiniteNumber(actualCost) !== null ? 'request' : null;
       if (actual === null && (actualCost === undefined || actualCost === null)) {
         // BR-07 (vòng 3): chi phí THẬT của **RIÊNG LƯỢT NÀY** — trước đây lấy tổng usage của
         // cả job nên lượt thứ n thu luôn chi phí của mọi lượt trước (đo được: +100…+150%).
         // BR-09 (vòng 4): không quy được usage về lượt ⇒ KHÔNG thu (thà thu thiếu) + ghi vết.
         const usage = await this.#usageCostOfRun(jid, targetRun, rows);
         if (!usage) {
+          // Không đọc được usage ⇒ KHÔNG thu, và phải để lại VẾT rõ ràng (BR-11).
           usageUnavailable = true;
+          usageSource = 'unavailable';
           actual = 0;
-          this.logger?.warn?.('billing.settle_usage_unavailable', { user_id: uid, job_id: jid, run_key: targetRun });
+          this.logger?.warn?.('billing.usage_unavailable', { user_id: uid, job_id: jid, run_key: targetRun, reason: 'unreadable' });
         } else {
           actual = usage.cost;
           legacyCounted = usage.legacy_counted;
+          usageSource = usage.source;
+          if (usage.source === 'unavailable') {
+            usageUnavailable = true;
+            this.logger?.warn?.('billing.usage_unavailable', {
+              user_id: uid,
+              job_id: jid,
+              run_key: targetRun,
+              reason: 'no_event_of_this_run',
+              usage_events: 'có dòng usage nhưng KHÔNG thuộc lượt này (đã hoàn/lượt khác) ⇒ thu 0',
+            });
+          }
         }
       }
       if (actual === null || actual < 0) {
@@ -837,7 +862,9 @@ export class BillingService {
       // BR-09: đánh dấu đã tính bao nhiêu dòng usage KHÔNG gắn lượt (để lượt sau không thu lại).
       if (legacyCounted !== null) meta.legacy_usage_counted = Math.trunc(legacyCounted);
       if (shortfall > 0) meta.shortfall = shortfall;
-      if (usageUnavailable) meta.usage_unavailable = true; // BR-09: thu 0 vì không quy được usage
+      if (usageUnavailable) meta.usage_unavailable = true; // BR-09/BR-11: thu 0 vì không quy được usage
+      // BR-11: LUÔN ghi nguồn chi phí ⇒ đọc sổ là biết "job không tốn gì" hay "không quy được usage".
+      meta.usage_source = usageSource ?? (actual <= MONEY_EPSILON ? 'none' : 'request');
       return this.#append({ userId: uid, amount, reason: 'job_settle', jobId: jid, runKey: targetRun, meta, balanceBefore });
     });
   }
@@ -953,12 +980,28 @@ export class BillingService {
    *
    * @returns {Promise<{reconciled:number, refunded:number, older_than_ms:number, runs:object[]}>}
    */
-  async reconcileStuckRuns({ userId = null, olderThanMs = null, limit = 200 } = {}) {
+  async reconcileStuckRuns({ userId = null, olderThanMs = null, limit = 200, isJobActive = null, force = false } = {}) {
     const store = this.store;
-    const out = { reconciled: 0, refunded: 0, older_than_ms: this.stuckRunMs, runs: [] };
+    const out = { reconciled: 0, refunded: 0, older_than_ms: this.stuckRunMs, runs: [], skipped_active: 0 };
     if (typeof store?.listOpenJobHolds !== 'function') return out; // store không hỗ trợ ⇒ không làm gì
+    // BR-10 — NGƯỠNG HIỆU LỰC:
+    //   · có `isJobActive` (đường app/route: biết job nào đang chạy) hoặc `force` ⇒ dùng đúng
+    //     ngưỡng cấu hình (vận hành vẫn phục hồi được job chết nhanh);
+    //   · KHÔNG kiểm được trạng thái job ⇒ áp ĐÁY AN TOÀN `minStuckRunMs`, để một cấu hình ngắn
+    //     không thể cắt ngang job đang chạy thật.
+    const canVerify = force || typeof isJobActive === 'function';
     const ms = toFiniteNumber(olderThanMs);
-    const older = ms !== null && ms >= 0 ? ms : this.stuckRunMs;
+    const wanted = ms !== null && ms >= 0 ? ms : this.stuckRunMs;
+    const older = canVerify ? wanted : Math.max(wanted, this.minStuckRunMs);
+    if (older !== wanted && !this.#floorWarned) {
+      this.#floorWarned = true;
+      this.logger?.warn?.('billing.stuck_run_ms_raised', {
+        configured_ms: wanted,
+        applied_ms: older,
+        min_stuck_run_ms: this.minStuckRunMs,
+        reason: 'Không kiểm được job nào đang chạy ⇒ nâng ngưỡng TREO lên đáy an toàn để KHÔNG cắt ngang job thật.',
+      });
+    }
     out.older_than_ms = older;
     const cutoffIso = new Date(Date.now() - older).toISOString();
 
@@ -973,6 +1016,24 @@ export class BillingService {
       const jid = String(hold?.job_id || '');
       const runKey = runKeyOf(hold);
       if (!owner || !jid || !runKey) continue;
+      // BR-10 (vòng 5): job ĐANG HOẠT ĐỘNG (hàng đợi còn việc, hoặc trạng thái queued/running)
+      // ⇒ KHÔNG thu hồi, dù đã quá ngưỡng: lượt đó đang chạy THẬT, cắt ngang là làm nó miễn phí.
+      // `force: true` (chỉ owner/admin, khi biết chắc job đã chết) bỏ qua rào này.
+      if (!force && typeof isJobActive === 'function') {
+        let active = false;
+        try {
+          active = (await isJobActive(jid)) === true;
+        } catch (err) {
+          // Không kiểm được trạng thái ⇒ coi như ĐANG hoạt động (an toàn: không cắt ngang).
+          active = true;
+          this.logger?.warn?.('billing.reconcile_active_check_failed', { job_id: jid, error_name: err?.name || 'Error' });
+        }
+        if (active) {
+          out.skipped_active += 1;
+          this.logger?.info?.('billing.stuck_run_skipped_active', { job_id: jid, run_key: runKey });
+          continue;
+        }
+      }
       try {
         const stuckMs = Math.max(0, Date.now() - Date.parse(String(hold?.created_at || '')) || 0);
         const row = await this.refundForJob({
@@ -980,7 +1041,11 @@ export class BillingService {
           jobId: jid,
           runKey,
           reason: 'STUCK_RUN_RECONCILE',
-          meta: { reconciled: true, stuck_ms: Number.isFinite(stuckMs) ? stuckMs : null },
+          meta: {
+            reconciled: true,
+            stuck_ms: Number.isFinite(stuckMs) ? stuckMs : null,
+            ...(force ? { forced: true } : {}),
+          },
         });
         const amount = Math.abs(toFiniteNumber(row?.amount) ?? 0);
         out.reconciled += 1;
@@ -1111,7 +1176,16 @@ export class BillingService {
       cost += toFiniteNumber(event?.estimated_cost ?? event?.estimatedCost ?? 0) ?? 0;
       counted += 1;
     }
-    return { cost: counted > 0 ? roundMoney(cost) : 0, legacy_counted: legacySkip + mineLegacy.length, unavailable: false };
+    // BR-11 (vòng 5): LUÔN nói rõ chi phí đến từ đâu — không phân biệt được "job không tốn gì" với
+    // "không quy được usage về lượt" là điều KHÔNG được phép (đã từng ghi `actual_cost = 0` im lặng).
+    const attributed = list.filter((event) => String(event?.run_key || '') === runKey).length;
+    const source = counted === 0 ? (list.length === 0 ? 'none' : 'unavailable') : (attributed > 0 ? 'run' : 'legacy');
+    return {
+      cost: counted > 0 ? roundMoney(cost) : 0,
+      legacy_counted: legacySkip + mineLegacy.length,
+      unavailable: false,
+      source,
+    };
   }
 
   async #usageCostOfJob(jobId) {
