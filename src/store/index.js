@@ -243,6 +243,15 @@ export class Store {
     // này chưa có cột ⇒ thêm tại chỗ; dòng cũ giữ `seq = 0` (không UPDATE sổ append-only).
     await this.#addColumnIfMissing('wallet_ledger', 'seq', 'INTEGER NOT NULL DEFAULT 0');
     await this.#createIndexIfPossible('idx_wallet_ledger_user_seq', 'wallet_ledger', 'user_id, seq');
+    // MVP-05 (vòng 2, PB-02/PB-04): `wallet_ledger.run_key` — khoá chu kỳ tiền theo LƯỢT CHẠY
+    // (`<jobId>#<n>`), để mỗi lượt chạy lại có hold/settle/refund riêng. Thêm SAU migration
+    // (bài học `seq`: index trong `schema.sql` làm chết `init()` trên DB cũ).
+    await this.#addColumnIfMissing('wallet_ledger', 'run_key', 'TEXT');
+    await this.#createIndexIfPossible('idx_wallet_ledger_run_key', 'wallet_ledger', 'user_id, job_id, run_key');
+    await this.#createUniqueIndexIfPossible('uniq_wallet_ledger_run_reason', 'wallet_ledger', {
+      columns: 'user_id, job_id, run_key, reason',
+      where: "reason IN ('job_hold','job_settle','job_refund') AND run_key IS NOT NULL",
+    });
     // Index tra cứu theo chủ sở hữu (A4 lọc dữ liệu theo user). Tạo SAU khi cột đã tồn tại;
     // lỗi ở đây không được làm chết boot (DB cũ/hỏng vẫn phải chạy được MVP-01/02/03).
     await this.#createIndexIfPossible('idx_jobs_user_id', 'jobs', 'user_id');
@@ -269,6 +278,26 @@ export class Store {
       await this.driver.run(`CREATE INDEX IF NOT EXISTS ${name} ON ${table} (${column})`);
     } catch (err) {
       this.logger?.warn('store.migration.index_skipped', { name, table, column, error: err?.message || String(err) });
+    }
+  }
+
+  /**
+   * Tạo UNIQUE index nếu có thể (PB-04, vòng 2) — chặn hai tiến trình ghi trùng một chu kỳ
+   * tiền của cùng lượt chạy. Partial unique index chạy được trên CẢ SQLite và PostgreSQL.
+   * Lỗi (DB cũ đã có dữ liệu trùng, driver không hỗ trợ…) chỉ ghi log, KHÔNG làm chết `init()`.
+   */
+  async #createUniqueIndexIfPossible(name, table, { columns, where = '' } = {}) {
+    try {
+      // ⚠️ `WHERE` phải nằm NGOÀI dấu ngoặc của danh sách cột (partial index); nhét vào trong
+      // là lỗi cú pháp trên cả SQLite lẫn PostgreSQL.
+      const clause = where ? ` WHERE ${where}` : '';
+      await this.driver.run(`CREATE UNIQUE INDEX IF NOT EXISTS ${name} ON ${table} (${columns})${clause}`);
+    } catch (err) {
+      this.logger?.warn('store.migration.unique_index_skipped', {
+        name,
+        table,
+        error: err?.message || String(err),
+      });
     }
   }
 
@@ -1058,6 +1087,9 @@ export class Store {
       currency: row.currency || 'USD',
       reason: row.reason,
       job_id: row.job_id ?? null,
+      // PB-02 (vòng 2): khoá chu kỳ tiền theo LƯỢT CHẠY — cột riêng (không chỉ trong `meta`)
+      // để tầng billing đọc lại được mà không phải parse JSON.
+      run_key: row.run_key ?? null,
       operation: row.operation ?? null,
       meta: fromJson(row.meta),
       balance_after: roundMoney(row.balance_after),
@@ -1080,7 +1112,7 @@ export class Store {
    * dung sai EPS: chỉ coi là âm thật khi vượt quá dung sai, nhờ vậy không từ chối oan một
    * giao dịch hợp lệ vì nhiễu số học.
    */
-  async appendLedger({ id = randomUUID(), userId = null, user_id = null, amount, currency = 'USD', reason = 'adjustment', jobId = null, job_id = null, operation = null, meta = null } = {}) {
+  async appendLedger({ id = randomUUID(), userId = null, user_id = null, amount, currency = 'USD', reason = 'adjustment', jobId = null, job_id = null, runKey = null, run_key = null, operation = null, meta = null } = {}) {
     const uid = String(userId || user_id || '');
     if (!uid) throw Object.assign(new Error('appendLedger thiếu userId.'), { code: 'INVALID_LEDGER_ROW' });
     const value = toNum(amount, null);
@@ -1099,6 +1131,7 @@ export class Store {
       currency: String(currency || 'USD'),
       reason: String(reason || 'adjustment'),
       job_id: jobId ?? job_id ?? null,
+      run_key: runKey ?? run_key ?? null,
       operation: operation ?? null,
       meta: meta && typeof meta === 'object' ? meta : null,
       created_at: ts,
@@ -1120,9 +1153,12 @@ export class Store {
       }
       const seq = Number(toNum(current?.max_seq, 0)) + 1;
       await tx.run(
-        `INSERT INTO wallet_ledger (id, user_id, seq, amount, currency, reason, job_id, operation, meta, balance_after, created_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-        [row.id, row.user_id, seq, row.amount, row.currency, row.reason, row.job_id, row.operation, toJson(row.meta), balanceAfter, ts],
+        `INSERT INTO wallet_ledger (id, user_id, seq, amount, currency, reason, job_id, run_key, operation, meta, balance_after, created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          row.id, row.user_id, seq, row.amount, row.currency, row.reason, row.job_id, row.run_key,
+          row.operation, toJson(row.meta), balanceAfter, ts,
+        ],
       );
       return { ...row, seq, balance_after: balanceAfter };
     });

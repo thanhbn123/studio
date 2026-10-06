@@ -57,6 +57,42 @@ export function roundMoney(value) {
   return Object.is(out, -0) ? 0 : out; // chuẩn hoá -0 → 0 để JSON/hiển thị không lạ
 }
 
+/**
+ * PB-06 (vòng 2) — TRẦN credit cho MỘT thao tác cấp/điều chỉnh.
+ *
+ * `grant(1e308)` trước đây: `roundMoney(1e308)` ⇒ `Infinity` ⇒ tầng store đọc bằng
+ * `toNum` (chỉ nhận số hữu hạn) ⇒ ghi dòng `amount = 0` mà API vẫn trả 201 ⇒ sổ có một
+ * dòng "đã nạp 0 credit" trong khi admin tin là đã nạp. Trần này chặn cả tràn số lẫn
+ * giá trị vô lý; giá trị hiệu lực lấy từ `config.billing.maxAmount`.
+ */
+export const DEFAULT_MAX_AMOUNT = 1e9;
+
+/**
+ * Chuẩn hoá một khoản tiền ĐỂ GHI SỔ — nghiêm ngặt, KHÔNG bao giờ trả `Infinity`/`NaN`.
+ *
+ * @param {unknown} value
+ * @param {{max?: number, allowZero?: boolean}} [options]
+ * @returns {{ok: true, value: number} | {ok: false, code: string, reason: string, amount: unknown}}
+ */
+export function normalizeAmount(value, { max = DEFAULT_MAX_AMOUNT, allowZero = false } = {}) {
+  const raw = toFiniteNumber(value);
+  if (raw === null) {
+    return { ok: false, code: 'INVALID_AMOUNT', reason: 'không phải số hữu hạn', amount: value ?? null };
+  }
+  const rounded = roundMoney(raw);
+  if (!Number.isFinite(rounded)) {
+    return { ok: false, code: 'INVALID_AMOUNT', reason: 'tràn số khi làm tròn', amount: raw };
+  }
+  const cap = toFiniteNumber(max);
+  if (cap !== null && Math.abs(rounded) > cap) {
+    return { ok: false, code: 'AMOUNT_TOO_LARGE', reason: `vượt trần ${cap}`, amount: raw, max: cap };
+  }
+  if (!allowZero && rounded === 0) {
+    return { ok: false, code: 'INVALID_AMOUNT', reason: 'số tiền bằng 0', amount: raw };
+  }
+  return { ok: true, value: rounded };
+}
+
 /** Cộng nhiều khoản tiền rồi mới làm tròn (tránh sai số tích luỹ khi cộng dồn). */
 export function sumMoney(values) {
   let total = 0;

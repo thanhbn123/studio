@@ -213,6 +213,9 @@ export function loadConfig(env = process.env) {
     // A4 đọc cả hai để dựng cookie và `/api/config`. Tên khoá ĐÓNG BĂNG — đổi là vỡ hợp đồng.
     auth: {
       enabled: toBool(env.AUTH_ENABLED, true),
+      // PB-03 (vòng 2): email được BOOTSTRAP thành owner khi hệ thống chưa có owner/admin nào.
+      // Rỗng = không bootstrap (chỉ ghi log warn hướng dẫn dùng CLI `npm run make-owner`).
+      ownerEmail: toStr(env.OWNER_EMAIL, '').toLowerCase(),
       cookieName: /^[A-Za-z0-9._-]+$/.test(toStr(env.AUTH_COOKIE_NAME, 'vauth'))
         ? toStr(env.AUTH_COOKIE_NAME, 'vauth')
         : 'vauth', // tên cookie sai định dạng ⇒ rơi về mặc định, không đưa rác vào header
@@ -236,6 +239,11 @@ export function loadConfig(env = process.env) {
       // Credit tặng khi đăng ký. Kẹp >= 0: số âm là "thu tiền lúc đăng ký" — vô nghĩa.
       defaultGrant: Math.max(0, toNum(env.BILLING_DEFAULT_GRANT, 0)),
       holdBeforeJob: toBool(env.BILLING_HOLD_BEFORE_JOB, true),
+      // PB-02 (vòng 2): trần số LƯỢT CHẠY có tính tiền cho mỗi job (chạy lần đầu + mọi lượt
+      // chạy lại). Vượt ⇒ `RERUN_LIMIT_EXCEEDED` (HTTP 429). Kẹp >= 1: 0 sẽ khoá luôn lượt đầu.
+      maxRunsPerJob: Math.max(1, toInt(env.BILLING_MAX_RUNS_PER_JOB, 10)),
+      // PB-06: trần credit cho MỘT thao tác cấp/điều chỉnh (chặn `grant(1e308)` ⇒ sổ ghi 0).
+      maxAmount: Math.max(1, toNum(env.BILLING_MAX_AMOUNT, 1e9)),
       // Seed bảng `pricing` từ `config.cost.*` của MVP-01 (nguồn giá mặc định).
       pricingFromCost: toBool(env.BILLING_PRICING_FROM_COST, true),
     },

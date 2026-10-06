@@ -34,11 +34,27 @@ npm install
 # 3. Tạo bảng
 npm run migrate
 
-# 4. Chạy
+# 4. Tạo OWNER ĐẦU TIÊN (bắt buộc nếu bật tài khoản/ví — MVP-05)
+#    Hệ thống mới tinh KHÔNG có owner/admin nào ⇒ không ai cấp được credit ⇒ ví vĩnh viễn 0
+#    ⇒ mọi job trả 402. Chọn MỘT trong hai:
+npm run make-owner -- owner@example.com    # (a) CLI: in MẬT KHẨU TẠM đúng một lần
+#    hoặc (b) đặt OWNER_EMAIL=owner@example.com trong .env rồi khởi động:
+#        - user đã tồn tại  ⇒ được NÂNG lên owner
+#        - chưa tồn tại    ⇒ TẠO mới, mật khẩu tạm in MỘT LẦN trong log (WARN) — ĐỔI NGAY
+#    Không đặt gì và cũng chưa có owner ⇒ log ghi WARN hướng dẫn (không im lặng).
+#    Sau khi có owner: đăng nhập → /api/admin/users → cấp credit cho user thường.
+
+# 5. Chạy
 npm start          # http://127.0.0.1:3000
 ```
 
 **Yêu cầu:** Node `>= 24` (dùng `node:sqlite` có sẵn, không cần biên dịch native module).
+
+> **MVP-05 (tài khoản + ví credit):** mỗi **lượt chạy** (chạy lần đầu, `regenerate`, `render`,
+> `generate`) là một chu kỳ tiền riêng — giữ tiền trước theo ước tính rồi quyết toán theo chi phí
+> thật; lỗi 4xx sau khi giữ tiền ⇒ **hoàn lại đủ**. Trần `BILLING_MAX_RUNS_PER_JOB` (mặc định 10)
+> chặn spam chạy lại (vượt ⇒ `429 RERUN_LIMIT_EXCEEDED`). Người dùng **ẩn danh không bị chạm** —
+> không ví, không dòng sổ, không 402.
 
 ### Kiểm thử
 

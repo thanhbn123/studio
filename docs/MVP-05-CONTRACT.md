@@ -281,3 +281,78 @@ app.billingHook = {
   **trừ** `INSUFFICIENT_CREDIT` ở `beforeJob` (đó là fail-closed có chủ ý, phải ném ra).
 - `billingHook` là **object hằng** trên `app` (không phải hàm), để A4 gọi ổn định kể cả khi
   `billingService` là `null`.
+
+---
+
+# VÒNG 2 — SỬA THEO PHẢN BIỆN (PB-01…PB-08)
+
+Phán quyết vòng 1: **FAIL** (`docs/MVP-05-REVIEW.md`: 1 CRITICAL/CAO ×3 + TB ×2 + THẤP ×3).
+Các mục dưới đây là **bổ sung** — không đổi tên field/khoá đã đóng băng, chỉ làm chúng có tác dụng thật.
+
+## 5.1 PB-01 — mọi lỗi SAU khi giữ tiền đều phải HOÀN
+
+- `src/http/routes.js` thêm `withHoldRelease(req, jobId, hold, fn)`: chạy phần việc sau khi giữ
+  tiền, lỗi ⇒ gọi `releaseHoldOnFailure` (hoàn 100%) rồi ném lại.
+- Áp cho **cả 5 chỗ** đã giữ tiền: `POST /api/jobs`, `POST /api/imagelab/jobs`,
+  `PUT /api/imagelab/jobs/:id/regions`, `POST /api/imagestudio/jobs`,
+  `POST /api/imagestudio/jobs/:id/generate` — kể cả nhánh `ingest` lỗi và `queue.enqueue` lỗi.
+- Bất biến mới: **request trả 4xx sau khi giữ tiền ⇒ số dư về đúng như trước + có dòng `job_refund`**.
+
+## 5.2 PB-02 — chu kỳ tiền theo LƯỢT CHẠY (run), không theo `jobId`
+
+- Cột mới `wallet_ledger.run_key` (TEXT, thêm bằng migration cộng thêm — **không** đặt trong
+  `schema.sql` để không làm chết `init()` trên DB cũ, cùng bài học với `seq`).
+- `run_key = "<jobId>#<n>"`, `n` = số lượt đã mở + 1. `BillingService.holdForJob/settleForJob/
+  refundForJob` nhận `runKey`; **idempotent theo (job, run)**: gọi lại cùng lượt ⇒ không ghi thêm.
+- Hook `beforeJob`: lượt ĐANG MỞ (hold chưa settle/refund) ⇒ dùng lại (idempotent); đã khép ⇒
+  **mở lượt MỚI** (chạy lại PHẢI trả tiền). `afterJob` khép ĐÚNG lượt đang mở.
+- Trần mới `config.billing.maxRunsPerJob` (env `BILLING_MAX_RUNS_PER_JOB`, mặc định 10): vượt ⇒
+  lỗi `RERUN_LIMIT_EXCEEDED`, route map **429** (kèm `details {job_id, runs, max_runs}`).
+  Vượt trần được kiểm **trong request** ở `regenerate`/`render`/`generate`/tạo job mới.
+- Ẩn danh vẫn KHÔNG có ví, KHÔNG dòng sổ (luật #1 không đổi).
+
+## 5.3 PB-03 — bootstrap owner đầu tiên
+
+- `AccountService.bootstrapOwner({ email, password? })`: chưa có owner/admin ⇒ nâng user đã có
+  lên `owner`, hoặc TẠO mới với mật khẩu tạm **trả về đúng một lần**; đã có owner ⇒ không làm gì.
+- Boot (`src/app.js`): `OWNER_EMAIL` (khoá mới `config.auth.ownerEmail`) ⇒ bootstrap ngay; tạo mới
+  thì log **WARN** kèm mật khẩu tạm + câu “ĐỔI MẬT KHẨU NGAY”. Không có `OWNER_EMAIL` và cũng
+  chưa có owner ⇒ log WARN hướng dẫn `npm run make-owner -- <email>` (không im lặng).
+- CLI `tools/make-owner.mjs` + script `npm run make-owner -- <email> [mật khẩu]` (idempotent).
+- Ghi vào `README.md` (mục khởi động) + `.env.example`.
+
+## 5.4 PB-04 — `refundForJob` không bao giờ hoàn phần ĐÃ TIÊU
+
+- Nếu lượt chạy đã có `job_settle` ⇒ `refundForJob` trả dòng settle cũ, **không ghi thêm**.
+- Chặn ở tầng DB: **partial unique index** `uniq_wallet_ledger_run_reason` trên
+  `(user_id, job_id, run_key, reason)` WHERE `reason IN ('job_hold','job_settle','job_refund') AND
+  run_key IS NOT NULL` — tạo SAU migration (idempotent, chạy được cả SQLite và PostgreSQL).
+
+## 5.5 PB-05 — hai khoá cấu hình hết "nói dối"
+
+- `billing.defaultGrant` được **nối thật**: đăng ký xong ⇒ `grant` đúng số đó (`reason='grant'`,
+  response có `credit_granted`), UI/ledger đọc được.
+- `billing.holdBeforeJob === false` ⇒ KHÔNG giữ tiền trước, KHÔNG chặn 402, chỉ settle theo chi phí
+  THẬT sau khi chạy + log WARN một lần; `GET /api/config.billing` trả `hold_before_job`,
+  `default_grant`, `max_runs_per_job`, `max_amount`.
+
+## 5.6 PB-06 — trần credit + chặn tràn số
+
+- `money.normalizeAmount(value, { max })`: `1e308` ⇒ `INVALID_AMOUNT` (tràn số), vượt trần ⇒
+  `AMOUNT_TOO_LARGE`; mọi khoản ghi sổ đi qua đây. `config.billing.maxAmount`
+  (`BILLING_MAX_AMOUNT`, mặc định `1e9`). Route map **400** (trước: `grant(1e308)` ⇒ 201 + dòng 0).
+
+## 5.7 PB-07 — credit số âm = điều chỉnh giảm
+
+- `POST /api/admin/users/:id/credit` nhận `amount` ÂM ⇒ `reason='adjustment'`; `amount = 0` hoặc
+  không phải số ⇒ 400 `BAD_AMOUNT`. Giảm quá số dư ⇒ **400 `INSUFFICIENT_CREDIT`** (giữ luật ví
+  không âm; KHÁC 402 vì đây là thao tác quản trị, không phải "ví không đủ để chạy job").
+
+## 5.8 PB-08 — chống brute-force đăng nhập
+
+- Bucket RIÊNG theo **`email` chuẩn hoá + IP**: 10 lần **SAI** / 5 phút cho mỗi cặp; vượt ⇒
+  **429 + `Retry-After`**.
+- **Đăng nhập ĐÚNG không bao giờ bị chặn** bởi bộ đếm lần sai của chính mình: khi bucket đầy vẫn
+  xác thực, đúng ⇒ cho vào + xoá bộ đếm; sai ⇒ 429.
+- ⚠️ Vận hành sau reverse proxy: xem ghi chú `trust proxy` ở `docs/SECURITY.md` — sai cấu hình thì
+  mọi khách chung một IP và bucket theo IP mất tác dụng.

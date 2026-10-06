@@ -117,6 +117,13 @@ const OPERATIONS_BY_KIND = Object.freeze({
  */
 function createBillingHook({ service, store, logger, config, BillingError = null } = {}) {
   let disabledLogged = false;
+  let holdDisabledLogged = false;
+  // PB-02/PB-05b (vòng 2): đọc thẳng cấu hình ví — trần lượt chạy và công tắc giữ-tiền-trước.
+  const maxRunsPerJob = (() => {
+    const n = Number(config?.billing?.maxRunsPerJob);
+    return Number.isFinite(n) && n >= 1 ? Math.trunc(n) : 10;
+  })();
+  const holdBeforeJob = config?.billing?.holdBeforeJob !== false;
   const configCurrency = () => String(config?.cost?.currency || 'USD');
   const currencyOf = (estimate) => String(estimate?.currency || configCurrency());
 
@@ -135,6 +142,14 @@ function createBillingHook({ service, store, logger, config, BillingError = null
     if (!userId || !jobId || typeof store?.listLedger !== 'function') return [];
     const rows = await store.listLedger({ userId, jobId, limit: 200 });
     return Array.isArray(rows) ? rows : [];
+  };
+
+  /** Làm tròn 6 chữ số như tầng ví (không import để hook vẫn chạy khi thiếu module billing). */
+  const roundMoneyLike = (value) => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return 0;
+    const scaled = n * 1e6;
+    return (scaled < 0 ? -Math.round(-scaled) : Math.round(scaled)) / 1e6;
   };
 
   const heldAmount = (rows) => rows
@@ -183,11 +198,36 @@ function createBillingHook({ service, store, logger, config, BillingError = null
       if (!userId) return { held: 0, balance_after: null, currency: configCurrency() }; // ẩn danh: luật #1
       if (!jobId) return { held: 0, balance_after: null, currency: configCurrency() };
 
+      // PB-05b (vòng 2): `BILLING_HOLD_BEFORE_JOB=false` ⇒ KHÔNG giữ tiền trước, chỉ quyết toán
+      // theo chi phí THẬT sau khi chạy (và KHÔNG chặn 402). Trước đây khoá này là config chết.
+      if (holdBeforeJob === false) {
+        if (!holdDisabledLogged) {
+          holdDisabledLogged = true;
+          logger?.warn?.('billing.hold_disabled', {
+            reason: 'BILLING_HOLD_BEFORE_JOB=false — không giữ tiền trước, chỉ thu theo usage thật sau khi chạy (KHÔNG chặn thiếu credit).',
+          });
+        }
+        return { held: 0, balance_after: await balanceOf(userId), currency: configCurrency(), hold_disabled: true };
+      }
+
       try {
-        // IDEMPOTENT theo jobId: đã giữ rồi thì trả thông tin lần giữ CŨ, KHÔNG giữ nữa.
+        // PB-02: IDEMPOTENT THEO **LƯỢT CHẠY**. Lượt đang mở (hold chưa settle/refund) ⇒ dùng
+        // lại; đã khép ⇒ mở lượt MỚI (chạy lại phải trả tiền). Trần `maxRunsPerJob` chặn spam.
+        const runs = typeof service.runsOfJob === 'function'
+          ? await service.runsOfJob({ userId, jobId })
+          : (await ledgerOfJob(userId, jobId)).filter((r) => r?.reason === 'job_hold').map((r) => r?.run_key || '');
         const rows = await ledgerOfJob(userId, jobId);
-        if (rows.some((r) => r?.reason === 'job_hold')) {
-          return { held: heldAmount(rows), balance_after: await balanceOf(userId), currency: configCurrency(), skipped: true };
+        const openRow = rows.find((r) => r?.reason === 'job_hold' && !rows.some((x) => ['job_settle', 'job_refund'].includes(x?.reason) && (x?.run_key || '') === (r?.run_key || '')));
+        if (openRow) {
+          return { held: heldAmount(rows), balance_after: await balanceOf(userId), currency: configCurrency(), skipped: true, run_key: openRow.run_key || null };
+        }
+        if (runs.length >= maxRunsPerJob) {
+          const err = typeof BillingError === 'function'
+            ? new BillingError('RERUN_LIMIT_EXCEEDED', `Job đã chạy ${runs.length} lượt có tính tiền — vượt trần ${maxRunsPerJob} lượt mỗi job. Hãy tạo job mới.`)
+            : Object.assign(new Error('Vượt trần số lượt chạy lại của job.'), { code: 'RERUN_LIMIT_EXCEEDED' });
+          err.code = 'RERUN_LIMIT_EXCEEDED';
+          err.details = { job_id: jobId, runs: runs.length, max_runs: maxRunsPerJob };
+          throw err;
         }
 
         const ops = operationsOf({ kind, operations });
@@ -218,6 +258,10 @@ function createBillingHook({ service, store, logger, config, BillingError = null
         };
       } catch (err) {
         if (err?.code === 'INSUFFICIENT_CREDIT') throw err; // fail-closed: phải ra tới HTTP (402)
+        // PB-02 (vòng 2): vượt trần lượt chạy là lỗi NGƯỜI DÙNG phải thấy (HTTP 429), KHÔNG
+        // được nuốt thành "không giữ được tiền nhưng vẫn cho chạy" — nuốt là mở lại đúng lỗ
+        // "chạy thoải mái không mất tiền".
+        if (err?.code === 'RERUN_LIMIT_EXCEEDED') throw err;
         // Lỗi ví khác (DB hỏng, A2 chưa sẵn sàng…) KHÔNG được biến thành job hỏng.
         logger?.warn?.('billing.hook_failed', {
           job_id: jobId,
@@ -240,17 +284,27 @@ function createBillingHook({ service, store, logger, config, BillingError = null
 
       try {
         const rows = await ledgerOfJob(userId, jobId);
-        // IDEMPOTENT theo jobId: chu kỳ đã khép ⇒ không quyết toán/hoàn thêm lần nữa.
-        if (rows.some((r) => r?.reason === 'job_settle' || r?.reason === 'job_refund')) {
+        // PB-02 (vòng 2): khoá chu kỳ theo LƯỢT CHẠY, không theo jobId. Tìm lượt ĐANG MỞ
+        // (có hold, chưa settle/refund) rồi khép đúng lượt đó; lượt đã khép thì không đụng lại.
+        const keyOf = (r) => String(r?.run_key || (r?.meta && typeof r.meta === 'object' ? r.meta.run_key : '') || '');
+        const closed = new Set(rows.filter((r) => r?.reason === 'job_settle' || r?.reason === 'job_refund').map(keyOf));
+        const openHold = [...rows].reverse().find((r) => r?.reason === 'job_hold' && keyOf(r) && !closed.has(keyOf(r)));
+        const heldRun = openHold ? keyOf(openHold) : '';
+
+        if (!heldRun && holdBeforeJob && rows.some((r) => r?.reason === 'job_hold')) {
+          // Không còn lượt mở mà trước đó CÓ giữ tiền ⇒ chu kỳ đã khép, không quyết toán lại.
           return { ...out, skipped: true };
         }
-        const held = heldAmount(rows);
+
+        const held = heldRun
+          ? roundMoneyLike(rows.filter((r) => keyOf(r) === heldRun && ['job_hold', 'job_settle', 'job_refund'].includes(r?.reason)).reduce((sum, r) => sum + (Number(r?.amount) || 0), 0) * -1)
+          : 0;
 
         if (String(status) === 'failed') {
           if (held <= 0) return { ...out, skipped: true }; // chưa giữ gì thì không có gì để hoàn
-          const row = await service.refundForJob({ userId, jobId, reason: 'JOB_FAILED' });
+          const row = await service.refundForJob({ userId, jobId, reason: 'JOB_FAILED', runKey: heldRun });
           const refunded = Math.abs(Number(row?.amount));
-          return { settled: false, refunded: Number.isFinite(refunded) && refunded > 0 ? refunded : held };
+          return { settled: false, refunded: Number.isFinite(refunded) && refunded > 0 ? refunded : held, run_key: heldRun };
         }
 
         let cost = Number(actualCost);
@@ -258,9 +312,10 @@ function createBillingHook({ service, store, logger, config, BillingError = null
           const summary = typeof store?.usageSummary === 'function' ? await store.usageSummary(jobId) : null;
           cost = Number(summary?.estimated_cost ?? 0);
         }
-        await service.settleForJob({ userId, jobId, actualCost: cost });
+        const settledRow = await service.settleForJob({ userId, jobId, actualCost: cost, runKey: heldRun || null });
+        if (!settledRow) return { ...out, skipped: true }; // lượt miễn phí, không có gì để quyết toán
         // `refunded` = phần GIỮ DƯ đã trả lại (0 nếu chi phí thật ≥ phần đã giữ).
-        return { settled: true, refunded: Math.max(0, held - cost) };
+        return { settled: true, refunded: Math.max(0, roundMoneyLike(held - cost)), run_key: keyOf(settledRow) || heldRun || null };
       } catch (err) {
         logger?.warn?.('billing.hook_failed', {
           job_id: jobId,
@@ -348,6 +403,34 @@ export async function createApp(opts = {}) {
         // Không đưa cả object lỗi vào log: stack/message của Node chứa đường dẫn tuyệt đối.
         error_name: err?.cause?.name || err?.name || 'Error',
         error_code: err?.cause?.code || err?.code || null,
+        error_message: scrubPaths(err?.message || err),
+      });
+    }
+  }
+
+  // PB-03 (vòng 2) — BOOTSTRAP OWNER: hệ thống mới tinh không có owner/admin ⇒ không ai cấp
+  // được credit ⇒ ví vĩnh viễn 0 ⇒ mọi job 402. Có `OWNER_EMAIL` thì nâng/tạo owner ngay khi
+  // boot (mật khẩu tạm in ĐÚNG MỘT LẦN ở log); không có thì WARN hướng dẫn dùng CLI.
+  if (accounts.service && typeof accounts.service.bootstrapOwner === 'function') {
+    try {
+      const boot = await accounts.service.bootstrapOwner({ email: config?.auth?.ownerEmail || '' });
+      if (boot?.created) {
+        rootLogger.warn('accounts.owner_bootstrapped', {
+          email: config?.auth?.ownerEmail || null,
+          temporary_password: boot.password,
+          note: 'ĐÂY LÀ MẬT KHẨU TẠM IN MỘT LẦN — hãy đăng nhập và đổi mật khẩu ngay (hoặc đặt lại bằng `npm run make-owner -- <email>`).',
+        });
+      } else if (boot?.promoted) {
+        rootLogger.warn('accounts.owner_bootstrapped_promoted', { email: config?.auth?.ownerEmail || null });
+      } else if (boot?.reason === 'NO_OWNER_EMAIL') {
+        rootLogger.warn('accounts.no_owner_configured', {
+          note: 'Hệ thống chưa có owner/admin nào. Đặt OWNER_EMAIL=<email> trong .env hoặc chạy `npm run make-owner -- <email>` để tạo owner đầu tiên — nếu không, KHÔNG ai cấp được credit và mọi job sẽ trả 402.',
+        });
+      }
+    } catch (err) {
+      rootLogger.warn('accounts.owner_bootstrap_failed', {
+        error_name: err?.name || 'Error',
+        error_code: err?.code || null,
         error_message: scrubPaths(err?.message || err),
       });
     }

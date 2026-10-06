@@ -767,6 +767,102 @@ export function buildRouter(app) {
    * tồn tại): tự bỏ qua khi ẩn danh, tự trả `{held: 0}` khi chưa có ví, IDEMPOTENT theo jobId.
    * A4 KHÔNG chép luật giá — chỉ gọi hook và ánh xạ lỗi.
    */
+  /* ── PB-08: chống brute-force đăng nhập theo CẶP (email chuẩn hoá, IP) ────────────────
+   * Chỉ đếm lần THẤT BẠI; đăng nhập đúng xoá bộ đếm ⇒ không bao giờ tự khoá đường vào hợp lệ.
+   * Cửa sổ 5 phút / 10 lần sai cho mỗi cặp; vượt ⇒ 429 kèm `Retry-After`.
+   * ⚠️ `clientKey(req)` lấy IP từ socket/`x-forwarded-for`; sau reverse proxy PHẢI bật
+   * `trust proxy` của tầng chạy (hoặc `ALLOW_PRIVATE_NETWORK` + header đúng) — xem
+   * `docs/SECURITY.md`. Nếu không, mọi khách chung một IP và bucket theo IP mất tác dụng.
+   */
+  const LOGIN_WINDOW_MS = 5 * 60 * 1000;
+  const LOGIN_MAX_FAILURES = 10;
+  const loginFailures = new Map(); // key → { count, firstAt }
+
+  const normalizeEmailLike = (value) => String(value ?? '').trim().toLowerCase().replace(/\s+/g, '');
+
+  const checkLoginAttempts = (key) => {
+    const now = Date.now();
+    const entry = loginFailures.get(key);
+    if (!entry) return { blocked: false, retryAfterSec: 0 };
+    if (now - entry.firstAt > LOGIN_WINDOW_MS) {
+      loginFailures.delete(key);
+      return { blocked: false, retryAfterSec: 0 };
+    }
+    if (entry.count < LOGIN_MAX_FAILURES) return { blocked: false, retryAfterSec: 0 };
+    return { blocked: true, retryAfterSec: Math.max(1, Math.ceil((entry.firstAt + LOGIN_WINDOW_MS - now) / 1000)) };
+  };
+
+  const registerLoginFailure = (key) => {
+    const now = Date.now();
+    const entry = loginFailures.get(key);
+    if (!entry || now - entry.firstAt > LOGIN_WINDOW_MS) {
+      loginFailures.set(key, { count: 1, firstAt: now });
+    } else {
+      entry.count += 1;
+    }
+    // Trần bộ nhớ: dọn các mục đã hết hạn khi map phình ra (không để rò rỉ bộ nhớ).
+    if (loginFailures.size > 5000) {
+      for (const [k, v] of loginFailures) if (now - v.firstAt > LOGIN_WINDOW_MS) loginFailures.delete(k);
+    }
+    return checkLoginAttempts(key);
+  };
+
+  const clearLoginFailures = (key) => {
+    loginFailures.delete(key);
+  };
+
+  /**
+   * PB-05 — tặng credit khi đăng ký theo `config.billing.defaultGrant` (0 = không tặng).
+   * Lỗi ví KHÔNG được làm hỏng việc đăng ký: tài khoản đã tạo xong rồi — chỉ ghi log.
+   */
+  const grantDefaultOnRegister = async (user) => {
+    const rawGrant = Number(config?.billing?.defaultGrant);
+    const amount = Number.isFinite(rawGrant) && rawGrant > 0 ? rawGrant : 0;
+    const userId = user?.id;
+    if (!userId || !(amount > 0)) return null;
+    const service = app?.billingService;
+    if (!service || typeof service.grant !== 'function') {
+      logger?.warn?.('billing.default_grant_skipped', { reason: 'không có billingService', user_id: userId, amount });
+      return null;
+    }
+    try {
+      const row = await service.grant({ userId, amount, reason: 'grant', note: 'credit tặng khi đăng ký' });
+      logger?.info?.('billing.default_grant', { user_id: userId, amount });
+      return { amount: Number(row?.amount ?? amount), currency: String(row?.currency || config?.billing?.currency || 'USD') };
+    } catch (err) {
+      logger?.warn?.('billing.default_grant_failed', {
+        user_id: userId,
+        amount,
+        error_name: err?.name || 'Error',
+        error_code: err?.code || null,
+      });
+      return null;
+    }
+  };
+
+  /**
+   * PB-01 (vòng 2) — chạy phần việc NẰM SAU `holdCreditBeforeJob` và GIẢI PHÓNG khoản giữ nếu
+   * có bất kỳ lỗi nào. Trước đây chỉ `POST /api/jobs` gọi `releaseHoldOnFailure`; các route
+   * khác để tiền bị giữ vĩnh viễn cho một request trả 4xx (đo được: 5 × 409 ⇒ mất 0,0415 credit,
+   * sổ chỉ có `job_hold`).
+   *
+   * `releaseHoldOnFailure` chỉ chạy khi ĐÃ giữ tiền (`hold.held > 0`) và tự bỏ qua ẩn danh.
+   *
+   * @template T
+   * @param {object} req
+   * @param {string} jobId
+   * @param {() => Promise<T>} fn
+   * @returns {Promise<T>}
+   */
+  const withHoldRelease = async (req, jobId, hold, fn) => {
+    try {
+      return await fn();
+    } catch (err) {
+      if (hold && Number(hold.held) > 0) await releaseHoldOnFailure(req, jobId);
+      throw err;
+    }
+  };
+
   const holdCreditBeforeJob = async (req, jobId, kind) => {
     const userId = req?.user?.id ?? null;
     if (!userId || !billingEnabled()) return null; // ẩn danh: không ví, không trừ credit (§2.2)
@@ -822,18 +918,35 @@ export function buildRouter(app) {
     if (token && result?.expiresAt) appendSetCookie(res, authCookie(token, result.expiresAt));
     else logger?.warn?.('auth.register_no_token', { has_token: Boolean(token) });
 
-    sendJson(res, 201, { user: publicUserJson(result?.user), expires_at: toIsoString(result?.expiresAt) });
+    // PB-05 (vòng 2): `BILLING_DEFAULT_GRANT` trước đây là khoá CHẾT (khai 5 mà ví vẫn 0).
+    // Nay đăng ký xong thì tặng đúng số đó, ghi sổ với `reason='grant'` (đối soát được).
+    const grant = await grantDefaultOnRegister(result?.user);
+    sendJson(res, 201, {
+      user: publicUserJson(result?.user),
+      expires_at: toIsoString(result?.expiresAt),
+      ...(grant ? { credit_granted: grant } : {}),
+    });
   });
 
   router.post('/api/auth/login', async (req, res) => {
     const svc = requireAuthFeature();
-    enforce(rateLimiters.requests, `auth:login:${clientKey(req)}`);
 
     const body = await readAuthBody(req);
     if (typeof body.email !== 'string' || !body.email.trim() || typeof body.password !== 'string' || !body.password) {
       throw HttpError.safe(400, 'BAD_BODY', 'Cần `email` (chuỗi) và `password` (chuỗi).');
     }
 
+    // PB-08 (vòng 2): bucket RIÊNG theo `email` chuẩn hoá + IP, và CHỈ đếm lần THẤT BẠI.
+    // Trước đây dùng chung bucket 120 req/phút theo IP ⇒ vừa quá rộng cho brute-force, vừa
+    // tự khoá đường đăng nhập ĐÚNG của chính mình. Đăng nhập đúng KHÔNG tiêu quota.
+    const emailKey = normalizeEmailLike(body.email);
+    const loginKey = `auth:login:${emailKey || '-'}:${clientKey(req)}`;
+    const gate = checkLoginAttempts(loginKey);
+
+    // Vì sao KHÔNG chặn thẳng khi bucket đã đầy: yêu cầu PB-08 là "đăng nhập ĐÚNG không bị
+    // chặn bởi chính bộ đếm lần sai của mình". Nên vẫn XÁC THỰC, rồi mới phán quyết:
+    //   · đúng ⇒ cho vào + xoá bộ đếm (người dùng thật không bao giờ bị khoá vì gõ nhầm);
+    //   · sai  ⇒ 429 kèm `Retry-After` (kẻ dò mật khẩu bị chặn đúng lúc cần chặn).
     let result;
     try {
       result = await svc.login({
@@ -842,8 +955,22 @@ export function buildRouter(app) {
         userAgent: sanitizeText(req?.headers?.['user-agent'], { maxLength: 300 }),
       });
     } catch (err) {
-      throw mapLoginError(err);
+      const mapped = mapLoginError(err);
+      if (mapped?.code === 'BAD_CREDENTIALS') {
+        const now = registerLoginFailure(loginKey);
+        const active = now.blocked ? now : (gate.blocked ? gate : null);
+        if (active) {
+          res.setHeader('retry-after', String(active.retryAfterSec));
+          throw HttpError.safe(
+            429,
+            'RATE_LIMITED',
+            `Quá nhiều lần đăng nhập sai cho tài khoản này — thử lại sau ${active.retryAfterSec} giây.`,
+          );
+        }
+      }
+      throw mapped;
     }
+    clearLoginFailures(loginKey); // đăng nhập đúng ⇒ xoá bộ đếm sai của cặp (email, IP) này
 
     const token = safeToken(result?.token);
     if (token && result?.expiresAt) appendSetCookie(res, authCookie(token, result.expiresAt));
@@ -963,8 +1090,11 @@ export function buildRouter(app) {
     const svc = requireWallet();
     const body = await readJson(req, { maxBytes: 32 * 1024 });
     const amount = Number(body?.amount);
-    if (!Number.isFinite(amount) || amount <= 0) {
-      throw HttpError.safe(400, 'BAD_AMOUNT', '`amount` phải là số hữu hạn LỚN HƠN 0 (credit muốn cấp).');
+    // PB-07 (vòng 2): UI ghi rõ "dương = cấp thêm, âm = điều chỉnh giảm" nhưng API trước đây
+    // luôn từ chối số âm ⇒ không có đường hợp lệ nào để GIẢM credit. Nay cho phép số âm, map
+    // sang `reason='adjustment'`; luật "số dư không âm" vẫn giữ (thiếu ⇒ 400 INSUFFICIENT_CREDIT).
+    if (!Number.isFinite(amount) || amount === 0) {
+      throw HttpError.safe(400, 'BAD_AMOUNT', '`amount` phải là số hữu hạn KHÁC 0 (dương = cấp thêm, âm = điều chỉnh giảm).');
     }
     const target = await findUserById(params?.id ?? '');
     if (!target) throw HttpError.safe(404, 'USER_NOT_FOUND', 'Không tìm thấy người dùng.');
@@ -972,8 +1102,23 @@ export function buildRouter(app) {
 
     let ledger;
     try {
-      ledger = await svc.grant({ userId: target.id, amount, reason: 'admin_grant', actorId: admin.id, note });
+      ledger = await svc.grant({
+        userId: target.id,
+        amount,
+        reason: amount < 0 ? 'adjustment' : 'admin_grant',
+        actorId: admin.id,
+        note,
+      });
     } catch (err) {
+      // PB-07: giảm quá số dư ⇒ 400 `INSUFFICIENT_CREDIT` (KHÔNG phải 402: đây là thao tác
+      // quản trị sai số liệu, không phải "ví không đủ để chạy job").
+      if (String(err?.code) === 'INSUFFICIENT_CREDIT') {
+        const d = err?.details && typeof err.details === 'object' ? err.details : {};
+        throw HttpError.safe(400, 'INSUFFICIENT_CREDIT', 'Số dư không đủ để điều chỉnh giảm từng đó — ví không được âm.', {
+          balance: Number.isFinite(Number(d.balance)) ? Number(d.balance) : null,
+          amount: Number.isFinite(Number(d.amount)) ? Number(d.amount) : null,
+        });
+      }
       throw mapBillingError(err) || mapAuthError(err);
     }
     const balance = await readBalance(target.id);
@@ -1116,6 +1261,13 @@ export function buildRouter(app) {
         enabled: billingEnabled(),
         currency: creditCurrency(),
         available: billingAvailable(),
+        // PB-05b (vòng 2): công tắc giữ-tiền-trước phải HIỆN RA cho người vận hành — trước đây
+        // `BILLING_HOLD_BEFORE_JOB=false` bị bỏ qua im lặng (vẫn giữ tiền, vẫn 402).
+        hold_before_job: billingConfig().holdBeforeJob !== false,
+        default_grant: Number.isFinite(Number(billingConfig().defaultGrant)) ? Number(billingConfig().defaultGrant) : 0,
+        // PB-02: trần số lượt chạy có tính tiền cho mỗi job (vượt ⇒ 429 RERUN_LIMIT_EXCEEDED).
+        max_runs_per_job: Number.isFinite(Number(billingConfig().maxRunsPerJob)) ? Number(billingConfig().maxRunsPerJob) : 10,
+        max_amount: Number.isFinite(Number(billingConfig().maxAmount)) ? Number(billingConfig().maxAmount) : null,
       },
       // §3.4 — trạng thái thật của dịch vụ tài khoản/ví để người vận hành biết VÌ SAO tắt.
       accounts: { available: accountsAvailable(), reason: accountsAvailable() ? null : AUTH_UNAVAILABLE_MESSAGE },
@@ -1199,16 +1351,22 @@ export function buildRouter(app) {
       throw mapBillingError(err) || err;
     }
 
-    queue.enqueue(jobId, () =>
-      pipeline.run(jobId, {
-        url,
-        manual: hasManual ? manual : null,
-        style: opts.style,
-        length: opts.length,
-        sessionId: sid,
-        userId,
-      }),
-    );
+    try {
+      queue.enqueue(jobId, () =>
+        pipeline.run(jobId, {
+          url,
+          manual: hasManual ? manual : null,
+          style: opts.style,
+          length: opts.length,
+          sessionId: sid,
+          userId,
+        }),
+      );
+    } catch (err) {
+      // PB-01: xếp hàng lỗi sau khi đã giữ tiền ⇒ hoàn khoản giữ.
+      await releaseHoldOnFailure(req, jobId);
+      throw mapBillingError(err) || err;
+    }
 
     sendJson(res, 202, {
       job_id: jobId,
@@ -1337,19 +1495,25 @@ export function buildRouter(app) {
       throw new HttpError(409, 'NO_MASTER', 'Job chưa có Product Master để sinh lại nội dung.');
     }
 
-    // MVP-05: sinh lại nội dung cũng TIÊU credit. Route này KHÔNG nằm trong 5 chỗ đóng băng
-    // của §3.4b (A3 gọi `afterJob` ở cuối pipeline), nên chỉ ánh xạ lỗi billing ⇒ 402 nếu
-    // tầng dưới ném ra, KHÔNG tự giữ tiền lần hai cho cùng một job.
-    await store.updateJob(job.id, { style: opts.style, length: opts.length, status: JOB_STATUS.QUEUED, stage: 'regenerating' });
-    queue.enqueue(job.id, () =>
-      pipeline.resumeFromMaster(job.id, job.product_master, {
-        sessionId: sid,
-        style: opts.style,
-        length: opts.length,
-        userId: req.user?.id ?? null,
-        extraInstructions: sanitizeText(body.extra_instructions, { maxLength: 1000 }),
-      }),
-    );
+    // MVP-05 (PB-02, vòng 2): mỗi LƯỢT CHẠY LẠI là một chu kỳ tiền MỚI ⇒ giữ tiền ngay trong
+    // request (thiếu ⇒ 402, vượt trần lượt chạy ⇒ 429 RERUN_LIMIT_EXCEEDED — TRƯỚC khi xếp
+    // hàng). Trước đây route này không giữ tiền nên mọi lượt regenerate đều miễn phí.
+    const hold = await holdCreditBeforeJob(req, job.id, job.kind || 'content');
+    try {
+      await store.updateJob(job.id, { style: opts.style, length: opts.length, status: JOB_STATUS.QUEUED, stage: 'regenerating' });
+      queue.enqueue(job.id, () =>
+        pipeline.resumeFromMaster(job.id, job.product_master, {
+          sessionId: sid,
+          style: opts.style,
+          length: opts.length,
+          userId: req.user?.id ?? null,
+          extraInstructions: sanitizeText(body.extra_instructions, { maxLength: 1000 }),
+        }),
+      );
+    } catch (err) {
+      await withHoldRelease(req, job.id, hold, async () => { throw err; }).catch(() => {});
+      throw mapBillingError(err) || err;
+    }
     sendJson(res, 202, { job_id: job.id, status: JOB_STATUS.QUEUED, style: opts.style, length: opts.length });
   });
 
@@ -1480,7 +1644,7 @@ export function buildRouter(app) {
     // KHÔNG tăng dòng nào (job_id sinh trước để hook giữ tiền theo đúng job đó).
     const userId = req.user?.id ?? null;
     const jobId = randomUUID();
-    await holdCreditBeforeJob(req, jobId, 'image_translation');
+    const hold = await holdCreditBeforeJob(req, jobId, 'image_translation');
 
     try {
       await store.createJob({
@@ -1505,10 +1669,17 @@ export function buildRouter(app) {
     try {
       ingest = await app.imagelabPipeline.ingest(jobId, { image, sessionId: sid, userId, options });
     } catch (err) {
+      // PB-01: ingest lỗi SAU khi đã giữ tiền ⇒ phải hoàn khoản giữ (trước đây chỉ throw).
+      await releaseHoldOnFailure(req, jobId);
       throw mapImagelabError(err, 'Không lưu được ảnh tải lên.');
     }
 
-    queue.enqueue(jobId, () => app.imagelabPipeline.runOcr(jobId, { sessionId: sid, userId, options }));
+    try {
+      queue.enqueue(jobId, () => app.imagelabPipeline.runOcr(jobId, { sessionId: sid, userId, options }));
+    } catch (err) {
+      await releaseHoldOnFailure(req, jobId);
+      throw err;
+    }
 
     sendJson(res, 202, {
       job_id: jobId,
@@ -1659,11 +1830,11 @@ export function buildRouter(app) {
 
     // MVP-05 (§3.4b, chỗ #3 trong 5 chỗ đóng băng): nhập lại vùng chữ = chạy lại OCR/dịch
     // (TIÊU credit) ⇒ cổng ví chạy NGAY trong request; thiếu ⇒ 402, không ghi vùng nào.
-    await holdCreditBeforeJob(req, job.id, job.kind || 'image_translation');
+    const hold = await holdCreditBeforeJob(req, job.id, job.kind || 'image_translation');
 
     let result;
     try {
-      result = await app.imagelabPipeline.setManualRegions(job.id, {
+      result = await withHoldRelease(req, job.id, hold, () => app.imagelabPipeline.setManualRegions(job.id, {
         sessionId: sid,
         userId: req.user?.id ?? null,
         regions,
@@ -1671,7 +1842,7 @@ export function buildRouter(app) {
         confirmReplaceEdited,
         // IL08-01(a): chỉ chặn khi có lượt OCR THẬT đang chờ/đang chạy trong hàng đợi.
         ocrPending: typeof queue?.isPending === 'function' ? queue.isPending(job.id) : null,
-      });
+      }));
     } catch (err) {
       throw mapImagelabError(err, 'Không lưu được vùng chữ nhập tay.');
     }
@@ -1758,24 +1929,31 @@ export function buildRouter(app) {
       });
     }
 
-    // MVP-05: render cũng tiêu credit, nhưng route này KHÔNG nằm trong 5 chỗ đóng băng của
-    // §3.4b ⇒ chỉ ánh xạ 402 khi tầng dưới ném lỗi billing, không tự giữ tiền lần hai.
-    await store.updateJob(job.id, {
-      status: JOB_STATUS.QUEUED,
-      stage: 'rendering',
-      error_code: null,
-      error_message: null,
-    });
+    // MVP-05 (PB-02, vòng 2): RENDER là một LƯỢT CHẠY có tính tiền ⇒ giữ tiền ngay trong
+    // request (thiếu ⇒ 402; vượt trần lượt chạy ⇒ 429 RERUN_LIMIT_EXCEEDED) TRƯỚC khi xếp
+    // hàng. Trước đây lượt render không bao giờ bị thu.
+    const hold = await holdCreditBeforeJob(req, job.id, job.kind || 'image_translation');
+    try {
+      await store.updateJob(job.id, {
+        status: JOB_STATUS.QUEUED,
+        stage: 'rendering',
+        error_code: null,
+        error_message: null,
+      });
 
-    queue.enqueue(job.id, () =>
-      app.imagelabPipeline.renderApproved(job.id, {
-        sessionId: sid,
-        userId: req.user?.id ?? null,
-        onlyRegionIds,
-        force,
-        unknownRegionIds,
-      }),
-    );
+      queue.enqueue(job.id, () =>
+        app.imagelabPipeline.renderApproved(job.id, {
+          sessionId: sid,
+          userId: req.user?.id ?? null,
+          onlyRegionIds,
+          force,
+          unknownRegionIds,
+        }),
+      );
+    } catch (err) {
+      await withHoldRelease(req, job.id, hold, async () => { throw err; }).catch(() => {});
+      throw mapImagelabError(err, 'Không xếp hàng render được.');
+    }
 
     sendJson(res, 202, { job_id: job.id, status: JOB_STATUS.QUEUED, force });
   });
@@ -1857,7 +2035,7 @@ export function buildRouter(app) {
     // KHÔNG tăng dòng nào (job_id sinh trước để hook giữ tiền theo đúng job đó).
     const userId = req.user?.id ?? null;
     const jobId = randomUUID();
-    await holdCreditBeforeJob(req, jobId, IMAGESTUDIO_KIND);
+    const hold = await holdCreditBeforeJob(req, jobId, IMAGESTUDIO_KIND);
 
     try {
       await store.createJob({
@@ -1880,10 +2058,17 @@ export function buildRouter(app) {
       ingest = await app.imagestudioPipeline.ingest(jobId, { image, sessionId: sid, userId, options });
     } catch (err) {
       await markImagestudioJobFailed(jobId, err);
+      // PB-01: ingest lỗi SAU khi đã giữ tiền ⇒ hoàn khoản giữ (job đã failed, không chạy gì).
+      await releaseHoldOnFailure(req, jobId);
       throw mapImagestudioError(err, 'Không lưu được ảnh tải lên.');
     }
 
-    queue.enqueue(jobId, () => app.imagestudioPipeline.generate(jobId, { sessionId: sid, userId, options, force: false }));
+    try {
+      queue.enqueue(jobId, () => app.imagestudioPipeline.generate(jobId, { sessionId: sid, userId, options, force: false }));
+    } catch (err) {
+      await releaseHoldOnFailure(req, jobId);
+      throw err;
+    }
 
     sendJson(res, 202, {
       job_id: jobId,
@@ -1976,19 +2161,25 @@ export function buildRouter(app) {
 
     // MVP-05 (§3.4b, chỗ #5 trong 5 chỗ đóng băng): chạy tạo ảnh là bước TIÊU credit ⇒ cổng
     // ví chạy NGAY trong request; thiếu ⇒ 402 trước khi xếp hàng (job giữ nguyên trạng thái).
-    await holdCreditBeforeJob(req, job.id, IMAGESTUDIO_KIND);
+    const hold = await holdCreditBeforeJob(req, job.id, IMAGESTUDIO_KIND);
 
-    await store.updateJob(job.id, {
-      status: JOB_STATUS.QUEUED,
-      stage: 'queued',
-      error_code: null,
-      error_message: null,
-    });
+    // PB-01: mọi lỗi SAU khi giữ tiền (ghi trạng thái / xếp hàng) phải hoàn khoản giữ.
+    try {
+      await store.updateJob(job.id, {
+        status: JOB_STATUS.QUEUED,
+        stage: 'queued',
+        error_code: null,
+        error_message: null,
+      });
 
-    // Ảnh MỚI: pipeline ghi asset role `rendered` với `parent_id` = ảnh gốc; ảnh cũ còn nguyên.
-    queue.enqueue(job.id, () =>
-      app.imagestudioPipeline.generate(job.id, { sessionId: sid, userId: req.user?.id ?? null, options, force }),
-    );
+      // Ảnh MỚI: pipeline ghi asset role `rendered` với `parent_id` = ảnh gốc; ảnh cũ còn nguyên.
+      queue.enqueue(job.id, () =>
+        app.imagestudioPipeline.generate(job.id, { sessionId: sid, userId: req.user?.id ?? null, options, force }),
+      );
+    } catch (err) {
+      await withHoldRelease(req, job.id, hold, async () => { throw err; }).catch(() => {});
+      throw err;
+    }
 
     sendJson(res, 202, { job_id: job.id, status: JOB_STATUS.QUEUED, force, poll: `/api/imagestudio/jobs/${job.id}` });
   });
@@ -2187,6 +2378,25 @@ function insufficientCreditMessage(required, balance) {
 function mapBillingError(err) {
   if (!err || typeof err !== 'object') return null;
   const code = String(err.code || '');
+  // PB-02 (vòng 2): vượt trần số lượt chạy có tính tiền của job ⇒ 429 (không phải 5xx, không
+  // phải 402: người dùng CÓ tiền, chỉ là job này đã chạy quá nhiều lượt).
+  if (code === 'RERUN_LIMIT_EXCEEDED') {
+    const d = err.details && typeof err.details === 'object' ? err.details : {};
+    return HttpError.safe(
+      429,
+      'RERUN_LIMIT_EXCEEDED',
+      String(err.message || 'Job đã chạy quá số lượt cho phép — hãy tạo job mới.'),
+      { job_id: d.job_id ?? null, runs: Number.isFinite(Number(d.runs)) ? Number(d.runs) : null, max_runs: Number.isFinite(Number(d.max_runs)) ? Number(d.max_runs) : null },
+    );
+  }
+  // PB-06: khoản tiền không hợp lệ / vượt trần ⇒ 400 (trước đây `grant(1e308)` ghi sổ 0 mà vẫn 201).
+  if (code === 'INVALID_AMOUNT' || code === 'AMOUNT_TOO_LARGE' || code === 'INVALID_REASON') {
+    const d = err.details && typeof err.details === 'object' ? err.details : {};
+    return HttpError.safe(400, code, String(err.message || 'Số credit không hợp lệ.'), {
+      amount: d.amount ?? null,
+      max: d.max ?? null,
+    });
+  }
   if (code !== 'INSUFFICIENT_CREDIT' && Number(err.status) !== 402) return null;
   const raw = err.details && typeof err.details === 'object' ? err.details : {};
   const required = Number(raw.required ?? raw.estimated ?? raw.amount);

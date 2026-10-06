@@ -30,7 +30,7 @@
  *     đó sẽ được ghi log `billing.ledger_scan_truncated` (không im lặng).
  */
 
-import { MONEY_EPSILON, roundMoney, sumMoney, toFiniteNumber } from './money.js';
+import { DEFAULT_MAX_AMOUNT, MONEY_EPSILON, normalizeAmount, roundMoney, sumMoney, toFiniteNumber } from './money.js';
 import { normalizeLedgerRow, normalizeLedgerRows, normalizePricingRow } from './ledger-rows.js';
 
 /**
@@ -179,6 +179,71 @@ function heldFromRows(rows) {
   return roundMoney(-sumMoney(amounts));
 }
 
+/**
+ * PB-02 (vòng 2) — KHOÁ SỔ THEO **LƯỢT CHẠY** (run), không theo `jobId`.
+ *
+ * Vì sao: khoá theo `jobId` khiến mọi lượt chạy lại (`regenerate`/`render`/`generate`/retry)
+ * đều MIỄN PHÍ — `beforeJob` thấy "job đã từng có `job_hold`" là bỏ qua. Nay mỗi lượt chạy có
+ * `run_key` riêng: `"<jobId>#<n>"` với `n` = số lượt đã mở + 1. `run_key` được ghi vào CỘT
+ * `wallet_ledger.run_key` (không chỉ trong `meta`) để có thể đánh unique index ở tầng DB.
+ */
+export function runKeyOf(row) {
+  const direct = typeof row?.run_key === 'string' ? row.run_key.trim() : '';
+  if (direct) return direct;
+  const fromMeta = row?.meta && typeof row.meta === 'object' ? row.meta.run_key : null;
+  return typeof fromMeta === 'string' && fromMeta.trim() ? fromMeta.trim() : '';
+}
+
+/** Mọi `run_key` đã thấy trong sổ của MỘT job (theo thứ tự xuất hiện). */
+function runKeysOf(rows) {
+  const out = [];
+  for (const row of rows) {
+    if (!JOB_REASONS.includes(row?.reason)) continue;
+    const key = runKeyOf(row);
+    if (key && !out.includes(key)) out.push(key);
+  }
+  return out;
+}
+
+/** Lượt chạy đang MỞ = lượt mới nhất có `job_hold` mà CHƯA có `job_settle`/`job_refund`. */
+function openRunKeyOf(rows) {
+  const closed = new Set();
+  for (const row of rows) {
+    const key = runKeyOf(row);
+    if (key && (row?.reason === 'job_settle' || row?.reason === 'job_refund')) closed.add(key);
+  }
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const row = rows[i];
+    if (row?.reason !== 'job_hold') continue;
+    const key = runKeyOf(row);
+    if (!key) continue;
+    if (!closed.has(key)) return key;
+  }
+  return '';
+}
+
+/** `run_key` của lượt chạy KẾ TIẾP cho một job: `"<jobId>#<số lượt đã mở + 1>"`. */
+function nextRunKeyOf(rows, jobId) {
+  const keys = runKeysOf(rows);
+  let max = keys.length;
+  for (const key of keys) {
+    const m = /#(\d+)$/.exec(key);
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return `${jobId}#${max + 1}`;
+}
+
+/** Phần credit ĐANG GIỮ của MỘT lượt chạy (chỉ tính dòng mang đúng `run_key` đó). */
+function heldOfRun(rows, runKey) {
+  const amounts = [];
+  for (const row of rows) {
+    if (!JOB_REASONS.includes(row?.reason)) continue;
+    if (runKeyOf(row) !== runKey) continue;
+    amounts.push(row?.amount);
+  }
+  return roundMoney(-sumMoney(amounts));
+}
+
 /** Dòng store trả về sau khi ghi: object | id | không gì cả. */
 function pickReturnedRow(returned, payload) {
   if (returned && typeof returned === 'object') return returned;
@@ -198,6 +263,9 @@ export class BillingService {
   constructor(deps = {}) {
     const { store, logger, config } = normalizeDeps(deps);
     this.store = store;
+    // PB-06: trần credit cho một thao tác cấp/điều chỉnh (mặc định 1e9 — xem `money.js`).
+    const cap = toFiniteNumber(config?.billing?.maxAmount);
+    this.maxAmount = cap !== null && cap > 0 ? cap : DEFAULT_MAX_AMOUNT;
     this.logger = logger;
     this.config = config;
   }
@@ -370,10 +438,20 @@ export class BillingService {
    * `balanceBefore` đọc từ sổ. Không bao giờ để số dư âm: nếu phép cộng ra âm thì
    * ném `INSUFFICIENT_CREDIT` và KHÔNG ghi gì.
    */
-  async #append({ userId, amount, reason, jobId = null, operation = null, meta = null, balanceBefore }) {
+  async #append({ userId, amount, reason, jobId = null, operation = null, meta = null, balanceBefore, runKey = null }) {
     const store = this.#requireMethod('appendLedger');
     const currency = this.#currency();
-    const delta = roundMoney(amount);
+    // PB-06: khoản ghi sổ phải HỮU HẠN và trong trần — `roundMoney(1e308) === Infinity` và
+    // tầng store biến nó thành 0 ⇒ sổ ghi "0 credit" trong khi API báo thành công.
+    const checkedDelta = normalizeAmount(amount, { max: this.maxAmount, allowZero: true });
+    if (!checkedDelta.ok) {
+      throw new BillingError(checkedDelta.code, `Khoản ghi sổ không hợp lệ (${checkedDelta.reason}).`, {
+        amount: checkedDelta.amount,
+        max: this.maxAmount,
+        reason,
+      });
+    }
+    const delta = checkedDelta.value;
     const afterRaw = roundMoney(balanceBefore + delta);
     if (afterRaw < -MONEY_EPSILON) {
       throw new BillingError(
@@ -390,6 +468,7 @@ export class BillingService {
       reason,
       jobId,
       operation,
+      runKey: runKey ?? null,
       meta: meta ?? null,
       balanceAfter,
     };
@@ -526,12 +605,16 @@ export class BillingService {
   async grant({ userId, amount, reason, actorId = null, note = '' } = {}) {
     const uid = this.#requireUserId(userId);
     const raw = toFiniteNumber(amount);
-    const value = roundMoney(raw);
-    if (raw === null || value === 0) {
-      throw new BillingError('INVALID_AMOUNT', `Số credit không hợp lệ: ${JSON.stringify(amount ?? null)}`, {
+    // PB-06 (vòng 2): `normalizeAmount` TỪ CHỐI tràn số (1e308 ⇒ Infinity) và vượt trần
+    // `billing.maxAmount` — trước đây sổ ghi một dòng `amount = 0` mà API vẫn báo 201.
+    const checked = normalizeAmount(amount, { max: this.maxAmount });
+    if (!checked.ok) {
+      throw new BillingError(checked.code, `Số credit không hợp lệ: ${JSON.stringify(amount ?? null)} (${checked.reason})`, {
         amount: raw,
+        max: checked.max ?? this.maxAmount,
       });
     }
+    const value = checked.value;
     const picked = typeof reason === 'string' && reason.trim()
       ? reason.trim()
       : (actorId ? 'admin_grant' : 'grant');
@@ -558,7 +641,7 @@ export class BillingService {
    * (hook pipeline hay truyền kiểu này). Không có `operations` thì lấy luôn từ `estimate.lines`
    * để `meta.operations` vẫn ghi được dấu vết đã giữ tiền cho những bước nào.
    */
-  async holdForJob({ userId, jobId, estimate: estimateValue, operations = null } = {}) {
+  async holdForJob({ userId, jobId, estimate: estimateValue, operations = null, runKey = null, maxRunsPerJob = null } = {}) {
     const uid = this.#requireUserId(userId);
     const jid = requireJobId(jobId);
     const estimateObject = estimateValue && typeof estimateValue === 'object' ? estimateValue : null;
@@ -580,18 +663,40 @@ export class BillingService {
     const amount = roundMoney(value);
     const operationNames = listOperationNames(ops);
 
+    const runsCap = toFiniteNumber(maxRunsPerJob);
+
     return this.#withUserLock(uid, async () => {
+      const rows = await this.#jobRows(uid, jid);
+
+      // (b0) PB-02: chọn LƯỢT CHẠY để giữ tiền — lượt đang mở nếu có (idempotent theo run),
+      //      ngược lại mở lượt MỚI. Đây là chỗ sửa lỗi "chạy lại cùng jobId = miễn phí".
+      const asked = typeof runKey === 'string' && runKey.trim() ? runKey.trim() : '';
+      const openRun = openRunKeyOf(rows);
+      const targetRun = asked || openRun || nextRunKeyOf(rows, jid);
+
+      // (b0b) Trần số lượt chạy có tính tiền cho mỗi job ⇒ vượt thì TỪ CHỐI (route map 429).
+      if (runsCap !== null && runsCap > 0) {
+        const known = runKeysOf(rows);
+        const already = known.includes(targetRun);
+        if (!already && known.length >= runsCap) {
+          throw new BillingError(
+            'RERUN_LIMIT_EXCEEDED',
+            `Job đã chạy ${known.length} lượt có tính tiền — vượt trần ${runsCap} lượt mỗi job. Hãy tạo job mới.`,
+            { job_id: jid, runs: known.length, max_runs: runsCap },
+          );
+        }
+      }
+
+      // (b) LƯỢT CHẠY NÀY đang được giữ tiền (gọi lại cùng run) ⇒ không giữ lần hai.
+      if (openRun === targetRun && heldOfRun(rows, targetRun) > 0) {
+        const currentHold = findLast(rows.filter((row) => runKeyOf(row) === targetRun), (row) => row.reason === 'job_hold');
+        return { ledgerId: currentHold?.id ?? null, balance_after: await this.#balanceLocked(uid), run_key: targetRun, skipped: true };
+      }
+
       const balanceBefore = await this.#balanceLocked(uid);
 
       // (a) Job miễn phí: KHÔNG ghi dòng 0 — sổ sạch, không nhiễu.
-      if (amount <= 0) return { ledgerId: null, balance_after: balanceBefore };
-
-      // (b) Job này ĐANG được giữ tiền (retry cùng jobId) ⇒ không giữ lần hai.
-      const rows = await this.#jobRows(uid, jid);
-      if (heldFromRows(rows) > 0) {
-        const currentHold = findLast(rows, (row) => row.reason === 'job_hold');
-        return { ledgerId: currentHold?.id ?? null, balance_after: balanceBefore };
-      }
+      if (amount <= 0) return { ledgerId: null, balance_after: balanceBefore, run_key: targetRun };
 
       // (c) Thiếu credit ⇒ ném lỗi TRƯỚC, không ghi gì.
       if (balanceBefore - amount < -MONEY_EPSILON) {
@@ -607,17 +712,18 @@ export class BillingService {
         );
       }
 
-      const meta = { estimate: amount, operations: operationNames };
+      const meta = { estimate: amount, operations: operationNames, run_key: targetRun };
       const row = await this.#append({
         userId: uid,
         amount: -amount,
         reason: 'job_hold',
         jobId: jid,
+        runKey: targetRun,
         operation: singleOperation(operationNames),
         meta,
         balanceBefore,
       });
-      return { ledgerId: row?.id ?? null, balance_after: row?.balance_after ?? balanceBefore };
+      return { ledgerId: row?.id ?? null, balance_after: row?.balance_after ?? balanceBefore, run_key: targetRun };
     });
   }
 
@@ -634,14 +740,27 @@ export class BillingService {
    * `actualCost` bỏ trống ⇒ đọc `usage_events` thật của job (`store.usageSummary` — G13).
    * Job không giữ tiền và chi phí thật = 0 ⇒ không có gì để quyết toán, trả `null`.
    */
-  async settleForJob({ userId, jobId, actualCost } = {}) {
+  async settleForJob({ userId, jobId, actualCost, runKey = null } = {}) {
     const uid = this.#requireUserId(userId);
     const jid = requireJobId(jobId);
 
     return this.#withUserLock(uid, async () => {
       const rows = await this.#jobRows(uid, jid);
-      const existing = findLast(rows, (row) => row.reason === 'job_settle');
-      if (existing) return existing; // đã quyết toán ⇒ không ghi thêm dòng nào
+      // PB-02: quyết toán theo LƯỢT CHẠY. Lượt mặc định = lượt đang mở; nếu không còn lượt mở
+      // (chế độ `holdBeforeJob=false`, hoặc lượt đã bị hoàn) thì dùng lượt mới nhất đã thấy,
+      // cuối cùng mới mở khoá mới.
+      const runs = runKeysOf(rows);
+      const asked = typeof runKey === 'string' && runKey.trim() ? runKey.trim() : '';
+      const targetRun = asked || openRunKeyOf(rows) || runs[runs.length - 1] || nextRunKeyOf(rows, jid);
+
+      // IDEMPOTENT THEO LƯỢT: lượt này đã settle/refund ⇒ trả dòng cũ, KHÔNG ghi thêm.
+      const runRows = rows.filter((row) => runKeyOf(row) === targetRun);
+      const existing = findLast(runRows, (row) => row.reason === 'job_settle');
+      if (existing) return existing;
+      if (runRows.some((row) => row.reason === 'job_refund')) {
+        // Lượt đã được HOÀN (job failed) ⇒ không quyết toán lại (giữ luật "một chu kỳ một lần").
+        return findLast(runRows, (row) => row.reason === 'job_refund');
+      }
 
       let actual = toFiniteNumber(actualCost);
       if (actual === null && (actualCost === undefined || actualCost === null)) {
@@ -656,10 +775,10 @@ export class BillingService {
       }
       actual = roundMoney(actual);
 
-      const held = heldFromRows(rows);
+      const held = heldOfRun(rows, targetRun);
       if (held <= MONEY_EPSILON && actual <= MONEY_EPSILON) {
-        this.logger?.info?.('billing.settle_noop', { user_id: uid, job_id: jid, held, actual_cost: actual });
-        return null; // job miễn phí — không có gì để quyết toán
+        this.logger?.info?.('billing.settle_noop', { user_id: uid, job_id: jid, run_key: targetRun, held, actual_cost: actual });
+        return null; // lượt chạy miễn phí — không có gì để quyết toán
       }
 
       const balanceBefore = await this.#balanceLocked(uid);
@@ -678,9 +797,9 @@ export class BillingService {
         });
       }
 
-      const meta = { held, actual_cost: actual, delta };
+      const meta = { held, actual_cost: actual, delta, run_key: targetRun };
       if (shortfall > 0) meta.shortfall = shortfall;
-      return this.#append({ userId: uid, amount, reason: 'job_settle', jobId: jid, meta, balanceBefore });
+      return this.#append({ userId: uid, amount, reason: 'job_settle', jobId: jid, runKey: targetRun, meta, balanceBefore });
     });
   }
 
@@ -695,19 +814,30 @@ export class BillingService {
    * `reason` ở đây là LÝ DO NGHIỆP VỤ (lưu ở `meta.reason`, mặc định 'job_failed');
    * cột `reason` của sổ LUÔN là 'job_refund' vì đó là giá trị đã đóng băng ở §2.1.
    */
-  async refundForJob({ userId, jobId, reason = '' } = {}) {
+  async refundForJob({ userId, jobId, reason = '', runKey = null } = {}) {
     const uid = this.#requireUserId(userId);
     const jid = requireJobId(jobId);
     const note = typeof reason === 'string' && reason.trim() ? reason.trim() : 'job_failed';
 
     return this.#withUserLock(uid, async () => {
       const rows = await this.#jobRows(uid, jid);
-      const remaining = heldFromRows(rows);
+      const runs = runKeysOf(rows);
+      const asked = typeof runKey === 'string' && runKey.trim() ? runKey.trim() : '';
+      const targetRun = asked || openRunKeyOf(rows) || runs[runs.length - 1] || '';
+      const runRows = targetRun ? rows.filter((row) => runKeyOf(row) === targetRun) : rows;
+
+      // PB-04 (vòng 2): TUYỆT ĐỐI không hoàn phần ĐÃ TIÊU. Nếu lượt này đã có `job_settle`
+      // thì khoản "còn giữ" theo công thức `-(tổng job_*)` chính là SỐ ĐÃ THU — hoàn nó là
+      // TẠO TIỀN (đo được ở `atk7-race.mjs` §7.3/§7.4: 20/20 lần job thành miễn phí).
+      if (runRows.some((row) => row.reason === 'job_settle')) {
+        return findLast(runRows, (row) => row.reason === 'job_settle'); // đã quyết toán ⇒ không hoàn gì thêm
+      }
+      const remaining = heldOfRun(rows, targetRun);
       if (remaining <= MONEY_EPSILON) {
-        if (!rows.some((row) => row.reason === 'job_hold')) {
-          this.logger?.info?.('billing.refund_without_hold', { user_id: uid, job_id: jid });
+        if (!runRows.some((row) => row.reason === 'job_hold')) {
+          this.logger?.info?.('billing.refund_without_hold', { user_id: uid, job_id: jid, run_key: targetRun });
         }
-        return findLast(rows, (row) => row.reason === 'job_refund') ?? null; // không có gì để hoàn ⇒ không ghi
+        return findLast(runRows, (row) => row.reason === 'job_refund') ?? null; // không có gì để hoàn ⇒ không ghi
       }
       const balanceBefore = await this.#balanceLocked(uid);
       return this.#append({
@@ -715,10 +845,22 @@ export class BillingService {
         amount: remaining,
         reason: 'job_refund',
         jobId: jid,
-        meta: { reason: note, refunded: remaining },
+        runKey: targetRun,
+        meta: { reason: note, refunded: remaining, run_key: targetRun },
         balanceBefore,
       });
     });
+  }
+
+  /**
+   * PB-02 — số LƯỢT CHẠY có tính tiền đã mở cho một job (đếm theo `run_key` trong sổ).
+   * Dùng cho trần `billing.maxRunsPerJob` và cho `GET /api/config.billing`.
+   */
+  async runsOfJob({ userId, jobId } = {}) {
+    const uid = this.#requireUserId(userId);
+    const jid = requireJobId(jobId);
+    const rows = await this.#jobRows(uid, jid);
+    return runKeysOf(rows);
   }
 
   /** §3.2 — lịch sử sổ (mới nhất trước, theo store). Ẩn danh ⇒ `ANONYMOUS_NO_WALLET`. */

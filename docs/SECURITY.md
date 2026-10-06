@@ -130,3 +130,22 @@ rồi đóng DB. `SIGTERM`/`SIGINT` được xử lý.
 
 > **Kết luận thẳng:** MVP-01 **chưa có xác thực**. Không được đưa lên Internet công khai ở trạng
 > thái này. Staging phải nằm sau lớp xác thực mạng (basic auth / IP allowlist / VPN).
+
+---
+
+## MVP-05 — chống brute-force đăng nhập & `trust proxy` (vòng 2, PB-08)
+
+`POST /api/auth/login` dùng bucket **riêng theo cặp (email chuẩn hoá, IP)**: 10 lần **thất bại**
+trong 5 phút ⇒ `429 RATE_LIMITED` kèm header `Retry-After`. Chỉ lần SAI mới bị đếm; đăng nhập ĐÚNG
+luôn được xác thực và **xoá** bộ đếm, nên người dùng thật không bao giờ tự khoá mình.
+
+⚠️ **Bắt buộc khi chạy sau reverse proxy** (nginx/Caddy/Cloudflare…): `clientKey()` lấy IP từ
+`x-forwarded-for` (header ĐẦU TIÊN) hoặc socket. Nếu proxy không được cấu hình để ghi lại
+`x-forwarded-for` — hoặc nếu ứng dụng tin header đó khi proxy KHÔNG ghi đè — thì:
+
+1. mọi khách có thể chung một IP ⇒ bucket theo IP mất tác dụng (kẻ tấn công chỉ cần đổi email);
+2. ngược lại, client có thể **giả** `x-forwarded-for` để né bucket ⇒ coi như không có rate limit.
+
+Cách đúng: chỉ tin `x-forwarded-for` khi có proxy thật đứng trước và proxy đó **ghi đè** header
+(nginx: `proxy_set_header X-Forwarded-For $remote_addr;`). Bật `ALLOW_PRIVATE_NETWORK` **không**
+thay đổi luật này — nó chỉ mở khoá gọi mạng nội bộ cho provider.

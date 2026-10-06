@@ -247,6 +247,65 @@ export class AccountService {
     return issued;
   }
 
+  /**
+   * PB-03 (vòng 2) — BOOTSTRAP OWNER ĐẦU TIÊN.
+   *
+   * Vì sao: tự đăng ký luôn là `member`; mọi route `/api/admin/*` đòi `owner|admin`; không có
+   * route/CLI/env nào phong owner đầu tiên ⇒ trên cài đặt mới KHÔNG ai cấp được credit ⇒ ví
+   * vĩnh viễn 0 ⇒ mọi job 402 (tính năng không dùng được). Đây là đường bootstrap CÓ CHỦ ĐÍCH:
+   *
+   *   - đã có owner/admin ⇒ KHÔNG làm gì (idempotent, không bao giờ hạ cấp ai);
+   *   - `email` được chỉ định và user ĐÃ tồn tại ⇒ nâng lên `owner`;
+   *   - chưa tồn tại ⇒ TẠO user owner với mật khẩu NGẪU NHIÊN, trả về đúng MỘT LẦN để tầng gọi
+   *     in ra log kèm cảnh báo đổi mật khẩu (mật khẩu KHÔNG được lưu ở đâu khác);
+   *   - không có `email` ⇒ trả `{ created: false, reason: 'NO_OWNER_EMAIL' }` để tầng boot ghi
+   *     log mức WARN hướng dẫn dùng `npm run make-owner -- <email>`.
+   *
+   * @returns {Promise<{created:boolean, promoted:boolean, user?:object, password?:string,
+   *                    reason?:string, owners?:number}>}
+   */
+  async bootstrapOwner({ email = '', password = null } = {}) {
+    this.#require('getUserByEmail', 'createUser');
+    const owners = await this.#countOwners().catch(() => null);
+    if (Number.isFinite(owners) && owners > 0) return { created: false, promoted: false, owners };
+
+    const normalized = normalizeEmail(email);
+    if (!normalized) return { created: false, promoted: false, owners: Number.isFinite(owners) ? owners : 0, reason: 'NO_OWNER_EMAIL' };
+
+    const existing = await this.store.getUserByEmail(normalized);
+    if (existing) {
+      if (existing.role === 'owner') return { created: false, promoted: false, user: toPublicUser(existing), owners: 1 };
+      const updated = await this.store.updateUser(existing.id, { role: 'owner' });
+      const user = updated && typeof updated === 'object' ? updated : { ...existing, role: 'owner' };
+      if (!user.status) user.status = existing.status;
+      this.logger?.warn('accounts.bootstrap_owner_promoted', { userId: existing.id });
+      return { created: false, promoted: true, user: toPublicUser(user), owners: 1 };
+    }
+
+    const generated = typeof password === 'string' && password.length >= PASSWORD_MIN_LENGTH
+      ? password
+      : generateTemporaryPassword();
+    let user;
+    try {
+      user = await this.store.createUser({
+        id: randomUUID(),
+        email: normalized,
+        displayName: 'Owner',
+        role: 'owner',
+        passwordHash: hashPassword(generated),
+        status: 'active',
+      });
+    } catch (err) {
+      if (isUniqueViolation(err)) throw new AccountError('EMAIL_TAKEN', 'Email này đã được đăng ký.');
+      throw asAccountError(err, 'STORE_ERROR', 'Không tạo được tài khoản owner.');
+    }
+    if (!user || typeof user !== 'object' || !user.id || !user.status) {
+      throw new AccountError('STORE_ERROR', 'Store.createUser không trả về bản ghi người dùng đầy đủ (id/email/status).');
+    }
+    this.logger?.warn('accounts.bootstrap_owner_created', { userId: user.id });
+    return { created: true, promoted: false, user: toPublicUser(user), password: generated, owners: 1 };
+  }
+
   /** Thu hồi phiên. Idempotent: gọi lần hai vẫn `true` và KHÔNG ném. */
   async logout(token) {
     this.#require('getUserSessionByTokenHash', 'revokeUserSession');
@@ -465,6 +524,15 @@ export class AccountService {
  *   - PostgreSQL: `23505`;
  *   - store A3 đã dịch sẵn thành `{ code: 'EMAIL_TAKEN' }` (kèm `cause` là lỗi driver).
  */
+/** Mật khẩu TẠM ngẫu nhiên cho owner bootstrap — in một lần, người dùng phải đổi ngay. */
+function generateTemporaryPassword(length = 20) {
+  const alphabet = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#%^&*-_';
+  const bytes = randomBytes(length);
+  let out = '';
+  for (let i = 0; i < length; i += 1) out += alphabet[bytes[i] % alphabet.length];
+  return out;
+}
+
 function isUniqueViolation(err) {
   const code = String(err?.code ?? '');
   if (code === 'EMAIL_TAKEN' || code === '23505' || /SQLITE_CONSTRAINT/i.test(code)) return true;
