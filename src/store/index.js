@@ -247,6 +247,19 @@ export class Store {
     // (`<jobId>#<n>`), để mỗi lượt chạy lại có hold/settle/refund riêng. Thêm SAU migration
     // (bài học `seq`: index trong `schema.sql` làm chết `init()` trên DB cũ).
     await this.#addColumnIfMissing('wallet_ledger', 'run_key', 'TEXT');
+    // BR-03b (vòng 3): `wallet_ledger.close_kind` — 'settle' | 'refund' cho dòng ĐÓNG lượt chạy.
+    // Nhờ cột này, ràng buộc ở tầng DB phát biểu được đúng luật "MỘT dòng đóng cho mỗi lượt"
+    // (unique trên `(user_id, job_id, run_key)` WHERE `close_kind IS NOT NULL`) — unique theo
+    // `reason` không chặn được cặp settle+refund cho cùng lượt.
+    await this.#addColumnIfMissing('wallet_ledger', 'close_kind', 'TEXT');
+    await this.#createUniqueIndexIfPossible('uniq_wallet_ledger_run_close', 'wallet_ledger', {
+      columns: 'user_id, job_id, run_key',
+      where: 'close_kind IS NOT NULL AND run_key IS NOT NULL',
+    });
+    // BR-07 (vòng 3): `usage_events.run_key` — chi phí THẬT phải quy được về TỪNG LƯỢT CHẠY,
+    // nếu không `afterJob` sẽ settle theo usage TÍCH LUỸ của cả job (thu thừa các lượt trước).
+    await this.#addColumnIfMissing('usage_events', 'run_key', 'TEXT');
+    await this.#createIndexIfPossible('idx_usage_run_key', 'usage_events', 'job_id, run_key');
     await this.#createIndexIfPossible('idx_wallet_ledger_run_key', 'wallet_ledger', 'user_id, job_id, run_key');
     await this.#createUniqueIndexIfPossible('uniq_wallet_ledger_run_reason', 'wallet_ledger', {
       columns: 'user_id, job_id, run_key, reason',
@@ -480,6 +493,8 @@ export class Store {
     id = randomUUID(),
     jobId = null,
     sessionId = '',
+    runKey = null,
+    run_key = null,
     operation,
     provider = '',
     model = '',
@@ -490,10 +505,13 @@ export class Store {
     meta = null,
   }) {
     await this.driver.run(
-      `INSERT INTO usage_events (id, job_id, session_id, operation, provider, model,
+      `INSERT INTO usage_events (id, job_id, session_id, run_key, operation, provider, model,
         input_units, output_units, estimated_cost, currency, meta, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [id, jobId, sessionId, operation, provider, model, inputUnits, outputUnits, estimatedCost, currency, toJson(meta), nowIso()],
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        id, jobId, sessionId, runKey ?? run_key ?? null, operation, provider, model,
+        inputUnits, outputUnits, estimatedCost, currency, toJson(meta), nowIso(),
+      ],
     );
     return id;
   }
@@ -502,13 +520,26 @@ export class Store {
     return this.driver.all('SELECT * FROM usage_events WHERE job_id = ? ORDER BY created_at ASC', [jobId]);
   }
 
-  /** Tổng hợp chi phí theo job — nền tảng cho credit-based billing sau này. */
-  async usageSummary(jobId) {
+  /**
+   * Tổng hợp chi phí theo job — nền tảng cho credit-based billing.
+   *
+   * BR-07 (vòng 3): nhận thêm `runKey` để lấy chi phí của **RIÊNG MỘT LƯỢT CHẠY**. Không có
+   * tham số này thì vẫn là tổng của cả job (tương thích ngược cho route thống kê).
+   * Dòng cũ (ghi trước khi có cột) mang `run_key IS NULL` ⇒ quy về lượt `#1` — nhờ vậy DB cũ
+   * vẫn quyết toán đúng cho lượt chạy đầu tiên thay vì thu 0.
+   */
+  async usageSummary(jobId, { runKey = null, run_key = null } = {}) {
+    const run = runKey ?? run_key ?? null;
+    const firstRun = typeof run === 'string' && /#1$/.test(run);
+    const where = run
+      ? (firstRun ? 'WHERE job_id = ? AND (run_key = ? OR run_key IS NULL)' : 'WHERE job_id = ? AND run_key = ?')
+      : 'WHERE job_id = ?';
+    const params = run ? [jobId, run] : [jobId];
     const row = await this.driver.get(
       `SELECT COUNT(*) AS events, COALESCE(SUM(estimated_cost),0) AS cost,
               COALESCE(SUM(input_units),0) AS input_units, COALESCE(SUM(output_units),0) AS output_units
-       FROM usage_events WHERE job_id = ?`,
-      [jobId],
+       FROM usage_events ${where}`,
+      params,
     );
     return {
       events: Number(row?.events ?? 0),
@@ -1090,6 +1121,7 @@ export class Store {
       // PB-02 (vòng 2): khoá chu kỳ tiền theo LƯỢT CHẠY — cột riêng (không chỉ trong `meta`)
       // để tầng billing đọc lại được mà không phải parse JSON.
       run_key: row.run_key ?? null,
+      close_kind: row.close_kind ?? null,
       operation: row.operation ?? null,
       meta: fromJson(row.meta),
       balance_after: roundMoney(row.balance_after),
@@ -1132,6 +1164,14 @@ export class Store {
       reason: String(reason || 'adjustment'),
       job_id: jobId ?? job_id ?? null,
       run_key: runKey ?? run_key ?? null,
+      // BR-03b: dòng ĐÓNG lượt chạy (settle/refund) được đánh dấu để unique index chặn việc
+      // một lượt vừa settle vừa refund (trên PostgreSQL, đọc-rồi-ghi giữa 2 tiến trình vẫn hở).
+      close_kind: (() => {
+        const r = String(reason || '');
+        if (r === 'job_settle') return 'settle';
+        if (r === 'job_refund') return 'refund';
+        return null;
+      })(),
       operation: operation ?? null,
       meta: meta && typeof meta === 'object' ? meta : null,
       created_at: ts,
@@ -1153,11 +1193,11 @@ export class Store {
       }
       const seq = Number(toNum(current?.max_seq, 0)) + 1;
       await tx.run(
-        `INSERT INTO wallet_ledger (id, user_id, seq, amount, currency, reason, job_id, run_key, operation, meta, balance_after, created_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO wallet_ledger (id, user_id, seq, amount, currency, reason, job_id, run_key, close_kind, operation, meta, balance_after, created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [
           row.id, row.user_id, seq, row.amount, row.currency, row.reason, row.job_id, row.run_key,
-          row.operation, toJson(row.meta), balanceAfter, ts,
+          row.close_kind, row.operation, toJson(row.meta), balanceAfter, ts,
         ],
       );
       return { ...row, seq, balance_after: balanceAfter };

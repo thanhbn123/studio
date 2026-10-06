@@ -356,3 +356,55 @@ Các mục dưới đây là **bổ sung** — không đổi tên field/khoá đ
   xác thực, đúng ⇒ cho vào + xoá bộ đếm; sai ⇒ 429.
 - ⚠️ Vận hành sau reverse proxy: xem ghi chú `trust proxy` ở `docs/SECURITY.md` — sai cấu hình thì
   mọi khách chung một IP và bucket theo IP mất tác dụng.
+
+---
+
+# VÒNG 3 — SỬA THEO PHẢN BIỆN VÒNG 2 (BR-01…BR-07)
+
+Phán quyết vòng 2: **FAIL** (`docs/MVP-05-REVIEW.md` mục “VÒNG 2”). Bổ sung bắt buộc:
+
+## 6.1 BR-07 — settle theo LƯỢT CHẠY, không theo usage tích luỹ
+
+- `usage_events.run_key` (cột mới, migration cộng thêm — cùng cách với `wallet_ledger.run_key`);
+  `store.recordUsage({..., runKey})` ghi khoá lượt; `store.usageSummary(jobId, { runKey })` lọc theo
+  lượt (dòng cũ `run_key IS NULL` quy về lượt `#1`).
+- Pipeline (jobs/imagelab/imagestudio) nhớ `run_key` của lượt đang chạy (`#runKeys`, lấy từ
+  `hook.beforeJob` / `hook.runKeyForJob`), gắn vào MỌI `recordUsage`, và truyền vào `afterJob`.
+- `BillingService.settleForJob({..., runKey})`: nếu không có `actualCost` thì lấy chi phí **của
+  riêng lượt** (`usageSummary(runKey)`), nếu lượt chưa có dòng usage gắn khoá thì lấy
+  `max(0, tổng usage − Σ đã thu của các lượt trước)` — **không bao giờ** thu lại tiền lượt cũ.
+- Bất biến: với N lượt chạy, `Σ(đã thu) == chi phí THẬT của N lượt` (không thu thừa).
+
+## 6.2 BR-01 — `BILLING_HOLD_BEFORE_JOB=false` vẫn phải mở LƯỢT, settle và áp trần
+
+- Không giữ tiền trước, nhưng `beforeJob` **mở lượt** (`run_key`), `afterJob` ghi `job_settle`
+  theo chi phí THẬT của lượt đó, và **trần `maxRunsPerJob` vẫn áp** (429 `RERUN_LIMIT_EXCEEDED`).
+- Ví không đủ lúc quyết toán ⇒ thu tối đa phần đang có, ghi `meta.shortfall` vào sổ + log **ERROR**
+  `billing.settle_shortfall` (không im lặng).
+
+## 6.3 BR-02 — hai request chồng nhau trên cùng job
+
+- Lượt đang MỞ ⇒ request thứ hai (route) trả **409 `JOB_ALREADY_RUNNING`** kèm `{job_id, run_key}`;
+  không dùng chung khoản giữ để chạy K lượt thật. Bất biến: số lượt chạy thật == số lượt bị thu.
+
+## 6.4 BR-03 — sổ lỗi/khoá ghi: fail-closed + ràng buộc DB
+
+- Lỗi ghi sổ ở `beforeJob` ⇒ `BILLING_UNAVAILABLE` ⇒ **503** (TRỪ khi `billing.enabled=false`):
+  không cho job chạy mà không thu được tiền (trước đây bị nuốt ⇒ fail-open).
+- `#callStore` map lỗi hạ tầng (`database is locked`, deadlock/`40001`/`40P01`, timeout) thành
+  `LEDGER_BUSY` (kèm `details.retryable`) thay vì để lộ mã thô của driver.
+- `afterJob` lỗi ⇒ log **ERROR** `billing.after_job_failed` (có `run_key`) — không chết im lặng.
+- Cột `wallet_ledger.close_kind` (`settle`|`refund`) + **unique index** `uniq_wallet_ledger_run_close`
+  trên `(user_id, job_id, run_key)` WHERE `close_kind IS NOT NULL` ⇒ mỗi lượt chỉ có MỘT dòng đóng
+  (settle HOẶC refund), chạy được cả SQLite lẫn PostgreSQL, tạo SAU migration.
+- SQLite: `PRAGMA busy_timeout = 5000` (đã có trong `src/store/sqlite-driver.js`).
+
+## 6.5 BR-04…BR-06
+
+- **BR-04**: login giữ **cả hai** bucket — `(email chuẩn hoá, IP)` 10 lần sai/5 phút **và** theo
+  `IP` 60 lần sai/5 phút (chống spraying); 429 kèm `Retry-After`. Đăng nhập ĐÚNG vẫn luôn được
+  xác thực và xoá cả hai bộ đếm.
+- **BR-05**: trần `maxRunsPerJob` chỉ đếm **lượt có thu** (đã `job_settle`, hoặc đang mở). Lượt
+  lỗi đã hoàn tiền **không** tính ⇒ job chưa từng thành công không bị 429 oan.
+- **BR-06**: `ingest` lỗi ở route ImageLab ⇒ job `failed` + `error_code` + `finished_at`
+  (hết treo `running`), tiền vẫn hoàn đủ.

@@ -233,6 +233,32 @@ function nextRunKeyOf(rows, jobId) {
   return `${jobId}#${max + 1}`;
 }
 
+/**
+ * BR-07 — tổng credit ĐÃ THU của các lượt chạy TRƯỚC (không tính lượt đang xét): với mỗi lượt
+ * đã `job_settle`, phần đã thu = `|job_hold|` trừ phần được hoàn trong dòng settle (settle dương
+ * = hoàn phần giữ thừa; settle âm = thu thêm). Lượt bị `job_refund` coi như thu 0.
+ */
+function alreadyChargedOf(rows, exceptRunKey) {
+  const byRun = new Map();
+  for (const row of rows) {
+    const key = runKeyOf(row);
+    if (!key || key === exceptRunKey) continue;
+    const entry = byRun.get(key) || { hold: 0, settle: null, refunded: false };
+    if (row.reason === 'job_hold') entry.hold += Math.abs(toFiniteNumber(row.amount) ?? 0);
+    else if (row.reason === 'job_settle') entry.settle = toFiniteNumber(row.amount);
+    else if (row.reason === 'job_refund') entry.refunded = true;
+    byRun.set(key, entry);
+  }
+  let total = 0;
+  for (const entry of byRun.values()) {
+    if (entry.settle === null) continue; // lượt đang mở hoặc đã hoàn ⇒ chưa thu đồng nào
+    // Dòng settle = `held − actual` (dương: hoàn phần giữ thừa; âm: thu thêm) ⇒ đã thu =
+    // `hold − settle`, không bao giờ âm.
+    total += Math.max(0, entry.hold - entry.settle);
+  }
+  return roundMoney(total);
+}
+
 /** Phần credit ĐANG GIỮ của MỘT lượt chạy (chỉ tính dòng mang đúng `run_key` đó). */
 function heldOfRun(rows, runKey) {
   const amounts = [];
@@ -354,9 +380,21 @@ export class BillingService {
         error: err?.message ?? String(err),
         ...(details ?? {}),
       });
-      const wrapped = err && typeof err.code === 'string' && err.code
-        ? new BillingError(err.code, err.message || message, err.details ?? details)
-        : new BillingError(code, message, details);
+      // BR-03 (vòng 3): lỗi HẠ TẦNG (SQLite `database is locked`, deadlock/serialization của
+      // PostgreSQL, mất kết nối…) phải ra tới tầng gọi bằng một mã NGHIỆP VỤ ổn định kèm cờ
+      // `retryable` — không để lộ mã thô của driver (`ERR_SQLITE_ERROR`, `40P01`…) rồi bị tầng
+      // trên nuốt mất, biến thành "job chạy mà không ai thu tiền".
+      const rawCode = String(err?.code ?? '');
+      const isBusy = /SQLITE_ERROR|SQLITE_BUSY|locked|deadlock|40001|40P01|ECONNRESET|ETIMEDOUT/i.test(`${rawCode} ${String(err?.message ?? '')}`);
+      const wrapped = isBusy
+        ? new BillingError('LEDGER_BUSY', 'Sổ credit đang bận (khoá ghi/đua tiến trình) — thao tác chưa được ghi.', {
+          ...(details ?? {}),
+          retryable: true,
+          driver_code: rawCode || null,
+        })
+        : err && rawCode
+          ? new BillingError(rawCode, err.message || message, err.details ?? details)
+          : new BillingError(code, message, details);
       wrapped.cause = err;
       throw wrapped;
     }
@@ -676,13 +714,21 @@ export class BillingService {
 
       // (b0b) Trần số lượt chạy có tính tiền cho mỗi job ⇒ vượt thì TỪ CHỐI (route map 429).
       if (runsCap !== null && runsCap > 0) {
+        // BR-05: chỉ đếm lượt CÓ THU (lượt lỗi đã hoàn không khoá job).
         const known = runKeysOf(rows);
+        const billable = [...new Set(rows.filter((row) => {
+          const key = runKeyOf(row);
+          if (!key) return false;
+          if (row.reason === 'job_settle') return true;
+          if (row.reason === 'job_hold') return !rows.some((x) => x.reason === 'job_refund' && runKeyOf(x) === key);
+          return false;
+        }).map(runKeyOf))];
         const already = known.includes(targetRun);
-        if (!already && known.length >= runsCap) {
+        if (!already && billable.length >= runsCap) {
           throw new BillingError(
             'RERUN_LIMIT_EXCEEDED',
-            `Job đã chạy ${known.length} lượt có tính tiền — vượt trần ${runsCap} lượt mỗi job. Hãy tạo job mới.`,
-            { job_id: jid, runs: known.length, max_runs: runsCap },
+            `Job đã chạy ${billable.length} lượt có tính tiền — vượt trần ${runsCap} lượt mỗi job. Hãy tạo job mới.`,
+            { job_id: jid, runs: billable.length, max_runs: runsCap },
           );
         }
       }
@@ -764,7 +810,9 @@ export class BillingService {
 
       let actual = toFiniteNumber(actualCost);
       if (actual === null && (actualCost === undefined || actualCost === null)) {
-        actual = await this.#usageCostOfJob(jid);
+        // BR-07 (vòng 3): chi phí THẬT của **RIÊNG LƯỢT NÀY** — trước đây lấy tổng usage của
+        // cả job nên lượt thứ n thu luôn chi phí của mọi lượt trước (đo được: +100…+150%).
+        actual = await this.#usageCostOfRun(jid, targetRun, rows);
       }
       if (actual === null || actual < 0) {
         throw new BillingError(
@@ -863,6 +911,36 @@ export class BillingService {
     return runKeysOf(rows);
   }
 
+  /**
+   * BR-05 (vòng 3) — số LƯỢT CÓ THU của một job: lượt đã `job_settle`, hoặc lượt còn ĐANG MỞ.
+   * Lượt lỗi đã được hoàn (`job_refund` mà không settle) **không** tính ⇒ job chưa từng thành
+   * công không bị khoá oan bằng 429.
+   */
+  async billableRunsOfJob({ userId, jobId } = {}) {
+    const uid = this.#requireUserId(userId);
+    const jid = requireJobId(jobId);
+    const rows = await this.#jobRows(uid, jid);
+    const byRun = new Map();
+    for (const row of rows) {
+      const key = runKeyOf(row);
+      if (!key) continue;
+      const entry = byRun.get(key) || { settle: false, refund: false, hold: false };
+      if (row.reason === 'job_settle') entry.settle = true;
+      else if (row.reason === 'job_refund') entry.refund = true;
+      else if (row.reason === 'job_hold') entry.hold = true;
+      byRun.set(key, entry);
+    }
+    return [...byRun.entries()].filter(([, e]) => e.settle || (!e.refund && e.hold)).map(([key]) => key);
+  }
+
+  /** BR-07/BR-01 — `run_key` KẾ TIẾP cho một job (dùng khi không giữ tiền trước). */
+  async nextRunKey({ userId, jobId } = {}) {
+    const uid = this.#requireUserId(userId);
+    const jid = requireJobId(jobId);
+    const rows = await this.#jobRows(uid, jid);
+    return nextRunKeyOf(rows, jid);
+  }
+
   /** §3.2 — lịch sử sổ (mới nhất trước, theo store). Ẩn danh ⇒ `ANONYMOUS_NO_WALLET`. */
   async history({ userId, limit, offset } = {}) {
     const uid = this.#requireUserId(userId);
@@ -902,6 +980,28 @@ export class BillingService {
   }
 
   /** Chi phí THẬT của job theo `usage_events` (G13). Không đọc được ⇒ `null`. */
+  /**
+   * BR-07 — chi phí của MỘT LƯỢT CHẠY.
+   *
+   * Ưu tiên số đo ĐÃ GẮN `run_key` (`usage_events.run_key`). Nếu lượt này chưa có dòng usage
+   * nào gắn khoá (DB cũ / caller ghi usage không kèm lượt) thì dùng **phần TĂNG so với phần đã
+   * thu của các lượt trước** — vẫn không bao giờ thu lại tiền của lượt cũ:
+   *   chi_phí_lượt = max(0, tổng_usage_của_job − Σ(đã_thu của các lượt trước)).
+   */
+  async #usageCostOfRun(jobId, runKey, rows) {
+    const store = this.store;
+    if (typeof store?.usageSummary !== 'function') return null;
+    try {
+      const ofRun = await store.usageSummary(jobId, { runKey });
+      if (Number(ofRun?.events) > 0) return toFiniteNumber(ofRun.estimated_cost);
+    } catch (err) {
+      this.logger?.warn?.('billing.usage_of_run_failed', { job_id: jobId, run_key: runKey, error_name: err?.name || 'Error' });
+    }
+    const total = await this.#usageCostOfJob(jobId);
+    if (total === null) return null;
+    return roundMoney(Math.max(0, total - alreadyChargedOf(rows, runKey)));
+  }
+
   async #usageCostOfJob(jobId) {
     const store = this.store;
     if (typeof store?.usageSummary !== 'function') return null;

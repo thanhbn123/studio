@@ -775,12 +775,13 @@ export function buildRouter(app) {
    * `docs/SECURITY.md`. Nếu không, mọi khách chung một IP và bucket theo IP mất tác dụng.
    */
   const LOGIN_WINDOW_MS = 5 * 60 * 1000;
-  const LOGIN_MAX_FAILURES = 10;
+  const LOGIN_MAX_FAILURES = 10;   // trần cho một CẶP (email, IP)
+  const LOGIN_IP_MAX_FAILURES = 60; // BR-04: trần RỘNG theo IP — chặn "spraying" qua nhiều email
   const loginFailures = new Map(); // key → { count, firstAt }
 
   const normalizeEmailLike = (value) => String(value ?? '').trim().toLowerCase().replace(/\s+/g, '');
 
-  const checkLoginAttempts = (key) => {
+  const checkLoginAttempts = (key, max = LOGIN_MAX_FAILURES) => {
     const now = Date.now();
     const entry = loginFailures.get(key);
     if (!entry) return { blocked: false, retryAfterSec: 0 };
@@ -788,11 +789,11 @@ export function buildRouter(app) {
       loginFailures.delete(key);
       return { blocked: false, retryAfterSec: 0 };
     }
-    if (entry.count < LOGIN_MAX_FAILURES) return { blocked: false, retryAfterSec: 0 };
+    if (entry.count < max) return { blocked: false, retryAfterSec: 0 };
     return { blocked: true, retryAfterSec: Math.max(1, Math.ceil((entry.firstAt + LOGIN_WINDOW_MS - now) / 1000)) };
   };
 
-  const registerLoginFailure = (key) => {
+  const registerLoginFailure = (key, max = LOGIN_MAX_FAILURES) => {
     const now = Date.now();
     const entry = loginFailures.get(key);
     if (!entry || now - entry.firstAt > LOGIN_WINDOW_MS) {
@@ -804,7 +805,7 @@ export function buildRouter(app) {
     if (loginFailures.size > 5000) {
       for (const [k, v] of loginFailures) if (now - v.firstAt > LOGIN_WINDOW_MS) loginFailures.delete(k);
     }
-    return checkLoginAttempts(key);
+    return checkLoginAttempts(key, max);
   };
 
   const clearLoginFailures = (key) => {
@@ -863,13 +864,42 @@ export function buildRouter(app) {
     }
   };
 
+  /**
+   * BR-06 (vòng 3) — đánh dấu job ImageLab `failed` khi `ingest` lỗi SAU khi job đã được tạo.
+   * Trước đây tiền được hoàn đúng nhưng job **treo `running` vĩnh viễn** (không có entry hàng
+   * đợi, không ai đánh dấu) ⇒ rác trong UI.
+   */
+  const markImagelabJobFailed = async (jobId, err) => {
+    if (typeof store.updateJob !== 'function') return;
+    try {
+      await store.updateJob(jobId, {
+        status: JOB_STATUS.FAILED,
+        stage: 'failed',
+        error_code: err?.code || 'IMAGELAB_INGEST_FAILED',
+        error_message: scrubPaths(String(err?.message || 'Không lưu được ảnh tải lên.')),
+        finished_at: new Date().toISOString(),
+      });
+    } catch (inner) {
+      logger?.warn?.('imagelab.fail_mark_failed', { job_id: jobId, error_name: inner?.name || 'Error' });
+    }
+  };
+
   const holdCreditBeforeJob = async (req, jobId, kind) => {
     const userId = req?.user?.id ?? null;
     if (!userId || !billingEnabled()) return null; // ẩn danh: không ví, không trừ credit (§2.2)
     const hook = billingHook();
     if (hook) {
       try {
-        return (await hook.beforeJob({ userId, jobId, kind, sessionId: presentedSessionId(req) })) ?? null;
+        const result = (await hook.beforeJob({ userId, jobId, kind, sessionId: presentedSessionId(req) })) ?? null;
+        // BR-02 (vòng 3): lượt chạy của job này ĐANG MỞ ⇒ request thứ hai KHÔNG được dùng chung
+        // khoản giữ rồi chạy thật (K lượt chạy / 1 lượt bị thu). Chặn rõ ràng bằng 409.
+        if (result?.skipped === true && result?.hold_disabled !== true) {
+          throw HttpError.safe(409, 'JOB_ALREADY_RUNNING', 'Job này đang chạy một lượt khác — chờ lượt đó xong rồi hãy chạy lại.', {
+            job_id: jobId,
+            run_key: result?.run_key ?? null,
+          });
+        }
+        return result;
       } catch (err) {
         // Thiếu tiền ⇒ 402 (mapBillingError); lỗi khác ⇒ fail-closed, báo lỗi thật.
         throw mapBillingError(err) || err;
@@ -940,8 +970,11 @@ export function buildRouter(app) {
     // Trước đây dùng chung bucket 120 req/phút theo IP ⇒ vừa quá rộng cho brute-force, vừa
     // tự khoá đường đăng nhập ĐÚNG của chính mình. Đăng nhập đúng KHÔNG tiêu quota.
     const emailKey = normalizeEmailLike(body.email);
-    const loginKey = `auth:login:${emailKey || '-'}:${clientKey(req)}`;
-    const gate = checkLoginAttempts(loginKey);
+    const ipKey = clientKey(req);
+    const loginKey = `auth:login:${emailKey || '-'}:${ipKey}`;
+    const ipWideKey = `auth:login-ip:${ipKey}`;
+    const gate = checkLoginAttempts(loginKey, LOGIN_MAX_FAILURES);
+    const ipGate = checkLoginAttempts(ipWideKey, LOGIN_IP_MAX_FAILURES);
 
     // Vì sao KHÔNG chặn thẳng khi bucket đã đầy: yêu cầu PB-08 là "đăng nhập ĐÚNG không bị
     // chặn bởi chính bộ đếm lần sai của mình". Nên vẫn XÁC THỰC, rồi mới phán quyết:
@@ -957,8 +990,9 @@ export function buildRouter(app) {
     } catch (err) {
       const mapped = mapLoginError(err);
       if (mapped?.code === 'BAD_CREDENTIALS') {
-        const now = registerLoginFailure(loginKey);
-        const active = now.blocked ? now : (gate.blocked ? gate : null);
+        const now = registerLoginFailure(loginKey, LOGIN_MAX_FAILURES);
+        registerLoginFailure(ipWideKey, LOGIN_IP_MAX_FAILURES); // BR-04: đếm cả ở bucket theo IP
+        const active = now.blocked ? now : (ipGate.blocked ? ipGate : (gate.blocked ? gate : null));
         if (active) {
           res.setHeader('retry-after', String(active.retryAfterSec));
           throw HttpError.safe(
@@ -971,6 +1005,7 @@ export function buildRouter(app) {
       throw mapped;
     }
     clearLoginFailures(loginKey); // đăng nhập đúng ⇒ xoá bộ đếm sai của cặp (email, IP) này
+    clearLoginFailures(ipWideKey); // ... và bộ đếm theo IP (người dùng thật vừa chứng minh mình hợp lệ)
 
     const token = safeToken(result?.token);
     if (token && result?.expiresAt) appendSetCookie(res, authCookie(token, result.expiresAt));
@@ -1670,6 +1705,8 @@ export function buildRouter(app) {
       ingest = await app.imagelabPipeline.ingest(jobId, { image, sessionId: sid, userId, options });
     } catch (err) {
       // PB-01: ingest lỗi SAU khi đã giữ tiền ⇒ phải hoàn khoản giữ (trước đây chỉ throw).
+      // BR-06: đồng thời đánh dấu job `failed` để KHÔNG treo `running` vĩnh viễn.
+      await markImagelabJobFailed(jobId, err);
       await releaseHoldOnFailure(req, jobId);
       throw mapImagelabError(err, 'Không lưu được ảnh tải lên.');
     }
@@ -2378,6 +2415,13 @@ function insufficientCreditMessage(required, balance) {
 function mapBillingError(err) {
   if (!err || typeof err !== 'object') return null;
   const code = String(err.code || '');
+  // BR-03a (vòng 3): không giữ được tiền vì SỔ LỖI ⇒ 503 (fail-closed), KHÔNG cho chạy miễn phí.
+  if (code === 'BILLING_UNAVAILABLE') {
+    return HttpError.safe(503, 'BILLING_UNAVAILABLE', String(err.message || 'Sổ ví tạm thời không dùng được — thử lại sau.'), {
+      job_id: err?.details?.job_id ?? null,
+      cause_code: err?.details?.cause_code ?? null,
+    });
+  }
   // PB-02 (vòng 2): vượt trần số lượt chạy có tính tiền của job ⇒ 429 (không phải 5xx, không
   // phải 402: người dùng CÓ tiền, chỉ là job này đã chạy quá nhiều lượt).
   if (code === 'RERUN_LIMIT_EXCEEDED') {

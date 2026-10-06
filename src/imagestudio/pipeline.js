@@ -306,6 +306,11 @@ export class ImageGenerationPipeline {
 
   /** Cảnh báo `billing.disabled` chỉ được ghi MỘT LẦN cho mỗi pipeline (không spam log). */
   #billingDisabledLogged = false;
+  /**
+   * BR-07 (vòng 3) — `run_key` của LƯỢT CHẠY đang chạy cho mỗi job (xem `src/jobs/pipeline.js`).
+   * Không có nó thì `recordUsage` không quy được chi phí về lượt ⇒ settle theo usage TÍCH LUỸ.
+   */
+  #runKeys = new Map();
 
   constructor({ config, logger, store, storage, mattingProvider = null, retouchProvider = null, billingService = null, billingHook = null } = {}) {
     this.config = config ?? {};
@@ -353,6 +358,7 @@ export class ImageGenerationPipeline {
     try {
       await this.store.recordUsage({
         jobId,
+        runKey: this.#runKeys.get(jobId) ?? null,
         sessionId,
         operation,
         provider: String(provider || ''),
@@ -442,7 +448,7 @@ export class ImageGenerationPipeline {
   /** Chi phí THẬT của job = tổng `estimated_cost` của mọi `usage_events` (hợp đồng §3.4). */
   async #actualCost(jobId) {
     try {
-      const summary = await this.store?.usageSummary?.(jobId);
+      const summary = await this.store?.usageSummary?.(jobId, { runKey: this.#runKeys.get(jobId) ?? null });
       return Number(summary?.estimated_cost ?? 0);
     } catch (err) {
       this.#warnHook('usage_summary', jobId, err);
@@ -506,15 +512,17 @@ export class ImageGenerationPipeline {
     const userId = job?.user_id || null;
     if (!userId) return run(); // ẩn danh ⇒ bỏ qua HOÀN TOÀN (luật #1)
 
+    let began = null; // BR-07: kết quả `beforeJob` (mang `run_key` của lượt chạy này)
     try {
       if (hook) {
-        await hook.beforeJob({
+        began = await hook.beforeJob({
           userId,
           jobId,
           kind: job?.kind || 'image_generation',
           sessionId: job?.session_id || '',
           operations,
         });
+        this.#runKeys.set(jobId, (began && began.run_key) || (typeof hook.runKeyForJob === 'function' ? (await hook.runKeyForJob({ userId, jobId }))?.run_key : null) || null);
       } else {
         await this.#holdDirect(billing, userId, jobId, operations);
       }
@@ -546,7 +554,7 @@ export class ImageGenerationPipeline {
 
     try {
       if (hook) {
-        await hook.afterJob({ userId, jobId, status: status || JOB_STATUS.SUCCEEDED, actualCost });
+        await hook.afterJob({ userId, jobId, runKey: this.#runKeys.get(jobId) ?? null, status: status || JOB_STATUS.SUCCEEDED, actualCost });
       } else {
         await this.#closeDirect(billing, userId, jobId, {
           failed: status === JOB_STATUS.FAILED,
@@ -558,6 +566,7 @@ export class ImageGenerationPipeline {
       this.#warnHook('after_job', jobId, err);
     }
 
+    this.#runKeys.delete(jobId); // BR-07: dọn ngữ cảnh lượt chạy
     if (failure) throw failure;
     return result;
   }

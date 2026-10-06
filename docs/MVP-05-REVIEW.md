@@ -392,3 +392,149 @@ node /tmp/mvp05-atk/atk13-imagestudio.mjs # PB-02: ImageStudio chạy lại 2 l�
 node /tmp/mvp05-atk/atk2-idor.mjs         # 23 đường IDOR (đều bị chặn)
 node /tmp/mvp05-atk/atk5-migration.mjs    # migration 2 lần, DB cũ, ẩn danh 3 loại, module lỗi vẫn boot
 ```
+
+---
+---
+
+# VÒNG 2 — CHẤM LẠI TẠI COMMIT `107a455`
+
+*Phản biện viên độc lập (vẫn không sửa mã nguồn, không sửa `test/**`) · commit chấm: `107a455` (+`dbb9a9e` chỉ
+ghi chú) · script vòng 2: `/tmp/mvp05-atk2/` (t1…t13, output `out-t*.txt`) · chạy lại toàn bộ script vòng 1
+trên mã mới: `/tmp/mvp05-atk2/atk*-r2.txt`.*
+
+## PHÁN QUYẾT VÒNG 2: **FAIL**
+
+**Vì sao FAIL (1 lỗi tiền mới, ở ĐƯỜNG MẶC ĐỊNH):**
+
+> **BR-07 (CAO)** — bản vá PB-02 đổi chu kỳ tiền sang **LƯỢT CHẠY**, nhưng `usage_events` vẫn chỉ gắn
+> `job_id` (không có `run_key`). `afterJob` lấy `actualCost = store.usageSummary(jobId).estimated_cost` =
+> **usage TÍCH LUỸ của cả job**, rồi `settleForJob` coi đó là chi phí của lượt ⇒ **mỗi lượt chạy lại thu
+> luôn chi phí của TẤT CẢ các lượt trước**. Đo tất định (`t13`): 3 lượt, mỗi lượt thật 0,1 credit ⇒ **thu
+> 0,6 (thu thừa 100%)**, và lượt 4 **không chạy được** vì ví 0,4 < hold 0,5 (dù chi phí thật mỗi lượt 0,1).
+> Qua HTTP (`t12`): 4 lượt content, chi phí thật tổng 0,0072 ⇒ **đã thu 0,018 (+150%)**.
+> Đây đúng câu hỏi trung tâm: **hệ thống đang LẤY TIỀN CỦA NGƯỜI DÙNG cho công việc không thực hiện.**
+
+**Điều kiện để thành PASS:**
+1. **BR-07** — `usage_events` phải gắn `run_key` (hoặc `afterJob` phải truyền **chênh lệch usage của riêng
+   lượt**); `settleForJob` chỉ được thu `min(usage_của_lượt, …)`. Không sửa thì **không được merge**.
+2. **BR-01** — `BILLING_HOLD_BEFORE_JOB=false` đang cho **mọi lượt chạy lại miễn phí, không giới hạn**
+   (và bỏ luôn trần lượt): sửa, hoặc tuyên bố rõ chế độ này không dùng được.
+3. **BR-02** — 2 request **chồng nhau** trên cùng job dùng chung một lượt đang mở ⇒ *K lượt chạy thật /
+   1 lượt bị thu*: chặn bằng 409 cho request thứ hai cùng job, hoặc đếm theo **lượt thực thi**.
+4. BR-03 (2 tiến trình: `database is locked` bị nuốt ⇒ fail-open) · BR-04 (bỏ trần login theo IP ⇒
+   spraying) · BR-05 (lượt LỖI ăn vào trần) · BR-06 (ingest lỗi ⇒ job treo `running`) — backlog.
+
+Tóm tắt một dòng: **PB-01/PB-03/PB-04/PB-05/PB-06/PB-07/PB-08 đã vá thật (kiểm bằng bơm lỗi + đua + 2
+tiến trình); PB-02 vá đúng hướng nhưng mở ra lỗi thu thừa BR-07 ở đường mặc định ⇒ vòng 2 vẫn FAIL.**
+
+## 1. Bảng đối chiếu PB-01…PB-08
+
+| # | Kết luận | Bằng chứng 1 dòng (lệnh · output thật) |
+|---|---|---|
+| **PB-01** giữ tiền rồi 4xx không hoàn | ✅ **ĐÃ VÁ THẬT** | `atk8-confirm-r2 §8.3`: 5×409 `IMAGELAB_NO_ORIGINAL` ⇒ `balance 1 → 1`, sổ 5×`job_hold` + 5×`job_refund`; `t1` §T1.1/§T1.2/§T1.3 + `t8` §T8.1 (bơm lỗi `enqueue`/`createJob`/`updateJob`/`storage.save`) ⇒ mỗi hold có đúng 1 refund, số dư về đúng trước; §T1.4 gọi lại 3 lần **không** hoàn thừa; ẩn danh không đụng ví (§T1.5) |
+| **PB-02** chạy lại miễn phí | ⚠️ **VÁ ĐÚNG HƯỚNG NHƯNG PHÁT SINH LỖI THU THỪA (BR-07)** — hết miễn phí, nhưng nay thu luôn phần của các lượt trước | `atk4-gate-r2 §G3`: 3 lượt regenerate ⇒ `balance 0.9982 → 0.982`, mỗi lượt một `run_key` mới — **hết miễn phí, NHƯNG số thu bị thổi theo usage tích luỹ (BR-07)**; `atk8 §8.2`: job lỗi đã hoàn → regenerate mở **lượt #2** và thu `0.0026`; `atk6 §6.2`: render bị thu (`0.9988 → 0.9961`); `atk13`: imagestudio 3 lượt generate ⇒ `1 → 0.9925`; trần: `t2 §T2.2/§T2.3/§T8.2` ⇒ **429 `RERUN_LIMIT_EXCEEDED`** kèm `{runs,max_runs}`, **không** ghi thêm dòng sổ; ví 0 ⇒ **402**, usage không tăng (`t2 §T2.5`); retry hàng đợi vẫn bị thu (`t2 §T2.6`); unique index chặn ghi trùng ở DB (`t2 §T2.7`) |
+| **PB-03** không có owner đầu tiên | ✅ **ĐÃ VÁ THẬT** | `t3 §T3.1`: `OWNER_EMAIL` ⇒ tạo owner + mật khẩu tạm **in 1 lần**, DB chỉ có `scrypt$…`, login 200, boot lần 2 **không** tạo lại; `t3 §T3.5`: CLI `npm run make-owner` idempotent, lần 2 **không** in lại mật khẩu, không tham số ⇒ exit 2; `t3 §T3.3` nâng member cũ (mật khẩu cũ vẫn dùng được); `t3 §T3.6` không có đường tự phong qua API |
+| **PB-04** refund sau settle hoàn phần đã tiêu | ✅ **ĐÃ VÁ (1 tiến trình)** — còn BR-03 | `atk7-race-r2 §7.3`: 20 lần đua `settle`+`refund` ⇒ **20/20 thu đúng 0.9, 0 lần miễn phí**; §7.4 refund sau settle **không** ghi thêm dòng; `t4 §T4.1`: 50 lần nữa ⇒ **50/50 thu đúng**; `t2 §T2.7` index unique thật ở tầng DB |
+| **PB-05** 2 khoá cấu hình chết | ✅ **ĐÃ VÁ THẬT** (nhưng xem BR-01) | `t5 §T5.1`: `BILLING_DEFAULT_GRANT=5` ⇒ `credit_granted`, `balance=5`, dòng sổ `reason='grant'`; §T5.2: `hold_before_job=false` ⇒ ví 0 vẫn **202**, không có `job_hold`, có `job_settle`, log `billing.hold_disabled`, `/api/config.billing` nói thật |
+| **PB-06** grant 1e308 ghi dòng 0 mà 201 | ✅ **ĐÃ VÁ THẬT** | `t6 §T6.1`: `1e308`/`-1e308` ⇒ **400 `INVALID_AMOUNT`**; `1e9+1` ⇒ 400 `AMOUNT_TOO_LARGE`; `1e9` (đúng trần) ⇒ 201; sổ **không còn** dòng `amount=0` do tràn số; `atk1-r2 §1.1` xác nhận ở tầng dịch vụ |
+| **PB-07** UI mời số âm mà API 400 | ✅ **ĐÃ VÁ THẬT** | `t6 §T6.2`: `-0.5` ⇒ **201** (`reason='adjustment'`, balance 4.5); `-4.5` ⇒ 201 (về 0); quá số dư ⇒ **400 `INSUFFICIENT_CREDIT`** kèm `{balance,amount}`; `-1e308` ⇒ 400 `INVALID_AMOUNT`; `MIN(balance_after)=0` |
+| **PB-08** rate limit login mỏng | ✅ **ĐÃ VÁ THẬT** (kèm BR-04) | `t6 §T6.3`: sai lần 10 ⇒ **429 + `Retry-After: 300`**; **đăng nhập ĐÚNG sau 12 lần sai ⇒ 200**; email khác không bị ảnh hưởng; `'U@LOCAL'` và `'u@local'` **chung bucket** (chống né); thời gian email lạ/sai mk vẫn bằng nhau (`atk3-r2 §3.5`: 22.4 vs 22.3 ms) |
+
+## 2. Lỗ hổng MỚI (vòng 2)
+
+| # | Mức | Phát hiện | Bằng chứng (lệnh · output thật) | Gợi ý sửa |
+|---|---|---|---|---|
+| **BR-07** | **CAO (ĐƯỜNG MẶC ĐỊNH)** | **Mỗi lượt chạy lại bị thu theo usage TÍCH LUỸ của cả job** (không phải chi phí của riêng lượt): `afterJob` truyền `usageSummary(jobId).estimated_cost` (tổng của job) làm `actualCost`, `settleForJob` coi đó là chi phí lượt ⇒ lượt thứ n thu `c1+…+cn`. Người dùng trả tiền cho công việc **đã trả ở lượt trước**, và ví cạn dần tới mức không chạy lại được dù chi phí thật rất nhỏ. | **Tất định** (`t13-overcharge-unit.mjs`): 3 lượt, mỗi lượt thật `0.1` ⇒ `settle` = `0.4/0.3/0.2` ⇒ **thu 0.6 cho 0.3 chi phí thật (+100%)**; lượt 4 → `INSUFFICIENT_CREDIT: cần 0.5, ví còn 0.4`. **Qua HTTP** (`t12-overcharge.mjs`): 4 lượt content, usage thật tổng `0.0072` ⇒ **thu `0.018` (+150%)**, sổ `settle` = `0.0065/0.0047/0.0029/0.0011` (= hold − usage tích luỹ). **ImageLab** (`t11`): render bị thu `0.0027` trong khi chi phí riêng của lượt render là `0.0015`. | Gắn `run_key` vào `usage_events` (cột + `recordUsage`), hoặc để pipeline trả **chi phí của riêng lượt** cho `afterJob`; `settleForJob` chỉ thu phần chênh của lượt đó. |
+| **BR-01** | **CAO (theo cấu hình)** | **`BILLING_HOLD_BEFORE_JOB=false` ⇒ mọi lượt chạy lại MIỄN PHÍ và KHÔNG GIỚI HẠN.** Không có hold ⇒ `afterJob` luôn nhắm vào **lượt đã khép** (`runs[last]`) nên `settleForJob` trả dòng cũ; `beforeJob` cũng thoát sớm nên **trần lượt không được áp**. Đúng câu hỏi trung tâm: "cho qua mà không trả tiền". | `t7 §T7.1` (`BILLING_HOLD_BEFORE_JOB=false`, trần 3): lượt 1 thu `-0.0018`; lượt 2/3/4 → **202**, `usage_events 4/6/8`, `balance 0.9982` **không đổi**, sổ vẫn **2 dòng**; lượt 5 (vượt trần) → **202** (không 429) | `settleForJob` phải mở **lượt mới** khi lượt cuối đã khép (đừng tái dùng `runs[last]`); áp trần lượt cho cả chế độ không giữ trước; hoặc tuyên bố chế độ này chỉ để thử nghiệm. |
+| **BR-02** | **TRUNG BÌNH** | **2 request CHỒNG NHAU trên cùng job dùng chung một lượt đang mở ⇒ K lượt chạy thật / 1 lượt bị thu.** Là hệ quả trực tiếp của luật "lượt đang mở ⇒ dùng lại (idempotent)": request thứ hai vào giữa lượt đang chạy không mở hold mới, nhưng pipeline **vẫn chạy thật**. Trần lượt đếm *lượt*, không đếm *lượt thực thi*. | `t9-overlap.mjs` (content engine chậm 700 ms, B bắn sau A 250 ms): `A=202 B=202` · `usage_events=6` (3 lượt chạy thật) · `job_hold` chỉ **2** · run `#2` thu `0.0044` cho **2 lượt chạy** · `balance 1.9982 → 1.9938` | Request thứ hai cùng job trong lúc lượt đang mở ⇒ **409** (hoặc xếp hàng lượt mới), đừng để pipeline thứ hai chạy chung hold; đếm trần theo lượt thực thi. |
+| **BR-03** | **THẤP–TB** | **2 tiến trình trên cùng file SQLite: một thao tác tiền chết với `ERR_SQLITE_ERROR: database is locked`** (lỗi thô, không phải mã nghiệp vụ). Trong đường hook, lỗi này bị **nuốt** (`billing.hook_failed` → fail-open) ⇒ `settle`/`refund` có thể **không xảy ra**. Index unique chỉ chặn **trùng cùng `reason`**, KHÔNG chặn cặp `settle`+`refund` cho cùng lượt ⇒ trên PostgreSQL (mỗi câu lệnh một snapshot) rào chắn đọc-rồi-ghi vẫn hở. | `t4 §T4.2` (`settle`‖`refund`): con A `{"ok":false,"code":"ERR_SQLITE_ERROR","message":"database is locked"}`, con B refund OK, sổ chỉ có `job_refund`; §T4.3 (2 settle) và §T4.4 (2 refund) tương tự — **1 trong 2 luôn chết vì lock**, không phải vì logic | Bọc lỗi DB thành `BillingError` có mã + retry; đổi ràng buộc thành **một dòng "đóng lượt" cho mỗi run** (unique trên `(user_id, job_id, run_key)` WHERE `reason IN ('job_settle','job_refund')`), và/hoặc khoá theo job ở tầng DB (`SELECT … FOR UPDATE`). |
+| **BR-04** | **THẤP** | **Bỏ trần đăng nhập theo IP** (vòng 1 có `120 req/phút/IP`): nay chỉ còn bucket `(email, IP)`, nên **spraying mật khẩu qua nhiều tài khoản không bị chặn**. | `t6 §T6.3`: 60 email khác nhau × 1 lần sai ⇒ `{"401":60}` (không có 429 nào) | Giữ bucket `(email, IP)` **và** thêm trần mềm theo IP (vd 60 lần sai/5 phút) + `Retry-After`. |
+| **BR-05** | **THẤP** | **Lượt chạy LỖI (kể cả retry tự động của hàng đợi) vẫn ăn vào trần lượt** ⇒ job chưa từng thành công có thể bị khoá bằng 429; tiền thì đã hoàn. | `t10-cap-failed.mjs` (trần 2, template sai ⇒ queue retry): job `failed/TEMPLATE_NOT_FOUND`, **2 lượt** đã tiêu (2 hold + 2 refund, tiền hoàn đủ), rồi `generate` sửa đúng cách ⇒ **429** `{runs:2,max_runs:2}` | Chỉ đếm lượt **có thu tiền** (hold không bị refund) vào trần, hoặc không retry các lỗi vĩnh viễn (`TEMPLATE_NOT_FOUND`). |
+| **BR-06** | **THẤP** | **`ingest` lỗi ⇒ hoàn tiền đúng nhưng job imagelab treo `running` vĩnh viễn** (không có entry hàng đợi, không được đánh dấu `failed`) — job rác trong UI. | `t8 §T8.1`: `storage.save` ném ⇒ 500 nhưng `balance 1 → 1` (2 hold + 2 refund); `jobs theo status: [{"failed":1},{"running":1}]` | Trong nhánh `ingest` lỗi của route imagelab: đánh dấu job `failed` (giống imagestudio đã làm). |
+
+## 3. Đã cố phá ở vòng 2 mà KHÔNG phá được
+
+- **PB-01 — bơm lỗi ở CẢ 7 chỗ giữ tiền** (`POST /api/jobs`, `regenerate`, `POST /api/imagelab/jobs`,
+  `PUT regions`, `render`, `POST /api/imagestudio/jobs`, `generate`): `queue.enqueue` ném, `store.createJob`
+  ném, `store.updateJob` ném, `storage.save` ném ⇒ **mỗi khoản giữ đều có đúng một dòng hoàn**, số dư về đúng
+  giá trị trước, không có khoản nào bị kẹt (`t1`, `t8`). Gọi lại 3 lần (3×409) không hoàn thừa. Ẩn danh
+  không đụng ví.
+- **PB-02 — lách `run_key`**: `jobId` rỗng/`null`/khoảng trắng ⇒ `INVALID_ARGUMENT`; `jobId` chứa `#` ⇒ run
+  key vẫn tăng đúng `A#9#1`, `A#9#2` và thu đúng (`t8 §T8.4`); 3 request **song song** (không chồng) ⇒ mỗi
+  request một lượt riêng và **đều bị thu** (`t2b §B`: 4 `run_key`, 4 lần thu); ghi trùng `(user, job, run,
+  reason)` ở tầng store ⇒ **UNIQUE constraint** (`t2 §T2.7`).
+- **PB-03 — leo thang đặc quyền**: đăng ký kèm `role:'owner'` ⇒ vẫn `member`; tự gọi route admin ⇒ 403; PUT
+  kèm `role` ⇒ 404; `OWNER_EMAIL` rác ⇒ không tạo gì, app vẫn boot (`t3 §T3.4/§T3.6`).
+- **PB-04 — đua trong 1 tiến trình**: 50 lần `Promise.all([settle, refund])` ⇒ **50/50 thu đúng**, không lần
+  nào thành "job miễn phí"; `refund` sau `settle` không ghi thêm dòng (`t4 §T4.1`, `atk7-r2 §7.3/§7.4`).
+- **PB-06/07 — số học**: `1e308`, `-1e308`, `Infinity`, `-Infinity`, `NaN`, `-0`, `0`, `0.0000004`,
+  `1e9`, `1e9+1`, chuỗi `"1e308"` ⇒ 400 đúng mã, không có dòng sổ rác; điều chỉnh âm không bao giờ làm số dư
+  âm (`MIN(balance_after)=0`).
+- **PB-08 — chống né bucket**: `'U@LOCAL'` và `'u@local'` chung bucket; email khác không bị lây; đăng nhập
+  đúng sau 12 lần sai vẫn 200.
+- **Hồi quy**: ẩn danh 3 loại job (0 cookie) vẫn 202/`succeeded`/`awaiting_review` và **0 dòng sổ**;
+  `init()` 2 lần trên DB cũ (schema trước MVP-05, `wallet_ledger` **thiếu `run_key`**) ⇒ thêm cột + tạo
+  index unique + dòng sổ cũ nguyên vẹn + job cũ đọc ẩn danh 200; **23/23 đường IDOR vẫn 404/403**; bất biến
+  sổ sau nhiều lượt: `balance_after` nhảy cóc = 0, dòng âm = 0, số dư = tổng sổ = 0 sai lệch.
+- **`npm test` (tự đo)**: **826 test · 825 pass · 0 fail · 1 skipped** (exit 0); `node tools/verify.mjs`:
+  **826 · 825 pass · 0 fail · 1 skipped** (exit 0); `node tools/imagelab-demo.mjs`: exit 0
+  (`Tổng: 3 event · 0.0027 USD`, `Trạng thái job: succeeded`).
+
+## 4. Chưa kiểm được (vòng 2)
+
+1. **PostgreSQL** — vẫn không có `DATABASE_URL`/server PG: unique index partial + rào chắn đọc-rồi-ghi
+   (`settle`‖`refund` khác `reason`) **chưa** được đo trên PG; đây là nơi BR-03 có khả năng thành lỗ thật.
+2. **Tiền trong bộ nhớ 1 tiến trình** — `#locks` của `BillingService` vẫn chỉ đúng khi chạy 1 tiến trình;
+   tôi chỉ đo được SQLite 2 tiến trình (kết quả: lock error, không double-close — may mắn, không phải do
+   thiết kế).
+3. **Provider thật** (AI/OCR/render) — mọi thí nghiệm dùng mock; **cửa sổ chồng request của BR-02** với
+   provider thật chậm vài giây (số lượt chạy chen được vào một lượt) chưa đo; chi phí thật chưa đối chiếu.
+4. **UI trong trình duyệt thật** — mới đọc mã (`esc()` ở mọi chỗ render dữ liệu người dùng; không thấy token
+   trong DOM); luồng nhập **số âm** ở trang quản trị (PB-07) và luồng 429 `RERUN_LIMIT_EXCEEDED` chưa bấm tay.
+5. **Reverse proxy** — `clientKey()` không có `trustProxy`: sau nginx/Cloudflare mọi khách chung một IP ⇒
+   bucket `(email, IP)` mất tác dụng (đã ghi ở `docs/SECURITY.md`, nhưng chưa đo thật).
+6. **Tải/độ bền** — chưa chạy load test; ca job có sổ dài hơn `LEDGER_MAX_SCAN = 5000` dòng vẫn chưa đo.
+
+## 5. FAIL vòng 2 nghĩa là gì — cái gì ĐÃ đạt, cái gì CHƯA
+
+**ĐÃ đạt (đo được, không phải lời hứa):** 7/8 lỗi vòng 1 vá thật — PB-01 (bơm lỗi cả 7 chỗ giữ tiền: mỗi
+hold có đúng một refund, số dư về đúng trước), PB-03 (bootstrap owner + CLI, idempotent, không lộ mật khẩu
+thô, không có đường tự phong qua API), PB-04 (50/50 lần đua trong 1 tiến trình thu đúng; unique index thật
+ở tầng DB), PB-05 (cả 2 khoá cấu hình có tác dụng), PB-06 (mọi giá trị biên ⇒ 400, hết dòng `amount=0`),
+PB-07 (số âm ⇒ `adjustment`, không bao giờ âm ví), PB-08 (bucket `(email, IP)` + `Retry-After`, đăng nhập
+đúng không bị chặn). Ẩn danh, IDOR, migration, bất biến sổ, `npm test`/`verify`/`demo` đều xanh.
+
+**CHƯA đạt (lý do FAIL):**
+- **BR-07** — mỗi lượt chạy lại thu theo usage **tích luỹ** ⇒ **lấy tiền của người dùng cho công việc không
+  thực hiện** (đo: +100% sau 3 lượt ở tầng dịch vụ, +150% sau 4 lượt qua HTTP), và ví cạn dần tới mức
+  **không chạy lại được** dù chi phí thật mỗi lượt rất nhỏ. Đây là đường **mặc định**, người dùng thường
+  (bấm "chạy lại"/"render" vài lần) là trúng.
+- **BR-01** — chế độ `BILLING_HOLD_BEFORE_JOB=false`: chạy lại **miễn phí & không giới hạn**, trần lượt bị bỏ.
+- **BR-02** — request **chồng nhau** cùng job: *K lượt chạy thật / 1 lượt bị thu*.
+- **BR-03…BR-06** — lỗi vận hành nhỏ hơn (2 tiến trình, spraying, trần bị ăn bởi lượt lỗi, job treo `running`).
+
+**FAIL này KHÔNG có nghĩa:** xác thực/phân quyền/ẩn danh hỏng (chúng vẫn kín), hay sổ credit hỏng (bất biến
+vẫn đúng: số dư = tổng sổ, không âm, `balance_after` liên tục kể cả 100 thao tác đồng thời). Nó có nghĩa:
+**vòng đời TIỀN theo lượt chạy chưa khớp với vòng đời USAGE** — sửa `run_key` cho `usage_events` (hoặc cho
+`afterJob` biết chi phí riêng của lượt) là điều kiện tiên quyết để merge.
+
+## 6. Phụ lục — lệnh tái lập vòng 2
+
+```bash
+cd "/Users/viporder/Library/CloudStorage/SynologyDrive-Macbook/Thành bộ não/production/vip-product-studio"
+node /tmp/mvp05-atk2/t1-pb01-release.mjs          # PB-01: bơm lỗi 7 chỗ giữ tiền (§T1.1–T1.5)
+node /tmp/mvp05-atk2/t2-pb02-runkey.mjs           # PB-02: thu mỗi lượt, trần 429, đua, unique index
+node /tmp/mvp05-atk2/t2b-probe.mjs                # run_key chi tiết + 3 request song song (mỗi request 1 lượt)
+node /tmp/mvp05-atk2/t3-pb03-owner.mjs            # PB-03: OWNER_EMAIL + CLI + chống leo thang
+node /tmp/mvp05-atk2/t4-pb04-proc.mjs             # PB-04: 50 lần đua + 2 TIẾN TRÌNH (BR-03)
+node /tmp/mvp05-atk2/t5t6-config-money-auth.mjs   # PB-05/06/07/08 + BR-04
+node /tmp/mvp05-atk2/t7-regression.mjs            # BR-01 + ẩn danh + migration DB cũ + bất biến sổ
+node /tmp/mvp05-atk2/t8-extras.mjs                # ingest lỗi (§T8.1), trần=1, CLI mật khẩu ngắn, jobId lạ
+node /tmp/mvp05-atk2/t9-overlap.mjs               # BR-02: 2 request chồng nhau
+node /tmp/mvp05-atk2/t10-cap-failed.mjs           # BR-05: lượt LỖI ăn vào trần
+node /tmp/mvp05-atk2/t11-render-final.mjs         # render: thu 0.0027 cho lượt chỉ tốn 0.0015 (BR-07)
+node /tmp/mvp05-atk2/t12-overcharge.mjs           # BR-07 qua HTTP: 4 lượt, thu 0.018 cho 0.0072 thật (+150%)
+node /tmp/mvp05-atk2/t13-overcharge-unit.mjs      # BR-07 tất định: 3 lượt × 0.1 ⇒ thu 0.6 (+100%)
+for f in /tmp/mvp05-atk/atk*.mjs; do node "$f" > "/tmp/mvp05-atk2/$(basename $f .mjs)-r2.txt" 2>&1; done
+npm test && node tools/verify.mjs && node tools/imagelab-demo.mjs
+```

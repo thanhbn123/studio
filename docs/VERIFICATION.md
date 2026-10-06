@@ -1096,3 +1096,101 @@ $ node /tmp/mvp05-atk/atk7-race.mjs
     `run_key`, hai tiến trình có thể cùng mở một lượt ⇒ chưa đo.
   · Chưa đo: PostgreSQL thật cho partial unique index (chỉ chạy SQLite), reverse proxy thật cho
     `trust proxy`, trình duyệt thật cho UI credit âm.
+
+---
+
+## 17. MVP-05 — vòng 3: sửa BR-01…BR-07 của phản biện vòng 2
+
+Phán quyết vòng 2: **FAIL** — “bản vá PB-02 phát sinh lỗi thu thừa ở ĐƯỜNG MẶC ĐỊNH” (BR-07).
+Đã sửa cả 7 mục. `npm test` → **836 test · 835 pass · 0 fail · 1 skipped**; `verify.mjs` EXIT=0;
+`imagelab-demo.mjs` → `succeeded`.
+
+### 17.1 BR-07 (CAO, đường mặc định) — thu theo usage TÍCH LUỸ của cả job
+
+`usage_events.run_key` + `recordUsage({runKey})` + `usageSummary(jobId, {runKey})`; pipeline gắn
+`run_key` của lượt vào mọi event và truyền vào `afterJob`; `settleForJob` chỉ thu **chi phí của
+riêng lượt** (fallback: `max(0, tổng usage − Σ đã thu các lượt trước)`).
+
+```
+$ node /tmp/mvp05-atk2/t13-overcharge-unit.mjs
+  lượt 1: hold=JOB-OVER#1 · usage TÍCH LUỸ=0.1 · chi phí THẬT của lượt=0.1 · settle=0.4 · balance=0.9
+  lượt 2: hold=JOB-OVER#2 · usage TÍCH LUỸ=0.2 · chi phí THẬT của lượt=0.1 · settle=0.4 · balance=0.8
+  lượt 3: hold=JOB-OVER#3 · usage TÍCH LUỸ=0.3 · chi phí THẬT của lượt=0.1 · settle=0.4 · balance=0.7
+  lượt 4: hold=JOB-OVER#4 … settle=0.4 · balance=0.6      ← KHÔNG còn bị chặn oan
+  TỔNG chi phí THẬT = 0.5 · TỔNG ĐÃ THU = 0.5 ⇒ không thu thừa
+        (vòng 2: settle 0.4/0.3/0.2 ⇒ thu 0.6 cho 0.3, lượt 4 INSUFFICIENT_CREDIT)
+
+$ node /tmp/mvp05-atk2/t12-overcharge.mjs
+  chi phí THẬT từng lượt: [0.0018 ×4] · TỔNG THẬT = 0.0072
+  TỔNG ĐÃ THU = 0.0072 ⇒ không thu thừa          (vòng 2: 0.018 = +150%)
+  sổ: hold#1,settle#1 … hold#4,settle#4 (mỗi lượt 0.0083/0.0065)
+
+$ node /tmp/mvp05-atk2/t11-render-final.mjs
+  sổ: ["job_hold@#1=-0.0027","job_settle@#1=0.0015","job_hold@#2=-0.0027","job_settle@#2=0.0012"]
+  ⇒ lượt render chỉ bị thu phần CỦA LƯỢT (0.0015), không phải cả job 0.0027
+
+$ node /tmp/mvp05-atk/atk4-gate.mjs   §G3 (3 lượt regenerate)
+  balance: 0.9982 → 0.9928 · tổng chi phí thật usage = 0.0072   (vòng 2: → 0.982, tức 0.018)
+```
+
+### 17.2 BR-01 — `BILLING_HOLD_BEFORE_JOB=false` (trần 3)
+
+```
+$ node /tmp/mvp05-atk2/t7-regression.mjs   §T7.1
+[audit sau lượt 1] OK rows=2 … reasons={"admin_grant":1,"job_settle":-0.0018}
+  lượt 2: HTTP 202 · balance=0.9964 · dòng sổ=3 · usage={"events":4,…}
+  lượt 3: HTTP 202 · balance=0.9946 · dòng sổ=4 · usage={"events":6,…}
+  lượt 4: HTTP 429 · balance=0.9946 · dòng sổ=4      ← trần CÓ tác dụng
+  sổ cuối: ["job_settle=-0.0018","job_settle=-0.0018","job_settle=-0.0018"]
+  ⇒ có thu tiền            (vòng 2: 202/202/202, số dư 0.9982 không đổi, 0 dòng settle)
+```
+
+### 17.3 BR-02 — chồng nhau; BR-05 — lượt lỗi không ăn trần; BR-06 — ingest lỗi
+
+```
+$ node /tmp/mvp05-atk2/t9-overlap.mjs
+  A=202 B=409
+  sổ: ["job_hold@#1=-0.0083","job_settle@#1=0.0065","job_hold@#2=-0.0083","job_settle@#2=0.0065"]
+  số lượt (run_key) = 2 · số lần chạy thật = 2 · số lần bị giữ tiền = 2 ⇒ mỗi lượt chạy đều bị giữ tiền
+        (vòng 2: A=202 B=202 · 3 lượt chạy thật nhưng chỉ 2 lượt bị thu)
+
+$ node /tmp/mvp05-atk2/t10-cap-failed.mjs
+  job.status=failed error=TEMPLATE_NOT_FOUND · số lượt đã tiêu: 2
+  balance = {"amount":1} (các lượt lỗi đều được hoàn) · chạy lại sau khi job lỗi → HTTP 202
+        (vòng 2: 429 {runs:2,max_runs:2} — job chưa từng thành công đã bị khoá)
+
+$ node /tmp/mvp05-atk2/t4-pb04-proc.mjs      (BR-03: 2 tiến trình chung 1 file SQLite)
+  §T4.2 settle‖refund: A ok (job_settle 0.4) · B {"code":"ERR_SQLITE_ERROR","message":"database is locked"}
+    CÓ CẢ settle VÀ refund cho cùng run? false ⇒ không · balance cuối = 0.9 (thu đúng)
+  §T4.3 hai settle: số dòng settle = 1 · balance = 0.9    §T4.4 hai refund: số dòng refund = 1 · balance = 1
+  §T4.1 50 lần đua trong 1 tiến trình: thu ĐÚNG = 50 · job MIỄN PHÍ = 0
+  Ghi chú: lỗi `database is locked` ở tiến trình thua là lỗi HẠ TẦNG (đã map thành `LEDGER_BUSY`
+  khi đi qua tầng billing); điều quan trọng: **không** run nào vừa settle vừa refund, số dòng đóng
+  = 1, số dư đúng. `beforeJob` gặp lỗi sổ ⇒ 503 `BILLING_UNAVAILABLE` (fail-closed, xem test).
+```
+
+### 17.4 Hồi quy vòng 1 + ẩn danh + migration
+
+```
+$ node /tmp/mvp05-atk/{atk8-confirm,atk7-race,atk4-gate}.mjs
+  atk8 §8.3: 5×409 ⇒ balance 1 → 1, sổ 5 hold + 5 refund        (PB-01 vẫn xanh)
+  atk8 §8.2: job lỗi đã hoàn → regenerate mở lượt #2, thu 0.0018 (PB-02 vẫn xanh)
+  atk7 §7.3: 20/20 thu đúng 0.9, 0 lần miễn phí · §7.4 balance cuối 0.9 ⇒ ok  (PB-04 vẫn xanh)
+$ node /tmp/mvp05-atk2/t7-regression.mjs §T7.2/§T7.3
+  3 job ẨN DANH (0 cookie) → 202 · dòng sổ = 0        (luật #1 không đổi)
+  init() 2 lần trên DB CŨ → OK · cột wallet_ledger có thêm run_key, close_kind
+```
+
+### 17.5 Test thêm & phần chưa sửa được
+
+- **Thêm** `test/mvp05-round3-hardening.test.js` (**10 test**: BR-01…BR-07, gồm cả ca fail-closed
+  và ràng buộc DB chặn 2 dòng đóng cho cùng lượt).
+- **Chưa sửa được / còn đo được:**
+  · Hai tiến trình ghi sổ **cùng lúc** trên một file SQLite: một tiến trình vẫn nhận
+    `database is locked` (dù `busy_timeout = 5000`) — nay được map thành `LEDGER_BUSY`/503 thay vì
+    chạy free, nhưng **chưa** có retry tự động; PostgreSQL thật cũng **chưa đo**.
+  · `usage_events.run_key` của các dòng CŨ là NULL; chúng được quy về lượt `#1`, nên trên DB cũ
+    lượt `#1` vẫn có thể gộp usage của nhiều lượt lịch sử (không thể tái tạo dữ liệu đã mất).
+  · BR-02 chặn bằng 409 khi lượt đang mở: nếu client chạy **hai tiến trình** cùng job (không qua
+    route) thì vẫn phụ thuộc trạng thái sổ (đã có unique index bảo vệ, chưa đo đa tiến trình).
+  · Chưa đo: reverse proxy thật cho `trust proxy`, hàng đợi đa tiến trình, PG partial unique index.
