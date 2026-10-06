@@ -47,6 +47,9 @@ async function api(path, options = {}) {
     // hiện ĐÚNG các vi phạm đó, không nuốt mất.
     err.payload = json?.error || null;
     err.body = json || null;
+    // Hợp đồng §3.5: 402 `INSUFFICIENT_CREDIT` ở BẤT KỲ thao tác nào cũng phải hiện rõ
+    // số cần / số đang có + link nạp ⇒ bắt ngay tại tầng gọi API, không phụ thuộc từng màn hình.
+    if (err.code === 'INSUFFICIENT_CREDIT' || res.status === 402) noteCreditAlert(err);
     throw err;
   }
   return json;
@@ -189,6 +192,43 @@ const state = {
       dirtyPaint: false,
     },
   },
+  // MVP-05 — Tài khoản + ví credit (§3.5). `me` là câu trả lời THẬT của `GET /api/auth/me`.
+  auth: {
+    me: null, // { user, anonymous, balance } | null = chưa kiểm tra
+    loaded: false,
+    loading: false,
+    error: null,
+    mode: 'login', // 'login' | 'register'
+    form: { email: '', display_name: '' }, // KHÔNG bao giờ giữ mật khẩu trong state
+    busy: false,
+    formError: null,
+    formNotice: null,
+    ledger: null,
+    ledgerOffset: 0,
+    ledgerMore: false,
+    ledgerLoading: false,
+    pricing: null,
+    pricingLoading: false,
+    users: null,
+    usersTotal: null,
+    usersOffset: 0,
+    usersMore: false,
+    usersLoading: false,
+    usage: null,
+    usageGroup: 'day',
+    usageFrom: '',
+    usageTo: '',
+    usageLoading: false,
+    adminBusy: false,
+    adminError: null,
+    adminNotice: null,
+    creditTarget: null, // { userId, email } — đang mở form cấp credit cho ai
+    creditDraft: { amount: '', note: '' },
+    creditConfirm: null, // { userId, email, amount, note } — đã xem lại, chờ xác nhận
+    roleDraft: {}, // userId → vai trò đang chọn (chưa lưu)
+  },
+  // 402 INSUFFICIENT_CREDIT gặp ở BẤT KỲ thao tác nào (kể cả trong `api()`) ⇒ băng báo dùng chung.
+  creditAlert: null,
   // MVP-03 — Tạo ảnh (imagestudio). Tách riêng khỏi `il` để không giẫm chân MVP-02.
   is: {
     jobId: null,
@@ -235,6 +275,10 @@ async function boot() {
   window.addEventListener('hashchange', route);
   wireImagelabGlobal();
   wireImagestudioGlobal();
+  wireAuthGlobal();
+  // Kiểm tra phiên THẬT trước khi vẽ: hỏi được thì header đúng ngay, không hỏi được thì vẫn là
+  // khách ẩn danh và nói thật là chưa kiểm tra được (luật #1: không chặn gì cả).
+  await loadMe();
   route();
 }
 
@@ -260,6 +304,28 @@ function renderBadge() {
 
 function route() {
   const hash = location.hash || '#/';
+  // MVP-05 (§3.5) — ba route tài khoản: đăng nhập/đăng ký, tài khoản, quản trị.
+  if (hash.startsWith('#/dangnhap')) {
+    stopPolling();
+    stopIlPolling();
+    stopIsPolling();
+    openAuth();
+    return;
+  }
+  if (hash.startsWith('#/taikhoan')) {
+    stopPolling();
+    stopIlPolling();
+    stopIsPolling();
+    openAccount();
+    return;
+  }
+  if (hash.startsWith('#/quantri')) {
+    stopPolling();
+    stopIlPolling();
+    stopIsPolling();
+    openAdmin();
+    return;
+  }
   // MVP-03 (§3.7) — tab thứ ba “Tạo ảnh”, route hash riêng: `#/taoanh` và `#/taoanh/:id`.
   const isMatch = /^#\/taoanh(?:\/([A-Za-z0-9_-]+))?/.exec(hash);
   if (isMatch) {
@@ -414,6 +480,40 @@ function onGlobalClick(ev) {
       location.hash = '#/taoanh';
       renderImagestudio();
     },
+    // ── MVP-05 — Tài khoản + ví credit ──
+    login: () => {
+      location.hash = '#/dangnhap';
+    },
+    account: () => {
+      location.hash = '#/taikhoan';
+    },
+    admin: () => {
+      location.hash = '#/quantri';
+    },
+    logout: () => doLogout(),
+    authmode: () => {
+      state.auth.mode = btn.dataset.mode === 'register' ? 'register' : 'login';
+      state.auth.formError = null;
+      state.auth.formNotice = null;
+      renderAuthPage();
+    },
+    ledgerreload: () => loadLedger(true),
+    ledgerMore: () => loadLedger(false),
+    pricingreload: () => loadPricing(true),
+    creditopen: () => openCreditForm(btn.dataset.user, btn.dataset.email),
+    creditcancel: () => {
+      state.auth.creditConfirm = null;
+      state.auth.creditTarget = null;
+      state.auth.adminError = null;
+      renderAdminPage();
+    },
+    creditreview: () => reviewCreditGrant(),
+    creditgrant: () => grantCredit(btn.dataset.user),
+    rolesave: () => saveRole(btn.dataset.user),
+    usersreload: () => loadAdminUsers(true),
+    usersMore: () => loadAdminUsers(false),
+    usageload: () => loadAdminUsage(true),
+    creditdismiss: () => dismissCreditAlert(),
   };
   if (handlers[action]) handlers[action](ev);
 }
@@ -445,6 +545,7 @@ function renderHome() {
         <code>https://mobile.yangkeduo.com/goods.html?goods_id=&lt;id&gt;</code>
       </p>
       <div id="home-error"></div>
+      ${authHintHtml()}
     </section>
 
     <section class="panel">
@@ -1301,6 +1402,7 @@ function renderImagelab() {
       : `<section class="panel"><div class="notice error"><strong>Tính năng dịch ảnh chưa sẵn sàng trên máy chủ này (IMAGELAB_UNAVAILABLE).</strong>
            <p style="margin:6px 0 0">Lý do máy chủ báo: ${esc(il.reason || 'không nêu lý do — xem log máy chủ (imagelab.wiring_failed).')}</p>
            <p style="margin:6px 0 0">Các tính năng MVP-01 vẫn dùng bình thường.</p></div></section>`}
+    ${authHintHtml()}
     <div id="il-error"></div>
   `;
   paintIlError();
@@ -3057,7 +3159,8 @@ function renderImagestudio() {
   state.view = 'imagestudio';
   stopPolling();
   stopIlPolling();
-  app.innerHTML = renderImagestudioBody();
+  // Luật #1: khách ẩn danh vẫn tạo ảnh được — chỉ thêm gợi ý nhẹ ở cuối trang, không chặn gì.
+  app.innerHTML = `${renderImagestudioBody()}${authHintHtml()}`;
   const cfg = state.config?.imagestudio || {};
   if (cfg.available !== false && !state.is.templates && !state.is.templatesLoading && !state.is.templatesError) {
     loadImagestudioTemplates();
@@ -3347,6 +3450,1088 @@ function wireImagestudioGlobal() {
   }
   document.addEventListener('drop', (ev) => {
     if (ev.target.closest?.('#is-drop')) pickImagestudioFiles(ev.dataTransfer?.files);
+  });
+}
+
+/* ═════════════════════ MVP-05 — Tài khoản + Ví credit ═════════════════════
+ *
+ * LUẬT #1 của hợp đồng §0: KHÔNG chặn tính năng với người chưa đăng nhập. Mọi thứ ở khối này là
+ * TUỲ CHỌN — chưa đăng nhập vẫn dán link / dịch ảnh / tạo ảnh bình thường, chỉ kém phần “lưu
+ * lịch sử theo tài khoản” và ví credit. Giao diện chỉ hiện gợi ý nhẹ, KHÔNG khoá tab nào.
+ *
+ * Nhãn trung thực (§3.5 + §6): credit là CREDIT NỘI BỘ, không phải tiền thật; giai đoạn này chỉ
+ * quản trị cấp tay, CHƯA có cổng thanh toán (MVP-06) — giao diện không hứa gì hơn thế.
+ */
+
+const LEDGER_REASON_LABEL = {
+  grant: 'Tặng',
+  admin_grant: 'Quản trị cấp',
+  job_hold: 'Giữ cho job',
+  job_settle: 'Quyết toán',
+  job_refund: 'Hoàn tiền',
+  adjustment: 'Điều chỉnh',
+};
+
+const ROLE_LABEL = { owner: 'Chủ sở hữu', admin: 'Quản trị', member: 'Thành viên' };
+
+const USER_STATUS_LABEL = { active: 'Đang hoạt động', disabled: 'Đã khoá' };
+
+const USAGE_GROUP_LABEL = { day: 'Theo ngày', operation: 'Theo thao tác', user: 'Theo người dùng' };
+
+// Bảng giá / thống kê: chỉ những thao tác có trong hợp đồng §2.1 — không bịa thêm.
+const OPERATION_LABEL = {
+  SOURCE_EXTRACT: 'Trích xuất dữ liệu sản phẩm',
+  VISION_ANALYSIS: 'Phân tích ảnh (vision)',
+  TRANSLATION: 'Dịch chữ trong ảnh',
+  CONTENT_GENERATE: 'Sinh nội dung tiếng Việt',
+  CONTENT_REPAIR: 'Sửa lại nội dung',
+  OCR_DETECT: 'Đọc chữ trong ảnh (OCR)',
+  IMAGE_RENDER: 'Render ảnh đã dịch',
+  IMAGE_MATTING: 'Tách nền ảnh',
+  IMAGE_COMPOSE: 'Ghép nền',
+  IMAGE_RETOUCH: 'Retouch ảnh',
+};
+
+// Câu tiếng Việt cho mã lỗi xác thực §3.3. `WEAK_PASSWORD` cần độ dài tối thiểu lấy từ
+// `/api/config` nên được ghép ĐỘNG trong `authErrorText()` — KHÔNG hardcode con số.
+const AUTH_ERROR_HINT = {
+  EMAIL_TAKEN: 'Email này đã được dùng cho một tài khoản khác.',
+  WEAK_PASSWORD: 'Mật khẩu quá yếu.',
+  BAD_BODY: 'Dữ liệu gửi lên không hợp lệ (kiểm tra lại email / mật khẩu).',
+  BAD_EMAIL: 'Email không hợp lệ.',
+  INVALID_CREDENTIALS: 'Sai email hoặc mật khẩu.',
+  UNAUTHENTICATED: 'Bạn chưa đăng nhập (hoặc phiên đã hết hạn) — hãy đăng nhập lại.',
+  FORBIDDEN: 'Bạn không có quyền làm việc này (chỉ owner/admin).',
+  AUTH_DISABLED: 'Chức năng tài khoản đang tắt trên máy chủ này.',
+  RATE_LIMITED: 'Bạn thao tác quá nhanh — chờ một lát rồi thử lại.',
+  USER_NOT_FOUND: 'Không tìm thấy người dùng này.',
+  INSUFFICIENT_CREDIT: 'Không đủ credit để chạy thao tác này.',
+};
+
+// Nói thẳng, không hứa hẹn: credit nội bộ, chưa có cổng thanh toán.
+const CREDIT_HONEST_NOTE = 'Credit nội bộ — KHÔNG phải tiền thật. Số dư = tổng sổ (append-only), không sửa tay được.';
+const CREDIT_TOPUP_HINT = 'Giai đoạn này CHƯA có cổng thanh toán: credit chỉ do quản trị viên cấp tay (trang Quản trị). Không có khoản thanh toán nào được thực hiện ở đây.';
+
+const LEDGER_PAGE_SIZE = 50;
+const ADMIN_PAGE_SIZE = 50;
+
+/** Nhãn cột cho bảng usage — body của `/api/admin/usage` chưa đóng băng từng field, nên
+ *  giao diện hiện ĐÚNG những cột máy chủ trả về (tên lạ thì giữ nguyên tên, không bịa).
+ *  Cột NHÓM của A2/A3 là `group` (bản cũ hơn dùng `bucket`) — cả hai đều là “Nhóm”, vì cùng
+ *  một cột chứa ngày / operation / user_id tuỳ `group_by`. */
+const USAGE_COLUMN_LABEL = {
+  group: 'Nhóm', bucket: 'Nhóm', day: 'Ngày', date: 'Ngày', bucket_day: 'Ngày', period: 'Kỳ',
+  operation: 'Thao tác', user_id: 'Người dùng', owner_id: 'Người dùng (id)', user: 'Người dùng', email: 'Email',
+  events: 'Số lần', count: 'Số lần', jobs: 'Số job', runs: 'Số lần', total: 'Số lần',
+  estimated_cost: 'Chi phí ước tính (credit)', cost: 'Chi phí', total_cost: 'Tổng chi phí', total_amount: 'Tổng credit',
+  amount: 'Credit', credits: 'Credit', input_units: 'Đơn vị vào', output_units: 'Đơn vị ra',
+  tokens: 'Token', total_tokens: 'Tổng token', users: 'Số người dùng', sessions: 'Số phiên',
+};
+
+function currentUser() {
+  return state.auth?.me?.user || null;
+}
+
+function isAdminRole(role) {
+  return role === 'owner' || role === 'admin';
+}
+
+function canAdmin() {
+  return isAdminRole(currentUser()?.role);
+}
+
+/** `/api/config` báo chức năng tài khoản có bật không (A1/A3). Thiếu khối ⇒ coi như có, để
+ *  trang đăng nhập vẫn gọi được API và hiện LỖI THẬT thay vì tự khoá giao diện. */
+function authEnabled() {
+  if (state.config?.accounts?.available === false) return false;
+  return state.config?.auth?.enabled !== false;
+}
+
+function accountsUnavailableText() {
+  const acc = state.config?.accounts;
+  if (acc && acc.available === false && acc.reason) return String(acc.reason);
+  if (state.config?.auth?.enabled === false) return 'Máy chủ đặt AUTH_ENABLED=false.';
+  return 'không rõ lý do — xem log máy chủ (accounts.wiring_failed).';
+}
+
+/** Độ dài mật khẩu tối thiểu LẤY TỪ `/api/config` (auth.password_min_length) — không hardcode.
+ *  Chưa tải được cấu hình ⇒ trả null và UI nói thật là chưa biết. */
+function passwordMinLength() {
+  const n = Number(state.config?.auth?.password_min_length);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function passwordRuleText() {
+  const min = passwordMinLength();
+  return min
+    ? `Mật khẩu cần ít nhất ${min} ký tự (theo cấu hình máy chủ).`
+    : 'Độ dài mật khẩu tối thiểu do máy chủ quy định — chưa tải được cấu hình, hãy dùng mật khẩu dài.';
+}
+
+/* ── Định dạng số / thời gian (dùng chung cho sổ, bảng giá, quản trị) ───────── */
+
+function fmtAmount(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  return String(Math.round(n * 10000) / 10000);
+}
+
+function creditText(balance) {
+  if (!balance || balance.amount === null || balance.amount === undefined) return 'chưa rõ số dư';
+  const cur = balance.currency ? ` (${balance.currency})` : '';
+  return `${fmtAmount(balance.amount)} credit${cur}`;
+}
+
+function fmtTime(value) {
+  const raw = String(value ?? '');
+  if (!raw) return '—';
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return raw;
+  return d.toLocaleString('vi-VN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+
+function ledgerReasonLabel(reason) {
+  const key = String(reason ?? '');
+  if (!key) return 'Không rõ';
+  return LEDGER_REASON_LABEL[key] || key;
+}
+
+function ledgerAmountText(amount, currency) {
+  const n = Number(amount);
+  if (!Number.isFinite(n)) return '—';
+  const sign = n < 0 ? '-' : '+';
+  const cur = currency ? ` ${String(currency)}` : '';
+  return `${sign}${fmtAmount(Math.abs(n))}${cur}`;
+}
+
+function ledgerAmountClass(amount) {
+  const n = Number(amount);
+  if (!Number.isFinite(n) || n === 0) return 'credit-zero';
+  return n > 0 ? 'credit-plus' : 'credit-minus';
+}
+
+function operationLabel(operation) {
+  const key = String(operation ?? '');
+  if (!key) return '—';
+  return OPERATION_LABEL[key] || key;
+}
+
+function roleLabel(role) {
+  const key = String(role ?? '');
+  return key ? ROLE_LABEL[key] || key : '—';
+}
+
+function userStatusLabel(status) {
+  const key = String(status ?? '');
+  return key ? USER_STATUS_LABEL[key] || key : '—';
+}
+
+/* ── Lỗi: nói thật, không nuốt thông điệp của máy chủ ─────────────────────── */
+
+function authErrorText(err, opts = {}) {
+  const form = opts.mode === 'login' || opts.mode === 'register';
+  const code = String(err?.code || '');
+  const server = String(err?.message || '').trim();
+  const min = passwordMinLength();
+  let head = '';
+  if (form && (err?.status === 401 || err?.status === 403) && code !== 'AUTH_DISABLED') {
+    // Đang ở form đăng nhập/đăng ký: 401/403 nghĩa là sai thông tin hoặc bị khoá, KHÁC 401 do
+    // phiên hết hạn ở các trang gọi API khác.
+    head = 'Sai email hoặc mật khẩu (hoặc tài khoản đã bị khoá).';
+  } else if (code === 'WEAK_PASSWORD') {
+    head = min ? `Mật khẩu quá yếu — cần ít nhất ${min} ký tự.` : 'Mật khẩu quá yếu — hãy dùng mật khẩu dài hơn.';
+  } else if (code === 'EMAIL_TAKEN' || err?.status === 409) {
+    head = AUTH_ERROR_HINT.EMAIL_TAKEN;
+  } else if (code === 'BAD_BODY' || code === 'BAD_EMAIL' || err?.status === 400) {
+    head = AUTH_ERROR_HINT.BAD_BODY;
+  } else if (code === 'AUTH_DISABLED' || err?.status === 503) {
+    head = AUTH_ERROR_HINT.AUTH_DISABLED;
+  } else if (code === 'INSUFFICIENT_CREDIT' || err?.status === 402) {
+    head = creditShortfallText(err);
+  } else if (code === 'FORBIDDEN' || err?.status === 403) {
+    head = AUTH_ERROR_HINT.FORBIDDEN;
+  } else if (code === 'UNAUTHENTICATED' || err?.status === 401) {
+    head = AUTH_ERROR_HINT.UNAUTHENTICATED;
+  } else if (AUTH_ERROR_HINT[code]) {
+    head = AUTH_ERROR_HINT[code];
+  }
+  if (!head) head = server || 'Không rõ lỗi từ máy chủ.';
+  return server && server !== head ? `${head} (máy chủ báo: ${server})` : head;
+}
+
+/** Câu lỗi cho các trang gọi API (tài khoản / quản trị) — khác form đăng nhập ở chỗ 401 là
+ *  “phiên hết hạn”, không phải “sai mật khẩu”. */
+function apiErrorText(err) {
+  const code = String(err?.code || '');
+  if (code === 'INSUFFICIENT_CREDIT' || err?.status === 402) return creditShortfallText(err);
+  if (AUTH_ERROR_HINT[code]) return `${code}: ${AUTH_ERROR_HINT[code]}`;
+  if (err?.status >= 500) return `${code || `HTTP ${err.status}`}: máy chủ lỗi — thử lại sau (xem log máy chủ).`;
+  return String(err?.message || 'Lỗi không xác định.');
+}
+
+/**
+ * Đọc “số cần / số đang có” từ lỗi 402. Hợp đồng §3.3 đóng băng MÃ lỗi nhưng chưa đóng băng
+ * body chi tiết, nên đọc nhiều tên field hợp lý; máy chủ không kèm số thì nói THẬT là không có số
+ * (không bịa). `have` có thể lấy từ số dư gần nhất giao diện biết — khi đó có cờ `haveCached`.
+ */
+function creditShortfall(err) {
+  const details = err?.payload?.details || err?.body?.error?.details || err?.body?.details || {};
+  const num = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const need = num(details.required ?? details.needed ?? details.required_amount ?? details.amount ?? details.cost);
+  let have = num(details.balance ?? details.available ?? details.current_balance ?? details.balance_after);
+  let haveCached = false;
+  if (have === null) {
+    const cached = num(state.auth?.me?.balance?.amount);
+    if (cached !== null) {
+      have = cached;
+      haveCached = true;
+    }
+  }
+  const currency = String(details.currency || state.auth?.me?.balance?.currency || '');
+  const short = need !== null && have !== null ? Math.round((need - have) * 10000) / 10000 : null;
+  return { need, have, haveCached, short, currency };
+}
+
+function creditShortfallText(err) {
+  const s = creditShortfall(err);
+  const cur = s.currency ? ` ${s.currency}` : '';
+  if (s.need !== null && s.have !== null) {
+    const short = s.short !== null && s.short > 0 ? ` — thiếu ${fmtAmount(s.short)}${cur}` : '';
+    const src = s.haveCached ? ' (số dư gần nhất giao diện biết)' : '';
+    return `Không đủ credit: cần ${fmtAmount(s.need)}${cur}, bạn đang có ${fmtAmount(s.have)}${cur}${src}${short}.`;
+  }
+  if (s.need !== null) return `Không đủ credit: thao tác này cần ${fmtAmount(s.need)}${cur}, số dư hiện có không đủ.`;
+  if (s.have !== null) {
+    const src = s.haveCached ? ' (số dư gần nhất giao diện biết)' : '';
+    return `Không đủ credit cho thao tác này — số dư hiện có ${fmtAmount(s.have)}${cur}${src}.`;
+  }
+  return 'Không đủ credit cho thao tác này (máy chủ không kèm số cần / số đang có).';
+}
+
+function creditAlertBox(text) {
+  return `<div class="notice error credit-short" id="credit-short">
+    <strong>${esc(text)}</strong>
+    <p class="small" style="margin:6px 0 0">${esc(CREDIT_HONEST_NOTE)}</p>
+    <p class="small" style="margin:6px 0 0">${esc(CREDIT_TOPUP_HINT)}</p>
+    <div class="row" style="margin-top:8px">
+      <button class="btn tiny" data-action="account" type="button">Xem cách nạp credit &amp; số dư</button>
+      <button class="btn tiny ghost" data-action="creditdismiss" type="button">Đã hiểu</button>
+    </div>
+  </div>`;
+}
+
+function creditShortfallHtml(err) {
+  return creditAlertBox(creditShortfallText(err));
+}
+
+function renderCreditAlert() {
+  const a = state.creditAlert;
+  return a && a.text ? creditAlertBox(a.text) : '';
+}
+
+function paintCreditAlert() {
+  const el = $('#credit-alert');
+  if (el) el.innerHTML = renderCreditAlert();
+}
+
+/** Gặp 402 ở BẤT KỲ thao tác nào (kể cả trong `api()`) ⇒ băng báo số cần / số đang có + link nạp. */
+function noteCreditAlert(err) {
+  state.creditAlert = { text: creditShortfallText(err), code: err?.code || 'INSUFFICIENT_CREDIT', at: Date.now() };
+  paintCreditAlert();
+}
+
+function dismissCreditAlert() {
+  state.creditAlert = null;
+  paintCreditAlert();
+}
+
+/* ── Header: khách ẩn danh ⇄ tài khoản ────────────────────────────────────── */
+
+function renderAccountBar() {
+  const me = state.auth?.me;
+  const user = me?.user || null;
+  if (!user) {
+    const probeError = me?.error
+      ? `<span class="badge warn" title="${esc(me.error)}">chưa kiểm tra được phiên</span>`
+      : '';
+    return `<div class="account-bar">
+      <span class="badge">Khách ẩn danh</span>
+      <span class="muted small">Dữ liệu chỉ theo phiên trình duyệt này.</span>
+      ${probeError}
+      <button class="btn ghost tiny" data-action="login" type="button">Đăng nhập</button>
+      <button class="btn ghost tiny" data-action="account" type="button">Tài khoản</button>
+    </div>`;
+  }
+  const adminBtn = isAdminRole(user.role)
+    ? `<button class="btn ghost tiny" data-action="admin" type="button">Quản trị</button>`
+    : '';
+  return `<div class="account-bar">
+    <span class="badge ok" title="Vai trò: ${esc(roleLabel(user.role))}">${esc(user.email || '(không có email)')}</span>
+    <span class="muted small">· <strong>${esc(creditText(me?.balance))}</strong></span>
+    <button class="btn ghost tiny" data-action="account" type="button">Tài khoản</button>
+    ${adminBtn}
+    <button class="btn ghost tiny" data-action="logout" type="button">Đăng xuất</button>
+  </div>`;
+}
+
+function paintAccountBar() {
+  const el = $('#account-bar');
+  if (el) el.innerHTML = renderAccountBar();
+}
+
+/** Gợi ý NHẸ cho khách ẩn danh (luật #1: không chặn tab nào). Đã đăng nhập ⇒ không hiện gì. */
+function authHintHtml() {
+  if (currentUser()) return '';
+  return `<div class="notice hint-inline" id="auth-hint">
+    <span><strong>Bạn đang là khách ẩn danh.</strong> Dữ liệu chỉ theo phiên trình duyệt này.</span>
+    <button class="btn ghost tiny" data-action="login" type="button">Đăng nhập để lưu lịch sử và dùng credit</button>
+  </div>`;
+}
+
+/* ── Trang Đăng nhập / Đăng ký (#/dangnhap) ───────────────────────────────── */
+
+function renderAuthBody() {
+  const a = state.auth;
+  const register = a.mode === 'register';
+  const min = passwordMinLength();
+  const form = a.form || {};
+  const minAttr = min ? ` minlength="${min}"` : '';
+  const autocomplete = register ? 'new-password' : 'current-password';
+  const errorBox = a.formError ? `<div class="notice error" id="auth-error">${esc(a.formError)}</div>` : '';
+  const noticeBox = a.formNotice ? `<div class="notice ok" id="auth-notice">${esc(a.formNotice)}</div>` : '';
+  const gate = authEnabled()
+    ? ''
+    : `<div class="notice warn" id="auth-disabled">
+        <strong>Máy chủ chưa bật chức năng tài khoản (AUTH_DISABLED).</strong>
+        <p class="small" style="margin:6px 0 0">Lý do: ${esc(accountsUnavailableText())}</p>
+        <p class="small" style="margin:6px 0 0">Bạn vẫn dùng được Nội dung / Dịch ảnh / Tạo ảnh ở chế độ khách ẩn danh
+        (không có ví credit, dữ liệu chỉ theo phiên trình duyệt này).</p>
+      </div>`;
+  return `<section class="panel auth-panel">
+    <div class="tabs auth-tabs">
+      <button class="tab ${register ? '' : 'active'}" data-action="authmode" data-mode="login" type="button">Đăng nhập</button>
+      <button class="tab ${register ? 'active' : ''}" data-action="authmode" data-mode="register" type="button">Đăng ký</button>
+    </div>
+    <h2>${register ? 'Đăng ký tài khoản' : 'Đăng nhập'}</h2>
+    <p class="muted small">
+      Tài khoản để <strong>lưu lịch sử theo bạn</strong> và dùng <strong>credit nội bộ</strong>.
+      Đăng nhập là TUỲ CHỌN: chưa đăng nhập vẫn dán link và chạy được, chỉ là dữ liệu chỉ theo phiên trình duyệt này.
+    </p>
+    ${gate}${errorBox}${noticeBox}
+    <form id="auth-form" novalidate>
+      <div class="field">
+        <div class="field-head"><label for="auth-email">Email</label></div>
+        <input class="text-input" id="auth-email" name="email" type="email" autocomplete="username"
+               value="${esc(form.email || '')}" placeholder="ban@example.com" />
+      </div>
+      <div class="field">
+        <div class="field-head"><label for="auth-password">Mật khẩu</label></div>
+        <input class="text-input" id="auth-password" name="password" type="password" autocomplete="${autocomplete}"${minAttr} />
+        <p class="hint" style="margin:6px 0 0">${esc(passwordRuleText())}</p>
+      </div>
+      ${register ? `<div class="field">
+        <div class="field-head"><label for="auth-name">Tên hiển thị (không bắt buộc)</label></div>
+        <input class="text-input" id="auth-name" name="display_name" type="text" maxlength="80"
+               value="${esc(form.display_name || '')}" placeholder="Ví dụ: Nguyễn Văn A" />
+      </div>` : ''}
+      <div class="row">
+        <button class="btn primary" type="submit" id="auth-submit"${a.busy || !authEnabled() ? ' disabled' : ''}>
+          ${a.busy ? 'ĐANG GỬI…' : register ? 'ĐĂNG KÝ' : 'ĐĂNG NHẬP'}
+        </button>
+        <button class="btn ghost" type="button" data-action="home">Để sau — dùng ẩn danh</button>
+      </div>
+    </form>
+    <p class="hint">Mật khẩu chỉ được máy chủ lưu dưới dạng băm (scrypt). Giao diện KHÔNG lưu mật khẩu của bạn.</p>
+  </section>`;
+}
+
+function renderAuthPage() {
+  state.view = 'auth';
+  stopPolling();
+  stopIlPolling();
+  stopIsPolling();
+  app.innerHTML = renderAuthBody();
+}
+
+async function openAuth() {
+  state.auth.formError = null;
+  renderAuthPage();
+  if (!state.auth.loaded) {
+    await loadMe();
+    if (state.view === 'auth') renderAuthPage();
+  }
+}
+
+async function submitAuthForm() {
+  const a = state.auth;
+  if (a.busy) return;
+  const register = a.mode === 'register';
+  const email = String($('#auth-email')?.value ?? a.form.email ?? '').trim();
+  const password = String($('#auth-password')?.value ?? '');
+  const displayName = String($('#auth-name')?.value ?? a.form.display_name ?? '').trim();
+  // Giữ email/tên đã gõ để render lại không mất chữ; KHÔNG giữ mật khẩu trong state.
+  a.form = { email, display_name: displayName };
+  a.formError = null;
+  a.formNotice = null;
+  if (!email) {
+    a.formError = 'Hãy nhập email.';
+    renderAuthPage();
+    return;
+  }
+  if (!password) {
+    a.formError = 'Hãy nhập mật khẩu.';
+    renderAuthPage();
+    return;
+  }
+  const min = passwordMinLength();
+  if (register && min && password.length < min) {
+    a.formError = `Mật khẩu cần ít nhất ${min} ký tự (theo cấu hình máy chủ).`;
+    renderAuthPage();
+    return;
+  }
+  a.busy = true;
+  renderAuthPage();
+  try {
+    const body = register ? { email, password, ...(displayName ? { display_name: displayName } : {}) } : { email, password };
+    const res = await api(register ? '/api/auth/register' : '/api/auth/login', { method: 'POST', body });
+    a.me = { user: res?.user || null, anonymous: !res?.user, balance: null };
+    a.loaded = true;
+    a.busy = false;
+    a.form = { email: '', display_name: '' };
+    toast(register ? 'Đã tạo tài khoản.' : 'Đã đăng nhập.');
+    await loadMe(); // số dư THẬT từ máy chủ, không đoán
+    if (state.view === 'auth') {
+      location.hash = '#/taikhoan';
+      await openAccount(); // đổi hash có thể không phát hashchange ⇒ mở trang tài khoản ngay
+    }
+  } catch (err) {
+    a.busy = false;
+    a.formError = authErrorText(err, { mode: register ? 'register' : 'login' });
+    renderAuthPage();
+  }
+}
+
+/* ── Trang Tài khoản (#/taikhoan) ─────────────────────────────────────────── */
+
+function renderLedgerTable(items) {
+  if (items === null || items === undefined) return '<p class="muted small">Đang tải sổ credit…</p>';
+  if (!Array.isArray(items) || items.length === 0) return '<p class="muted small">Sổ credit còn trống — chưa có dòng nào.</p>';
+  const rows = items.map((it) => `<tr>
+      <td class="mono small">${esc(fmtTime(it?.created_at))}</td>
+      <td>${esc(ledgerReasonLabel(it?.reason))}${it?.operation ? `<div class="muted small">${esc(operationLabel(it.operation))}</div>` : ''}</td>
+      <td class="mono ${ledgerAmountClass(it?.amount)}">${esc(ledgerAmountText(it?.amount, it?.currency))}</td>
+      <td class="mono small">${it?.job_id ? esc(it.job_id) : '<span class="muted">—</span>'}</td>
+      <td class="mono small">${esc(fmtAmount(it?.balance_after))}</td>
+    </tr>`).join('');
+  return `<div class="il-tablewrap"><table class="evidence ledger-table">
+    <thead><tr><th>Thời gian</th><th>Lý do</th><th>Số tiền</th><th>Job</th><th>Số dư sau</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
+function renderPricingTable(pricing) {
+  if (pricing === null || pricing === undefined) return '<p class="muted small">Đang tải bảng giá…</p>';
+  if (!Array.isArray(pricing) || pricing.length === 0) {
+    return '<p class="muted small">Máy chủ chưa trả về bảng giá nào. Ví vẫn trừ credit theo đơn giá cấu hình của máy chủ.</p>';
+  }
+  const rows = pricing.map((p) => `<tr>
+      <td>${esc(operationLabel(p?.operation))}<div class="muted small mono">${esc(p?.operation)}</div></td>
+      <td class="mono">${esc(fmtAmount(p?.unit_price))}</td>
+      <td>${esc(p?.currency || '—')}</td>
+      <td class="small">${p?.note ? esc(p.note) : '<span class="muted">—</span>'}</td>
+    </tr>`).join('');
+  return `<div class="il-tablewrap"><table class="evidence pricing-table">
+    <thead><tr><th>Thao tác</th><th>Đơn giá</th><th>Tiền tệ</th><th>Ghi chú</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
+function renderAccountBody() {
+  const a = state.auth;
+  const me = a.me || {};
+  const user = me.user || null;
+  if (!user) {
+    return `<section class="panel">
+      <h2>Tài khoản</h2>
+      <div class="notice warn">
+        <strong>Bạn chưa đăng nhập — đang ở chế độ khách ẩn danh.</strong>
+        <p class="small" style="margin:6px 0 0">Dữ liệu chỉ theo phiên trình duyệt này và KHÔNG có ví credit.
+        Mọi tính năng (Nội dung / Dịch ảnh / Tạo ảnh) vẫn chạy bình thường.</p>
+      </div>
+      ${a.error ? `<div class="notice error">${esc(a.error)}</div>` : ''}
+      <div class="row">
+        <button class="btn primary" data-action="login" type="button">Đăng nhập / Đăng ký</button>
+        <button class="btn ghost" data-action="home" type="button">Về trang chủ</button>
+      </div>
+    </section>`;
+  }
+  const errorBox = a.error ? `<div class="notice error">${esc(a.error)}</div>` : '';
+  return `<section class="panel">
+    <div class="spread">
+      <div style="min-width:0">
+        <h2 style="margin:0 0 4px">Tài khoản</h2>
+        <p class="muted small" style="margin:0">${esc(CREDIT_HONEST_NOTE)}</p>
+      </div>
+      <span class="badge ok">${esc(roleLabel(user.role))}</span>
+    </div>
+    <dl class="kv" style="margin-top:12px">
+      <dt>Email</dt><dd>${esc(user.email)}</dd>
+      <dt>Tên hiển thị</dt><dd>${user.display_name ? esc(user.display_name) : '<span class="muted">chưa đặt</span>'}</dd>
+      <dt>Vai trò</dt><dd>${esc(roleLabel(user.role))}</dd>
+      <dt>Trạng thái</dt><dd>${esc(userStatusLabel(user.status))}</dd>
+      <dt>Số dư credit</dt><dd><strong>${esc(creditText(me.balance))}</strong></dd>
+    </dl>
+    <div class="notice warn" style="margin-top:12px">
+      <strong>Nạp credit thế nào?</strong>
+      <p class="small" style="margin:6px 0 0">${esc(CREDIT_TOPUP_HINT)}</p>
+    </div>
+  </section>
+  ${errorBox}
+  <section class="panel">
+    <div class="spread">
+      <h2 style="margin:0">Lịch sử sổ credit</h2>
+      <div class="row">
+        <button class="btn ghost tiny" data-action="ledgerreload" type="button">Tải lại</button>
+      </div>
+    </div>
+    ${renderLedgerTable(a.ledger)}
+    ${a.ledgerMore ? `<div class="row" style="margin-top:8px"><button class="btn tiny" data-action="ledgerMore" type="button">Tải thêm</button></div>` : ''}
+  </section>
+  <section class="panel">
+    <div class="spread">
+      <h2 style="margin:0">Giá theo thao tác</h2>
+      <button class="btn ghost tiny" data-action="pricingreload" type="button">Tải lại</button>
+    </div>
+    <p class="muted small">Đơn giá credit cho từng thao tác (máy chủ là nguồn giá duy nhất).</p>
+    ${renderPricingTable(a.pricing)}
+  </section>`;
+}
+
+function renderAccountPage() {
+  state.view = 'account';
+  app.innerHTML = renderAccountBody();
+}
+
+async function openAccount() {
+  state.view = 'account';
+  stopPolling();
+  stopIlPolling();
+  stopIsPolling();
+  // Hỏi máy chủ MỖI lần vào trang: phiên có thể đã hết hạn hoặc số dư vừa đổi — không đoán.
+  await loadMe();
+  renderAccountPage();
+  await Promise.all([loadLedger(true), loadPricing(true)]);
+}
+
+async function loadLedger(reset = false) {
+  const a = state.auth;
+  if (a.ledgerLoading) return;
+  if (!currentUser()) {
+    a.ledger = [];
+    if (state.view === 'account') renderAccountPage();
+    return;
+  }
+  a.ledgerLoading = true;
+  if (reset) {
+    a.ledger = null;
+    a.ledgerOffset = 0;
+    a.ledgerMore = false;
+  }
+  try {
+    const data = await api(`/api/billing/ledger?limit=${LEDGER_PAGE_SIZE}&offset=${a.ledgerOffset}`);
+    const items = Array.isArray(data?.items) ? data.items : [];
+    a.ledger = a.ledger ? [...a.ledger, ...items] : items;
+    a.ledgerOffset = a.ledger.length;
+    a.ledgerMore = items.length >= LEDGER_PAGE_SIZE;
+    if (data?.balance) {
+      a.me = { ...(a.me || { user: currentUser(), anonymous: false }), balance: data.balance };
+      paintAccountBar();
+    }
+    a.error = null;
+  } catch (err) {
+    a.error = apiErrorText(err);
+    if (err?.status === 401) {
+      // Phiên THẬT SỰ hết hạn ⇒ không giữ giao diện ở trạng thái “đã đăng nhập” nữa.
+      a.me = { user: null, anonymous: true, balance: null };
+      a.loaded = true;
+      a.ledger = [];
+      a.formNotice = 'Phiên đăng nhập đã hết hạn — hãy đăng nhập lại.';
+      paintAccountBar();
+    }
+  } finally {
+    a.ledgerLoading = false;
+  }
+  if (state.view === 'account') renderAccountPage();
+}
+
+async function loadPricing(force = false) {
+  const a = state.auth;
+  if (a.pricingLoading) return;
+  if (!force && a.pricing) return;
+  a.pricingLoading = true;
+  try {
+    const data = await api('/api/billing/pricing');
+    a.pricing = Array.isArray(data?.pricing) ? data.pricing : [];
+  } catch (err) {
+    a.pricing = [];
+    a.error = apiErrorText(err);
+  } finally {
+    a.pricingLoading = false;
+  }
+  if (state.view === 'account') renderAccountPage();
+}
+
+/* ── Trang Quản trị (#/quantri) — CHỈ owner/admin ─────────────────────────── */
+
+function usageColumns(rows) {
+  const cols = [];
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!row || typeof row !== 'object') continue;
+    for (const key of Object.keys(row)) if (!cols.includes(key)) cols.push(key);
+    if (cols.length >= 8) break;
+  }
+  return cols;
+}
+
+function usageColumnLabel(key) {
+  const k = String(key ?? '');
+  return USAGE_COLUMN_LABEL[k] || k;
+}
+
+/** Một ô của bảng usage. `opts.group` cho biết cột nhóm (`group`/`bucket`) đang chứa gì — A2/A3
+ *  dùng CHUNG một cột nhóm cho cả 3 kiểu gộp — và `opts.emailOf` để đổi user_id thành email. */
+function usageCellText(key, value, opts = {}) {
+  if (value === null || value === undefined || value === '') return '—';
+  if (typeof value === 'number') return fmtAmount(value);
+  if (typeof value === 'boolean') return value ? 'có' : 'không';
+  const k = String(key || '').toLowerCase();
+  const group = String(opts.group || '');
+  const isGroupCol = k === 'group' || k === 'bucket';
+  const isUserCol = k === 'user_id' || k === 'owner_id' || (isGroupCol && group === 'user');
+  if (k === 'operation' || (isGroupCol && group === 'operation')) return operationLabel(value);
+  if (isUserCol) return String((typeof opts.emailOf === 'function' ? opts.emailOf(value) : null) || value);
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
+}
+
+function usageDateDefaults() {
+  const now = new Date();
+  const from = new Date(now.getTime() - 6 * 24 * 3600 * 1000);
+  const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return { from: iso(from), to: iso(now) };
+}
+
+function renderAdminUsers() {
+  const a = state.auth;
+  if (a.users === null || a.users === undefined) return '<p class="muted small">Đang tải danh sách người dùng…</p>';
+  if (!a.users.length) return '<p class="muted small">Chưa có người dùng nào.</p>';
+  const rows = a.users.map((u) => {
+    const id = String(u?.id || '');
+    const balance = u?.balance !== undefined && u?.balance !== null
+      ? (typeof u.balance === 'object' ? u.balance : { amount: u.balance, currency: u.currency })
+      : null;
+    const roles = ['owner', 'admin', 'member'];
+    const selected = a.roleDraft?.[id] || u?.role || 'member';
+    const options = roles.map((r) => `<option value="${esc(r)}"${r === selected ? ' selected' : ''}>${esc(roleLabel(r))}</option>`).join('');
+    return `<tr>
+      <td>${esc(u?.email)}${u?.display_name ? `<div class="muted small">${esc(u.display_name)}</div>` : ''}</td>
+      <td><span class="badge ${isAdminRole(u?.role) ? 'ok' : ''}">${esc(roleLabel(u?.role))}</span></td>
+      <td>${esc(userStatusLabel(u?.status))}${balance ? `<div class="muted small">${esc(creditText(balance))}</div>` : ''}</td>
+      <td class="mono small">${esc(id)}</td>
+      <td>
+        <div class="row">
+          <select class="text-input mini" data-role-user="${esc(id)}" aria-label="Vai trò của ${esc(u?.email)}">${options}</select>
+          <button class="btn tiny" data-action="rolesave" data-user="${esc(id)}" type="button">Lưu vai trò</button>
+          <button class="btn tiny ghost" data-action="creditopen" data-user="${esc(id)}" data-email="${esc(u?.email || id)}" type="button">Cấp credit</button>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+  return `<div class="il-tablewrap"><table class="evidence admin-table">
+    <thead><tr><th>Email</th><th>Vai trò</th><th>Trạng thái</th><th>ID</th><th>Hành động</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
+function renderAdminCreditForm() {
+  const a = state.auth;
+  const target = a.creditTarget;
+  if (!target) return '';
+  const draft = a.creditDraft || { amount: '', note: '' };
+  const confirmBox = a.creditConfirm
+    ? `<div class="notice warn" id="credit-confirm">
+        <strong>Xác nhận: cấp ${esc(fmtAmount(a.creditConfirm.amount))} credit cho ${esc(a.creditConfirm.email)}?</strong>
+        <p class="small" style="margin:6px 0 0">Ghi chú: ${esc(a.creditConfirm.note || '(không có)')}</p>
+        <p class="small" style="margin:6px 0 0">Việc này ghi THÊM một dòng sổ (append-only) — không sửa, không xoá được.
+        Số dư không bao giờ âm: máy chủ từ chối nếu khoản trừ làm số dư âm.</p>
+        <div class="row" style="margin-top:8px">
+          <button class="btn primary tiny" data-action="creditgrant" data-user="${esc(target.userId)}" type="button"${a.adminBusy ? ' disabled' : ''}>XÁC NHẬN CẤP</button>
+          <button class="btn ghost tiny" data-action="creditcancel" type="button">Huỷ</button>
+        </div>
+      </div>`
+    : `<div class="row" style="margin-top:6px">
+        <button class="btn tiny" data-action="creditreview" type="button">Xem lại &amp; xác nhận</button>
+        <button class="btn ghost tiny" data-action="creditcancel" type="button">Đóng</button>
+      </div>`;
+  return `<section class="panel" id="credit-form">
+    <h2>Cấp credit cho ${esc(target.email || target.userId)}</h2>
+    <p class="muted small">${esc(CREDIT_HONEST_NOTE)}</p>
+    <div class="field">
+      <div class="field-head"><label for="credit-amount">Số credit (dương = cấp thêm, âm = điều chỉnh giảm)</label></div>
+      <input class="text-input" id="credit-amount" type="number" step="0.01" value="${esc(draft.amount)}" />
+    </div>
+    <div class="field">
+      <div class="field-head"><label for="credit-note">Ghi chú (vì sao cấp)</label></div>
+      <input class="text-input" id="credit-note" type="text" maxlength="200" value="${esc(draft.note)}" placeholder="Ví dụ: tặng credit thử nghiệm" />
+    </div>
+    ${confirmBox}
+  </section>`;
+}
+
+function renderAdminUsage() {
+  const a = state.auth;
+  const rows = a.usage;
+  if (rows === null || rows === undefined) return '<p class="muted small">Đang tải số liệu sử dụng…</p>';
+  if (!rows.length) return '<p class="muted small">Không có số liệu trong khoảng đã chọn.</p>';
+  const cols = usageColumns(rows);
+  if (!cols.length) return '<p class="muted small">Máy chủ trả về dữ liệu không có cột nào để hiện.</p>';
+  const group = a.usageGroup || 'day';
+  // Có danh sách người dùng ⇒ đổi user_id thành email cho dễ đọc (không có thì hiện id thật).
+  const emailOf = (id) => (Array.isArray(a.users) ? a.users.find((u) => u?.id === id)?.email || null : null);
+  const head = cols.map((c) => `<th>${esc(usageColumnLabel(c))}</th>`).join('');
+  const body = rows.map((r) => `<tr>${cols.map((c) => `<td class="small">${esc(usageCellText(c, r?.[c], { group, emailOf }))}</td>`).join('')}</tr>`).join('');
+  return `<div class="il-tablewrap"><table class="evidence admin-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+function renderAdminBody() {
+  const user = currentUser();
+  if (!user) {
+    return `<section class="panel">
+      <h2>Quản trị</h2>
+      <div class="notice error"><strong>Bạn chưa đăng nhập (401).</strong>
+        <p class="small" style="margin:6px 0 0">Trang quản trị yêu cầu tài khoản vai trò owner/admin.</p></div>
+      <div class="row">
+        <button class="btn primary" data-action="login" type="button">Đăng nhập</button>
+        <button class="btn ghost" data-action="home" type="button">Về trang chủ</button>
+      </div>
+    </section>`;
+  }
+  if (!isAdminRole(user.role)) {
+    return `<section class="panel">
+      <h2>Quản trị</h2>
+      <div class="notice error"><strong>Không có quyền (403).</strong>
+        <p class="small" style="margin:6px 0 0">Tài khoản ${esc(user.email)} có vai trò ${esc(roleLabel(user.role))} —
+        chỉ owner/admin mới vào được trang này. Giao diện ẩn link “Quản trị” với vai trò member;
+        vào bằng URL trực tiếp thì máy chủ vẫn chặn (403).</p></div>
+      <button class="btn ghost" data-action="account" type="button">Về trang Tài khoản</button>
+    </section>`;
+  }
+  const a = state.auth;
+  const noticeBox = a.adminNotice ? `<div class="notice ok" id="admin-notice">${esc(a.adminNotice)}</div>` : '';
+  const errorBox = a.adminError ? `<div class="notice error" id="admin-error">${esc(a.adminError)}</div>` : '';
+  const groups = ['day', 'operation', 'user'].map((g) =>
+    `<option value="${esc(g)}"${g === a.usageGroup ? ' selected' : ''}>${esc(USAGE_GROUP_LABEL[g] || g)}</option>`).join('');
+  return `<section class="panel">
+    <div class="spread">
+      <div style="min-width:0">
+        <h2 style="margin:0 0 4px">Quản trị</h2>
+        <p class="muted small" style="margin:0">${esc(CREDIT_HONEST_NOTE)}</p>
+      </div>
+      <span class="badge ok">${esc(user.email)} · ${esc(roleLabel(user.role))}</span>
+    </div>
+  </section>
+  ${noticeBox}${errorBox}
+  <section class="panel">
+    <div class="spread">
+      <h2 style="margin:0">Người dùng${a.usersTotal !== null && a.usersTotal !== undefined ? ` (${esc(fmtAmount(a.usersTotal))})` : ''}</h2>
+      <button class="btn ghost tiny" data-action="usersreload" type="button">Tải lại</button>
+    </div>
+    ${renderAdminUsers()}
+    ${a.usersMore ? `<div class="row" style="margin-top:8px"><button class="btn tiny" data-action="usersMore" type="button">Tải thêm</button></div>` : ''}
+  </section>
+  ${renderAdminCreditForm()}
+  <section class="panel">
+    <h2>Số liệu sử dụng</h2>
+    <div class="row">
+      <label class="small muted" for="admin-usage-group">Nhóm theo</label>
+      <select class="text-input mini" id="admin-usage-group">${groups}</select>
+      <label class="small muted" for="admin-usage-from">Từ ngày</label>
+      <input class="text-input mini" id="admin-usage-from" type="date" value="${esc(a.usageFrom)}" />
+      <label class="small muted" for="admin-usage-to">Đến ngày</label>
+      <input class="text-input mini" id="admin-usage-to" type="date" value="${esc(a.usageTo)}" />
+      <button class="btn tiny" data-action="usageload" type="button">Xem</button>
+    </div>
+    ${renderAdminUsage()}
+  </section>`;
+}
+
+function renderAdminPage() {
+  state.view = 'admin';
+  app.innerHTML = renderAdminBody();
+}
+
+async function openAdmin() {
+  state.view = 'admin';
+  stopPolling();
+  stopIlPolling();
+  stopIsPolling();
+  // Vai trò có thể vừa bị đổi ở nơi khác ⇒ luôn hỏi máy chủ trước khi quyết định có gọi API quản trị.
+  await loadMe();
+  const d = usageDateDefaults();
+  if (!state.auth.usageFrom) state.auth.usageFrom = d.from;
+  if (!state.auth.usageTo) state.auth.usageTo = d.to;
+  renderAdminPage();
+  if (canAdmin()) await Promise.all([loadAdminUsers(true), loadAdminUsage(true)]);
+}
+
+async function loadAdminUsers(reset = false) {
+  const a = state.auth;
+  if (a.usersLoading) return;
+  a.usersLoading = true;
+  if (reset) {
+    a.users = null;
+    a.usersOffset = 0;
+  }
+  try {
+    const data = await api(`/api/admin/users?limit=${ADMIN_PAGE_SIZE}&offset=${a.usersOffset}`);
+    const items = Array.isArray(data?.items) ? data.items : [];
+    const hadList = Array.isArray(a.users);
+    a.users = hadList && !reset ? [...a.users, ...items] : items;
+    a.usersOffset = a.users.length;
+    a.usersTotal = Number.isFinite(Number(data?.total)) ? Number(data.total) : a.users.length;
+    a.usersMore = items.length >= ADMIN_PAGE_SIZE;
+    a.adminError = null;
+  } catch (err) {
+    a.adminError = apiErrorText(err);
+    a.users = [];
+    a.usersMore = false;
+    if (err?.status === 401) a.formNotice = 'Phiên đăng nhập đã hết hạn — hãy đăng nhập lại.';
+  } finally {
+    a.usersLoading = false;
+  }
+  if (state.view === 'admin') renderAdminPage();
+}
+
+async function loadAdminUsage(reset = false) {
+  const a = state.auth;
+  if (a.usageLoading) return;
+  a.usageLoading = true;
+  if (reset) a.usage = null;
+  const params = new URLSearchParams({ group_by: a.usageGroup || 'day' });
+  if (a.usageFrom) params.set('from', a.usageFrom);
+  if (a.usageTo) params.set('to', a.usageTo);
+  try {
+    const data = await api(`/api/admin/usage?${params.toString()}`);
+    a.usage = Array.isArray(data?.rows) ? data.rows : [];
+    a.adminError = null;
+  } catch (err) {
+    a.adminError = apiErrorText(err);
+    a.usage = [];
+  } finally {
+    a.usageLoading = false;
+  }
+  if (state.view === 'admin') renderAdminPage();
+}
+
+function openCreditForm(userId, email) {
+  if (!userId) return;
+  state.auth.creditTarget = { userId: String(userId), email: String(email || userId) };
+  state.auth.creditDraft = { amount: '', note: '' };
+  state.auth.creditConfirm = null;
+  state.auth.adminError = null;
+  state.auth.adminNotice = null;
+  renderAdminPage();
+}
+
+function reviewCreditGrant() {
+  const a = state.auth;
+  const target = a.creditTarget;
+  if (!target) return;
+  const amountRaw = String($('#credit-amount')?.value ?? a.creditDraft?.amount ?? '').trim();
+  const note = String($('#credit-note')?.value ?? a.creditDraft?.note ?? '').trim();
+  a.creditDraft = { amount: amountRaw, note };
+  const amount = Number(amountRaw.replace(',', '.'));
+  if (!amountRaw || !Number.isFinite(amount) || amount === 0) {
+    a.adminError = 'Số credit phải là một số khác 0 (ví dụ 5 hoặc -2.5).';
+    a.creditConfirm = null;
+    renderAdminPage();
+    return;
+  }
+  a.adminError = null;
+  a.adminNotice = null;
+  a.creditConfirm = { userId: target.userId, email: target.email || target.userId, amount, note };
+  renderAdminPage();
+}
+
+async function grantCredit(userId) {
+  const a = state.auth;
+  const conf = a.creditConfirm;
+  if (!conf || a.adminBusy) return;
+  a.adminBusy = true;
+  a.adminError = null;
+  a.adminNotice = null;
+  renderAdminPage();
+  try {
+    const res = await api(`/api/admin/users/${encodeURIComponent(userId)}/credit`, {
+      method: 'POST',
+      body: { amount: conf.amount, note: conf.note || '' },
+    });
+    a.adminNotice = `Đã cấp ${fmtAmount(conf.amount)} credit cho ${conf.email}. Số dư mới: ${creditText(res?.balance)}.`;
+    a.creditConfirm = null;
+    a.creditTarget = null;
+    a.creditDraft = { amount: '', note: '' };
+    a.users = null; // danh sách có thể kèm số dư ⇒ nạp lại cho thật
+    await loadMe();
+  } catch (err) {
+    a.adminError = apiErrorText(err);
+    if (err?.code === 'INSUFFICIENT_CREDIT') a.creditConfirm = null;
+  } finally {
+    a.adminBusy = false;
+  }
+  renderAdminPage();
+  paintAccountBar();
+}
+
+async function saveRole(userId) {
+  const a = state.auth;
+  if (!userId || a.adminBusy) return;
+  const user = (Array.isArray(a.users) ? a.users : []).find((u) => u?.id === userId) || null;
+  const role = a.roleDraft?.[userId] || user?.role || '';
+  if (!role) {
+    a.adminError = 'Hãy chọn vai trò trước khi lưu.';
+    renderAdminPage();
+    return;
+  }
+  if (user && role === user.role) {
+    a.adminError = null;
+    a.adminNotice = `Vai trò của ${user.email} vẫn là ${roleLabel(role)} — không có gì thay đổi.`;
+    renderAdminPage();
+    return;
+  }
+  a.adminBusy = true;
+  a.adminError = null;
+  a.adminNotice = null;
+  renderAdminPage();
+  try {
+    const res = await api(`/api/admin/users/${encodeURIComponent(userId)}/role`, { method: 'POST', body: { role } });
+    const updated = res?.user || { ...(user || { id: userId }), role };
+    if (Array.isArray(a.users)) a.users = a.users.map((u) => (u?.id === updated.id ? { ...u, ...updated } : u));
+    if (a.roleDraft) delete a.roleDraft[userId];
+    a.adminNotice = `Đã đổi vai trò của ${updated.email || userId} thành ${roleLabel(updated.role)}.`;
+    if (currentUser()?.id === updated.id) await loadMe();
+  } catch (err) {
+    a.adminError = apiErrorText(err);
+  } finally {
+    a.adminBusy = false;
+  }
+  renderAdminPage();
+  paintAccountBar();
+}
+
+/* ── Phiên: tải / đăng xuất ───────────────────────────────────────────────── */
+
+async function loadMe() {
+  const a = state.auth;
+  a.loading = true;
+  try {
+    const data = await api('/api/auth/me');
+    a.me = { user: data?.user || null, anonymous: data?.anonymous !== false, balance: data?.balance || null };
+    a.error = null;
+    a.loaded = true;
+  } catch (err) {
+    // Chưa nối được API xác thực (A4 chưa xong / mạng lỗi) ⇒ vẫn là khách ẩn danh, nhưng NÓI THẬT
+    // là chưa kiểm tra được phiên — không im lặng giả vờ.
+    if (!a.me?.user) a.me = { user: null, anonymous: true, balance: null };
+    a.loaded = true;
+    a.error = apiErrorText(err);
+  } finally {
+    a.loading = false;
+  }
+  paintAccountBar();
+  return a.me;
+}
+
+/** Đăng xuất: gọi API THẬT + xoá state riêng tư (không để lại dữ liệu của người vừa thoát). */
+function clearPrivateState() {
+  const a = state.auth;
+  a.me = { user: null, anonymous: true, balance: null };
+  a.loaded = true;
+  a.ledger = null;
+  a.ledgerOffset = 0;
+  a.ledgerMore = false;
+  a.pricing = null;
+  a.users = null;
+  a.usersOffset = 0;
+  a.usersTotal = null;
+  a.usage = null;
+  a.creditTarget = null;
+  a.creditConfirm = null;
+  a.creditDraft = { amount: '', note: '' };
+  a.roleDraft = {};
+  a.form = { email: '', display_name: '' };
+  a.formError = null;
+  a.formNotice = null;
+  a.adminError = null;
+  a.adminNotice = null;
+  state.job = null;
+  state.jobId = null;
+  state.history = [];
+  state.il.job = null;
+  state.il.jobId = null;
+  state.il.pending = null;
+  isReset();
+  ilManualReset();
+  state.creditAlert = null;
+}
+
+async function doLogout() {
+  try {
+    await api('/api/auth/logout', { method: 'POST' });
+  } catch (err) {
+    toast(`Máy chủ báo lỗi khi đăng xuất: ${apiErrorText(err)}`);
+  }
+  clearPrivateState();
+  paintAccountBar();
+  paintCreditAlert();
+  toast('Đã đăng xuất — bạn đang ở chế độ khách ẩn danh.');
+  // Về trang chủ: đổi hash cho lịch sử trình duyệt, VÀ tự vẽ (có trình duyệt không phát hashchange).
+  if (String(location.hash || '') !== '#/' && String(location.hash || '') !== '') location.hash = '#/';
+  renderHome();
+}
+
+/* ── Nối sự kiện cho khối tài khoản (chỉ gắn một lần) ─────────────────────── */
+
+function wireAuthGlobal() {
+  document.addEventListener('submit', (ev) => {
+    if (ev.target?.id === 'auth-form') {
+      ev.preventDefault();
+      submitAuthForm();
+    }
+  });
+  document.addEventListener('input', (ev) => {
+    const t = ev.target;
+    if (!t?.id) return;
+    // Giữ bản nháp để render lại không mất chữ. Mật khẩu KHÔNG bao giờ vào state.
+    if (t.id === 'auth-email') state.auth.form.email = String(t.value ?? '');
+    else if (t.id === 'auth-name') state.auth.form.display_name = String(t.value ?? '');
+    else if (t.id === 'credit-amount') state.auth.creditDraft.amount = String(t.value ?? '');
+    else if (t.id === 'credit-note') state.auth.creditDraft.note = String(t.value ?? '');
+  });
+  document.addEventListener('change', (ev) => {
+    const t = ev.target;
+    if (!t) return;
+    if (t.dataset?.roleUser) {
+      state.auth.roleDraft[t.dataset.roleUser] = String(t.value || '');
+      return;
+    }
+    if (t.id === 'admin-usage-group') {
+      state.auth.usageGroup = String(t.value || 'day');
+      loadAdminUsage(true);
+    } else if (t.id === 'admin-usage-from') {
+      state.auth.usageFrom = String(t.value || '');
+    } else if (t.id === 'admin-usage-to') {
+      state.auth.usageTo = String(t.value || '');
+    }
   });
 }
 

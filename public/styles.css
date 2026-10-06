@@ -294,3 +294,42 @@ ul.bullets li { margin-bottom: 5px; }
 }
 .is-overlay input[type="text"]:focus { outline: 2px solid rgba(79, 140, 255, .45); outline-offset: 1px; }
 .is-overlay input[type="text"]:disabled { opacity: .6; }
+
+/* ── MVP-05 · Tài khoản + ví credit ─────────────────────────── */
+
+#account-bar:empty { display: none; }
+.account-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 0 10px; border-top: 1px solid var(--line); font-size: 13px;
+}
+.account-bar .badge { max-width: 42ch; overflow: hidden; text-overflow: ellipsis; }
+
+#credit-alert:empty { display: none; }
+.credit-short { margin-top: 14px; }
+
+.hint-inline { display: flex; align-items: center; justify-content: center; gap: 10px; flex-wrap: wrap; text-align: left; }
+
+.text-input {
+  width: 100%; background: var(--bg-soft); color: var(--text); border: 1px solid var(--line);
+  border-radius: 8px; padding: 10px 12px; font: inherit;
+}
+.text-input:focus { outline: 2px solid rgba(79, 140, 255, .45); outline-offset: 1px; }
+.text-input.mini { width: auto; min-width: 150px; padding: 7px 9px; font-size: 13px; }
+select.text-input.mini { min-width: 132px; }
+
+.auth-panel { max-width: 620px; }
+.auth-tabs { margin-bottom: 6px; }
+.auth-panel .field { margin-bottom: 16px; }
+
+.ledger-table, .pricing-table, .admin-table { min-width: 660px; }
+.admin-table td { vertical-align: top; }
+.admin-table select { margin: 0; }
+
+.credit-plus { color: #9ff5d8; font-weight: 700; }
+.credit-minus { color: #ffb3b3; font-weight: 700; }
+.credit-zero { color: var(--muted); font-weight: 700; }
+
+@media (max-width: 640px) {
+  .account-bar { padding-bottom: 12px; }
+  .text-input.mini { width: 100%; }
+}

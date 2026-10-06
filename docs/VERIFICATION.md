@@ -1002,3 +1002,346 @@ $ cd /tmp/mvp03-atk3 && node r3c-exposure.mjs
 - **Ngưỡng `1.0` và `DIRTY_DEEP_MIN_DISTANCE = 2` chọn từ ảnh TỔNG HỢP** (bóng mềm 0.061–0.196 vs
   ăn sản phẩm 2.24–19.23); ảnh chụp thật (JPEG→PNG, nền màu, bóng lớn) chưa đo.
 - Đường `http` vẫn **chưa đo end-to-end**; chưa đo PostgreSQL/trình duyệt thật/queue đa tiến trình.
+
+---
+
+## 16. MVP-05 — vòng 2: sửa PB-01…PB-08 của phản biện
+
+Phán quyết vòng 1: **FAIL** (`docs/MVP-05-REVIEW.md`: “mất tiền của người dùng”, “tạo tiền từ hư
+không”, “chạy lại miễn phí”, “không có đường tạo owner”). Đã sửa cả 8 mục.
+`npm test` → **826 test · 825 pass · 0 fail · 1 skipped**; `verify.mjs` EXIT=0;
+`imagelab-demo.mjs` → `succeeded`; probe cũ `mvp05-refund-retry.probe.mjs` đã **chuyển thành
+`test/mvp05-refund-retry.test.js`** (3 khẳng định, XANH).
+
+### 16.1 PB-01 (CAO) — giữ tiền rồi trả 4xx mà không hoàn
+
+`src/http/routes.js` thêm `withHoldRelease()`; áp cho **cả 5 chỗ** đã giữ tiền (kể cả nhánh
+`ingest` lỗi và `queue.enqueue` lỗi).
+
+```
+$ node /tmp/mvp05-atk/atk8-confirm.mjs   §8.3 (5 request 409 liên tiếp)
+[audit sau 5 request 409] OK rows=11 sum=1 balance=1 reasons={"admin_grant":1,"job_hold":-0.0415,"job_refund":0.0415}
+  số dư: {"amount":1} → {"amount":1}  (mất 0 credit)     ← vòng 1: 1 → 0.9585, KHÔNG dòng hoàn
+$ node test/mvp05-refund-retry.test.js   → (3) request 4xx sau khi giữ tiền ⇒ có dòng hoàn, ví về đúng cũ ✅
+```
+
+### 16.2 PB-02 (CAO) — chạy lại miễn phí
+
+`run_key` mới trong `wallet_ledger` (migration cộng thêm) + chu kỳ theo LƯỢT CHẠY ở hook;
+`regenerate`/`render`/`generate` giữ tiền ngay trong request; trần `BILLING_MAX_RUNS_PER_JOB`
+⇒ `429 RERUN_LIMIT_EXCEEDED`.
+
+```
+$ node /tmp/mvp05-atk/atk4-gate.mjs   §G3 (1 lượt chạy + 3 regenerate)
+regenerate #1..#3 → 202, usage_events 2→4→6→8
+[audit sau 3 lần regenerate] OK rows=9 sum=0.982 balance=0.982
+  balance: 0.9982 → 0.982                                  ← vòng 1: 0.9982 → 0.9982 (miễn phí)
+$ node /tmp/mvp05-atk/atk8-confirm.mjs §8.2 (chạy lại SAU khi job lỗi đã hoàn tiền)
+  sổ theo job: [job_hold −0.0083, job_refund +0.0083, job_hold −0.0078, job_settle +0.0052]
+  lần 2: status=succeeded, balance=0.9974                   ← vòng 1: balance = 1 (miễn phí)
+```
+
+### 16.3 PB-03 (CAO) — không có đường tạo owner đầu tiên
+
+`AccountService.bootstrapOwner()` + `config.auth.ownerEmail` (`OWNER_EMAIL`) + CLI
+`npm run make-owner -- <email>` + README/`.env.example`; không có owner và không có `OWNER_EMAIL`
+⇒ log WARN hướng dẫn.
+
+```
+$ SQLITE_PATH=<DB mới> npm run make-owner -- owner@example.com
+✅ Đã TẠO owner owner@example.com.  MẬT KHẨU TẠM (chỉ in lần này): …   (chạy lần 2: idempotent)
+$ node /tmp/gop11/pb03-e2e.mjs
+1) CLI: ✅ Đã TẠO owner owner@example.com | MẬT KHẨU TẠM …   2) owner login → 200
+3) GET /api/admin/users → 200   4) cấp credit → 201 {"amount":1,"currency":"USD"}
+5) user chạy job → 202 (KHÔNG còn 402)
+```
+
+### 16.4 PB-04 (TB) — refund sau settle tạo tiền
+
+`refundForJob` trả dòng settle cũ khi lượt đã settle; thêm **partial unique index**
+`uniq_wallet_ledger_run_reason` (SQLite + PostgreSQL, tạo sau migration).
+
+```
+$ node /tmp/mvp05-atk/atk7-race.mjs
+§7.3: 20 lần đua settle+refund: số lần bị thu ĐÚNG (0.9) = 20; số lần job THÀNH RA MIỄN PHÍ (1.0) = 0
+§7.4: sau settle: balance=0.9 (đã thu 0.1) → refund → balance cuối = 0.9 ⇒ ok
+      ← vòng 1: §7.3 = 0/20 thu đúng (20/20 miễn phí); §7.4 hoàn thêm +0.1 ⇒ balance 1.0
+```
+
+### 16.5 PB-05…PB-08
+
+| # | Sửa gì | Bằng chứng |
+|---|---|---|
+| PB-05 | `defaultGrant` nối thật vào `register()` (`reason='grant'`); `holdBeforeJob=false` ⇒ không giữ trước, không 402, có log WARN + `/api/config.billing` nói thật | test `PB-05` (2 ca): `credit_granted.amount = 5`, ví 5, 1 dòng `grant`; `hold_before_job:false` ⇒ job 202 với ví 0 + 0 dòng `job_hold` |
+| PB-06 | `normalizeAmount` chặn tràn số + trần `BILLING_MAX_AMOUNT` ⇒ 400 | `node atk6-money.mjs` §6.5: `credit amount=1e308 → 400 INVALID_AMOUNT` (vòng 1: 201 + dòng `amount=0`); test HTTP: 400 + sổ không thêm dòng |
+| PB-07 | `amount` âm ⇒ `reason='adjustment'`; `0`/không phải số ⇒ 400; giảm quá số dư ⇒ 400 `INSUFFICIENT_CREDIT` | `node atk6-money.mjs` §6.5: `amount=-5 → 400 INSUFFICIENT_CREDIT` (ví 0); test: `-0.5` ⇒ 201 `adjustment`, số dư 1.25 → 1 |
+| PB-08 | bucket theo (email chuẩn hoá, IP), chỉ đếm lần SAI, 429 + `Retry-After`, đăng nhập ĐÚNG không bị chặn; ghi chú `trust proxy` ở `docs/SECURITY.md` | `/tmp/gop11/pb08-check.mjs`: `14 lần SAI → {"401":9,"429":5}`, 429 đầu tiên ở **lần 10**; `đăng nhập ĐÚNG sau khi bucket đầy → 200`; email khác → 401 |
+
+### 16.6 Test thêm & phần chưa sửa được
+
+- **Thêm** `test/mvp05-round2-hardening.test.js` (14 test cho PB-01…PB-08) và
+  `test/mvp05-refund-retry.test.js` (3 test — chuyển từ probe cũ, đã **xoá** `*.probe.mjs`).
+- **Sửa** 1 khẳng định cũ trong `test/mvp05-api.test.js`: `amount = -1 ⇒ 400` đổi thành
+  `-0.25 ⇒ 201 adjustment` (PB-07 đổi hành vi có chủ đích) + thêm ca `-99 ⇒ 400 INSUFFICIENT_CREDIT`.
+- **Chưa sửa được / giới hạn đã biết:**
+  · `run_key` khoá theo LƯỢT CHẠY dựa trên sổ + trạng thái job: nếu hai lượt chạy **chồng thời gian**
+    trên cùng job (route gọi `beforeJob` khi lượt trước CHƯA settle) thì hook coi là CÙNG lượt ⇒ lượt
+    thứ hai không mở hold mới. **Ca đo được còn lại: `atk8-confirm.mjs` §8.1 — retry TỰ ĐỘNG của hàng
+    đợi sau khi job lỗi**: lượt retry chạy khi dòng `job_refund` của lượt trước CHƯA kịp ghi ⇒ hook
+    thấy lượt cũ còn mở ⇒ chạy lại KHÔNG mở hold mới (`rows=3 sum=1 balance=1`). Đường người dùng bấm
+    (`regenerate`/`render`/`generate` sau khi job đã dừng) thì ĐÃ thu đúng — xem §16.2. Sửa triệt để
+    cần cho hàng đợi chờ `afterJob` xong trước khi retry (thay đổi tầng queue/pipeline, ngoài phạm vi
+    vòng này). Chưa đo với nhiều tiến trình (`#locks` vẫn trong bộ nhớ — giới hạn đã ghi từ vòng 1).
+  · `BILLING_HOLD_BEFORE_JOB=false` ở chế độ nhiều tiến trình: lượt settle-only dựa vào sổ để suy ra
+    `run_key`, hai tiến trình có thể cùng mở một lượt ⇒ chưa đo.
+  · Chưa đo: PostgreSQL thật cho partial unique index (chỉ chạy SQLite), reverse proxy thật cho
+    `trust proxy`, trình duyệt thật cho UI credit âm.
+
+---
+
+## 17. MVP-05 — vòng 3: sửa BR-01…BR-07 của phản biện vòng 2
+
+Phán quyết vòng 2: **FAIL** — “bản vá PB-02 phát sinh lỗi thu thừa ở ĐƯỜNG MẶC ĐỊNH” (BR-07).
+Đã sửa cả 7 mục. `npm test` → **836 test · 835 pass · 0 fail · 1 skipped**; `verify.mjs` EXIT=0;
+`imagelab-demo.mjs` → `succeeded`.
+
+### 17.1 BR-07 (CAO, đường mặc định) — thu theo usage TÍCH LUỸ của cả job
+
+`usage_events.run_key` + `recordUsage({runKey})` + `usageSummary(jobId, {runKey})`; pipeline gắn
+`run_key` của lượt vào mọi event và truyền vào `afterJob`; `settleForJob` chỉ thu **chi phí của
+riêng lượt** (fallback: `max(0, tổng usage − Σ đã thu các lượt trước)`).
+
+```
+$ node /tmp/mvp05-atk2/t13-overcharge-unit.mjs
+  lượt 1: hold=JOB-OVER#1 · usage TÍCH LUỸ=0.1 · chi phí THẬT của lượt=0.1 · settle=0.4 · balance=0.9
+  lượt 2: hold=JOB-OVER#2 · usage TÍCH LUỸ=0.2 · chi phí THẬT của lượt=0.1 · settle=0.4 · balance=0.8
+  lượt 3: hold=JOB-OVER#3 · usage TÍCH LUỸ=0.3 · chi phí THẬT của lượt=0.1 · settle=0.4 · balance=0.7
+  lượt 4: hold=JOB-OVER#4 … settle=0.4 · balance=0.6      ← KHÔNG còn bị chặn oan
+  TỔNG chi phí THẬT = 0.5 · TỔNG ĐÃ THU = 0.5 ⇒ không thu thừa
+        (vòng 2: settle 0.4/0.3/0.2 ⇒ thu 0.6 cho 0.3, lượt 4 INSUFFICIENT_CREDIT)
+
+$ node /tmp/mvp05-atk2/t12-overcharge.mjs
+  chi phí THẬT từng lượt: [0.0018 ×4] · TỔNG THẬT = 0.0072
+  TỔNG ĐÃ THU = 0.0072 ⇒ không thu thừa          (vòng 2: 0.018 = +150%)
+  sổ: hold#1,settle#1 … hold#4,settle#4 (mỗi lượt 0.0083/0.0065)
+
+$ node /tmp/mvp05-atk2/t11-render-final.mjs
+  sổ: ["job_hold@#1=-0.0027","job_settle@#1=0.0015","job_hold@#2=-0.0027","job_settle@#2=0.0012"]
+  ⇒ lượt render chỉ bị thu phần CỦA LƯỢT (0.0015), không phải cả job 0.0027
+
+$ node /tmp/mvp05-atk/atk4-gate.mjs   §G3 (3 lượt regenerate)
+  balance: 0.9982 → 0.9928 · tổng chi phí thật usage = 0.0072   (vòng 2: → 0.982, tức 0.018)
+```
+
+### 17.2 BR-01 — `BILLING_HOLD_BEFORE_JOB=false` (trần 3)
+
+```
+$ node /tmp/mvp05-atk2/t7-regression.mjs   §T7.1
+[audit sau lượt 1] OK rows=2 … reasons={"admin_grant":1,"job_settle":-0.0018}
+  lượt 2: HTTP 202 · balance=0.9964 · dòng sổ=3 · usage={"events":4,…}
+  lượt 3: HTTP 202 · balance=0.9946 · dòng sổ=4 · usage={"events":6,…}
+  lượt 4: HTTP 429 · balance=0.9946 · dòng sổ=4      ← trần CÓ tác dụng
+  sổ cuối: ["job_settle=-0.0018","job_settle=-0.0018","job_settle=-0.0018"]
+  ⇒ có thu tiền            (vòng 2: 202/202/202, số dư 0.9982 không đổi, 0 dòng settle)
+```
+
+### 17.3 BR-02 — chồng nhau; BR-05 — lượt lỗi không ăn trần; BR-06 — ingest lỗi
+
+```
+$ node /tmp/mvp05-atk2/t9-overlap.mjs
+  A=202 B=409
+  sổ: ["job_hold@#1=-0.0083","job_settle@#1=0.0065","job_hold@#2=-0.0083","job_settle@#2=0.0065"]
+  số lượt (run_key) = 2 · số lần chạy thật = 2 · số lần bị giữ tiền = 2 ⇒ mỗi lượt chạy đều bị giữ tiền
+        (vòng 2: A=202 B=202 · 3 lượt chạy thật nhưng chỉ 2 lượt bị thu)
+
+$ node /tmp/mvp05-atk2/t10-cap-failed.mjs
+  job.status=failed error=TEMPLATE_NOT_FOUND · số lượt đã tiêu: 2
+  balance = {"amount":1} (các lượt lỗi đều được hoàn) · chạy lại sau khi job lỗi → HTTP 202
+        (vòng 2: 429 {runs:2,max_runs:2} — job chưa từng thành công đã bị khoá)
+
+$ node /tmp/mvp05-atk2/t4-pb04-proc.mjs      (BR-03: 2 tiến trình chung 1 file SQLite)
+  §T4.2 settle‖refund: A ok (job_settle 0.4) · B {"code":"ERR_SQLITE_ERROR","message":"database is locked"}
+    CÓ CẢ settle VÀ refund cho cùng run? false ⇒ không · balance cuối = 0.9 (thu đúng)
+  §T4.3 hai settle: số dòng settle = 1 · balance = 0.9    §T4.4 hai refund: số dòng refund = 1 · balance = 1
+  §T4.1 50 lần đua trong 1 tiến trình: thu ĐÚNG = 50 · job MIỄN PHÍ = 0
+  Ghi chú: lỗi `database is locked` ở tiến trình thua là lỗi HẠ TẦNG (đã map thành `LEDGER_BUSY`
+  khi đi qua tầng billing); điều quan trọng: **không** run nào vừa settle vừa refund, số dòng đóng
+  = 1, số dư đúng. `beforeJob` gặp lỗi sổ ⇒ 503 `BILLING_UNAVAILABLE` (fail-closed, xem test).
+```
+
+### 17.4 Hồi quy vòng 1 + ẩn danh + migration
+
+```
+$ node /tmp/mvp05-atk/{atk8-confirm,atk7-race,atk4-gate}.mjs
+  atk8 §8.3: 5×409 ⇒ balance 1 → 1, sổ 5 hold + 5 refund        (PB-01 vẫn xanh)
+  atk8 §8.2: job lỗi đã hoàn → regenerate mở lượt #2, thu 0.0018 (PB-02 vẫn xanh)
+  atk7 §7.3: 20/20 thu đúng 0.9, 0 lần miễn phí · §7.4 balance cuối 0.9 ⇒ ok  (PB-04 vẫn xanh)
+$ node /tmp/mvp05-atk2/t7-regression.mjs §T7.2/§T7.3
+  3 job ẨN DANH (0 cookie) → 202 · dòng sổ = 0        (luật #1 không đổi)
+  init() 2 lần trên DB CŨ → OK · cột wallet_ledger có thêm run_key, close_kind
+```
+
+### 17.5 Test thêm & phần chưa sửa được
+
+- **Thêm** `test/mvp05-round3-hardening.test.js` (**10 test**: BR-01…BR-07, gồm cả ca fail-closed
+  và ràng buộc DB chặn 2 dòng đóng cho cùng lượt).
+- **Chưa sửa được / còn đo được:**
+  · Hai tiến trình ghi sổ **cùng lúc** trên một file SQLite: một tiến trình vẫn nhận
+    `database is locked` (dù `busy_timeout = 5000`) — nay được map thành `LEDGER_BUSY`/503 thay vì
+    chạy free, nhưng **chưa** có retry tự động; PostgreSQL thật cũng **chưa đo**.
+  · `usage_events.run_key` của các dòng CŨ là NULL; chúng được quy về lượt `#1`, nên trên DB cũ
+    lượt `#1` vẫn có thể gộp usage của nhiều lượt lịch sử (không thể tái tạo dữ liệu đã mất).
+  · BR-02 chặn bằng 409 khi lượt đang mở: nếu client chạy **hai tiến trình** cùng job (không qua
+    route) thì vẫn phụ thuộc trạng thái sổ (đã có unique index bảo vệ, chưa đo đa tiến trình).
+  · Chưa đo: reverse proxy thật cho `trust proxy`, hàng đợi đa tiến trình, PG partial unique index.
+
+---
+
+## 18. MVP-05 — vòng 4: sửa BR-08 + BR-09 của phản biện vòng 3
+
+Phán quyết vòng 3: **PASS CÓ ĐIỀU KIỆN** (2 lỗ mới). Đã sửa cả hai.
+`npm test` → **842 test · 841 pass · 0 fail · 1 skipped**; `verify.mjs` EXIT=0; `imagelab-demo.mjs`
+→ `succeeded`.
+
+### 18.1 BR-08 — lượt TREO (hold không có dòng đóng) ⇒ thu hồi, hết 409 vĩnh viễn
+
+`store.listOpenJobHolds()` + `BillingService.reconcileStuckRuns()` (hoàn 100% + `meta.reconciled`,
+`meta.stuck_ms`), gọi lúc boot, trước 409, và qua `POST /api/admin/billing/reconcile`.
+
+```
+$ node /tmp/mvp05-atk3/u3b-stuck.mjs        (ngưỡng MẶC ĐỊNH 15 phút = ĐỐI CHỨNG ÂM)
+  SAU khi settle lượt 2 bị lỗi: balance=1.9899 sổ=["job_hold@#1","job_settle@#1","job_hold@#2"]
+  chạy lại lần 3/4/5 → HTTP 409 JOB_ALREADY_RUNNING run_key=#2
+  ⇒ lượt CÒN MỚI: KHÔNG bị thu hồi, vẫn 409 (không cắt ngang job đang chạy thật) ✔
+
+$ node /tmp/gop13/u3b-low.mjs               (cùng kịch bản, hạ ngưỡng qua configOverrides)
+  SAU khi settle lượt 2 bị lỗi: balance=1.9899 sổ=[... "job_hold@#2"]
+  chạy lại lần 3 → HTTP 202
+    sau lần 3: balance=1.9964 sổ=[hold#1, settle#1, hold#2, job_refund@#2=0.0083, hold#3, settle#3]
+  chạy lại lần 4 → HTTP 202 · sau lần 4: balance=1.9946 (hold#4, settle#4)
+  POST /api/admin/billing/reconcile → HTTP 200 {"reconciled":0,"refunded":0,"older_than_ms":50}
+  ⇒ 4 hold, 4 dòng đóng ⇒ MỌI lượt đều đã khép (không còn kẹt) ✔
+
+$ node --test test/mvp05-round4-hardening.test.js
+  ✔ lượt quá hạn ⇒ hoàn 100% + có dòng đóng; lượt CÒN MỚI ⇒ không đụng
+  ✔ HTTP: lượt treo quá hạn ⇒ request sau KHÔNG còn 409, tiền được hoàn, lượt mới bị thu
+  ✔ route bảo trì: member ⇒ 403, owner ⇒ 200 kèm {reconciled, refunded}
+```
+
+Ghi chú trung thực: harness của phản biện (`/tmp/mvp05-atk3/lib3.mjs`) dựng config từ một object env
+cố định nên **không** đọc biến môi trường `BILLING_STUCK_RUN_MS`; muốn chạy ca "thu hồi" với script
+của họ phải truyền `configOverrides` — đó chính là `/tmp/gop13/u3b-low.mjs` (bản sao 1:1 kịch bản,
+chỉ khác ngưỡng).
+
+### 18.2 BR-09 — không thu lại usage của lượt ĐÃ HOÀN
+
+```
+$ node /tmp/mvp05-atk3/u1-br07.mjs
+  U1.1: TỔNG THẬT=0.3 · TỔNG ĐÃ THU=0.3 ⇒ KHÔNG thu thừa ✔
+  U1.2 (HTTP 4 lượt): TỔNG THẬT=0.0072 · TỔNG ĐÃ THU=0.0072 ⇒ KHÔNG thu thừa ✔
+  U1.3: #1 (usage NULL) thu 0.5 · #2 (usage gắn #2) thu 0.2 · #3 (không usage riêng) thu 0
+  U1.4: lượt #1 LỖI → refund 0.5 (hoàn 100%) · lượt #2 (KHÔNG usage riêng): thu 0 ⇒ KHÔNG thu lại ✔
+        (vòng 3: thu 0.3 — tức thu lại đúng phần vừa hoàn)
+
+$ node /tmp/mvp05-atk3/u6-late-usage.mjs
+  lượt 1: thu 0.1 · ghi thêm usage 0.2 cho LƯỢT 1 SAU khi đã settle
+  lượt 2 (usage riêng 0.3): thu 0.3 (KHÔNG thu phần đến muộn của lượt 1)
+  lượt 3 (không usage riêng): thu 0 ⇒ không thu      (vòng 3: thu 0.2 của lượt 1)
+  tổng chi phí THẬT đã ghi = 0.6 · tổng ĐÃ THU = 0.4  ← thu THIẾU 0.2 (có chủ ý: thà thiếu hơn thừa)
+```
+
+### 18.3 Không hồi quy (script phản biện vòng 2)
+
+```
+$ node /tmp/mvp05-atk2/t13-overcharge-unit.mjs   → TỔNG ĐÃ THU = 0.5 ⇒ không thu thừa
+$ node /tmp/mvp05-atk2/t12-overcharge.mjs        → TỔNG ĐÃ THU = 0.0072 ⇒ không thu thừa
+$ node /tmp/mvp05-atk2/t9-overlap.mjs            → A=202 B=409 · mỗi lượt chạy đều bị giữ tiền
+$ node /tmp/mvp05-atk2/t7-regression.mjs §T7.1   → lượt 4 HTTP 429 · "⇒ có thu tiền"
+```
+
+### 18.4 Test thêm & phần chưa sửa được
+
+- **Thêm** `test/mvp05-round4-hardening.test.js` (**6 test**: BR-08 ba chiều — thu hồi lượt cũ, không
+  đụng lượt mới (409), route bảo trì 403/200; BR-09 ba ca — lượt đã hoàn, usage đến muộn, DB cũ).
+- **Chưa sửa được / còn đo được:**
+  · Thu hồi lượt treo dựa trên **ngưỡng thời gian**: một job bị treo vẫn phải chờ tới
+    `BILLING_STUCK_RUN_MS` (mặc định 15 phút) mới chạy lại được (trước đó vẫn 409).
+  · Thứ tự `created_at` giữa các dòng trong cùng mili-giây là ngẫu nhiên; BR-09 vì vậy dùng bộ đếm
+    xác định thay cho so sánh thời gian, nhưng usage ghi bởi **tiến trình khác** (không qua
+    `recordUsage` của repo) vẫn có thể bị quy nhầm lượt — chưa đo.
+  · Usage đến muộn của lượt đã khép bị **bỏ** (thu thiếu) — cố ý, đã ghi trong hợp đồng §7.2.
+  · Chưa đo: PostgreSQL thật cho `listOpenJobHolds` (NOT EXISTS + partial index) và cho
+    `reconcileStuckRuns`; chưa có job định kỳ (cron) gọi reconcile — hiện chỉ boot/409/route tay.
+
+---
+
+## 19. MVP-05 — vòng 5: BR-10 (không cắt ngang lượt đang chạy) + BR-11 (dấu vết usage)
+
+Phán quyết vòng 4: **PASS** + 2 cảnh báo. Đã sửa cả hai.
+`npm test` → **849 test · 848 pass · 0 fail · 1 skipped**; `verify.mjs` EXIT=0; `imagelab-demo.mjs`
+→ `succeeded`.
+
+### 19.1 BR-10 — reconcile không cắt ngang lượt ĐANG CHẠY
+
+`reconcileStuckRuns` nhận `isJobActive` (app bơm: `queue.isPending` hoặc status `queued|running`)
+⇒ bỏ qua lượt của job đang chạy; `force` cho admin; đáy an toàn `minStuckRunMs` chỉ áp cho đường
+KHÔNG kiểm được trạng thái job.
+
+```
+$ node /tmp/mvp05-atk4/v2-br09-boot.mjs   §V2.4 (hạ ngưỡng 300ms, job chậm 2s, bắn 2 request)
+  HTTP: A=202 B=409
+  sổ: hold/settle cho 2 lượt (KHÔNG có job_refund nào)
+  chi phí THẬT tổng=0.0036 · ĐÃ THU=0.0036 ⇒ không hụt
+        (vòng 4: 3 lượt chạy thật, chi phí 0.0054 mà chỉ thu 0.0036 = THU THIẾU 0.0018)
+  §V2.3 boot reconcile: "trước restart: balance=1.9899 · lượt MỞ=1" → "sau restart: balance=1.9982
+        (trước 1.9899) · lượt MỞ=0" ⇒ boot đã thu hồi ✔
+
+$ node /tmp/mvp05-atk4/v1-br08.mjs
+  §V1.1: dòng refund: [{"run_key":"#2","amount":0.0083,"reconciled":true,"stuck_ms":28937}] ⇒ PHỤC HỒI ĐƯỢC ✔
+  §V1.2 (đối chứng âm, ngưỡng mặc định): "có dòng refund nào mới không? không ✔" (vẫn 409)
+  §V1.3 route admin: owner → 200 {"reconciled":1,"refunded":0.0083,"older_than_ms":1000,
+        "skipped_active":0,"forced":false}; gọi lần 2 → {"reconciled":0} (idempotent)
+        (member 403 · ẩn danh 401)
+
+$ node /tmp/mvp05-atk4/v3-negative-regression.mjs
+  §V3.2 admin ép reconcile (older_than_ms=0) cho lượt MỚI ⇒ "retry → 409" (KHÔNG cắt lượt mới),
+        sau đó "admin reconcile older_than_ms=0 → 200 {reconciled:1, refunded:0.0083}" ⇒
+        "chạy lại sau khi ép reconcile → 202"
+  §V3.4 BR-07: TỔNG THẬT=0.0072 · ĐÃ THU=0.0072 ⇒ khớp ✔
+```
+
+### 19.2 BR-11 — dấu vết nguồn usage
+
+```
+$ node /tmp/mvp05-atk4/v3-negative-regression.mjs   §V3.3
+  usage_unavailable: KHÔNG đọc được usage ⇒ thu 0 + meta + WARN · balance=1 (thu 0 ⇒ hoàn hết)
+
+$ node --test test/mvp05-round5-hardening.test.js
+  ✔ job KHÔNG tốn gì ⇒ meta.usage_source = 'none' (không phải 'unavailable')
+  ✔ usage có nhưng KHÔNG thuộc lượt ⇒ usage_source='unavailable' + usage_unavailable + WARN
+  ✔ usage của chính lượt ⇒ 'run'; usage DB cũ (không run_key) ⇒ 'legacy'
+```
+
+### 19.3 Không hồi quy (script vòng 3 + vòng 4)
+
+```
+$ node /tmp/mvp05-atk3/u1-br07.mjs  → U1.1: 0.3 = 0.3 ✔ · U1.2: 0.0072 = 0.0072 ✔
+                                       U1.4: "lượt #2 (KHÔNG usage riêng): thu 0 ⇒ không thu lại ✔"
+$ node /tmp/mvp05-atk3/u3b-stuck.mjs → lượt CÒN MỚI + ngưỡng mặc định: vẫn 409 (đối chứng âm)
+$ node /tmp/mvp05-atk2/t13,t12,t9,t7 → mỗi lượt thu đúng phần của lượt; A=202 B=409; trần 429
+```
+
+### 19.4 Test thêm & phần chưa sửa được
+
+- **Thêm** `test/mvp05-round5-hardening.test.js` (**7 test**: BR-10 bốn chiều — bỏ qua job đang
+  chạy, đáy an toàn + WARN, ca HTTP "tổng thu = tổng thật", `force` + `meta.forced`; BR-11 ba ca —
+  `none`, `unavailable` + WARN, `run`/`legacy`).
+- **Chưa sửa được / còn đo được:**
+  · `isJobActive` dựa vào trạng thái job: một tiến trình **chết** để lại job `running` vĩnh viễn ⇒
+    reconciliation bỏ qua mãi (phải dùng `force: true`); chưa có heartbeat/TTL cho trạng thái job.
+  · Đáy an toàn chỉ áp cho đường KHÔNG kiểm được trạng thái job — nghĩa là vẫn có thể cấu hình
+    ngưỡng rất ngắn cho đường có `isJobActive`; rào thật ở đó là `queue.isPending` + status, chưa
+    đo với hàng đợi **đa tiến trình**.
+  · `/tmp/mvp05-atk4/v1-br08.mjs` §V1.4 crash trong **script của phản biện** (`no such table:
+    wallet_ledger`) khi họ thử dựng lại boot trên store in-memory — không phải lỗi repo; ca boot
+    được chứng minh bằng `v2 §V2.3` (DB file thật, restart thật).

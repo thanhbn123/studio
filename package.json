@@ -15,7 +15,8 @@
     "migrate": "node src/store/migrate.js",
     "probe": "node tools/live-probe.mjs",
     "verify": "node tools/verify.mjs",
-    "demo:imagelab": "node tools/imagelab-demo.mjs"
+    "demo:imagelab": "node tools/imagelab-demo.mjs",
+    "make-owner": "node tools/make-owner.mjs"
   },
   "dependencies": {
     "pg": "^8.13.1"

@@ -5,16 +5,61 @@
  * không lộ secret, không lộ chi tiết nội bộ).
  */
 
-import { Router, HttpError, sendJson, readJson, sessionId, presentedSessionId, MAX_BODY_BYTES_DEFAULT, SECURITY_HEADERS } from './server.js';
+import { randomUUID } from 'node:crypto';
+import { Router, HttpError, sendJson, readJson, sessionId, presentedSessionId, parseCookies, MAX_BODY_BYTES_DEFAULT, SECURITY_HEADERS } from './server.js';
 import { scrubPaths } from '../logger.js';
 import { tryDetectSource } from '../sources/detect.js';
 import { STYLES, LENGTHS } from '../content/styles.js';
 import { JOB_STATUS } from '../store/index.js';
-import { enforce } from '../security/ratelimit.js';
+import { enforce, clientKey } from '../security/ratelimit.js';
 import { sniffImageMime, sanitizeFilename, sanitizeText } from '../security/sanitize.js';
 import { parseContentOptions } from '../content/styles.js';
 
 const UUID_RE = /^[0-9a-fA-F-]{36}$|^[A-Za-z0-9_-]{8,64}$/;
+
+/* ══════════════ MVP-05 · hằng số ĐÓNG BĂNG (hợp đồng §2.1/§2.3/§3.3) ══════════════
+ * Khai ở cấp MODULE để mọi hàm ánh xạ lỗi dùng CHUNG một nguồn và không phụ thuộc thứ tự
+ * khai báo. Cố ý KHÔNG static-import `src/accounts/**`: routes.js phải nạp được kể cả khi
+ * khối MVP-05 chưa có mặt (A3 nạp phòng thủ bằng dynamic import) — một import hỏng ở đây
+ * sẽ làm chết cả MVP-01/02/03.
+ */
+
+/** Tiền tố route NGHIỆP VỤ — chỉ những route này mới bị cổng "bắt buộc đăng nhập" chạm tới. */
+const BUSINESS_PATH_RE = /^\/api\/(?:jobs|imagelab|imagestudio|uploads|detect)(?:\/|$)/;
+
+const ANON_EXEMPT_PATHS = new Set(['/api/health', '/api/config']);
+
+/** Vai trò hợp lệ (§2.1) — ĐÓNG BĂNG, dùng chung cho phân quyền và route quản trị. */
+const AUTH_ROLES = Object.freeze(['owner', 'admin', 'member']);
+const ADMIN_ROLES = new Set(['owner', 'admin']);
+
+/** Nhóm tổng hợp usage mà `/api/admin/usage` chấp nhận (§3.3). */
+const USAGE_GROUP_BY = Object.freeze(['day', 'operation', 'user']);
+
+/**
+ * Danh sách operation của bảng giá (§2.1) — chỉ dùng để hỏi giá khi store CHƯA có
+ * `listPricing`; không phải bản sao bảng giá (giá vẫn do A2/store quyết định).
+ */
+const PRICING_OPERATIONS = Object.freeze([
+  'SOURCE_EXTRACT', 'VISION_ANALYSIS', 'TRANSLATION', 'CONTENT_GENERATE', 'CONTENT_REPAIR',
+  'OCR_DETECT', 'IMAGE_RENDER', 'IMAGE_MATTING', 'IMAGE_COMPOSE', 'IMAGE_RETOUCH',
+]);
+
+/** Câu DUY NHẤT cho mọi ca sai thông tin đăng nhập (khớp hằng số trong `buildRouter`). */
+const BAD_CREDENTIALS_TEXT = 'Email hoặc mật khẩu không đúng.';
+
+const AUTH_CODE_SETS = Object.freeze({
+  EMAIL_TAKEN: new Set(['EMAIL_TAKEN', 'EMAIL_EXISTS', 'DUPLICATE_EMAIL', 'USER_EXISTS', 'EMAIL_IN_USE']),
+  WEAK_PASSWORD: new Set(['WEAK_PASSWORD', 'PASSWORD_TOO_SHORT', 'SHORT_PASSWORD', 'PASSWORD_TOO_WEAK', 'WEAK']),
+  BAD_CREDENTIALS: new Set([
+    'BAD_CREDENTIALS', 'INVALID_CREDENTIALS', 'INVALID_PASSWORD', 'WRONG_PASSWORD', 'PASSWORD_MISMATCH',
+    'USER_NOT_FOUND', 'NOT_FOUND', 'NO_SUCH_USER', 'BAD_EMAIL', 'INVALID_EMAIL',
+  ]),
+  DISABLED: new Set(['ACCOUNT_DISABLED', 'USER_DISABLED', 'DISABLED', 'FORBIDDEN']),
+  BAD_BODY: new Set(['BAD_BODY', 'INVALID_INPUT', 'VALIDATION_ERROR', 'MISSING_FIELD', 'BAD_REQUEST', 'BAD_EMAIL', 'INVALID_EMAIL']),
+  USER_NOT_FOUND: new Set(['USER_NOT_FOUND', 'NOT_FOUND', 'NO_SUCH_USER']),
+  BAD_ROLE: new Set(['BAD_ROLE', 'INVALID_ROLE', 'ROLE_INVALID']),
+});
 
 export function buildRouter(app) {
   const { config, logger, store, pipeline, queue, sessions, rateLimiters, registry, visionProvider, contentEngine } = app;
@@ -25,6 +70,28 @@ export function buildRouter(app) {
     const job = await store.getJob(id);
     if (!job) throw new HttpError(404, 'JOB_NOT_FOUND', 'Không tìm thấy job.');
     return job;
+  };
+
+  /**
+   * MVP-05 (§3.3) — TÁCH DỮ LIỆU THEO TÀI KHOẢN.
+   *
+   * Tài nguyên có `user_id` (job/asset của người đã đăng nhập) chỉ thuộc về ĐÚNG user đó:
+   * khác chủ ⇒ **404** (không xác nhận sự tồn tại), kể cả khi session_id trùng — nếu không,
+   * đăng xuất xong vẫn đọc được dữ liệu cũ bằng cookie `sid` còn lại.
+   *
+   * `user_id` NULL = tài nguyên của khách ẨN DANH (MVP-01/02/03) ⇒ trả `false` để tầng gọi
+   * giữ nguyên luật cũ theo `session_id`; KHÔNG tự gán tài nguyên ẩn danh cho tài khoản nào
+   * (§2.2). Đây là chỗ DUY NHẤT định nghĩa luật sở hữu theo tài khoản — mọi route job/asset
+   * (kể cả route cũ của MVP-01/02/03) đều đi qua đây.
+   *
+   * @returns {boolean} true = đã kiểm theo tài khoản (chủ hợp lệ), false = tài nguyên ẩn danh
+   */
+  const assertAccountOwnership = (resource, req, { code = 'JOB_NOT_FOUND', message = 'Không tìm thấy job.' } = {}) => {
+    const ownerId = resource?.user_id ?? null;
+    if (ownerId === null || ownerId === undefined || ownerId === '') return false;
+    const userId = req?.user?.id ?? null;
+    if (!userId || String(userId) !== String(ownerId)) throw new HttpError(404, code, message);
+    return true;
   };
 
   /**
@@ -40,6 +107,8 @@ export function buildRouter(app) {
    */
   const requireOwnJob = async (req, res, id) => {
     const job = await requireJob(id);
+    // MVP-05: job của TÀI KHOẢN khác ⇒ 404 trước mọi đối chiếu session.
+    if (assertAccountOwnership(job, req)) return job;
     if (!job.session_id) return job; // job cũ không gắn session → không có gì để đối chiếu
     const sid = sessionId(req, res);
     if (job.session_id === sid) return job;
@@ -141,27 +210,45 @@ export function buildRouter(app) {
 
   // Quyền sở hữu theo session: tài nguyên của người khác trả 404 y như tài nguyên
   // không tồn tại — không xác nhận sự tồn tại của job/asset của session khác.
-  const requireImagelabJob = async (id, sid) => {
+  // MVP-05: tài nguyên của TÀI KHOẢN khác cũng 404 (kiểm trước, xem `assertAccountOwnership`).
+  const requireImagelabJob = async (id, sid, req = null) => {
     requireImagelab();
     if (!UUID_RE.test(id)) throw new HttpError(400, 'BAD_JOB_ID', 'Mã job không hợp lệ.');
     const job = await store.getJob(id);
-    if (!job || job.session_id !== sid) throw new HttpError(404, 'JOB_NOT_FOUND', 'Không tìm thấy job.');
+    if (!job) throw new HttpError(404, 'JOB_NOT_FOUND', 'Không tìm thấy job.');
+    if (assertAccountOwnership(job, req)) return job;
+    if (job.session_id !== sid) throw new HttpError(404, 'JOB_NOT_FOUND', 'Không tìm thấy job.');
     return job;
   };
 
-  const requireImagelabAsset = async (id, sid) => {
+  const requireImagelabAsset = async (id, sid, req = null) => {
     requireImagelab();
     requireStoreMethod('getImageAsset');
     if (!UUID_RE.test(id)) throw new HttpError(400, 'BAD_ASSET_ID', 'Mã ảnh không hợp lệ.');
     const asset = await store.getImageAsset(id);
     if (!asset) throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
 
+    // Job sở hữu ảnh (nếu có) — dùng cho CẢ luật tài khoản (MVP-05) lẫn luật session (cũ).
+    const ownerJob = asset.job_id ? await store.getJob(asset.job_id) : null;
+
+    // (1) MVP-05 — ảnh HOẶC job sở hữu gắn `user_id`: chỉ chủ đọc được, khác chủ ⇒ 404.
+    const accountOwner = asset.user_id ?? ownerJob?.user_id ?? null;
+    if (accountOwner !== null && accountOwner !== undefined && accountOwner !== '') {
+      if (String(req?.user?.id ?? '') !== String(accountOwner)) {
+        throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
+      }
+      return asset;
+    }
+
+    // (2) Ảnh ẩn danh: giữ nguyên luật MVP-02/03 theo `session_id`. Khi chủ hệ thống TẮT
+    // chế độ ẩn danh (AUTH_ANONYMOUS_ALLOWED=false) thì tài nguyên ẩn danh không còn phục vụ.
+    if (!anonymousAllowed()) throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
+
     if (asset.session_id) {
       if (asset.session_id !== sid) throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
     } else if (asset.job_id) {
       // Thiếu session_id trên asset thì đối chiếu qua job sở hữu nó.
-      const job = await store.getJob(asset.job_id);
-      if (!job || job.session_id !== sid) throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
+      if (!ownerJob || ownerJob.session_id !== sid) throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
     } else {
       // Không xác định được chủ sở hữu → fail-closed, không trả dữ liệu.
       throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
@@ -281,27 +368,42 @@ export function buildRouter(app) {
   };
 
   /** Quyền sở hữu job theo session: job của session khác trả 404 y như job không tồn tại. */
-  const requireImagestudioJob = async (id, sid) => {
+  const requireImagestudioJob = async (id, sid, req = null) => {
     requireImagestudio();
     if (!UUID_RE.test(id)) throw new HttpError(400, 'BAD_JOB_ID', 'Mã job không hợp lệ.');
     const job = await store.getJob(id);
-    if (!job || job.session_id !== sid) throw new HttpError(404, 'JOB_NOT_FOUND', 'Không tìm thấy job.');
+    if (!job) throw new HttpError(404, 'JOB_NOT_FOUND', 'Không tìm thấy job.');
+    // MVP-05: job của TÀI KHOẢN khác ⇒ 404 (không xác nhận sự tồn tại).
+    if (assertAccountOwnership(job, req)) return job;
+    if (job.session_id !== sid) throw new HttpError(404, 'JOB_NOT_FOUND', 'Không tìm thấy job.');
     return job;
   };
 
   /** Quyền sở hữu ẢNH theo session — cùng luật với `requireImagelabAsset` (khác chủ ⇒ 404). */
-  const requireImagestudioAsset = async (id, sid) => {
+  const requireImagestudioAsset = async (id, sid, req = null) => {
     requireImagestudio();
     requireImagestudioStoreMethod('getImageAsset');
     if (!UUID_RE.test(id)) throw new HttpError(400, 'BAD_ASSET_ID', 'Mã ảnh không hợp lệ.');
     const asset = await store.getImageAsset(id);
     if (!asset) throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
 
+    const ownerJob = asset.job_id ? await store.getJob(asset.job_id) : null;
+
+    // (1) MVP-05 — ảnh HOẶC job sở hữu gắn `user_id`: chỉ chủ đọc được.
+    const accountOwner = asset.user_id ?? ownerJob?.user_id ?? null;
+    if (accountOwner !== null && accountOwner !== undefined && accountOwner !== '') {
+      if (String(req?.user?.id ?? '') !== String(accountOwner)) {
+        throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
+      }
+      return asset;
+    }
+
+    // (2) Ảnh ẩn danh: giữ nguyên luật theo `session_id`; tắt ẩn danh ⇒ không phục vụ.
+    if (!anonymousAllowed()) throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
     if (asset.session_id) {
       if (asset.session_id !== sid) throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
     } else if (asset.job_id) {
-      const job = await store.getJob(asset.job_id);
-      if (!job || job.session_id !== sid) throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
+      if (!ownerJob || ownerJob.session_id !== sid) throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
     } else {
       // Không xác định được chủ sở hữu → fail-closed, không trả dữ liệu.
       throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy ảnh.');
@@ -421,6 +523,757 @@ export function buildRouter(app) {
     }
   };
 
+  /* ══════════════ MVP-05 · Tài khoản + Ví credit (hợp đồng §3.3) ══════════════ */
+
+  /* ── Khoá cấu hình (§2.3 — A1 sở hữu `config.auth`, A2 sở hữu `config.billing`) ──
+   * Đọc PHÒNG THỦ: hai khối này có thể chưa có mặt khi các agent chạy song song. Thiếu
+   * khoá ⇒ mặc định TƯƠNG THÍCH NGƯỢC (bật + cho phép ẩn danh) để luật #1 luôn đúng:
+   * mọi test MVP-01/02/03 hiện có phải tiếp tục xanh.
+   */
+  const authConfig = () => (config?.auth && typeof config.auth === 'object' ? config.auth : {});
+  const billingConfig = () => (config?.billing && typeof config.billing === 'object' ? config.billing : {});
+  const authEnabled = () => authConfig().enabled !== false;
+  const anonymousAllowed = () => authConfig().anonymousAllowed !== false;
+  const billingEnabled = () => billingConfig().enabled !== false;
+  const passwordMinLength = () => {
+    const n = Number(authConfig().passwordMinLength);
+    return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 10;
+  };
+  const sessionDays = () => {
+    const n = Number(authConfig().sessionDays);
+    return Number.isFinite(n) && n > 0 ? n : 30;
+  };
+  /** Tên cookie xác thực — chỉ nhận tên hợp lệ (không cho cấu hình chèn header lạ). */
+  const authCookieName = () => {
+    const raw = String(authConfig().cookieName || 'vauth').trim();
+    return /^[A-Za-z0-9_.-]{1,64}$/.test(raw) ? raw : 'vauth';
+  };
+  const creditCurrency = () => String(billingConfig().currency || config?.cost?.currency || 'USD');
+
+  /** Dịch vụ A1/A3 bơm vào `app`; `null` khi chưa nạp được ⇒ hệ thống chạy như MVP-01/02/03. */
+  const accountService = () =>
+    app?.accountService && typeof app.accountService.authenticate === 'function' ? app.accountService : null;
+  const walletService = () => (app?.billingService && typeof app.billingService === 'object' ? app.billingService : null);
+  const accountsAvailable = () => Boolean(accountService());
+  const billingAvailable = () => Boolean(walletService()) && billingEnabled();
+
+  const AUTH_DISABLED_MESSAGE = 'Tính năng tài khoản đang bị tắt bằng cấu hình (AUTH_ENABLED=false).';
+  const AUTH_UNAVAILABLE_MESSAGE = 'Dịch vụ tài khoản chưa nạp được trên máy chủ này — tạm thời chưa đăng nhập/đăng ký được.';
+  const BILLING_UNAVAILABLE_MESSAGE = 'Ví credit chưa nạp được trên máy chủ này — tính năng ví tạm thời không dùng được.';
+  /** Câu DUY NHẤT cho mọi ca sai thông tin đăng nhập (không tiết lộ email có tồn tại hay không). */
+  const BAD_CREDENTIALS_MESSAGE = 'Email hoặc mật khẩu không đúng.';
+
+  /** `/api/auth/*` khi AUTH_ENABLED=false ⇒ 503 AUTH_DISABLED (hợp đồng §3.3). */
+  const requireAuthFeature = () => {
+    if (!authEnabled()) throw HttpError.safe(503, 'AUTH_DISABLED', AUTH_DISABLED_MESSAGE);
+    const svc = accountService();
+    if (!svc) throw HttpError.safe(503, 'AUTH_UNAVAILABLE', AUTH_UNAVAILABLE_MESSAGE);
+    return svc;
+  };
+
+  /** Ví: chưa nạp được hoặc bị tắt ⇒ 503 nói thẳng, KHÔNG trả số dư 0 giả. */
+  const requireWallet = () => {
+    if (!billingEnabled()) {
+      throw HttpError.safe(503, 'BILLING_UNAVAILABLE', 'Tính năng ví credit đang bị tắt bằng cấu hình (BILLING_ENABLED=false).');
+    }
+    const svc = walletService();
+    if (!svc) throw HttpError.safe(503, 'BILLING_UNAVAILABLE', BILLING_UNAVAILABLE_MESSAGE);
+    return svc;
+  };
+
+  /** Chưa đăng nhập ⇒ 401 (khác MVP-02: ở đây đã có xác thực thật). */
+  const requireUser = (req) => {
+    if (!req?.user) throw HttpError.safe(401, 'UNAUTHENTICATED', 'Bạn cần đăng nhập để dùng tính năng này.');
+    return req.user;
+  };
+
+  /** Chưa đăng nhập ⇒ 401; đã đăng nhập nhưng role `member` ⇒ 403 FORBIDDEN. */
+  const requireAdmin = (req) => {
+    const user = requireUser(req);
+    if (!ADMIN_ROLES.has(String(user?.role || 'member'))) {
+      throw HttpError.safe(403, 'FORBIDDEN', 'Chỉ quản trị viên (owner/admin) được dùng chức năng này.');
+    }
+    return user;
+  };
+
+  /**
+   * Đọc token THÔ từ cookie `vauth` (tên lấy từ `config.auth.cookieName`).
+   * Token rác/sai hình dạng ⇒ `null` (coi như khách ẩn danh) — KHÔNG ném lỗi, KHÔNG log token.
+   * `parseCookies` có thể ném URIError với cookie mã hoá hỏng nên phải bọc lại: một cookie
+   * hỏng của client KHÔNG được biến mọi request thành HTTP 500.
+   */
+  const authTokenFromRequest = (req) => {
+    let cookies = {};
+    try {
+      cookies = parseCookies(req?.headers?.cookie || '');
+    } catch {
+      return null;
+    }
+    const raw = cookies[authCookieName()];
+    // Token do A1 sinh: 32 byte ngẫu nhiên → base64url. Chỉ nhận hình dạng hợp lệ.
+    return typeof raw === 'string' && /^[A-Za-z0-9_-]{8,256}$/.test(raw) ? raw : null;
+  };
+
+  /**
+   * Middleware `attachUser` — gắn `req.user` từ cookie, KHÔNG BAO GIỜ ném lỗi:
+   * token rác/hết hạn/đã thu hồi/DB lỗi đều ⇒ khách ẩn danh (`req.user = null`).
+   * Không log token (chỉ log tên lỗi). Chạy đúng MỘT lần cho mỗi request.
+   */
+  const attachUser = async (req) => {
+    if (!req) return null;
+    if (req.userAttached === true) return req.user ?? null;
+    req.userAttached = true;
+    req.user = null;
+
+    const token = authTokenFromRequest(req);
+    const svc = accountService();
+    if (!token || !svc) return null;
+
+    try {
+      const user = await svc.authenticate(token);
+      if (user && typeof user === 'object') req.user = user;
+    } catch (err) {
+      // Hết hạn/thu hồi/token rác là chuyện THƯỜNG GẶP → mức warn, không kèm token.
+      logger?.warn?.('auth.authenticate_failed', {
+        error_name: err?.name || 'Error',
+        error_code: err?.code || null,
+      });
+    }
+    return req.user ?? null;
+  };
+
+  /** Ghi thêm Set-Cookie mà không đè cookie khác (vd `sid`) đã đặt trước đó. */
+  const appendSetCookie = (res, cookie) => {
+    const prev = res.getHeader?.('set-cookie');
+    const list = prev === undefined ? [] : Array.isArray(prev) ? prev.slice() : [String(prev)];
+    list.push(cookie);
+    res.setHeader('set-cookie', list);
+  };
+
+  const expiryMs = (value) => {
+    if (value instanceof Date) return Number.isFinite(value.getTime()) ? value.getTime() : null;
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim()) {
+      const t = Date.parse(value.trim());
+      return Number.isFinite(t) ? t : null;
+    }
+    return null;
+  };
+
+  /** Cookie phiên đăng nhập (§3.1): HttpOnly + SameSite=Lax + Path=/ + Max-Age theo `expiresAt`. */
+  const authCookie = (token, expiresAt) => {
+    const ms = expiryMs(expiresAt);
+    const maxAge = ms === null ? sessionDays() * 86400 : Math.max(0, Math.floor((ms - Date.now()) / 1000));
+    const parts = [`${authCookieName()}=${token}`, 'Path=/', 'HttpOnly', 'SameSite=Lax', `Max-Age=${maxAge}`];
+    if (authConfig().secureCookie === true) parts.push('Secure');
+    return parts.join('; ');
+  };
+
+  /** Đăng xuất: cookie rỗng + Max-Age=0 (không xoá cookie `sid` của phiên ẩn danh). */
+  const clearedAuthCookie = () => {
+    const parts = [`${authCookieName()}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
+    if (authConfig().secureCookie === true) parts.push('Secure');
+    return parts.join('; ');
+  };
+
+  /** Body của `/api/auth/*`: object JSON phẳng, tối đa 32KB; sai hình dạng ⇒ 400 BAD_BODY. */
+  const readAuthBody = async (req) => {
+    const body = await readJson(req, { maxBytes: 32 * 1024 });
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      throw HttpError.safe(400, 'BAD_BODY', 'Body phải là một object JSON.');
+    }
+    return body;
+  };
+
+  /** Số dư ví của một user — `null` khi không có dịch vụ ví (KHÔNG bịa số 0). */
+  const readBalance = async (userId) => {
+    const svc = walletService();
+    if (!svc || typeof svc.balance !== 'function' || !userId) return null;
+    try {
+      const b = await svc.balance(userId);
+      if (b === null || b === undefined) return null;
+      const amount = Number(b.amount);
+      if (!Number.isFinite(amount)) return null;
+      return { amount, currency: String(b.currency || creditCurrency()) };
+    } catch (err) {
+      logger?.warn?.('billing.balance_failed', { error_name: err?.name || 'Error', error_code: err?.code || null });
+      return null;
+    }
+  };
+
+  const balanceJson = (b) =>
+    b && Number.isFinite(Number(b.amount)) ? { amount: Number(b.amount), currency: String(b.currency || creditCurrency()) } : null;
+
+  /**
+   * Tìm user theo id cho route quản trị: ưu tiên A1 (`getById`, đã lọc `password_hash`),
+   * thiếu thì đọc thẳng store (A3). Không tìm thấy ⇒ `null` (route trả 404).
+   */
+  const findUserById = async (id) => {
+    if (!id || !UUID_RE.test(String(id))) return null;
+    const svc = accountService();
+    if (svc && typeof svc.getById === 'function') {
+      try {
+        const u = await svc.getById(id);
+        if (u) return u;
+      } catch (err) {
+        logger?.warn?.('auth.get_by_id_failed', { error_name: err?.name || 'Error', error_code: err?.code || null });
+      }
+    }
+    if (typeof store.getUserById === 'function') {
+      try {
+        return (await store.getUserById(id)) || null;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  };
+
+  /* ── Cổng giữ tiền TRƯỚC khi job chạy (§0 luật 2 + §4) ──
+   * A4 KHÔNG chép luật giá của A2/A3 (bản sao luật là thứ dễ lệch nhất):
+   *  - A3 bơm hook `app.billingHook.beforeJob({ userId, jobId, kind, sessionId })` (hoặc
+   *    `app.billingService.beforeJob`) ⇒ route gọi đúng hook đó; hook ném
+   *    `INSUFFICIENT_CREDIT` kèm `details { required, balance }` ⇒ route trả 402.
+   *  - CHƯA có hook: chỉ kiểm điều kiện CẦN, không đoán đơn giá — số dư ≤ 0 thì không tài
+   *    nào trả được job (mọi đơn giá đều > 0) ⇒ 402 sớm, KHÔNG tạo job nào.
+   * Ẩn danh (`req.user` null) ⇒ bỏ qua hoàn toàn: không ví, không trừ credit (§2.2).
+   */
+  const billingHook = () =>
+    app?.billingHook && typeof app.billingHook.beforeJob === 'function' ? app.billingHook : null;
+
+  /** Điều kiện CẦN (số dư ≤ 0) — chỉ dùng khi A3 CHƯA bơm hook giữ tiền (§3.4b). */
+  const assertWalletNotEmpty = async (req) => {
+    if (!req?.user || !billingEnabled() || billingHook()) return;
+    // Mọi đơn giá đều 0 (chế độ miễn phí) ⇒ không có gì để chặn.
+    const costs = Object.values(config?.cost || {}).map(Number).filter(Number.isFinite);
+    if (!(costs.length > 0 && costs.some((c) => c > 0))) return;
+    const balance = await readBalance(req.user.id);
+    if (balance && balance.amount <= 0) {
+      throw HttpError.safe(402, 'INSUFFICIENT_CREDIT', insufficientCreditMessage(null, balance.amount), {
+        required: null,
+        balance: balance.amount,
+        currency: balance.currency,
+      });
+    }
+  };
+
+  /**
+   * Cổng ví chạy NGAY TRONG REQUEST, TRƯỚC khi ghi bất cứ thứ gì vào DB (§0 luật 2 + §3.4b).
+   *
+   * Đây là đường DUY NHẤT để lỗi thiếu credit ra tới HTTP: job đã vào hàng đợi thì lỗi chỉ
+   * còn là job `failed`, tức là người dùng đã chờ rồi mới biết thiếu tiền.
+   *
+   * `app.billingHook.beforeJob` là hợp đồng ĐÓNG BĂNG của A3 (object hằng trên `app`, luôn
+   * tồn tại): tự bỏ qua khi ẩn danh, tự trả `{held: 0}` khi chưa có ví, IDEMPOTENT theo jobId.
+   * A4 KHÔNG chép luật giá — chỉ gọi hook và ánh xạ lỗi.
+   */
+  /* ── PB-08: chống brute-force đăng nhập theo CẶP (email chuẩn hoá, IP) ────────────────
+   * Chỉ đếm lần THẤT BẠI; đăng nhập đúng xoá bộ đếm ⇒ không bao giờ tự khoá đường vào hợp lệ.
+   * Cửa sổ 5 phút / 10 lần sai cho mỗi cặp; vượt ⇒ 429 kèm `Retry-After`.
+   * ⚠️ `clientKey(req)` lấy IP từ socket/`x-forwarded-for`; sau reverse proxy PHẢI bật
+   * `trust proxy` của tầng chạy (hoặc `ALLOW_PRIVATE_NETWORK` + header đúng) — xem
+   * `docs/SECURITY.md`. Nếu không, mọi khách chung một IP và bucket theo IP mất tác dụng.
+   */
+  const LOGIN_WINDOW_MS = 5 * 60 * 1000;
+  const LOGIN_MAX_FAILURES = 10;   // trần cho một CẶP (email, IP)
+  const LOGIN_IP_MAX_FAILURES = 60; // BR-04: trần RỘNG theo IP — chặn "spraying" qua nhiều email
+  const loginFailures = new Map(); // key → { count, firstAt }
+
+  const normalizeEmailLike = (value) => String(value ?? '').trim().toLowerCase().replace(/\s+/g, '');
+
+  const checkLoginAttempts = (key, max = LOGIN_MAX_FAILURES) => {
+    const now = Date.now();
+    const entry = loginFailures.get(key);
+    if (!entry) return { blocked: false, retryAfterSec: 0 };
+    if (now - entry.firstAt > LOGIN_WINDOW_MS) {
+      loginFailures.delete(key);
+      return { blocked: false, retryAfterSec: 0 };
+    }
+    if (entry.count < max) return { blocked: false, retryAfterSec: 0 };
+    return { blocked: true, retryAfterSec: Math.max(1, Math.ceil((entry.firstAt + LOGIN_WINDOW_MS - now) / 1000)) };
+  };
+
+  const registerLoginFailure = (key, max = LOGIN_MAX_FAILURES) => {
+    const now = Date.now();
+    const entry = loginFailures.get(key);
+    if (!entry || now - entry.firstAt > LOGIN_WINDOW_MS) {
+      loginFailures.set(key, { count: 1, firstAt: now });
+    } else {
+      entry.count += 1;
+    }
+    // Trần bộ nhớ: dọn các mục đã hết hạn khi map phình ra (không để rò rỉ bộ nhớ).
+    if (loginFailures.size > 5000) {
+      for (const [k, v] of loginFailures) if (now - v.firstAt > LOGIN_WINDOW_MS) loginFailures.delete(k);
+    }
+    return checkLoginAttempts(key, max);
+  };
+
+  const clearLoginFailures = (key) => {
+    loginFailures.delete(key);
+  };
+
+  /**
+   * PB-05 — tặng credit khi đăng ký theo `config.billing.defaultGrant` (0 = không tặng).
+   * Lỗi ví KHÔNG được làm hỏng việc đăng ký: tài khoản đã tạo xong rồi — chỉ ghi log.
+   */
+  const grantDefaultOnRegister = async (user) => {
+    const rawGrant = Number(config?.billing?.defaultGrant);
+    const amount = Number.isFinite(rawGrant) && rawGrant > 0 ? rawGrant : 0;
+    const userId = user?.id;
+    if (!userId || !(amount > 0)) return null;
+    const service = app?.billingService;
+    if (!service || typeof service.grant !== 'function') {
+      logger?.warn?.('billing.default_grant_skipped', { reason: 'không có billingService', user_id: userId, amount });
+      return null;
+    }
+    try {
+      const row = await service.grant({ userId, amount, reason: 'grant', note: 'credit tặng khi đăng ký' });
+      logger?.info?.('billing.default_grant', { user_id: userId, amount });
+      return { amount: Number(row?.amount ?? amount), currency: String(row?.currency || config?.billing?.currency || 'USD') };
+    } catch (err) {
+      logger?.warn?.('billing.default_grant_failed', {
+        user_id: userId,
+        amount,
+        error_name: err?.name || 'Error',
+        error_code: err?.code || null,
+      });
+      return null;
+    }
+  };
+
+  /**
+   * PB-01 (vòng 2) — chạy phần việc NẰM SAU `holdCreditBeforeJob` và GIẢI PHÓNG khoản giữ nếu
+   * có bất kỳ lỗi nào. Trước đây chỉ `POST /api/jobs` gọi `releaseHoldOnFailure`; các route
+   * khác để tiền bị giữ vĩnh viễn cho một request trả 4xx (đo được: 5 × 409 ⇒ mất 0,0415 credit,
+   * sổ chỉ có `job_hold`).
+   *
+   * `releaseHoldOnFailure` chỉ chạy khi ĐÃ giữ tiền (`hold.held > 0`) và tự bỏ qua ẩn danh.
+   *
+   * @template T
+   * @param {object} req
+   * @param {string} jobId
+   * @param {() => Promise<T>} fn
+   * @returns {Promise<T>}
+   */
+  const withHoldRelease = async (req, jobId, hold, fn) => {
+    try {
+      return await fn();
+    } catch (err) {
+      if (hold && Number(hold.held) > 0) await releaseHoldOnFailure(req, jobId);
+      throw err;
+    }
+  };
+
+  /**
+   * BR-06 (vòng 3) — đánh dấu job ImageLab `failed` khi `ingest` lỗi SAU khi job đã được tạo.
+   * Trước đây tiền được hoàn đúng nhưng job **treo `running` vĩnh viễn** (không có entry hàng
+   * đợi, không ai đánh dấu) ⇒ rác trong UI.
+   */
+  const markImagelabJobFailed = async (jobId, err) => {
+    if (typeof store.updateJob !== 'function') return;
+    try {
+      await store.updateJob(jobId, {
+        status: JOB_STATUS.FAILED,
+        stage: 'failed',
+        error_code: err?.code || 'IMAGELAB_INGEST_FAILED',
+        error_message: scrubPaths(String(err?.message || 'Không lưu được ảnh tải lên.')),
+        finished_at: new Date().toISOString(),
+      });
+    } catch (inner) {
+      logger?.warn?.('imagelab.fail_mark_failed', { job_id: jobId, error_name: inner?.name || 'Error' });
+    }
+  };
+
+  /**
+   * BR-08 — thu hồi các lượt TREO (chỉ những lượt cũ hơn `config.billing.stuckRunMs`).
+   * Trả về SỐ lượt đã thu hồi; nuốt lỗi (đây là đường phục hồi, không được làm hỏng request).
+   */
+  const reconcileStuckRunsFor = async (req, { userId = null, force = false } = {}) => {
+    const runner = typeof app?.reconcileStuckRuns === 'function'
+      ? app.reconcileStuckRuns
+      : (app?.billingService && typeof app.billingService.reconcileStuckRuns === 'function'
+        ? app.billingService.reconcileStuckRuns.bind(app.billingService)
+        : null);
+    if (!runner || !billingEnabled()) return 0;
+    try {
+      // `app.reconcileStuckRuns` đã bơm `isJobActive` (hàng đợi + trạng thái job) ⇒ KHÔNG cắt ngang
+      // lượt đang chạy thật (BR-10).
+      const res = await runner({ userId: userId || req?.user?.id || null, force });
+      const n = Number(res?.reconciled) || 0;
+      if (n > 0) logger?.warn?.('billing.stuck_runs_reconciled', { reconciled: n, refunded: res?.refunded ?? 0 });
+      return n;
+    } catch (err) {
+      logger?.warn?.('billing.reconcile_failed', { error_name: err?.name || 'Error', error_code: err?.code || null });
+      return 0;
+    }
+  };
+
+  const holdCreditBeforeJob = async (req, jobId, kind) => {
+    const userId = req?.user?.id ?? null;
+    if (!userId || !billingEnabled()) return null; // ẩn danh: không ví, không trừ credit (§2.2)
+    const hook = billingHook();
+    if (hook) {
+      try {
+        let result = (await hook.beforeJob({ userId, jobId, kind, sessionId: presentedSessionId(req) })) ?? null;
+        // BR-08 (vòng 4): nếu lượt "đang mở" thực ra đã TREO (quá `billing.stuckRunMs`) thì THU HỒI
+        // (hoàn 100% khoản giữ + đóng lượt) rồi cho chạy tiếp — thay vì 409 vĩnh viễn.
+        if (result?.skipped === true) {
+          const reconciled = await reconcileStuckRunsFor(req, { userId });
+          if (reconciled > 0) {
+            result = (await hook.beforeJob({ userId, jobId, kind, sessionId: presentedSessionId(req) })) ?? null;
+          }
+        }
+        // BR-02 (vòng 3): lượt chạy của job này ĐANG MỞ (và còn MỚI) ⇒ request thứ hai KHÔNG được
+        // dùng chung khoản giữ rồi chạy thật (K lượt chạy / 1 lượt bị thu). Chặn rõ ràng bằng 409.
+        if (result?.skipped === true && result?.hold_disabled !== true) {
+          throw HttpError.safe(409, 'JOB_ALREADY_RUNNING', 'Job này đang chạy một lượt khác — chờ lượt đó xong rồi hãy chạy lại.', {
+            job_id: jobId,
+            run_key: result?.run_key ?? null,
+          });
+        }
+        if (result?.skipped === true && result?.hold_disabled === true) {
+          // Chế độ không giữ tiền trước: lượt treo cũng phải được thu hồi rồi mở lượt mới.
+          const reconciled = await reconcileStuckRunsFor(req, { userId });
+          if (reconciled > 0) result = (await hook.beforeJob({ userId, jobId, kind, sessionId: presentedSessionId(req) })) ?? null;
+        }
+        return result;
+      } catch (err) {
+        // Thiếu tiền ⇒ 402 (mapBillingError); lỗi khác ⇒ fail-closed, báo lỗi thật.
+        throw mapBillingError(err) || err;
+      }
+    }
+    await assertWalletNotEmpty(req);
+    return null;
+  };
+
+  /**
+   * Ghi DB thất bại SAU khi hook đã giữ tiền ⇒ hoàn ngay phần đã giữ: không được để tiền
+   * của người dùng bị giữ cho một job không hề tồn tại (best-effort, có log).
+   */
+  const releaseHoldOnFailure = async (req, jobId) => {
+    const userId = req?.user?.id ?? null;
+    const hook = billingHook();
+    if (!userId || !hook || typeof hook.afterJob !== 'function') return;
+    try {
+      await hook.afterJob({ userId, jobId, status: 'failed', actualCost: 0 });
+    } catch (err) {
+      logger?.warn?.('billing.hook_failed', { phase: 'afterJob', error_name: err?.name || 'Error', error_code: err?.code || null });
+    }
+  };
+
+  /* ─────────────────────────── A4-01 → A4-04 · /api/auth/* ─────────────────────────── */
+
+  router.post('/api/auth/register', async (req, res) => {
+    const svc = requireAuthFeature();
+    // Chống dò tài khoản: bucket RIÊNG theo IP, dùng limiter CÓ SẴN (không tạo limiter mới).
+    enforce(rateLimiters.requests, `auth:register:${clientKey(req)}`);
+
+    const body = await readAuthBody(req);
+    if (typeof body.email !== 'string' || !body.email.trim() || typeof body.password !== 'string') {
+      throw HttpError.safe(400, 'BAD_BODY', 'Cần `email` (chuỗi) và `password` (chuỗi).');
+    }
+    const displayName = sanitizeText(body.display_name ?? body.displayName, { maxLength: 120 });
+
+    let result;
+    try {
+      result = await svc.register({ email: body.email.trim(), password: body.password, displayName });
+    } catch (err) {
+      throw mapRegisterError(err, passwordMinLength());
+    }
+
+    const token = safeToken(result?.token);
+    if (token && result?.expiresAt) appendSetCookie(res, authCookie(token, result.expiresAt));
+    else logger?.warn?.('auth.register_no_token', { has_token: Boolean(token) });
+
+    // PB-05 (vòng 2): `BILLING_DEFAULT_GRANT` trước đây là khoá CHẾT (khai 5 mà ví vẫn 0).
+    // Nay đăng ký xong thì tặng đúng số đó, ghi sổ với `reason='grant'` (đối soát được).
+    const grant = await grantDefaultOnRegister(result?.user);
+    sendJson(res, 201, {
+      user: publicUserJson(result?.user),
+      expires_at: toIsoString(result?.expiresAt),
+      ...(grant ? { credit_granted: grant } : {}),
+    });
+  });
+
+  router.post('/api/auth/login', async (req, res) => {
+    const svc = requireAuthFeature();
+
+    const body = await readAuthBody(req);
+    if (typeof body.email !== 'string' || !body.email.trim() || typeof body.password !== 'string' || !body.password) {
+      throw HttpError.safe(400, 'BAD_BODY', 'Cần `email` (chuỗi) và `password` (chuỗi).');
+    }
+
+    // PB-08 (vòng 2): bucket RIÊNG theo `email` chuẩn hoá + IP, và CHỈ đếm lần THẤT BẠI.
+    // Trước đây dùng chung bucket 120 req/phút theo IP ⇒ vừa quá rộng cho brute-force, vừa
+    // tự khoá đường đăng nhập ĐÚNG của chính mình. Đăng nhập đúng KHÔNG tiêu quota.
+    const emailKey = normalizeEmailLike(body.email);
+    const ipKey = clientKey(req);
+    const loginKey = `auth:login:${emailKey || '-'}:${ipKey}`;
+    const ipWideKey = `auth:login-ip:${ipKey}`;
+    const gate = checkLoginAttempts(loginKey, LOGIN_MAX_FAILURES);
+    const ipGate = checkLoginAttempts(ipWideKey, LOGIN_IP_MAX_FAILURES);
+
+    // Vì sao KHÔNG chặn thẳng khi bucket đã đầy: yêu cầu PB-08 là "đăng nhập ĐÚNG không bị
+    // chặn bởi chính bộ đếm lần sai của mình". Nên vẫn XÁC THỰC, rồi mới phán quyết:
+    //   · đúng ⇒ cho vào + xoá bộ đếm (người dùng thật không bao giờ bị khoá vì gõ nhầm);
+    //   · sai  ⇒ 429 kèm `Retry-After` (kẻ dò mật khẩu bị chặn đúng lúc cần chặn).
+    let result;
+    try {
+      result = await svc.login({
+        email: body.email.trim(),
+        password: body.password,
+        userAgent: sanitizeText(req?.headers?.['user-agent'], { maxLength: 300 }),
+      });
+    } catch (err) {
+      const mapped = mapLoginError(err);
+      if (mapped?.code === 'BAD_CREDENTIALS') {
+        const now = registerLoginFailure(loginKey, LOGIN_MAX_FAILURES);
+        registerLoginFailure(ipWideKey, LOGIN_IP_MAX_FAILURES); // BR-04: đếm cả ở bucket theo IP
+        const active = now.blocked ? now : (ipGate.blocked ? ipGate : (gate.blocked ? gate : null));
+        if (active) {
+          res.setHeader('retry-after', String(active.retryAfterSec));
+          throw HttpError.safe(
+            429,
+            'RATE_LIMITED',
+            `Quá nhiều lần đăng nhập sai cho tài khoản này — thử lại sau ${active.retryAfterSec} giây.`,
+          );
+        }
+      }
+      throw mapped;
+    }
+    clearLoginFailures(loginKey); // đăng nhập đúng ⇒ xoá bộ đếm sai của cặp (email, IP) này
+    clearLoginFailures(ipWideKey); // ... và bộ đếm theo IP (người dùng thật vừa chứng minh mình hợp lệ)
+
+    const token = safeToken(result?.token);
+    if (token && result?.expiresAt) appendSetCookie(res, authCookie(token, result.expiresAt));
+    else logger?.warn?.('auth.login_no_token', { has_token: Boolean(token) });
+
+    sendJson(res, 200, { user: publicUserJson(result?.user), expires_at: toIsoString(result?.expiresAt) });
+  });
+
+  router.post('/api/auth/logout', async (req, res) => {
+    // AUTH_ENABLED=false ⇒ 503 như mọi route /api/auth/*; còn lại đăng xuất luôn thành công
+    // (xoá cookie là việc của client, thu hồi token là best-effort).
+    if (!authEnabled()) throw HttpError.safe(503, 'AUTH_DISABLED', AUTH_DISABLED_MESSAGE);
+    const svc = accountService();
+    const token = authTokenFromRequest(req);
+    if (svc && token && typeof svc.logout === 'function') {
+      try {
+        await svc.logout(token);
+      } catch (err) {
+        logger?.warn?.('auth.logout_failed', { error_name: err?.name || 'Error', error_code: err?.code || null });
+      }
+    }
+    appendSetCookie(res, clearedAuthCookie());
+    sendJson(res, 200, { ok: true });
+  });
+
+  router.get('/api/auth/me', async (req, res) => {
+    if (!authEnabled()) throw HttpError.safe(503, 'AUTH_DISABLED', AUTH_DISABLED_MESSAGE);
+    await attachUser(req);
+    const user = req.user || null;
+    // Không có dịch vụ tài khoản ⇒ vẫn trả lời được "khách ẩn danh" (UI MVP-01/02/03 không vỡ).
+    const balance = user ? await readBalance(user.id) : null;
+    sendJson(res, 200, {
+      user: user ? publicUserJson(user) : null,
+      anonymous: !user,
+      balance: balanceJson(balance),
+    });
+  });
+
+  /* ───────────────────────── A4-05/A4-06 · /api/billing/* ───────────────────────── */
+
+  router.get('/api/billing/ledger', async (req, res) => {
+    const user = requireUser(req);
+    const svc = requireWallet();
+    const limit = clampInt(req.query.get('limit'), 50, 1, 200);
+    const offset = clampInt(req.query.get('offset'), 0, 0, 1_000_000);
+
+    let items = [];
+    try {
+      items = asArray(await svc.history({ userId: user.id, limit, offset }));
+    } catch (err) {
+      throw mapBillingError(err) || err;
+    }
+    const balance = await readBalance(user.id);
+    sendJson(res, 200, { items: items.map(ledgerJson), balance: balanceJson(balance) });
+  });
+
+  router.get('/api/billing/pricing', async (req, res) => {
+    // Bảng giá là thông tin công khai (không có bí mật): UI hiện được giá kể cả khi chưa
+    // đăng nhập. KHÔNG trả bất kỳ khoá cấu hình nào khác.
+    let pricing = [];
+    if (typeof store.listPricing === 'function') {
+      try {
+        pricing = asArray(await store.listPricing());
+      } catch (err) {
+        logger?.warn?.('billing.pricing_failed', { error_name: err?.name || 'Error', error_code: err?.code || null });
+      }
+    } else {
+      const svc = walletService();
+      if (svc && typeof svc.priceOf === 'function') {
+        for (const operation of PRICING_OPERATIONS) {
+          try {
+            const p = await svc.priceOf(operation);
+            if (p) pricing.push(p);
+          } catch {
+            /* thiếu một dòng giá không được làm hỏng cả bảng */
+          }
+        }
+      }
+    }
+    sendJson(res, 200, { pricing: pricing.map(pricingJson) });
+  });
+
+  /* ────────────────────────── A4-07 → A4-10 · /api/admin/* ────────────────────────── */
+
+  router.get('/api/admin/users', async (req, res) => {
+    requireAdmin(req);
+    const limit = clampInt(req.query.get('limit'), 50, 1, 200);
+    const offset = clampInt(req.query.get('offset'), 0, 0, 1_000_000);
+
+    let items = [];
+    const svc = accountService();
+    try {
+      if (svc && typeof svc.list === 'function') items = asArray(await svc.list({ limit, offset }));
+      else if (typeof store.listUsers === 'function') items = asArray(await store.listUsers({ limit, offset }));
+      else throw HttpError.safe(503, 'ACCOUNTS_UNAVAILABLE', AUTH_UNAVAILABLE_MESSAGE);
+    } catch (err) {
+      if (err instanceof HttpError) throw err;
+      throw mapAuthError(err);
+    }
+
+    // `total`: dùng count của store khi có; không có thì đếm được bao nhiêu trả bấy nhiêu
+    // (KHÔNG bịa con số). `countUsers` chưa nằm trong danh sách hàm đóng băng §3.4.
+    let total = items.length + offset;
+    if (typeof store.countUsers === 'function') {
+      try {
+        const n = Number(await store.countUsers());
+        if (Number.isFinite(n)) total = n;
+      } catch {
+        /* giữ ước lượng từ trang hiện tại */
+      }
+    }
+    sendJson(res, 200, { items: items.map(publicUserJson).filter(Boolean), total });
+  });
+
+  router.post('/api/admin/users/:id/credit', async (req, res, params) => {
+    const admin = requireAdmin(req);
+    const svc = requireWallet();
+    const body = await readJson(req, { maxBytes: 32 * 1024 });
+    const amount = Number(body?.amount);
+    // PB-07 (vòng 2): UI ghi rõ "dương = cấp thêm, âm = điều chỉnh giảm" nhưng API trước đây
+    // luôn từ chối số âm ⇒ không có đường hợp lệ nào để GIẢM credit. Nay cho phép số âm, map
+    // sang `reason='adjustment'`; luật "số dư không âm" vẫn giữ (thiếu ⇒ 400 INSUFFICIENT_CREDIT).
+    if (!Number.isFinite(amount) || amount === 0) {
+      throw HttpError.safe(400, 'BAD_AMOUNT', '`amount` phải là số hữu hạn KHÁC 0 (dương = cấp thêm, âm = điều chỉnh giảm).');
+    }
+    const target = await findUserById(params?.id ?? '');
+    if (!target) throw HttpError.safe(404, 'USER_NOT_FOUND', 'Không tìm thấy người dùng.');
+    const note = sanitizeText(body?.note, { maxLength: 300 });
+
+    let ledger;
+    try {
+      ledger = await svc.grant({
+        userId: target.id,
+        amount,
+        reason: amount < 0 ? 'adjustment' : 'admin_grant',
+        actorId: admin.id,
+        note,
+      });
+    } catch (err) {
+      // PB-07: giảm quá số dư ⇒ 400 `INSUFFICIENT_CREDIT` (KHÔNG phải 402: đây là thao tác
+      // quản trị sai số liệu, không phải "ví không đủ để chạy job").
+      if (String(err?.code) === 'INSUFFICIENT_CREDIT') {
+        const d = err?.details && typeof err.details === 'object' ? err.details : {};
+        throw HttpError.safe(400, 'INSUFFICIENT_CREDIT', 'Số dư không đủ để điều chỉnh giảm từng đó — ví không được âm.', {
+          balance: Number.isFinite(Number(d.balance)) ? Number(d.balance) : null,
+          amount: Number.isFinite(Number(d.amount)) ? Number(d.amount) : null,
+        });
+      }
+      throw mapBillingError(err) || mapAuthError(err);
+    }
+    const balance = await readBalance(target.id);
+    sendJson(res, 201, { ledger: ledgerJson(ledger), balance: balanceJson(balance) });
+  });
+
+  /**
+   * BR-08 (vòng 4) — BẢO TRÌ: thu hồi các lượt chạy TREO (có `job_hold` mà không có dòng đóng).
+   * Chỉ owner/admin. Trả `{ reconciled, refunded, older_than_ms }`.
+   */
+  router.post('/api/admin/billing/reconcile', async (req, res) => {
+    requireAdmin(req);
+    const service = app?.billingService;
+    if (!service || typeof service.reconcileStuckRuns !== 'function') {
+      throw HttpError.safe(503, 'BILLING_UNAVAILABLE', 'Ví credit chưa sẵn sàng — chưa thu hồi được lượt treo.');
+    }
+    const body = await readJson(req, { maxBytes: 8 * 1024 }).catch(() => ({}));
+    const rawMs = Number(body?.older_than_ms);
+    const olderThanMs = Number.isFinite(rawMs) && rawMs >= 0 ? rawMs : null;
+    // BR-10: `force: true` ⇒ ÉP thu hồi dù job đang hoạt động (chỉ owner/admin, khi biết chắc job
+    // đã chết) — dòng hoàn sẽ mang `meta.forced = true`.
+    const force = body?.force === true;
+    let out;
+    try {
+      out = typeof app?.reconcileStuckRuns === 'function'
+        ? await app.reconcileStuckRuns({ olderThanMs, force })
+        : await service.reconcileStuckRuns({ olderThanMs, force });
+    } catch (err) {
+      throw mapBillingError(err) || err;
+    }
+    logger?.warn?.('billing.reconcile_requested', { reconciled: out?.reconciled ?? 0, force, skipped_active: out?.skipped_active ?? 0 });
+    sendJson(res, 200, {
+      reconciled: Number(out?.reconciled) || 0,
+      refunded: Number(out?.refunded) || 0,
+      older_than_ms: out?.older_than_ms ?? null,
+      skipped_active: Number(out?.skipped_active) || 0,
+      forced: force,
+    });
+  });
+
+  router.post('/api/admin/users/:id/role', async (req, res, params) => {
+    requireAdmin(req);
+    const svc = requireAuthFeature();
+    const body = await readJson(req, { maxBytes: 16 * 1024 });
+    const role = String(body?.role ?? '').trim().toLowerCase();
+    if (!AUTH_ROLES.includes(role)) {
+      throw HttpError.safe(400, 'BAD_ROLE', `\`role\` phải là một trong: ${AUTH_ROLES.join(', ')}.`);
+    }
+    const target = await findUserById(params?.id ?? '');
+    if (!target) throw HttpError.safe(404, 'USER_NOT_FOUND', 'Không tìm thấy người dùng.');
+
+    let updated;
+    try {
+      updated = await svc.setRole(target.id, role);
+    } catch (err) {
+      throw mapAuthError(err);
+    }
+    if (!updated || typeof updated !== 'object') updated = (await findUserById(target.id)) || target;
+    sendJson(res, 200, { user: publicUserJson(updated) });
+  });
+
+  router.get('/api/admin/usage', async (req, res) => {
+    requireAdmin(req);
+    const from = sanitizeText(req.query.get('from'), { maxLength: 40 }) || null;
+    const to = sanitizeText(req.query.get('to'), { maxLength: 40 }) || null;
+    const groupBy = String(req.query.get('group_by') || 'day').trim().toLowerCase();
+    if (!USAGE_GROUP_BY.includes(groupBy)) {
+      throw HttpError.safe(400, 'BAD_GROUP_BY', `\`group_by\` phải là một trong: ${USAGE_GROUP_BY.join(', ')}.`);
+    }
+
+    const svc = walletService();
+    let rows = [];
+    try {
+      if (typeof store.usageAggregate === 'function') rows = asArray(await store.usageAggregate({ from, to, groupBy }));
+      else if (svc && typeof svc.usageSummary === 'function') rows = asArray(await svc.usageSummary({ from, to, groupBy }));
+      else throw HttpError.safe(503, 'BILLING_UNAVAILABLE', BILLING_UNAVAILABLE_MESSAGE);
+    } catch (err) {
+      if (err instanceof HttpError) throw err;
+      throw mapBillingError(err) || err;
+    }
+    sendJson(res, 200, { rows: rows.map(usageRowJson) });
+  });
+
   /* ───────────────────────────── Health ───────────────────────────── */
 
   router.get('/api/health', async (req, res) => {
@@ -442,6 +1295,13 @@ export function buildRouter(app) {
       // 4.6 — UI/người vận hành dựa vào cờ này để biết MVP-02 có sẵn sàng không,
       // và `reason` để biết VÌ SAO nó tắt (không im lặng).
       imagelab: { available: imagelabAvailable(), reason: imagelabAvailable() ? null : imagelabUnavailableReason() },
+      // MVP-05: tài khoản/ví có thật hay không — chỉ cờ + lý do, không lộ bí mật.
+      accounts: { available: accountsAvailable(), reason: accountsAvailable() ? null : AUTH_UNAVAILABLE_MESSAGE },
+      billing: {
+        available: billingAvailable(),
+        currency: creditCurrency(),
+        reason: billingAvailable() ? null : BILLING_UNAVAILABLE_MESSAGE,
+      },
     });
   });
 
@@ -494,6 +1354,32 @@ export function buildRouter(app) {
         matting: imagestudioProviderInfo(app.mattingProvider),
         retouch: imagestudioProviderInfo(app.retouchProvider),
       },
+      // MVP-05 (§3.3) — khối `auth`/`billing` cho UI: CHỈ cờ + giới hạn, TUYỆT ĐỐI không
+      // lộ bí mật (không token, không khoá ký, không chi tiết nội bộ của dịch vụ).
+      auth: {
+        enabled: authEnabled(),
+        anonymous_allowed: anonymousAllowed(),
+        password_min_length: passwordMinLength(),
+        roles: [...AUTH_ROLES],
+        available: accountsAvailable(),
+      },
+      billing: {
+        enabled: billingEnabled(),
+        currency: creditCurrency(),
+        available: billingAvailable(),
+        // PB-05b (vòng 2): công tắc giữ-tiền-trước phải HIỆN RA cho người vận hành — trước đây
+        // `BILLING_HOLD_BEFORE_JOB=false` bị bỏ qua im lặng (vẫn giữ tiền, vẫn 402).
+        hold_before_job: billingConfig().holdBeforeJob !== false,
+        default_grant: Number.isFinite(Number(billingConfig().defaultGrant)) ? Number(billingConfig().defaultGrant) : 0,
+        // PB-02: trần số lượt chạy có tính tiền cho mỗi job (vượt ⇒ 429 RERUN_LIMIT_EXCEEDED).
+        max_runs_per_job: Number.isFinite(Number(billingConfig().maxRunsPerJob)) ? Number(billingConfig().maxRunsPerJob) : 10,
+        max_amount: Number.isFinite(Number(billingConfig().maxAmount)) ? Number(billingConfig().maxAmount) : null,
+        // BR-08: ngưỡng coi một lượt chạy là TREO (ms) — quá ngưỡng thì được thu hồi tự động.
+        stuck_run_ms: Number.isFinite(Number(billingConfig().stuckRunMs)) ? Number(billingConfig().stuckRunMs) : null,
+        min_stuck_run_ms: Number.isFinite(Number(billingConfig().minStuckRunMs)) ? Number(billingConfig().minStuckRunMs) : null,
+      },
+      // §3.4 — trạng thái thật của dịch vụ tài khoản/ví để người vận hành biết VÌ SAO tắt.
+      accounts: { available: accountsAvailable(), reason: accountsAvailable() ? null : AUTH_UNAVAILABLE_MESSAGE },
     });
   });
 
@@ -550,26 +1436,46 @@ export function buildRouter(app) {
       validateManualPayload(manual, config);
     }
 
-    const jobId = await store.createJob({
-      sessionId: sid,
-      source: detection?.source || 'manual',
-      sourceUrl: url,
-      canonicalUrl: detection?.canonical_url || '',
-      sourceProductId: detection?.source_product_id || '',
-      style: opts.style,
-      length: opts.length,
-      inputMode: url && hasManual ? 'link+manual' : url ? 'link' : 'manual',
-    });
+    // MVP-05 (§0 luật 2 + §3.4b): cổng ví chạy TRƯỚC khi ghi job ⇒ thiếu credit thì DB
+    // KHÔNG tăng dòng nào (job_id sinh trước để hook giữ tiền theo đúng job đó).
+    const userId = req.user?.id ?? null;
+    const jobId = randomUUID();
+    await holdCreditBeforeJob(req, jobId, 'content');
 
-    queue.enqueue(jobId, () =>
-      pipeline.run(jobId, {
-        url,
-        manual: hasManual ? manual : null,
+    try {
+      await store.createJob({
+        id: jobId,
+        sessionId: sid,
+        userId,
+        source: detection?.source || 'manual',
+        sourceUrl: url,
+        canonicalUrl: detection?.canonical_url || '',
+        sourceProductId: detection?.source_product_id || '',
         style: opts.style,
         length: opts.length,
-        sessionId: sid,
-      }),
-    );
+        inputMode: url && hasManual ? 'link+manual' : url ? 'link' : 'manual',
+      });
+    } catch (err) {
+      await releaseHoldOnFailure(req, jobId);
+      throw mapBillingError(err) || err;
+    }
+
+    try {
+      queue.enqueue(jobId, () =>
+        pipeline.run(jobId, {
+          url,
+          manual: hasManual ? manual : null,
+          style: opts.style,
+          length: opts.length,
+          sessionId: sid,
+          userId,
+        }),
+      );
+    } catch (err) {
+      // PB-01: xếp hàng lỗi sau khi đã giữ tiền ⇒ hoàn khoản giữ.
+      await releaseHoldOnFailure(req, jobId);
+      throw mapBillingError(err) || err;
+    }
 
     sendJson(res, 202, {
       job_id: jobId,
@@ -588,15 +1494,41 @@ export function buildRouter(app) {
     const limit = req.query.get('limit');
     const offset = req.query.get('offset');
     const scope = req.query.get('scope');
-    const sessionIdFilter = scope === 'all' ? null : sid;
-    const [rows, total] = await Promise.all([
-      store.listJobs({ sessionId: sessionIdFilter, limit, offset }),
-      store.countJobs({ sessionId: sessionIdFilter }),
+    const user = req.user || null;
+
+    // MVP-05 (§3.3) — đã đăng nhập ⇒ CHỈ job của CHÍNH tài khoản (`jobs.user_id`), KHÔNG trộn
+    // job ẩn danh của session hiện tại (§2.2: job cũ của session không tự thuộc về ai) và
+    // KHÔNG cho `scope=all` nhìn sang dữ liệu người khác.
+    const sessionIdFilter = user ? null : scope === 'all' ? null : sid;
+    const [rows, rawTotal] = await Promise.all([
+      store.listJobs({ sessionId: sessionIdFilter, userId: user?.id ?? null, limit, offset }),
+      store.countJobs({ sessionId: sessionIdFilter, userId: user?.id ?? null }),
     ]);
+
+    // Lọc lại theo chủ sở hữu ở tầng route: nếu store CHƯA hỗ trợ `userId` (A3 chưa nối), dòng
+    // của người khác vẫn bị chặn. Dòng không khai chủ ⇒ đối chiếu qua `getJob` (fail-closed).
+    const visibleRows = [];
+    for (const row of Array.isArray(rows) ? rows : []) {
+      if (!user) {
+        visibleRows.push(row);
+        continue;
+      }
+      const owner = row?.user_id ?? row?.userId ?? null;
+      if (owner !== null && owner !== undefined && owner !== '') {
+        if (String(owner) === String(user.id)) visibleRows.push(row);
+        continue;
+      }
+      const hydrated = typeof store.getJob === 'function' ? await store.getJob(row.id).catch(() => null) : null;
+      if (hydrated && String(hydrated.user_id ?? '') === String(user.id)) visibleRows.push(row);
+    }
+    // `total`: chỉ tin con số của store khi nó KHÔNG trả về dòng của người khác (nếu trả về,
+    // nghĩa là bộ lọc `userId` chưa được store áp dụng ⇒ đếm theo số dòng đã kiểm được).
+    const total = user && visibleRows.length !== (Array.isArray(rows) ? rows.length : 0) ? visibleRows.length : rawTotal;
+
     // N-3 (vòng 4): mỗi dòng lịch sử phải phân biệt được job ImageLab và mang nhãn MOCK
     // theo DẤU VẾT ĐÃ LƯU của chính job đó (không theo cấu hình máy chủ đang chạy).
     // KHÔNG trả `session_id`/`content_meta` thô (dữ liệu nội bộ).
-    const items = (Array.isArray(rows) ? rows : []).map((row) => {
+    const items = visibleRows.map((row) => {
       // `listJobs` trả cột TEXT thô (SQLite) nên `content_meta` có thể là CHUỖI JSON —
       // phải parse trước khi đọc dấu vết MOCK, nếu không nhãn MOCK sẽ im lặng biến mất.
       const contentMeta = parseJsonObject(row?.content_meta);
@@ -672,15 +1604,25 @@ export function buildRouter(app) {
       throw new HttpError(409, 'NO_MASTER', 'Job chưa có Product Master để sinh lại nội dung.');
     }
 
-    await store.updateJob(job.id, { style: opts.style, length: opts.length, status: JOB_STATUS.QUEUED, stage: 'regenerating' });
-    queue.enqueue(job.id, () =>
-      pipeline.resumeFromMaster(job.id, job.product_master, {
-        sessionId: sid,
-        style: opts.style,
-        length: opts.length,
-        extraInstructions: sanitizeText(body.extra_instructions, { maxLength: 1000 }),
-      }),
-    );
+    // MVP-05 (PB-02, vòng 2): mỗi LƯỢT CHẠY LẠI là một chu kỳ tiền MỚI ⇒ giữ tiền ngay trong
+    // request (thiếu ⇒ 402, vượt trần lượt chạy ⇒ 429 RERUN_LIMIT_EXCEEDED — TRƯỚC khi xếp
+    // hàng). Trước đây route này không giữ tiền nên mọi lượt regenerate đều miễn phí.
+    const hold = await holdCreditBeforeJob(req, job.id, job.kind || 'content');
+    try {
+      await store.updateJob(job.id, { style: opts.style, length: opts.length, status: JOB_STATUS.QUEUED, stage: 'regenerating' });
+      queue.enqueue(job.id, () =>
+        pipeline.resumeFromMaster(job.id, job.product_master, {
+          sessionId: sid,
+          style: opts.style,
+          length: opts.length,
+          userId: req.user?.id ?? null,
+          extraInstructions: sanitizeText(body.extra_instructions, { maxLength: 1000 }),
+        }),
+      );
+    } catch (err) {
+      await withHoldRelease(req, job.id, hold, async () => { throw err; }).catch(() => {});
+      throw mapBillingError(err) || err;
+    }
     sendJson(res, 202, { job_id: job.id, status: JOB_STATUS.QUEUED, style: opts.style, length: opts.length });
   });
 
@@ -807,12 +1749,25 @@ export function buildRouter(app) {
       throw HttpError.safe(502, 'NOT_CONFIGURED', 'Provider OCR/dịch chưa được cấu hình — chưa thể dịch ảnh.');
     }
 
-    const jobId = await store.createJob({
-      sessionId: sid,
-      source: 'manual',
-      inputMode: 'manual',
-      kind: 'image_translation',
-    });
+    // MVP-05 (§0 luật 2 + §3.4b): cổng ví TRƯỚC khi ghi job/ảnh ⇒ thiếu credit thì DB
+    // KHÔNG tăng dòng nào (job_id sinh trước để hook giữ tiền theo đúng job đó).
+    const userId = req.user?.id ?? null;
+    const jobId = randomUUID();
+    const hold = await holdCreditBeforeJob(req, jobId, 'image_translation');
+
+    try {
+      await store.createJob({
+        id: jobId,
+        sessionId: sid,
+        userId,
+        source: 'manual',
+        inputMode: 'manual',
+        kind: 'image_translation',
+      });
+    } catch (err) {
+      await releaseHoldOnFailure(req, jobId);
+      throw mapImagelabError(err, 'Không tạo được job dịch ảnh.');
+    }
 
     // Ingest chạy NGAY trong request (xác thực magic bytes thêm một lần, dò kích thước,
     // ghi file + ghi DB) rồi mới xếp hàng OCR. Nhờ vậy:
@@ -821,12 +1776,21 @@ export function buildRouter(app) {
     //     trong hàng đợi mà người dùng không hiểu vì sao.
     let ingest;
     try {
-      ingest = await app.imagelabPipeline.ingest(jobId, { image, sessionId: sid, options });
+      ingest = await app.imagelabPipeline.ingest(jobId, { image, sessionId: sid, userId, options });
     } catch (err) {
+      // PB-01: ingest lỗi SAU khi đã giữ tiền ⇒ phải hoàn khoản giữ (trước đây chỉ throw).
+      // BR-06: đồng thời đánh dấu job `failed` để KHÔNG treo `running` vĩnh viễn.
+      await markImagelabJobFailed(jobId, err);
+      await releaseHoldOnFailure(req, jobId);
       throw mapImagelabError(err, 'Không lưu được ảnh tải lên.');
     }
 
-    queue.enqueue(jobId, () => app.imagelabPipeline.runOcr(jobId, { sessionId: sid, options }));
+    try {
+      queue.enqueue(jobId, () => app.imagelabPipeline.runOcr(jobId, { sessionId: sid, userId, options }));
+    } catch (err) {
+      await releaseHoldOnFailure(req, jobId);
+      throw err;
+    }
 
     sendJson(res, 202, {
       job_id: jobId,
@@ -845,7 +1809,7 @@ export function buildRouter(app) {
     requireStoreMethod('listTranslationLines');
 
     const sid = sessionId(req, res);
-    const job = await requireImagelabJob(params.id, sid);
+    const job = await requireImagelabJob(params.id, sid, req);
 
     const [assets, rawRegions, rawLines] = await Promise.all([
       store.listImageAssets(job.id, {}),
@@ -896,7 +1860,7 @@ export function buildRouter(app) {
 
     const sid = sessionId(req, res);
     enforce(rateLimiters.jobs, `imagelab-lines:${sid}`);
-    const job = await requireImagelabJob(params.id, sid);
+    const job = await requireImagelabJob(params.id, sid, req);
 
     const body = await readJson(req, { maxBytes: 512 * 1024 });
     const edits = sanitizeEdits(body.edits);
@@ -944,7 +1908,7 @@ export function buildRouter(app) {
 
     const sid = sessionId(req, res);
     enforce(rateLimiters.jobs, `imagelab-regions:${sid}`);
-    const job = await requireImagelabJob(params.id, sid);
+    const job = await requireImagelabJob(params.id, sid, req);
 
     const body = await readJson(req, { maxBytes: 512 * 1024 });
     const limits = imagelabLimits();
@@ -975,16 +1939,21 @@ export function buildRouter(app) {
     const replace = body?.replace !== false;
     const confirmReplaceEdited = body?.confirm_replace_edited === true;
 
+    // MVP-05 (§3.4b, chỗ #3 trong 5 chỗ đóng băng): nhập lại vùng chữ = chạy lại OCR/dịch
+    // (TIÊU credit) ⇒ cổng ví chạy NGAY trong request; thiếu ⇒ 402, không ghi vùng nào.
+    const hold = await holdCreditBeforeJob(req, job.id, job.kind || 'image_translation');
+
     let result;
     try {
-      result = await app.imagelabPipeline.setManualRegions(job.id, {
+      result = await withHoldRelease(req, job.id, hold, () => app.imagelabPipeline.setManualRegions(job.id, {
         sessionId: sid,
+        userId: req.user?.id ?? null,
         regions,
         replace,
         confirmReplaceEdited,
         // IL08-01(a): chỉ chặn khi có lượt OCR THẬT đang chờ/đang chạy trong hàng đợi.
         ocrPending: typeof queue?.isPending === 'function' ? queue.isPending(job.id) : null,
-      });
+      }));
     } catch (err) {
       throw mapImagelabError(err, 'Không lưu được vùng chữ nhập tay.');
     }
@@ -1009,7 +1978,7 @@ export function buildRouter(app) {
 
     const sid = sessionId(req, res);
     enforce(rateLimiters.jobs, `imagelab-render:${sid}`);
-    const job = await requireImagelabJob(params.id, sid);
+    const job = await requireImagelabJob(params.id, sid, req);
 
     const body = await readJson(req, { maxBytes: 256 * 1024 });
     const requestedRegionIds = Array.isArray(body.only_region_ids) ? body.only_region_ids : null;
@@ -1071,16 +2040,31 @@ export function buildRouter(app) {
       });
     }
 
-    await store.updateJob(job.id, {
-      status: JOB_STATUS.QUEUED,
-      stage: 'rendering',
-      error_code: null,
-      error_message: null,
-    });
+    // MVP-05 (PB-02, vòng 2): RENDER là một LƯỢT CHẠY có tính tiền ⇒ giữ tiền ngay trong
+    // request (thiếu ⇒ 402; vượt trần lượt chạy ⇒ 429 RERUN_LIMIT_EXCEEDED) TRƯỚC khi xếp
+    // hàng. Trước đây lượt render không bao giờ bị thu.
+    const hold = await holdCreditBeforeJob(req, job.id, job.kind || 'image_translation');
+    try {
+      await store.updateJob(job.id, {
+        status: JOB_STATUS.QUEUED,
+        stage: 'rendering',
+        error_code: null,
+        error_message: null,
+      });
 
-    queue.enqueue(job.id, () =>
-      app.imagelabPipeline.renderApproved(job.id, { sessionId: sid, onlyRegionIds, force, unknownRegionIds }),
-    );
+      queue.enqueue(job.id, () =>
+        app.imagelabPipeline.renderApproved(job.id, {
+          sessionId: sid,
+          userId: req.user?.id ?? null,
+          onlyRegionIds,
+          force,
+          unknownRegionIds,
+        }),
+      );
+    } catch (err) {
+      await withHoldRelease(req, job.id, hold, async () => { throw err; }).catch(() => {});
+      throw mapImagelabError(err, 'Không xếp hàng render được.');
+    }
 
     sendJson(res, 202, { job_id: job.id, status: JOB_STATUS.QUEUED, force });
   });
@@ -1089,7 +2073,7 @@ export function buildRouter(app) {
 
   router.get('/api/imagelab/assets/:id', async (req, res, params) => {
     const sid = sessionId(req, res);
-    const asset = await requireImagelabAsset(params.id, sid);
+    const asset = await requireImagelabAsset(params.id, sid, req);
     sendJson(res, 200, assetJson(asset));
   });
 
@@ -1097,7 +2081,7 @@ export function buildRouter(app) {
 
   router.get('/api/imagelab/assets/:id/file', async (req, res, params) => {
     const sid = sessionId(req, res);
-    const asset = await requireImagelabAsset(params.id, sid);
+    const asset = await requireImagelabAsset(params.id, sid, req);
 
     const allowed = config.net.allowedImageMime || [];
     if (!asset.mime || !allowed.includes(asset.mime)) {
@@ -1158,24 +2142,44 @@ export function buildRouter(app) {
     const blocked = await preflightOverlayBlock(null, options);
     if (blocked) return sendImagestudioOverlayBlocked(res, blocked);
 
-    const jobId = await store.createJob({
-      sessionId: sid,
-      source: 'manual',
-      inputMode: 'manual',
-      kind: IMAGESTUDIO_KIND,
-    });
+    // MVP-05 (§0 luật 2 + §3.4b): cổng ví TRƯỚC khi ghi job/ảnh ⇒ thiếu credit thì DB
+    // KHÔNG tăng dòng nào (job_id sinh trước để hook giữ tiền theo đúng job đó).
+    const userId = req.user?.id ?? null;
+    const jobId = randomUUID();
+    const hold = await holdCreditBeforeJob(req, jobId, IMAGESTUDIO_KIND);
+
+    try {
+      await store.createJob({
+        id: jobId,
+        sessionId: sid,
+        userId,
+        source: 'manual',
+        inputMode: 'manual',
+        kind: IMAGESTUDIO_KIND,
+      });
+    } catch (err) {
+      await releaseHoldOnFailure(req, jobId);
+      throw mapImagestudioError(err, 'Không tạo được job tạo ảnh.');
+    }
 
     // Ingest chạy NGAY trong request (như MVP-02 đã làm) để `asset_id` trả về là THẬT và
     // ảnh hỏng/không hỗ trợ ra HTTP ngay, không biến thành job chết trong hàng đợi.
     let ingest;
     try {
-      ingest = await app.imagestudioPipeline.ingest(jobId, { image, sessionId: sid, options });
+      ingest = await app.imagestudioPipeline.ingest(jobId, { image, sessionId: sid, userId, options });
     } catch (err) {
       await markImagestudioJobFailed(jobId, err);
+      // PB-01: ingest lỗi SAU khi đã giữ tiền ⇒ hoàn khoản giữ (job đã failed, không chạy gì).
+      await releaseHoldOnFailure(req, jobId);
       throw mapImagestudioError(err, 'Không lưu được ảnh tải lên.');
     }
 
-    queue.enqueue(jobId, () => app.imagestudioPipeline.generate(jobId, { sessionId: sid, options, force: false }));
+    try {
+      queue.enqueue(jobId, () => app.imagestudioPipeline.generate(jobId, { sessionId: sid, userId, options, force: false }));
+    } catch (err) {
+      await releaseHoldOnFailure(req, jobId);
+      throw err;
+    }
 
     sendJson(res, 202, {
       job_id: jobId,
@@ -1193,7 +2197,7 @@ export function buildRouter(app) {
     const { templates, retouchLimits } = await requireImagestudioTemplates();
 
     const sid = sessionId(req, res);
-    const job = await requireImagestudioJob(params.id, sid);
+    const job = await requireImagestudioJob(params.id, sid, req);
 
     const list = asArray(await store.listImageAssets(job.id, {}));
     const originals = list.filter((a) => a.role === 'original');
@@ -1244,7 +2248,7 @@ export function buildRouter(app) {
 
     const sid = sessionId(req, res);
     enforce(rateLimiters.jobs, `imagestudio-generate:${sid}`);
-    const job = await requireImagestudioJob(params.id, sid);
+    const job = await requireImagestudioJob(params.id, sid, req);
 
     if (String(job.kind ?? '') !== IMAGESTUDIO_KIND) {
       throw HttpError.safe(409, 'IMAGESTUDIO_NOT_IMAGE_JOB', 'Job này không phải job tạo ảnh (`image_generation`) — không chạy tạo ảnh được.');
@@ -1266,15 +2270,27 @@ export function buildRouter(app) {
     const blocked = await preflightOverlayBlock(job, options);
     if (blocked) return sendImagestudioOverlayBlocked(res, blocked);
 
-    await store.updateJob(job.id, {
-      status: JOB_STATUS.QUEUED,
-      stage: 'queued',
-      error_code: null,
-      error_message: null,
-    });
+    // MVP-05 (§3.4b, chỗ #5 trong 5 chỗ đóng băng): chạy tạo ảnh là bước TIÊU credit ⇒ cổng
+    // ví chạy NGAY trong request; thiếu ⇒ 402 trước khi xếp hàng (job giữ nguyên trạng thái).
+    const hold = await holdCreditBeforeJob(req, job.id, IMAGESTUDIO_KIND);
 
-    // Ảnh MỚI: pipeline ghi asset role `rendered` với `parent_id` = ảnh gốc; ảnh cũ còn nguyên.
-    queue.enqueue(job.id, () => app.imagestudioPipeline.generate(job.id, { sessionId: sid, options, force }));
+    // PB-01: mọi lỗi SAU khi giữ tiền (ghi trạng thái / xếp hàng) phải hoàn khoản giữ.
+    try {
+      await store.updateJob(job.id, {
+        status: JOB_STATUS.QUEUED,
+        stage: 'queued',
+        error_code: null,
+        error_message: null,
+      });
+
+      // Ảnh MỚI: pipeline ghi asset role `rendered` với `parent_id` = ảnh gốc; ảnh cũ còn nguyên.
+      queue.enqueue(job.id, () =>
+        app.imagestudioPipeline.generate(job.id, { sessionId: sid, userId: req.user?.id ?? null, options, force }),
+      );
+    } catch (err) {
+      await withHoldRelease(req, job.id, hold, async () => { throw err; }).catch(() => {});
+      throw err;
+    }
 
     sendJson(res, 202, { job_id: job.id, status: JOB_STATUS.QUEUED, force, poll: `/api/imagestudio/jobs/${job.id}` });
   });
@@ -1299,7 +2315,7 @@ export function buildRouter(app) {
 
   router.get('/api/imagestudio/assets/:id/file', async (req, res, params) => {
     const sid = sessionId(req, res);
-    const asset = await requireImagestudioAsset(params.id, sid);
+    const asset = await requireImagestudioAsset(params.id, sid, req);
     const storage = imagestudioStorage();
     if (!storage || typeof storage.read !== 'function') {
       throw HttpError.safe(503, 'IMAGESTUDIO_UNAVAILABLE', 'Không có kho ảnh để đọc tệp — tính năng tạo ảnh chưa sẵn sàng.');
@@ -1332,8 +2348,261 @@ export function buildRouter(app) {
     res.end(buffer);
   });
 
+  /**
+   * MVP-05 — gắn middleware `attachUser` (+ cổng "bắt buộc đăng nhập" khi chủ hệ thống tắt
+   * chế độ ẩn danh) cho MỌI route đã đăng ký ở trên.
+   *
+   * `Router` của repo cố ý tối giản (không có middleware toàn cục), nên bọc handler tại đây
+   * thay vì sửa `src/http/server.js`: mọi route — kể cả route cũ của MVP-01/02/03 — dùng
+   * CHUNG một chỗ đọc cookie/`req.user`, không route nào quên.
+   *
+   * Thứ tự chạy: attachUser (không bao giờ ném) → cổng ẩn danh → handler.
+   */
+  for (const route of router.routes) {
+    const handler = route.handler;
+    route.handler = async (req, res, params) => {
+      await attachUser(req);
+      if (!anonymousAllowed() && requiresLoginWhenAnonymousOff(req)) requireUser(req);
+      return handler(req, res, params);
+    };
+  }
+
   return router;
 }
+
+/**
+ * Khi `AUTH_ANONYMOUS_ALLOWED=false`: các route NGHIỆP VỤ (jobs/imagelab/imagestudio/uploads/
+ * detect) bắt buộc đăng nhập. Miễn trừ theo hợp đồng §2.3/§3.3:
+ *  - `/api/auth/*` (nếu không thì không ai đăng nhập được),
+ *  - `/api/health`, `/api/config` (giám sát + UI khởi động),
+ *  - route FILE ẢNH: tự kiểm quyền sở hữu và trả 404 cho ảnh không thuộc mình,
+ *    KHÔNG trả 401 (đúng câu "route file ảnh nếu ảnh thuộc chính user (còn lại 404)").
+ */
+function requiresLoginWhenAnonymousOff(req) {
+  const path = String(req?.url || '').split('?')[0];
+  if (ANON_EXEMPT_PATHS.has(path)) return false;
+  if (/^\/api\/(?:imagelab|imagestudio)\/assets\/[^/]+\/file\/?$/.test(path)) return false;
+  return BUSINESS_PATH_RE.test(path);
+}
+
+
+
+
+
+
+/** Số nguyên trong khoảng cho phép (query `limit`/`offset`); giá trị rác ⇒ mặc định. */
+function clampInt(raw, fallback, min, max) {
+  const n = Number.parseInt(String(raw ?? ''), 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(Math.max(n, min), max);
+}
+
+/** `Date`/ISO/ms → chuỗi ISO; không đọc được ⇒ `null` (KHÔNG bịa thời điểm). */
+function toIsoString(value) {
+  if (value instanceof Date) return Number.isFinite(value.getTime()) ? value.toISOString() : null;
+  if (typeof value === 'number' && Number.isFinite(value)) return new Date(value).toISOString();
+  if (typeof value === 'string' && value.trim()) {
+    const t = Date.parse(value.trim());
+    return Number.isFinite(t) ? new Date(t).toISOString() : value.trim();
+  }
+  return null;
+}
+
+/**
+ * Token phiên PHẢI là chuỗi an toàn để nhét vào header `Set-Cookie` (base64url).
+ * Token lạ ⇒ `null`: không đặt cookie, không để lọt ký tự điều khiển vào header.
+ */
+function safeToken(token) {
+  if (typeof token !== 'string') return null;
+  const clean = token.trim();
+  return /^[A-Za-z0-9_-]{8,256}$/.test(clean) ? clean : null;
+}
+
+/**
+ * `user` TRẢ RA CLIENT — danh sách TRẮNG: TUYỆT ĐỐI không có `password_hash`, không token,
+ * không khoá nội bộ nào khác (kể cả khi tầng A1/A3 lỡ trả cả dòng DB thô).
+ */
+function publicUserJson(user) {
+  if (!user || typeof user !== 'object') return null;
+  return {
+    id: user.id ?? null,
+    email: user.email ?? null,
+    display_name: user.display_name ?? user.displayName ?? null,
+    role: user.role ?? 'member',
+    status: user.status ?? 'active',
+    created_at: user.created_at ?? user.createdAt ?? null,
+    updated_at: user.updated_at ?? user.updatedAt ?? null,
+    last_login_at: user.last_login_at ?? user.lastLoginAt ?? null,
+  };
+}
+
+/** Dòng sổ credit trả cho client — chỉ field hợp đồng §2.1, không lộ cột nội bộ. */
+function ledgerJson(row) {
+  if (!row || typeof row !== 'object') return null;
+  return {
+    id: row.id ?? null,
+    amount: Number.isFinite(Number(row.amount)) ? Number(row.amount) : null,
+    currency: row.currency ?? null,
+    reason: row.reason ?? null,
+    job_id: row.job_id ?? null,
+    operation: row.operation ?? null,
+    balance_after: Number.isFinite(Number(row.balance_after)) ? Number(row.balance_after) : null,
+    created_at: row.created_at ?? null,
+  };
+}
+
+/** Một dòng bảng giá: `{operation, unit_price, currency, note}` (§3.3). */
+function pricingJson(row) {
+  if (!row || typeof row !== 'object') return null;
+  return {
+    operation: row.operation ?? null,
+    unit_price: Number.isFinite(Number(row.unit_price)) ? Number(row.unit_price) : null,
+    currency: row.currency ?? null,
+    note: row.note ?? null,
+  };
+}
+
+/** Một dòng usage tổng hợp — chuyển thẳng dữ liệu store trả, không diễn giải thêm. */
+function usageRowJson(row) {
+  if (!row || typeof row !== 'object') return null;
+  return { ...row };
+}
+
+/** Câu tiếng Việt cho 402 — kèm số đo THẬT khi có, không bịa khi thiếu. */
+function insufficientCreditMessage(required, balance) {
+  if (Number.isFinite(Number(required)) && Number.isFinite(Number(balance))) {
+    return `Số dư credit không đủ để chạy job này: cần ${Number(required)}, hiện có ${Number(balance)}. Hãy nạp thêm credit rồi thử lại.`;
+  }
+  if (Number.isFinite(Number(balance))) {
+    return `Số dư credit không đủ để chạy job này (hiện có ${Number(balance)}). Hãy nạp thêm credit rồi thử lại.`;
+  }
+  return 'Số dư credit không đủ để chạy job này. Hãy nạp thêm credit rồi thử lại.';
+}
+
+/**
+ * Lỗi của tầng ví (A2/A3) → HTTP.
+ *
+ * Chỉ nhận đúng `INSUFFICIENT_CREDIT` (hoặc lỗi đã mang `status: 402`) ⇒ **402** kèm
+ * `details { required, balance }` (trường nào tầng dưới không cung cấp thì để `null`,
+ * KHÔNG bịa số). Lỗi khác ⇒ `null` để tầng gọi dùng bảng ánh xạ của chính nó.
+ */
+function mapBillingError(err) {
+  if (!err || typeof err !== 'object') return null;
+  const code = String(err.code || '');
+  // BR-03a (vòng 3): không giữ được tiền vì SỔ LỖI ⇒ 503 (fail-closed), KHÔNG cho chạy miễn phí.
+  if (code === 'BILLING_UNAVAILABLE') {
+    return HttpError.safe(503, 'BILLING_UNAVAILABLE', String(err.message || 'Sổ ví tạm thời không dùng được — thử lại sau.'), {
+      job_id: err?.details?.job_id ?? null,
+      cause_code: err?.details?.cause_code ?? null,
+    });
+  }
+  // PB-02 (vòng 2): vượt trần số lượt chạy có tính tiền của job ⇒ 429 (không phải 5xx, không
+  // phải 402: người dùng CÓ tiền, chỉ là job này đã chạy quá nhiều lượt).
+  if (code === 'RERUN_LIMIT_EXCEEDED') {
+    const d = err.details && typeof err.details === 'object' ? err.details : {};
+    return HttpError.safe(
+      429,
+      'RERUN_LIMIT_EXCEEDED',
+      String(err.message || 'Job đã chạy quá số lượt cho phép — hãy tạo job mới.'),
+      { job_id: d.job_id ?? null, runs: Number.isFinite(Number(d.runs)) ? Number(d.runs) : null, max_runs: Number.isFinite(Number(d.max_runs)) ? Number(d.max_runs) : null },
+    );
+  }
+  // PB-06: khoản tiền không hợp lệ / vượt trần ⇒ 400 (trước đây `grant(1e308)` ghi sổ 0 mà vẫn 201).
+  if (code === 'INVALID_AMOUNT' || code === 'AMOUNT_TOO_LARGE' || code === 'INVALID_REASON') {
+    const d = err.details && typeof err.details === 'object' ? err.details : {};
+    return HttpError.safe(400, code, String(err.message || 'Số credit không hợp lệ.'), {
+      amount: d.amount ?? null,
+      max: d.max ?? null,
+    });
+  }
+  if (code !== 'INSUFFICIENT_CREDIT' && Number(err.status) !== 402) return null;
+  const raw = err.details && typeof err.details === 'object' ? err.details : {};
+  const required = Number(raw.required ?? raw.estimated ?? raw.amount);
+  const balance = Number(raw.balance ?? raw.available ?? raw.balance_after);
+  const details = {
+    required: Number.isFinite(required) ? required : null,
+    balance: Number.isFinite(balance) ? balance : null,
+    // §3.4b: details có cả `currency`; thiếu thì để `null` (không bịa đơn vị tiền).
+    currency: typeof raw.currency === 'string' && raw.currency ? raw.currency : null,
+  };
+  return HttpError.safe(402, 'INSUFFICIENT_CREDIT', insufficientCreditMessage(details.required, details.balance), details);
+}
+
+/**
+ * Lỗi của `/api/auth/register` → HTTP theo hợp đồng §3.3.
+ *
+ * A1 có thể dùng tên mã khác (`EMAIL_EXISTS`, `PASSWORD_TOO_SHORT`…) nên nhận cả nhóm
+ * tương đương; mã LẠ ⇒ 500 (không đoán bừa thành 4xx để tránh che lỗi hệ thống).
+ */
+function mapRegisterError(err, minLength = 10) {
+  if (err instanceof HttpError) return err;
+  const code = authErrorCode(err);
+  const details = err?.details && typeof err.details === 'object' ? err.details : {};
+  if (AUTH_CODE_SETS.EMAIL_TAKEN.has(code)) {
+    return HttpError.safe(409, 'EMAIL_TAKEN', 'Email này đã được đăng ký — hãy đăng nhập hoặc dùng email khác.');
+  }
+  if (AUTH_CODE_SETS.WEAK_PASSWORD.has(code)) {
+    return HttpError.safe(400, 'WEAK_PASSWORD', `Mật khẩu quá yếu — cần ít nhất ${minLength} ký tự.`);
+  }
+  if (AUTH_CODE_SETS.DISABLED.has(code)) {
+    return HttpError.safe(403, 'ACCOUNT_DISABLED', 'Tài khoản này đã bị khoá — liên hệ quản trị viên.');
+  }
+  if (AUTH_CODE_SETS.BAD_BODY.has(code)) {
+    return HttpError.safe(400, 'BAD_BODY', 'Dữ liệu đăng ký không hợp lệ (kiểm tra lại email/mật khẩu).', details);
+  }
+  return authInternalError(err, 'Không tạo được tài khoản.');
+}
+
+/**
+ * Lỗi của `/api/auth/login` → HTTP. MỌI ca sai thông tin (email không tồn tại, mật khẩu sai,
+ * email sai định dạng) trả **CÙNG MỘT** 401 + CÙNG MỘT câu: không được để kẻ dò tài khoản
+ * phân biệt được email nào có thật.
+ */
+function mapLoginError(err) {
+  if (err instanceof HttpError) return err;
+  const code = authErrorCode(err);
+  if (AUTH_CODE_SETS.BAD_CREDENTIALS.has(code)) {
+    return HttpError.safe(401, 'BAD_CREDENTIALS', BAD_CREDENTIALS_TEXT);
+  }
+  if (AUTH_CODE_SETS.DISABLED.has(code)) {
+    return HttpError.safe(403, 'ACCOUNT_DISABLED', 'Tài khoản này đã bị khoá — liên hệ quản trị viên.');
+  }
+  if (AUTH_CODE_SETS.BAD_BODY.has(code)) {
+    return HttpError.safe(400, 'BAD_BODY', 'Dữ liệu đăng nhập không hợp lệ (cần `email` và `password`).');
+  }
+  return authInternalError(err, 'Không đăng nhập được.');
+}
+
+/** Lỗi tài khoản dùng chung cho route quản trị (`setRole`, `list`…) — giữ đúng mã 4xx. */
+function mapAuthError(err) {
+  if (err instanceof HttpError) return err;
+  const code = authErrorCode(err);
+  if (AUTH_CODE_SETS.USER_NOT_FOUND.has(code)) {
+    return HttpError.safe(404, 'USER_NOT_FOUND', 'Không tìm thấy người dùng.');
+  }
+  if (AUTH_CODE_SETS.BAD_ROLE.has(code)) {
+    return HttpError.safe(400, 'BAD_ROLE', `\`role\` phải là một trong: ${AUTH_ROLES.join(', ')}.`);
+  }
+  if (AUTH_CODE_SETS.EMAIL_TAKEN.has(code)) {
+    return HttpError.safe(409, 'EMAIL_TAKEN', 'Email này đã được đăng ký — hãy dùng email khác.');
+  }
+  // A1 chặn hạ cấp owner CUỐI CÙNG (LAST_OWNER): 409 + câu tiếng Việt, không phải 500.
+  if (code === 'LAST_OWNER') {
+    return HttpError.safe(409, 'LAST_OWNER', 'Không thể hạ cấp owner cuối cùng — hệ thống sẽ không còn ai quản trị.');
+  }
+  if (code === 'STORE_UNAVAILABLE' || code === 'STORE_ERROR' || code === 'OWNER_COUNT_UNAVAILABLE') {
+    return HttpError.safe(503, 'ACCOUNTS_UNAVAILABLE', 'Kho dữ liệu tài khoản đang lỗi — vui lòng thử lại sau.');
+  }
+  return authInternalError(err, 'Không xử lý được yêu cầu tài khoản.');
+}
+
+/** Lỗi hệ thống của tầng tài khoản: 500 an toàn, KHÔNG dội message nội bộ ra client. */
+function authInternalError(err, fallbackMessage) {
+  const code = authErrorCode(err) || 'AUTH_FAILED';
+  return HttpError.safe(500, code, fallbackMessage);
+}
+
+const authErrorCode = (err) => String(err?.code || '').trim().toUpperCase();
 
 /** Kiểm dữ liệu thủ công trước khi tạo job. */
 function validateManualPayload(manual, config) {
@@ -1838,6 +3107,9 @@ function sanitizeRegionIds(raw) {
 /** Lỗi pipeline/provider → HTTP an toàn, giữ nguyên mã lỗi THẬT của provider. */
 function mapImagelabError(err, fallbackMessage = 'Không xử lý được yêu cầu.') {
   if (err instanceof HttpError) return err;
+  // MVP-05: thiếu credit (hook giữ tiền của A3 ném ra từ pipeline) ⇒ 402, KHÔNG phải 500.
+  const billing = mapBillingError(err);
+  if (billing) return billing;
   const code = typeof err?.code === 'string' && err.code ? err.code : 'IMAGELAB_FAILED';
   const message = typeof err?.message === 'string' && err.message ? err.message : fallbackMessage;
   if (code === 'REVIEW_REQUIRED') return HttpError.safe(409, code, message);
@@ -2139,6 +3411,9 @@ function imagestudioLastRun(run) {
  */
 function mapImagestudioError(err, fallbackMessage = 'Không tạo được ảnh.') {
   if (err instanceof HttpError) return err;
+  // MVP-05: thiếu credit ⇒ 402 (cùng một cách hiểu với MVP-01/MVP-02), không phải 500.
+  const billing = mapBillingError(err);
+  if (billing) return billing;
   const code = typeof err?.code === 'string' && err.code ? err.code : 'IMAGESTUDIO_FAILED';
   const message = scrubPaths(typeof err?.message === 'string' && err.message ? err.message : fallbackMessage);
   const details = err?.details && typeof err.details === 'object' ? err.details : {};

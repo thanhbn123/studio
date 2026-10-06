@@ -53,6 +53,68 @@ export const JOB_KINDS = Object.freeze({
 
 export const IMAGE_ASSET_ROLES = Object.freeze(['original', 'rendered']);
 
+/* ───────────────────────── MVP-05 — tài khoản + ví ───────────────────────── */
+
+/** Vai trò người dùng (hợp đồng §2.1) — A1/A4 dùng chung, không định nghĩa lại. */
+export const USER_ROLES = Object.freeze(['owner', 'admin', 'member']);
+
+/** Trạng thái tài khoản. `disabled` ⇒ mọi phiên bị từ chối (A1 kiểm ở authenticate). */
+export const USER_STATUSES = Object.freeze(['active', 'disabled']);
+
+/** Lý do hợp lệ của một dòng sổ credit (hợp đồng §2.1). Sổ là APPEND-ONLY. */
+export const LEDGER_REASONS = Object.freeze([
+  'grant',
+  'admin_grant',
+  'job_hold',
+  'job_settle',
+  'job_refund',
+  'adjustment',
+]);
+
+/** Kiểu nhóm của `usageAggregate` (hợp đồng §3.4). */
+export const USAGE_GROUP_BY = Object.freeze(['day', 'operation', 'user']);
+
+/** Nhãn nhóm cho usage của job ẩn danh (`jobs.user_id IS NULL`). */
+export const ANONYMOUS_GROUP_LABEL = '(ẩn danh)';
+
+/**
+ * Số chữ số làm tròn của TIỀN TỆ (credit). `amount`/`balance_after` là REAL nên cộng thô
+ * sẽ sinh `1.9000000000000001`; mọi chỗ ghi/đọc tiền đều đi qua `roundMoney` để số dư đối
+ * soát được bằng `===` và không lệch ~1e-15 giữa các lần đọc.
+ */
+export const MONEY_DECIMALS = 6;
+
+/** Làm tròn tiền về 6 chữ số thập phân (null/không phải số ⇒ null). */
+export function roundMoney(value) {
+  const n = toNum(value, null);
+  if (n === null) return null;
+  const factor = 10 ** MONEY_DECIMALS;
+  // `Math.round` trên số đã dịch dấu phẩy; cộng EPS để 0.0000005 không bị làm tròn xuống
+  // do biểu diễn nhị phân (ví dụ 1.0000005 → 1.000001).
+  return Math.round((n + Math.sign(n) * Number.EPSILON) * factor) / factor;
+}
+
+/**
+ * GIÁ MẶC ĐỊNH CỦA REPO cho từng operation — dùng khi `config.cost` thiếu khoá.
+ *
+ * ⚠️ Đây KHÔNG phải giá nhà cung cấp: đây là con số ước tính của repo (trùng mặc định
+ * `config.cost` của MVP-01) để mọi operation trong `USAGE_OPERATIONS` đều có giá và
+ * `priceOf()` không bao giờ ném `UNKNOWN_OPERATION`. `CONTENT_REPAIR` (lượt gọi model sửa
+ * nội dung) lấy cùng mức với `CONTENT_GENERATE`.
+ */
+export const DEFAULT_PRICING = Object.freeze({
+  SOURCE_EXTRACT: 0.0005,
+  VISION_ANALYSIS: 0.003,
+  TRANSLATION: 0.0008,
+  CONTENT_GENERATE: 0.004,
+  CONTENT_REPAIR: 0.004,
+  OCR_DETECT: 0.0004,
+  IMAGE_RENDER: 0.0015,
+  IMAGE_MATTING: 0.002,
+  IMAGE_COMPOSE: 0.0005,
+  IMAGE_RETOUCH: 0.0005,
+});
+
 export const VERIFICATION_LEVELS = Object.freeze([
   'MOCK_VERIFIED',
   'MANUAL_INPUT',
@@ -126,9 +188,12 @@ export function createDriver(config, logger) {
 }
 
 export class Store {
-  constructor({ driver, logger } = {}) {
+  constructor({ driver, logger, config = null } = {}) {
     this.driver = driver;
     this.logger = logger;
+    // MVP-05: `config.cost.*` là NGUỒN GIÁ MẶC ĐỊNH (§2.3) — Store cần nó để seed bảng
+    // `pricing` lúc `init()`. Không truyền (test dựng Store trực tiếp) ⇒ dùng DEFAULT_PRICING.
+    this.config = config;
     this.dialect = driver?.dialect || 'sqlite';
   }
 
@@ -146,6 +211,10 @@ export class Store {
       await this.driver.exec(schema);
     }
     await this.#applyAdditiveMigrations();
+    // MVP-05: bảng giá phải có ĐỦ mọi operation trong `USAGE_OPERATIONS` (kể cả
+    // `CONTENT_REPAIR`) trước khi bất kỳ ai gọi `priceOf()` — nếu không, ước tính giữ tiền
+    // sẽ ném `UNKNOWN_OPERATION`.
+    await this.#seedPricing();
     this.logger?.info('store.initialized', { dialect: this.dialect });
     return this;
   }
@@ -155,22 +224,132 @@ export class Store {
    *
    * `data/studio.db` của MVP-01 đã có bảng `jobs` từ trước, nên `CREATE TABLE IF NOT
    * EXISTS` trong schema KHÔNG thể thêm cột `kind` cho nó. Phải ALTER tại chỗ:
-   *   - SQLite: đọc `PRAGMA table_info(jobs)`, thiếu `kind` thì mới ALTER (SQLite không
+   *   - SQLite: đọc `PRAGMA table_info(<bảng>)`, thiếu cột thì mới ALTER (SQLite không
    *     có `ADD COLUMN IF NOT EXISTS`).
    *   - PostgreSQL: `ADD COLUMN IF NOT EXISTS` tự idempotent.
    * Nhờ vậy `init()` chạy hai lần liên tiếp không lỗi, và DB cũ nâng cấp được tại chỗ.
+   *
+   * MVP-05 thêm 2 cột (hợp đồng §2.1) — cả hai đều NULL-able và KHÔNG backfill:
+   *   - `jobs.user_id`         NULL = job ẩn danh (luật #1: người dùng ẩn danh không bị phá)
+   *   - `image_assets.user_id` NULL = ảnh của phiên ẩn danh
+   * Job/asset CŨ giữ nguyên `user_id = NULL`, KHÔNG tự gán cho ai (hợp đồng §2.2).
    */
   async #applyAdditiveMigrations() {
+    await this.#addColumnIfMissing('jobs', 'kind', "TEXT DEFAULT 'content'");
+    await this.#addColumnIfMissing('jobs', 'user_id', 'TEXT');
+    await this.#addColumnIfMissing('image_assets', 'user_id', 'TEXT');
+    // MVP-05 (vòng 2): `wallet_ledger.seq` — thứ tự TĂNG DẦN trong phạm vi một user, để
+    // `listLedger` sắp xếp ỔN ĐỊNH (nhiều dòng có thể cùng mili-giây). DB tạo trước vòng
+    // này chưa có cột ⇒ thêm tại chỗ; dòng cũ giữ `seq = 0` (không UPDATE sổ append-only).
+    await this.#addColumnIfMissing('wallet_ledger', 'seq', 'INTEGER NOT NULL DEFAULT 0');
+    await this.#createIndexIfPossible('idx_wallet_ledger_user_seq', 'wallet_ledger', 'user_id, seq');
+    // MVP-05 (vòng 2, PB-02/PB-04): `wallet_ledger.run_key` — khoá chu kỳ tiền theo LƯỢT CHẠY
+    // (`<jobId>#<n>`), để mỗi lượt chạy lại có hold/settle/refund riêng. Thêm SAU migration
+    // (bài học `seq`: index trong `schema.sql` làm chết `init()` trên DB cũ).
+    await this.#addColumnIfMissing('wallet_ledger', 'run_key', 'TEXT');
+    // BR-03b (vòng 3): `wallet_ledger.close_kind` — 'settle' | 'refund' cho dòng ĐÓNG lượt chạy.
+    // Nhờ cột này, ràng buộc ở tầng DB phát biểu được đúng luật "MỘT dòng đóng cho mỗi lượt"
+    // (unique trên `(user_id, job_id, run_key)` WHERE `close_kind IS NOT NULL`) — unique theo
+    // `reason` không chặn được cặp settle+refund cho cùng lượt.
+    await this.#addColumnIfMissing('wallet_ledger', 'close_kind', 'TEXT');
+    await this.#createUniqueIndexIfPossible('uniq_wallet_ledger_run_close', 'wallet_ledger', {
+      columns: 'user_id, job_id, run_key',
+      where: 'close_kind IS NOT NULL AND run_key IS NOT NULL',
+    });
+    // BR-07 (vòng 3): `usage_events.run_key` — chi phí THẬT phải quy được về TỪNG LƯỢT CHẠY,
+    // nếu không `afterJob` sẽ settle theo usage TÍCH LUỸ của cả job (thu thừa các lượt trước).
+    await this.#addColumnIfMissing('usage_events', 'run_key', 'TEXT');
+    await this.#createIndexIfPossible('idx_usage_run_key', 'usage_events', 'job_id, run_key');
+    await this.#createIndexIfPossible('idx_wallet_ledger_run_key', 'wallet_ledger', 'user_id, job_id, run_key');
+    await this.#createUniqueIndexIfPossible('uniq_wallet_ledger_run_reason', 'wallet_ledger', {
+      columns: 'user_id, job_id, run_key, reason',
+      where: "reason IN ('job_hold','job_settle','job_refund') AND run_key IS NOT NULL",
+    });
+    // Index tra cứu theo chủ sở hữu (A4 lọc dữ liệu theo user). Tạo SAU khi cột đã tồn tại;
+    // lỗi ở đây không được làm chết boot (DB cũ/hỏng vẫn phải chạy được MVP-01/02/03).
+    await this.#createIndexIfPossible('idx_jobs_user_id', 'jobs', 'user_id');
+    await this.#createIndexIfPossible('idx_image_assets_user_id', 'image_assets', 'user_id');
+  }
+
+  /** Thêm cột nếu thiếu — idempotent trên CẢ hai driver (xem #applyAdditiveMigrations). */
+  async #addColumnIfMissing(table, column, ddl) {
     if (this.isPostgres) {
-      await this.driver.run("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS kind TEXT DEFAULT 'content'");
+      await this.driver.run(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${ddl}`);
       return;
     }
-    const info = await this.driver.all('PRAGMA table_info(jobs)');
+    const info = await this.driver.all(`PRAGMA table_info(${table})`);
     // Bảng chưa tồn tại (schema lỗi?) thì không ALTER — tránh lỗi khó hiểu.
     if (!Array.isArray(info) || info.length === 0) return;
-    if (info.some((col) => col?.name === 'kind')) return;
-    await this.driver.run("ALTER TABLE jobs ADD COLUMN kind TEXT DEFAULT 'content'");
-    this.logger?.info('store.migration.column_added', { table: 'jobs', column: 'kind', dialect: this.dialect });
+    if (info.some((col) => col?.name === column)) return;
+    await this.driver.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+    this.logger?.info('store.migration.column_added', { table, column, dialect: this.dialect });
+  }
+
+  /** Tạo index nếu có thể — DB cũ thiếu cột thì chỉ ghi log, KHÔNG làm chết `init()`. */
+  async #createIndexIfPossible(name, table, column) {
+    try {
+      await this.driver.run(`CREATE INDEX IF NOT EXISTS ${name} ON ${table} (${column})`);
+    } catch (err) {
+      this.logger?.warn('store.migration.index_skipped', { name, table, column, error: err?.message || String(err) });
+    }
+  }
+
+  /**
+   * Tạo UNIQUE index nếu có thể (PB-04, vòng 2) — chặn hai tiến trình ghi trùng một chu kỳ
+   * tiền của cùng lượt chạy. Partial unique index chạy được trên CẢ SQLite và PostgreSQL.
+   * Lỗi (DB cũ đã có dữ liệu trùng, driver không hỗ trợ…) chỉ ghi log, KHÔNG làm chết `init()`.
+   */
+  async #createUniqueIndexIfPossible(name, table, { columns, where = '' } = {}) {
+    try {
+      // ⚠️ `WHERE` phải nằm NGOÀI dấu ngoặc của danh sách cột (partial index); nhét vào trong
+      // là lỗi cú pháp trên cả SQLite lẫn PostgreSQL.
+      const clause = where ? ` WHERE ${where}` : '';
+      await this.driver.run(`CREATE UNIQUE INDEX IF NOT EXISTS ${name} ON ${table} (${columns})${clause}`);
+    } catch (err) {
+      this.logger?.warn('store.migration.unique_index_skipped', {
+        name,
+        table,
+        error: err?.message || String(err),
+      });
+    }
+  }
+
+  /**
+   * Seed bảng `pricing` từ `config.cost` (hợp đồng §2.3 — `billing.pricingFromCost`) và bảo
+   * đảm MỌI operation trong `USAGE_OPERATIONS` đều có giá.
+   *
+   * Vì sao bắt buộc: `CONTENT_REPAIR` có trong hợp đồng §2.1 + `USAGE_OPERATIONS` nhưng
+   * KHÔNG có trong `config.cost`; thiếu dòng giá thì `priceOf('CONTENT_REPAIR')` ném
+   * `UNKNOWN_OPERATION` và cả lượt ước tính giữ tiền đổ.
+   *
+   * Idempotent (upsert `ON CONFLICT ... DO UPDATE`) và chạy mỗi lần `init()`:
+   *   - operation thiếu trong `config.cost` ⇒ dùng `DEFAULT_PRICING` (GIÁ MẶC ĐỊNH CỦA REPO,
+   *     KHÔNG phải giá nhà cung cấp) và ghi rõ nguồn vào `note`;
+   *   - `config.billing.pricingFromCost === false` ⇒ KHÔNG seed (giữ giá đã chỉnh tay).
+   */
+  async #seedPricing() {
+    if (this.config?.billing?.pricingFromCost === false) return;
+    const cost = this.config?.cost || {};
+    const currency = String(this.config?.billing?.currency || cost.currency || 'USD');
+    for (const operation of USAGE_OPERATIONS) {
+      const fromConfig = toNum(cost[operation], null);
+      const unitPrice = fromConfig === null ? DEFAULT_PRICING[operation] : fromConfig;
+      if (!Number.isFinite(Number(unitPrice))) continue;
+      try {
+        await this.upsertPricing({
+          operation,
+          unitPrice,
+          currency,
+          note: fromConfig === null
+            ? 'giá MẶC ĐỊNH của repo (config.cost thiếu khoá này — không phải giá nhà cung cấp)'
+            : 'seed từ config.cost',
+        });
+      } catch (err) {
+        // Seed hỏng KHÔNG được làm chết boot: A2 vẫn còn fallback `config.cost` khi tính giá.
+        this.logger?.warn('store.pricing_seed_failed', { operation, error: err?.message || String(err) });
+      }
+    }
+    this.logger?.info('store.pricing_seeded', { operations: USAGE_OPERATIONS.length, currency });
   }
 
   async close() {
@@ -179,14 +358,15 @@ export class Store {
 
   /* ───────────────────────────── Jobs ───────────────────────────── */
 
-  async createJob({ id = randomUUID(), sessionId = '', source = '', sourceUrl = '', canonicalUrl = '', sourceProductId = '', style = '', length = '', inputMode = 'link', kind = JOB_KINDS.CONTENT } = {}) {
+  async createJob({ id = randomUUID(), sessionId = '', source = '', sourceUrl = '', canonicalUrl = '', sourceProductId = '', style = '', length = '', inputMode = 'link', kind = JOB_KINDS.CONTENT, userId = null } = {}) {
     const ts = nowIso();
     const jobKind = String(kind || JOB_KINDS.CONTENT);
+    // MVP-05: `userId = null` ⇒ job ẩn danh (luật #1 — không có ví, không trừ credit).
     await this.driver.run(
       `INSERT INTO jobs (id, session_id, source, source_url, canonical_url, source_product_id,
-        product_name, status, stage, style, length, input_mode, kind, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [id, sessionId, source, sourceUrl, canonicalUrl, sourceProductId, '', JOB_STATUS.QUEUED, 'queued', style, length, inputMode, jobKind, ts, ts],
+        product_name, status, stage, style, length, input_mode, kind, user_id, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [id, sessionId, source, sourceUrl, canonicalUrl, sourceProductId, '', JOB_STATUS.QUEUED, 'queued', style, length, inputMode, jobKind, userId || null, ts, ts],
     );
     return id;
   }
@@ -237,6 +417,9 @@ export class Store {
     return {
       id: row.id,
       session_id: row.session_id,
+      // MVP-05: NULL = job ẩn danh. Đây là field A4 dùng để tách dữ liệu theo tài khoản
+      // (`jobs.user_id === user.id`), KHÔNG được trả cho client khi chưa đăng nhập.
+      user_id: row.user_id ?? null,
       source: row.source,
       source_url: row.source_url,
       canonical_url: row.canonical_url,
@@ -263,27 +446,44 @@ export class Store {
     };
   }
 
-  async listJobs({ sessionId = null, limit = 50, offset = 0 } = {}) {
+  /**
+   * Lịch sử job.
+   *
+   * MVP-05: thêm bộ lọc TUỲ CHỌN `userId` (A4 dùng để chỉ trả job của chính người đăng
+   * nhập). Chỉ lọc khi `userId` là chuỗi khác rỗng — nhờ vậy hành vi CŨ (theo `sessionId`,
+   * hoặc không lọc) giữ nguyên 100% và job ẩn danh không bị lộ sang nhau.
+   */
+  async listJobs({ sessionId = null, userId, limit = 50, offset = 0 } = {}) {
     const lim = Math.min(Math.max(Number(limit) || 50, 1), 200);
     const off = Math.max(Number(offset) || 0, 0);
+    const COLUMNS = 'id, session_id, user_id, kind, source, source_url, product_name, status, stage, style, length, content_meta, created_at, updated_at';
+    if (typeof userId === 'string' && userId) {
+      return this.driver.all(
+        `SELECT ${COLUMNS} FROM jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+        [userId, lim, off],
+      );
+    }
     const rows = sessionId
       ? await this.driver.all(
-          `SELECT id, session_id, kind, source, source_url, product_name, status, stage, style, length, content_meta, created_at, updated_at
+          `SELECT ${COLUMNS}
            FROM jobs WHERE session_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`,
           [sessionId, lim, off],
         )
       : await this.driver.all(
-          `SELECT id, session_id, kind, source, source_url, product_name, status, stage, style, length, content_meta, created_at, updated_at
+          `SELECT ${COLUMNS}
            FROM jobs ORDER BY created_at DESC LIMIT ? OFFSET ?`,
           [lim, off],
         );
     return rows;
   }
 
-  async countJobs({ sessionId = null } = {}) {
-    const row = sessionId
-      ? await this.driver.get('SELECT COUNT(*) AS n FROM jobs WHERE session_id = ?', [sessionId])
-      : await this.driver.get('SELECT COUNT(*) AS n FROM jobs');
+  /** Đếm job — cùng quy ước lọc với `listJobs` (MVP-05: thêm `userId` tuỳ chọn). */
+  async countJobs({ sessionId = null, userId } = {}) {
+    const row = (typeof userId === 'string' && userId)
+      ? await this.driver.get('SELECT COUNT(*) AS n FROM jobs WHERE user_id = ?', [userId])
+      : sessionId
+        ? await this.driver.get('SELECT COUNT(*) AS n FROM jobs WHERE session_id = ?', [sessionId])
+        : await this.driver.get('SELECT COUNT(*) AS n FROM jobs');
     return Number(row?.n ?? 0);
   }
 
@@ -293,6 +493,8 @@ export class Store {
     id = randomUUID(),
     jobId = null,
     sessionId = '',
+    runKey = null,
+    run_key = null,
     operation,
     provider = '',
     model = '',
@@ -303,10 +505,13 @@ export class Store {
     meta = null,
   }) {
     await this.driver.run(
-      `INSERT INTO usage_events (id, job_id, session_id, operation, provider, model,
+      `INSERT INTO usage_events (id, job_id, session_id, run_key, operation, provider, model,
         input_units, output_units, estimated_cost, currency, meta, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [id, jobId, sessionId, operation, provider, model, inputUnits, outputUnits, estimatedCost, currency, toJson(meta), nowIso()],
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        id, jobId, sessionId, runKey ?? run_key ?? null, operation, provider, model,
+        inputUnits, outputUnits, estimatedCost, currency, toJson(meta), nowIso(),
+      ],
     );
     return id;
   }
@@ -315,13 +520,26 @@ export class Store {
     return this.driver.all('SELECT * FROM usage_events WHERE job_id = ? ORDER BY created_at ASC', [jobId]);
   }
 
-  /** Tổng hợp chi phí theo job — nền tảng cho credit-based billing sau này. */
-  async usageSummary(jobId) {
+  /**
+   * Tổng hợp chi phí theo job — nền tảng cho credit-based billing.
+   *
+   * BR-07 (vòng 3): nhận thêm `runKey` để lấy chi phí của **RIÊNG MỘT LƯỢT CHẠY**. Không có
+   * tham số này thì vẫn là tổng của cả job (tương thích ngược cho route thống kê).
+   * Dòng cũ (ghi trước khi có cột) mang `run_key IS NULL` ⇒ quy về lượt `#1` — nhờ vậy DB cũ
+   * vẫn quyết toán đúng cho lượt chạy đầu tiên thay vì thu 0.
+   */
+  async usageSummary(jobId, { runKey = null, run_key = null } = {}) {
+    const run = runKey ?? run_key ?? null;
+    const firstRun = typeof run === 'string' && /#1$/.test(run);
+    const where = run
+      ? (firstRun ? 'WHERE job_id = ? AND (run_key = ? OR run_key IS NULL)' : 'WHERE job_id = ? AND run_key = ?')
+      : 'WHERE job_id = ?';
+    const params = run ? [jobId, run] : [jobId];
     const row = await this.driver.get(
       `SELECT COUNT(*) AS events, COALESCE(SUM(estimated_cost),0) AS cost,
               COALESCE(SUM(input_units),0) AS input_units, COALESCE(SUM(output_units),0) AS output_units
-       FROM usage_events WHERE job_id = ?`,
-      [jobId],
+       FROM usage_events ${where}`,
+      params,
     );
     return {
       events: Number(row?.events ?? 0),
@@ -402,6 +620,7 @@ export class Store {
     id = randomUUID(),
     jobId = null,
     sessionId = '',
+    userId = null,
     role,
     parentId = null,
     mime = '',
@@ -418,11 +637,12 @@ export class Store {
     }
     if (!jobId) throw new Error('createImageAsset thiếu jobId.');
     await this.driver.run(
-      `INSERT INTO image_assets (id, job_id, session_id, role, parent_id, mime, bytes, width, height,
+      `INSERT INTO image_assets (id, job_id, session_id, user_id, role, parent_id, mime, bytes, width, height,
         sha256, storage_path, source, meta, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
-        id, jobId, sessionId, role, parentId, mime, toNum(bytes, 0), toIntOrNull(width), toIntOrNull(height),
+        // MVP-05: `userId = null` ⇒ ảnh của phiên ẩn danh (luật #1 — không bắt buộc đăng nhập).
+        id, jobId, sessionId, userId || null, role, parentId, mime, toNum(bytes, 0), toIntOrNull(width), toIntOrNull(height),
         sha256, storagePath, source, toJson(meta), nowIso(),
       ],
     );
@@ -434,6 +654,8 @@ export class Store {
       id: row.id,
       job_id: row.job_id,
       session_id: row.session_id,
+      // MVP-05: NULL = ảnh của phiên ẩn danh (A4 kiểm chủ sở hữu qua job).
+      user_id: row.user_id ?? null,
       role: row.role,
       parent_id: row.parent_id ?? null,
       mime: row.mime || '',
@@ -662,12 +884,517 @@ export class Store {
       return changed;
     });
   }
+
+  /* ═════════════════ MVP-05 — TÀI KHOẢN, PHIÊN, VÍ CREDIT ═════════════════
+   *
+   * Toàn bộ tầng tài khoản/ví đi qua đây (A1 + A2 chỉ đọc file này, không viết vào).
+   * Hai luật riêng của MVP-05 được giữ ở tầng thấp nhất:
+   *   #1 Ẩn danh không bị phá — không method nào ở đây BẮT BUỘC phải có tài khoản; job
+   *      ẩn danh (`user_id = NULL`) vẫn chạy và KHÔNG có dòng sổ nào.
+   *   #2 Sổ APPEND-ONLY — chỉ có `appendLedger` (INSERT) và các hàm ĐỌC. Không có
+   *      UPDATE/DELETE trên `wallet_ledger`, không có cột `balance` sửa tay.
+   */
+
+  /* ─────────────────────────────── users ─────────────────────────────── */
+
+  /** Chuẩn hoá email: trim + lowercase (hợp đồng §2.1: "đã chuẩn hoá lowercase"). */
+  #normalizeEmail(email) {
+    return String(email ?? '').trim().toLowerCase();
+  }
+
+  /**
+   * Người dùng trả về tầng trên. CÓ `password_hash` vì A1 cần để `verifyPassword`;
+   * A1 chịu trách nhiệm lọc bằng `toPublicUser` trước khi trả ra HTTP (hợp đồng §3.1).
+   */
+  #hydrateUser(row) {
+    return {
+      id: row.id,
+      email: row.email,
+      display_name: row.display_name ?? '',
+      role: row.role || 'member',
+      password_hash: row.password_hash,
+      status: row.status || 'active',
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      last_login_at: row.last_login_at ?? null,
+    };
+  }
+
+  async createUser({ id = randomUUID(), email, displayName = '', display_name = '', role = 'member', passwordHash = '', password_hash = '', status = 'active' } = {}) {
+    const normalized = this.#normalizeEmail(email);
+    if (!normalized) throw Object.assign(new Error('createUser thiếu email hợp lệ.'), { code: 'INVALID_EMAIL' });
+    const hash = String(passwordHash || password_hash || '');
+    if (!hash) throw Object.assign(new Error('createUser thiếu passwordHash (mật khẩu thô KHÔNG bao giờ vào store).'), { code: 'INVALID_PASSWORD_HASH' });
+    const ts = nowIso();
+    try {
+      await this.driver.run(
+        `INSERT INTO users (id, email, display_name, role, password_hash, status, created_at, updated_at, last_login_at)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+        [id, normalized, String(displayName ?? display_name ?? ''), String(role || 'member'), hash, String(status || 'active'), ts, ts, null],
+      );
+    } catch (err) {
+      // Đua nhau đăng ký cùng email: UNIQUE của DB là chốt cuối. Dịch thành mã máy đọc được
+      // để A1 trả 409 thay vì 500 (SQLite: SQLITE_CONSTRAINT_UNIQUE, PostgreSQL: 23505).
+      const text = String(err?.message || '');
+      if (err?.code === '23505' || /UNIQUE|duplicate key/i.test(text)) {
+        throw Object.assign(new Error('Email đã được đăng ký.'), { code: 'EMAIL_TAKEN', cause: err });
+      }
+      throw err;
+    }
+    return this.getUserById(id);
+  }
+
+  async getUserByEmail(email) {
+    const normalized = this.#normalizeEmail(email);
+    if (!normalized) return null;
+    const row = await this.driver.get('SELECT * FROM users WHERE email = ?', [normalized]);
+    return row ? this.#hydrateUser(row) : null;
+  }
+
+  async getUserById(id) {
+    if (!id) return null;
+    const row = await this.driver.get('SELECT * FROM users WHERE id = ?', [String(id)]);
+    return row ? this.#hydrateUser(row) : null;
+  }
+
+  /**
+   * Danh sách người dùng cho trang quản trị — CỐ TÌNH không trả `password_hash`
+   * (đây đúng là đường dễ rò rỉ nhất; A1 vẫn lọc lại bằng `toPublicUser`).
+   */
+  async listUsers({ limit = 50, offset = 0 } = {}) {
+    const lim = Math.min(Math.max(Number(limit) || 50, 1), 200);
+    const off = Math.max(Number(offset) || 0, 0);
+    const rows = await this.driver.all(
+      `SELECT id, email, display_name, role, status, created_at, updated_at, last_login_at
+       FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+      [lim, off],
+    );
+    return rows.map((row) => ({
+      id: row.id,
+      email: row.email,
+      display_name: row.display_name ?? '',
+      role: row.role || 'member',
+      status: row.status || 'active',
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      last_login_at: row.last_login_at ?? null,
+    }));
+  }
+
+  /** Tổng số người dùng — để A4 trả `{ items, total }` cho `GET /api/admin/users`. */
+  async countUsers() {
+    const row = await this.driver.get('SELECT COUNT(*) AS n FROM users');
+    return Number(row?.n ?? 0);
+  }
+
+  /**
+   * Đếm người dùng theo vai trò — A1 dùng để chặn hạ cấp `owner` CUỐI CÙNG (đếm bằng SQL
+   * thay vì phân trang `listUsers`). A1 coi method này là TUỲ CHỌN nên thiếu cũng không sao.
+   */
+  async countUsersByRole(role) {
+    const row = await this.driver.get('SELECT COUNT(*) AS n FROM users WHERE role = ?', [String(role || '')]);
+    return Number(row?.n ?? 0);
+  }
+
+  /**
+   * Cập nhật người dùng theo allowlist (không nội suy tên cột từ input).
+   * Trả về người dùng SAU khi cập nhật, hoặc `null` nếu không tồn tại.
+   */
+  async updateUser(id, patch = {}) {
+    if (!id) return null;
+    const sets = [];
+    const params = [];
+    const push = (col, value) => {
+      sets.push(`${col} = ?`);
+      params.push(value);
+    };
+    if ('email' in patch) {
+      const normalized = this.#normalizeEmail(patch.email);
+      if (normalized) push('email', normalized);
+    }
+    if ('display_name' in patch || 'displayName' in patch) {
+      push('display_name', String(patch.display_name ?? patch.displayName ?? ''));
+    }
+    if ('role' in patch) push('role', String(patch.role || 'member'));
+    if ('password_hash' in patch || 'passwordHash' in patch) {
+      push('password_hash', String(patch.password_hash ?? patch.passwordHash ?? ''));
+    }
+    if ('status' in patch) push('status', String(patch.status || 'active'));
+    if ('last_login_at' in patch || 'lastLoginAt' in patch) {
+      push('last_login_at', patch.last_login_at ?? patch.lastLoginAt ?? null);
+    }
+    if (sets.length === 0) return this.getUserById(id);
+    push('updated_at', nowIso());
+    params.push(String(id));
+    await this.driver.run(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`, params);
+    return this.getUserById(id);
+  }
+
+  /** Ghi dấu lần đăng nhập gần nhất. Trả về người dùng sau khi cập nhật (null nếu không có). */
+  async touchLastLogin(id, at = nowIso()) {
+    if (!id) return null;
+    await this.driver.run(
+      'UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?',
+      [at, at, String(id)],
+    );
+    return this.getUserById(id);
+  }
+
+  /* ─────────────────────────── user_sessions ─────────────────────────── */
+
+  /** Phiên đăng nhập — DB chỉ có `token_hash`, KHÔNG BAO GIỜ có token thô. */
+  #hydrateUserSession(row) {
+    return {
+      id: row.id,
+      user_id: row.user_id,
+      token_hash: row.token_hash,
+      created_at: row.created_at,
+      expires_at: row.expires_at,
+      last_seen_at: row.last_seen_at ?? null,
+      revoked_at: row.revoked_at ?? null,
+      user_agent: row.user_agent ?? null,
+    };
+  }
+
+  async createUserSession({ id = randomUUID(), userId = null, user_id = null, tokenHash = '', token_hash = '', createdAt = null, created_at = null, expiresAt = null, expires_at = null, userAgent = '', user_agent = '' } = {}) {
+    const uid = String(userId || user_id || '');
+    const hash = String(tokenHash || token_hash || '');
+    const expires = expiresAt || expires_at || null;
+    if (!uid || !hash || !expires) {
+      throw Object.assign(new Error('createUserSession cần userId, tokenHash và expiresAt.'), { code: 'INVALID_SESSION' });
+    }
+    await this.driver.run(
+      `INSERT INTO user_sessions (id, user_id, token_hash, created_at, expires_at, last_seen_at, revoked_at, user_agent)
+       VALUES (?,?,?,?,?,?,?,?)`,
+      // `createdAt` do A1 truyền (nếu có) được tôn trọng — test hết hạn phiên cần mốc thời gian xác định.
+      [id, uid, hash, createdAt || created_at || nowIso(), expires, null, null, String(userAgent ?? user_agent ?? '')],
+    );
+    return this.getUserSessionByTokenHash(hash);
+  }
+
+  async getUserSessionByTokenHash(tokenHash) {
+    const hash = String(tokenHash ?? '');
+    if (!hash) return null;
+    const row = await this.driver.get('SELECT * FROM user_sessions WHERE token_hash = ?', [hash]);
+    return row ? this.#hydrateUserSession(row) : null;
+  }
+
+  /** Cập nhật `last_seen_at`. Trả về số dòng đã đổi (0 = phiên không tồn tại). */
+  async touchUserSession(id, at = nowIso()) {
+    if (!id) return 0;
+    const res = await this.driver.run('UPDATE user_sessions SET last_seen_at = ? WHERE id = ?', [at, String(id)]);
+    return Number(res?.changes ?? 0);
+  }
+
+  /** Thu hồi MỘT phiên (đăng xuất). Trả về số dòng đã đổi. */
+  async revokeUserSession(id, at = nowIso()) {
+    if (!id) return 0;
+    const res = await this.driver.run(
+      'UPDATE user_sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL',
+      [at, String(id)],
+    );
+    return Number(res?.changes ?? 0);
+  }
+
+  /** Thu hồi MỌI phiên còn hiệu lực của một người dùng (đổi mật khẩu / khoá tài khoản). */
+  async revokeAllUserSessions(userId, at = nowIso()) {
+    if (!userId) return 0;
+    const res = await this.driver.run(
+      'UPDATE user_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL',
+      [at, String(userId)],
+    );
+    return Number(res?.changes ?? 0);
+  }
+
+  /* ──────────────────────────── wallet_ledger ──────────────────────────── */
+
+  #hydrateLedgerRow(row) {
+    return {
+      id: row.id,
+      user_id: row.user_id,
+      // Số thứ tự tăng dần trong sổ của user — khoá sắp xếp ỔN ĐỊNH cho phân trang.
+      seq: Number(toNum(row.seq, 0)),
+      amount: roundMoney(row.amount),
+      currency: row.currency || 'USD',
+      reason: row.reason,
+      job_id: row.job_id ?? null,
+      // PB-02 (vòng 2): khoá chu kỳ tiền theo LƯỢT CHẠY — cột riêng (không chỉ trong `meta`)
+      // để tầng billing đọc lại được mà không phải parse JSON.
+      run_key: row.run_key ?? null,
+      close_kind: row.close_kind ?? null,
+      operation: row.operation ?? null,
+      meta: fromJson(row.meta),
+      balance_after: roundMoney(row.balance_after),
+      created_at: row.created_at,
+    };
+  }
+
+  /**
+   * Ghi MỘT dòng sổ (append-only) và trả về dòng vừa ghi kèm `balance_after`.
+   *
+   * NGUYÊN TỬ: số dư được tính bằng `SUM(amount)` và dòng mới được chèn trong CÙNG một
+   * transaction (`driver.transaction`) — hai request cùng lúc không thể cùng đọc một số dư
+   * rồi ghi hai dòng lệch nhau.
+   *
+   * FAIL-CLOSED: nếu số dư sau khi cộng < 0 thì NÉM lỗi `code = 'INSUFFICIENT_CREDIT'` và
+   * KHÔNG ghi dòng nào (transaction rollback) — đây là chốt chặn cuối của A2, không đường
+   * nào làm số dư âm được (luật #2).
+   *
+   * Sai số dấu phẩy động: `amount` là REAL nên một phép trừ "về 0" có thể ra -1e-17. Dùng
+   * dung sai EPS: chỉ coi là âm thật khi vượt quá dung sai, nhờ vậy không từ chối oan một
+   * giao dịch hợp lệ vì nhiễu số học.
+   */
+  async appendLedger({ id = randomUUID(), userId = null, user_id = null, amount, currency = 'USD', reason = 'adjustment', jobId = null, job_id = null, runKey = null, run_key = null, operation = null, meta = null } = {}) {
+    const uid = String(userId || user_id || '');
+    if (!uid) throw Object.assign(new Error('appendLedger thiếu userId.'), { code: 'INVALID_LEDGER_ROW' });
+    const value = toNum(amount, null);
+    if (value === null) {
+      throw Object.assign(new Error(`appendLedger: amount không phải số hữu hạn (${JSON.stringify(amount)}).`), { code: 'INVALID_LEDGER_ROW' });
+    }
+    const EPS = 1e-9;
+    const ts = nowIso();
+    // TIỀN TỆ LÀM TRÒN 6 CHỮ SỐ ngay tại biên ghi sổ: REAL cộng thô sinh 1.9000000000000001,
+    // khiến `ledgerBalance` trả 9.995999999999999 và mọi test so `===` đều lệch ~1e-15.
+    const valueRounded = roundMoney(value);
+    const row = {
+      id,
+      user_id: uid,
+      amount: valueRounded,
+      currency: String(currency || 'USD'),
+      reason: String(reason || 'adjustment'),
+      job_id: jobId ?? job_id ?? null,
+      run_key: runKey ?? run_key ?? null,
+      // BR-03b: dòng ĐÓNG lượt chạy (settle/refund) được đánh dấu để unique index chặn việc
+      // một lượt vừa settle vừa refund (trên PostgreSQL, đọc-rồi-ghi giữa 2 tiến trình vẫn hở).
+      close_kind: (() => {
+        const r = String(reason || '');
+        if (r === 'job_settle') return 'settle';
+        if (r === 'job_refund') return 'refund';
+        return null;
+      })(),
+      operation: operation ?? null,
+      meta: meta && typeof meta === 'object' ? meta : null,
+      created_at: ts,
+    };
+    return this.driver.transaction(async (tx) => {
+      // Số dư VÀ số thứ tự `seq` được đọc trong CÙNG transaction với lần chèn: hai request
+      // cùng lúc không thể cùng đọc một số dư (hay cùng một `seq`) rồi ghi hai dòng lệch nhau.
+      const current = await tx.get(
+        'SELECT COALESCE(SUM(amount),0) AS total, COALESCE(MAX(seq),0) AS max_seq FROM wallet_ledger WHERE user_id = ?',
+        [uid],
+      );
+      const balanceBefore = roundMoney(toNum(current?.total, 0));
+      const balanceAfter = roundMoney(balanceBefore + row.amount);
+      if (balanceAfter < -EPS) {
+        throw Object.assign(
+          new Error(`Không đủ credit: số dư ${balanceBefore} + ${row.amount} < 0.`),
+          { code: 'INSUFFICIENT_CREDIT', details: { user_id: uid, balance: balanceBefore, amount: row.amount, reason: row.reason, job_id: row.job_id } },
+        );
+      }
+      const seq = Number(toNum(current?.max_seq, 0)) + 1;
+      await tx.run(
+        `INSERT INTO wallet_ledger (id, user_id, seq, amount, currency, reason, job_id, run_key, close_kind, operation, meta, balance_after, created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          row.id, row.user_id, seq, row.amount, row.currency, row.reason, row.job_id, row.run_key,
+          row.close_kind, row.operation, toJson(row.meta), balanceAfter, ts,
+        ],
+      );
+      return { ...row, seq, balance_after: balanceAfter };
+    });
+  }
+
+  /**
+   * Lịch sử sổ của một người dùng (mới nhất trước). `jobId` là bộ lọc TUỲ CHỌN — hook tính
+   * tiền dùng nó để biết một job đã có chu kỳ hold/settle/refund nào chưa.
+   */
+  async listLedger({ userId = null, jobId = null, limit = 50, offset = 0 } = {}) {
+    const uid = String(userId ?? '');
+    if (!uid) return [];
+    const lim = Math.min(Math.max(Number(limit) || 50, 1), 500);
+    const off = Math.max(Number(offset) || 0, 0);
+    // Sắp xếp ỔN ĐỊNH: `seq` giảm dần (mới nhất trước). Nhiều dòng có thể cùng `created_at`
+    // tới từng mili-giây nên chỉ sắp theo thời gian là không đủ — trang sổ sẽ nhảy cóc và
+    // phân trang có thể trùng/sót dòng. `created_at`/`id` chỉ còn là khoá phụ cho dòng cũ
+    // (tạo trước khi có cột `seq`, giữ `seq = 0`).
+    const rows = jobId
+      ? await this.driver.all(
+          `SELECT * FROM wallet_ledger WHERE user_id = ? AND job_id = ? ORDER BY seq DESC, created_at DESC, id DESC LIMIT ? OFFSET ?`,
+          [uid, String(jobId), lim, off],
+        )
+      : await this.driver.all(
+          `SELECT * FROM wallet_ledger WHERE user_id = ? ORDER BY seq DESC, created_at DESC, id DESC LIMIT ? OFFSET ?`,
+          [uid, lim, off],
+        );
+    return rows.map((row) => this.#hydrateLedgerRow(row));
+  }
+
+  /**
+   * BR-08 (vòng 4) — LIỆT KÊ CÁC LƯỢT CHẠY ĐANG MỞ: dòng `job_hold` có `run_key` mà **không** có
+   * dòng ĐÓNG (`close_kind IS NOT NULL`) nào cùng `(user_id, job_id, run_key)`.
+   *
+   * `olderThanIso` (tuỳ chọn) chỉ lấy các khoản giữ CŨ HƠN mốc đó — nhờ vậy reconciliation không
+   * cắt ngang một job đang chạy thật. Sắp xếp cũ nhất trước để xử lý dần.
+   */
+  async listOpenJobHolds({ olderThanIso = null, limit = 200, userId = null } = {}) {
+    const where = [
+      "h.reason = 'job_hold'",
+      'h.run_key IS NOT NULL',
+      'h.job_id IS NOT NULL',
+      `NOT EXISTS (SELECT 1 FROM wallet_ledger c
+                     WHERE c.user_id = h.user_id AND c.job_id = h.job_id
+                       AND c.run_key = h.run_key AND c.close_kind IS NOT NULL)`,
+    ];
+    const params = [];
+    if (olderThanIso) { where.push('h.created_at < ?'); params.push(String(olderThanIso)); }
+    if (userId) { where.push('h.user_id = ?'); params.push(String(userId)); }
+    params.push(Math.min(Math.max(Number(limit) || 200, 1), 1000));
+    const rows = await this.driver.all(
+      `SELECT h.* FROM wallet_ledger h WHERE ${where.join(' AND ')}
+       ORDER BY h.created_at ASC, h.seq ASC LIMIT ?`,
+      params,
+    );
+    return rows.map((row) => this.#hydrateLedgerRow(row));
+  }
+
+  /** Số dư = TỔNG SỔ (không có cột balance sửa tay). Chưa có dòng nào ⇒ 0. */
+  async ledgerBalance(userId) {
+    const uid = String(userId ?? '');
+    if (!uid) return 0;
+    const row = await this.driver.get('SELECT COALESCE(SUM(amount),0) AS total FROM wallet_ledger WHERE user_id = ?', [uid]);
+    // Trả số ĐÃ LÀM TRÒN 6 chữ số để khớp đúng `balance_after` của dòng cuối trong sổ.
+    return roundMoney(toNum(row?.total, 0));
+  }
+
+  /* ─────────────────────────────── pricing ─────────────────────────────── */
+
+  #hydratePricing(row) {
+    return {
+      operation: row.operation,
+      unit_price: toNum(row.unit_price, 0),
+      currency: row.currency || 'USD',
+      note: row.note ?? '',
+      updated_at: row.updated_at,
+    };
+  }
+
+  /** Thêm/ghi đè đơn giá một operation (SQL `ON CONFLICT` chạy được cả SQLite và PostgreSQL). */
+  async upsertPricing({ operation, unitPrice = null, unit_price = null, currency = 'USD', note = '' } = {}) {
+    const op = String(operation || '').trim();
+    if (!op) throw Object.assign(new Error('upsertPricing thiếu operation.'), { code: 'INVALID_PRICING' });
+    const price = toNum(unitPrice ?? unit_price, null);
+    if (price === null || price < 0) {
+      throw Object.assign(new Error(`upsertPricing: unit_price không hợp lệ (${JSON.stringify(unitPrice ?? unit_price)}).`), { code: 'INVALID_PRICING' });
+    }
+    await this.driver.run(
+      `INSERT INTO pricing (operation, unit_price, currency, note, updated_at)
+       VALUES (?,?,?,?,?)
+       ON CONFLICT (operation) DO UPDATE SET
+         unit_price = excluded.unit_price,
+         currency = excluded.currency,
+         note = excluded.note,
+         updated_at = excluded.updated_at`,
+      [op, price, String(currency || 'USD'), String(note ?? ''), nowIso()],
+    );
+    const row = await this.driver.get('SELECT * FROM pricing WHERE operation = ?', [op]);
+    return row ? this.#hydratePricing(row) : null;
+  }
+
+  async listPricing() {
+    const rows = await this.driver.all('SELECT * FROM pricing ORDER BY operation ASC');
+    return rows.map((row) => this.#hydratePricing(row));
+  }
+
+  /* ───────────────────────────── usageAggregate ───────────────────────────── */
+
+  /**
+   * Tổng hợp `usage_events` cho trang quản trị (hợp đồng §3.4).
+   *
+   * `groupBy ∈ {day, operation, user}`:
+   *   - `day`       → `substr(created_at,1,10)` (chạy được cả SQLite lẫn PostgreSQL)
+   *   - `operation` → `usage_events.operation`
+   *   - `user`      → `jobs.user_id` qua JOIN (KHÔNG dùng `usage_events.session_id`:
+   *                   session chỉ là phiên trình duyệt, không phải chủ sở hữu). Job ẩn danh
+   *                   (`user_id IS NULL`) gom vào nhóm '(ẩn danh)'.
+   *
+   * Trả về mảng dòng đã chuẩn hoá:
+   *   `{ group, events, estimated_cost, input_units, output_units, user_id? }`
+   * (`user_id` chỉ có ở `groupBy = 'user'`; `null` = nhóm ẩn danh.)
+   *
+   * Mọi giá trị đếm/tổng đều được ép về `number`: PostgreSQL trả `COUNT`/`SUM(integer)` dạng
+   * chuỗi bigint, còn SQLite trả số — tầng trên không phải tự đoán.
+   */
+  async usageAggregate({ from = null, to = null, groupBy = 'day' } = {}) {
+    const group = String(groupBy || 'day');
+    if (!USAGE_GROUP_BY.includes(group)) {
+      throw Object.assign(new Error(`usageAggregate: groupBy không hợp lệ (${JSON.stringify(groupBy)}) — chỉ nhận ${USAGE_GROUP_BY.join('|')}.`), { code: 'INVALID_GROUP_BY' });
+    }
+    // Ngày trần 'YYYY-MM-DD' ⇒ mở rộng thành cả ngày (00:00:00.000 → 23:59:59.999).
+    const bound = (value, edge) => {
+      if (typeof value !== 'string' || !value) return null;
+      return value.length === 10 ? `${value}T${edge}` : value;
+    };
+    const fromBound = bound(from, '00:00:00.000Z');
+    const toBound = bound(to, '23:59:59.999Z');
+
+    const where = [];
+    const params = [];
+    if (fromBound) {
+      where.push('ue.created_at >= ?');
+      params.push(fromBound);
+    }
+    if (toBound) {
+      where.push('ue.created_at <= ?');
+      params.push(toBound);
+    }
+    const whereSql = where.length > 0 ? ` WHERE ${where.join(' AND ')}` : '';
+
+    const METRICS = `COUNT(*) AS events,
+             COALESCE(SUM(ue.estimated_cost),0) AS estimated_cost,
+             COALESCE(SUM(ue.input_units),0) AS input_units,
+             COALESCE(SUM(ue.output_units),0) AS output_units`;
+
+    let rows;
+    if (group === 'user') {
+      // `GROUP BY j.user_id` (không phải theo COALESCE) để PostgreSQL chấp nhận cả cột
+      // `j.user_id` lẫn biểu thức COALESCE trong SELECT.
+      rows = await this.driver.all(
+        `SELECT COALESCE(j.user_id, '${ANONYMOUS_GROUP_LABEL}') AS bucket, j.user_id AS owner_id, ${METRICS}
+         FROM usage_events ue
+         LEFT JOIN jobs j ON j.id = ue.job_id${whereSql}
+         GROUP BY j.user_id
+         ORDER BY 1 ASC`,
+        params,
+      );
+    } else {
+      const bucketExpr = group === 'day' ? 'substr(ue.created_at,1,10)' : 'ue.operation';
+      rows = await this.driver.all(
+        `SELECT ${bucketExpr} AS bucket, ${METRICS}
+         FROM usage_events ue${whereSql}
+         GROUP BY ${bucketExpr}
+         ORDER BY 1 ASC`,
+        params,
+      );
+    }
+
+    return (Array.isArray(rows) ? rows : []).map((row) => {
+      const out = {
+        group: String(row.bucket ?? ''),
+        events: Number(toNum(row.events, 0)),
+        estimated_cost: roundMoney(toNum(row.estimated_cost, 0)),
+        input_units: toNum(row.input_units, 0),
+        output_units: toNum(row.output_units, 0),
+      };
+      if (group === 'user') out.user_id = row.owner_id ?? null;
+      return out;
+    });
+  }
 }
 
 /** Tạo + khởi tạo store theo cấu hình. */
 export async function createStore(config, logger) {
   const driver = createDriver(config, logger);
-  const store = new Store({ driver, logger });
+  const store = new Store({ driver, logger, config });
   await store.init();
   return store;
 }

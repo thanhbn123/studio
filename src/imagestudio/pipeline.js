@@ -304,13 +304,25 @@ export class ImageGenerationPipeline {
    */
   #inFlight = new Set();
 
-  constructor({ config, logger, store, storage, mattingProvider = null, retouchProvider = null } = {}) {
+  /** Cảnh báo `billing.disabled` chỉ được ghi MỘT LẦN cho mỗi pipeline (không spam log). */
+  #billingDisabledLogged = false;
+  /**
+   * BR-07 (vòng 3) — `run_key` của LƯỢT CHẠY đang chạy cho mỗi job (xem `src/jobs/pipeline.js`).
+   * Không có nó thì `recordUsage` không quy được chi phí về lượt ⇒ settle theo usage TÍCH LUỸ.
+   */
+  #runKeys = new Map();
+
+  constructor({ config, logger, store, storage, mattingProvider = null, retouchProvider = null, billingService = null, billingHook = null } = {}) {
     this.config = config ?? {};
     this.logger = logger;
     this.store = store;
     this.storage = storage;
     this.mattingProvider = mattingProvider;
     this.retouchProvider = retouchProvider;
+    // MVP-05: dịch vụ ví credit (A2) + hook dùng chung với route (§3.4b). Cả hai `null`
+    // ⇒ hook tính tiền bỏ qua hoàn toàn.
+    this.billingService = billingService || null;
+    this.billingHook = billingHook || null;
   }
 
   /** Khối cấu hình dùng chung với MVP-02 (giới hạn ảnh). Thiếu khối → mặc định an toàn. */
@@ -346,6 +358,7 @@ export class ImageGenerationPipeline {
     try {
       await this.store.recordUsage({
         jobId,
+        runKey: this.#runKeys.get(jobId) ?? null,
         sessionId,
         operation,
         provider: String(provider || ''),
@@ -395,6 +408,167 @@ export class ImageGenerationPipeline {
       this.logger?.warn('imagestudio.asset_meta_update_failed', { job_id: jobId, asset_id: assetId, error: err });
       return 0;
     }
+  }
+
+  /* ═════════════════ MVP-05 — HOOK TÍNH TIỀN (hợp đồng §3.4) ═════════════════
+   *
+   * LUẬT #1 — ẨN DANH KHÔNG BỊ PHÁ: job không có `user_id` đi thẳng vào thân `generate()`,
+   * KHÔNG gọi một hàm billing nào (MVP-03 vẫn chạy y hệt cho khách chưa đăng nhập).
+   *
+   * LUẬT #2 — SỔ APPEND-ONLY: một lượt `generate()` của job có tài khoản là một chu kỳ
+   * `app.billingHook.beforeJob` → `afterJob` (bên dưới là `holdForJob`/`settleForJob`/
+   * `refundForJob` của A2), quyết toán theo usage THẬT và hoàn 100% khi job hỏng. Job đã có
+   * chu kỳ khép lại thì không thu thêm lần nữa (idempotent theo `jobId`).
+   *
+   * FAIL-CLOSED Ở ĐÚNG MỘT CHỖ: thiếu credit khi giữ tiền ⇒ ném `INSUFFICIENT_CREDIT` để
+   * KHÔNG chạy job (route map thành 402). Lỗi billing khác chỉ ghi log mức warn.
+   */
+
+  /** Ước tính các operation lượt chạy này sẽ dùng (cơ sở để giữ tiền trước). */
+  #estimateOperations(options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const ops = [];
+    if (opts.remove_background !== false && opts.removeBackground !== false) ops.push('IMAGE_MATTING');
+    ops.push('IMAGE_COMPOSE');
+    if (opts.retouch || opts.retouch_params) ops.push('IMAGE_RETOUCH');
+    return ops;
+  }
+
+  /** Ghi log lỗi billing ở mức warn — KHÔNG bao giờ làm hỏng job vì một sự cố ví tiền. */
+  #warnHook(step, jobId, err) {
+    this.logger?.warn('billing.hook_failed', {
+      job_id: jobId,
+      step,
+      error_name: err?.name || 'Error',
+      error_code: err?.code || null,
+      error_message: String(err?.message || err).slice(0, 300),
+    });
+  }
+
+  /** Chi phí THẬT của job = tổng `estimated_cost` của mọi `usage_events` (hợp đồng §3.4). */
+  async #actualCost(jobId) {
+    try {
+      const summary = await this.store?.usageSummary?.(jobId, { runKey: this.#runKeys.get(jobId) ?? null });
+      return Number(summary?.estimated_cost ?? 0);
+    } catch (err) {
+      this.#warnHook('usage_summary', jobId, err);
+      return 0;
+    }
+  }
+
+  /** Giữ tiền khi pipeline tự dựng với BillingService thô (test/demo) — không giữ hai lần. */
+  async #holdDirect(billing, userId, jobId, operations) {
+    if (typeof this.store?.listLedger === 'function') {
+      const rows = await this.store.listLedger({ userId, jobId, limit: 200 });
+      if (Array.isArray(rows) && rows.some((r) => r?.reason === 'job_hold')) return;
+    }
+    const estimate = await billing.estimate({ userId, operations });
+    await billing.holdForJob({ userId, jobId, estimate, operations });
+  }
+
+  /** Kết thúc chu kỳ khi dùng BillingService thô — bỏ qua nếu job đã settle/refund. */
+  async #closeDirect(billing, userId, jobId, { failed = false, actualCost = 0, reason = 'JOB_FAILED' } = {}) {
+    let rows = [];
+    if (typeof this.store?.listLedger === 'function') {
+      rows = await this.store.listLedger({ userId, jobId, limit: 200 }) || [];
+    }
+    if (rows.some((r) => r?.reason === 'job_settle' || r?.reason === 'job_refund')) return;
+    if (failed) {
+      if (!rows.some((r) => r?.reason === 'job_hold')) return; // chưa giữ gì ⇒ không có gì để hoàn
+      await billing.refundForJob({ userId, jobId, reason });
+      return;
+    }
+    await billing.settleForJob({ userId, jobId, actualCost });
+  }
+
+  /**
+   * Bọc một lượt `generate()` bằng chu kỳ: giữ tiền (nếu chưa giữ) → chạy → quyết toán/hoàn tiền.
+   *
+   * Nguồn ví ưu tiên `billingHook` — CHÍNH object A4 gọi trong request (§3.4b): A4 đã giữ
+   * tiền cho `POST /api/imagestudio/jobs` và `POST .../generate`; hook tự ĐỌC SỔ THẬT theo
+   * `jobId` nên lần gọi ở đây KHÔNG giữ thêm đồng nào. Nó là lưới an toàn cho đường không
+   * qua route (demo/tool) và cho job xếp hàng trước khi hook ra đời.
+   */
+  async #withBilling(jobId, operations, run) {
+    const hook = this.billingHook;
+    const billing = this.billingService;
+    if (!hook && !billing) {
+      if (!this.#billingDisabledLogged) {
+        this.#billingDisabledLogged = true;
+        this.logger?.warn('billing.disabled', {
+          reason: 'Không có billingService — hook tính tiền bị bỏ qua, job vẫn chạy và không ai bị chặn.',
+        });
+      }
+      return run();
+    }
+
+    let job = null;
+    try {
+      job = await this.store?.getJob?.(jobId);
+    } catch (err) {
+      this.#warnHook('read_job', jobId, err);
+      return run();
+    }
+    const userId = job?.user_id || null;
+    if (!userId) return run(); // ẩn danh ⇒ bỏ qua HOÀN TOÀN (luật #1)
+
+    let began = null; // BR-07: kết quả `beforeJob` (mang `run_key` của lượt chạy này)
+    try {
+      if (hook) {
+        began = await hook.beforeJob({
+          userId,
+          jobId,
+          kind: job?.kind || 'image_generation',
+          sessionId: job?.session_id || '',
+          operations,
+        });
+        this.#runKeys.set(jobId, (began && began.run_key) || (typeof hook.runKeyForJob === 'function' ? (await hook.runKeyForJob({ userId, jobId }))?.run_key : null) || null);
+      } else {
+        await this.#holdDirect(billing, userId, jobId, operations);
+      }
+    } catch (err) {
+      if (err?.code === 'INSUFFICIENT_CREDIT') throw err; // fail-closed có chủ ý (route map thành 402)
+      this.#warnHook('before_job', jobId, err);
+      return run();
+    }
+
+    let result;
+    let failure = null;
+    try {
+      result = await run();
+    } catch (err) {
+      failure = err;
+    }
+
+    // Trạng thái THẬT lấy từ DB: `#failJob` đánh dấu failed mà KHÔNG ném lỗi.
+    let status = failure ? JOB_STATUS.FAILED : (result?.status ?? null);
+    if (!failure) {
+      try {
+        const fresh = await this.store?.getJob?.(jobId);
+        status = fresh?.status ?? status;
+      } catch {
+        /* không đọc được trạng thái ⇒ dùng status pipeline trả về */
+      }
+    }
+    const actualCost = await this.#actualCost(jobId);
+
+    try {
+      if (hook) {
+        await hook.afterJob({ userId, jobId, runKey: this.#runKeys.get(jobId) ?? null, status: status || JOB_STATUS.SUCCEEDED, actualCost });
+      } else {
+        await this.#closeDirect(billing, userId, jobId, {
+          failed: status === JOB_STATUS.FAILED,
+          actualCost,
+          reason: 'IMAGESTUDIO_FAILED',
+        });
+      }
+    } catch (err) {
+      this.#warnHook('after_job', jobId, err);
+    }
+
+    this.#runKeys.delete(jobId); // BR-07: dọn ngữ cảnh lượt chạy
+    if (failure) throw failure;
+    return result;
   }
 
   /** Đánh dấu job thất bại kèm `error_code` + `finished_at` — không bao giờ treo `running`. */
@@ -586,6 +760,8 @@ export class ImageGenerationPipeline {
         id: assetId,
         jobId,
         sessionId: sid,
+        // MVP-05 §2.2: đã đăng nhập ⇒ mọi asset mới gắn `user_id`; ẩn danh ⇒ null.
+        userId: job.user_id || null,
         role: 'original',
         parentId: null,
         mime,
@@ -676,7 +852,9 @@ export class ImageGenerationPipeline {
     }
     this.#inFlight.add(String(jobId));
     try {
-      return await this.#generateLocked(jobId, { sessionId, options, force });
+      // MVP-05 §3.4: một lượt generate là một chu kỳ tính tiền (ẩn danh ⇒ bỏ qua hoàn toàn).
+      return await this.#withBilling(jobId, this.#estimateOperations(options), () =>
+        this.#generateLocked(jobId, { sessionId, options, force }));
     } finally {
       this.#inFlight.delete(String(jobId));
     }
@@ -1116,6 +1294,8 @@ export class ImageGenerationPipeline {
           id: assetId,
           jobId,
           sessionId: sid,
+          // MVP-05 §2.2: ảnh render thuộc cùng chủ sở hữu với job.
+          userId: job.user_id || null,
           role: 'rendered',
           parentId: original.id,
           mime: outMime,

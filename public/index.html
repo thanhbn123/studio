@@ -15,7 +15,7 @@
           <span class="brand-mark">V</span>
           <span class="brand-text">
             <strong>VIP Product Studio</strong>
-            <small>MVP-01 + MVP-02 + MVP-03 · Link &amp; ảnh Trung Quốc → tiếng Việt</small>
+            <small>MVP-01 → MVP-05 · Link &amp; ảnh Trung Quốc → tiếng Việt · tài khoản + credit nội bộ</small>
           </span>
         </a>
         <nav class="topnav">
@@ -26,7 +26,12 @@
           <span id="provider-badge" class="badge" title="Trạng thái AI provider">…</span>
         </nav>
       </div>
+      <!-- MVP-05: trạng thái phiên (khách ẩn danh ⇄ tài khoản) do app.js vẽ vào đây. -->
+      <div class="wrap" id="account-bar" aria-live="polite"></div>
     </header>
+
+    <!-- MVP-05: băng báo 402 INSUFFICIENT_CREDIT (số cần / số đang có + link nạp), vẽ bằng app.js. -->
+    <div class="wrap" id="credit-alert" role="status" aria-live="polite"></div>
 
     <main class="wrap" id="app">
       <noscript>
@@ -43,6 +48,8 @@
           MVP-02: dịch chữ Trung trên ảnh sản phẩm → bạn duyệt từng dòng → render ảnh mới (ảnh gốc bất biến).
           MVP-03: tạo ảnh marketing từ ảnh thật — tách nền fail-closed, nền MÔ PHỎNG (không phải ảnh thật),
           retouch bị kẹp trong ngưỡng cho phép.
+          MVP-05: tài khoản (tuỳ chọn — chưa đăng nhập vẫn dùng được mọi tính năng) + ví <strong>credit nội bộ</strong>:
+          credit KHÔNG phải tiền thật, giai đoạn này chỉ quản trị cấp tay, chưa có cổng thanh toán.
           Chưa bao gồm chỉnh video, hay đăng bài tự động.
         </p>
       </div>
