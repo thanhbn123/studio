@@ -256,6 +256,30 @@ const state = {
       overlay_text: '',
     },
   },
+  // MVP-04 — Video (videostudio). Tách riêng khỏi `il`/`is` để không giẫm chân MVP-02/03.
+  vs: {
+    jobId: null,
+    job: null,
+    poll: null,
+    pollCount: 0,
+    loading: null,
+    busy: false,
+    error: null, // đối tượng lỗi THẬT (giữ cả code/status/payload để hiện đúng) hoặc chuỗi
+    // Preset THẬT của máy chủ (GET /api/videostudio/presets) — UI KHÔNG hardcode kích thước.
+    presets: null,
+    encoder: null, // { name, is_mock, configured }
+    limits: null,
+    presetsLoading: false,
+    presetsError: null,
+    // scenes: thứ tự mảng = thứ tự cảnh = thứ tự ảnh người dùng chọn.
+    scenes: [],
+    fileErrors: [], // lý do từng tệp bị từ chối — hiện nguyên, không nuốt
+    pendingFiles: false,
+    preset: null, // preset_id đang chọn
+    fit: 'pad', // 'pad' (thêm viền) | 'crop' (cắt bớt) — KHÔNG bao giờ kéo giãn
+    textBlocked: null, // 422 VIDEO_TEXT_UNSUPPORTED_CLAIM: { code, reason, violations }
+    dirtyPaint: false,
+  },
 };
 
 /* ─────────────────────────── Khởi động ─────────────────────────── */
@@ -275,6 +299,7 @@ async function boot() {
   window.addEventListener('hashchange', route);
   wireImagelabGlobal();
   wireImagestudioGlobal();
+  wireVideostudioGlobal();
   wireAuthGlobal();
   // Kiểm tra phiên THẬT trước khi vẽ: hỏi được thì header đúng ngay, không hỏi được thì vẫn là
   // khách ẩn danh và nói thật là chưa kiểm tra được (luật #1: không chặn gì cả).
@@ -309,6 +334,7 @@ function route() {
     stopPolling();
     stopIlPolling();
     stopIsPolling();
+    stopVsPolling();
     openAuth();
     return;
   }
@@ -316,6 +342,7 @@ function route() {
     stopPolling();
     stopIlPolling();
     stopIsPolling();
+    stopVsPolling();
     openAccount();
     return;
   }
@@ -323,7 +350,23 @@ function route() {
     stopPolling();
     stopIlPolling();
     stopIsPolling();
+    stopVsPolling();
     openAdmin();
+    return;
+  }
+  // MVP-04 (§2.5) — tab thứ tư “Video”, route hash riêng: `#/video` và `#/video/:id`.
+  const vsMatch = /^#\/video(?:\/([A-Za-z0-9_-]+))?/.exec(hash);
+  if (vsMatch) {
+    stopPolling();
+    stopIlPolling();
+    stopIsPolling();
+    if (vsMatch[1]) {
+      openVideoJob(vsMatch[1]);
+    } else {
+      stopVsPolling();
+      vsReset();
+      vsRenderPage();
+    }
     return;
   }
   // MVP-03 (§3.7) — tab thứ ba “Tạo ảnh”, route hash riêng: `#/taoanh` và `#/taoanh/:id`.
@@ -331,6 +374,7 @@ function route() {
   if (isMatch) {
     stopPolling();
     stopIlPolling();
+    stopVsPolling();
     if (isMatch[1]) {
       openImagestudioJob(isMatch[1]);
     } else {
@@ -344,6 +388,7 @@ function route() {
   if (ilMatch) {
     stopPolling();
     stopIsPolling(); // rời tab “Tạo ảnh” thì dừng vòng poll của nó (không kéo người dùng về trang cũ)
+    stopVsPolling(); // rời tab “Video” thì dừng vòng poll của nó
     if (ilMatch[1]) {
       openImagelabJob(ilMatch[1]);
     } else {
@@ -357,13 +402,16 @@ function route() {
   }
   const jobMatch = /^#\/job\/([A-Za-z0-9_-]+)/.exec(hash);
   if (jobMatch) {
+    stopVsPolling();
     openJob(jobMatch[1]);
     return;
   }
   if (hash.startsWith('#/history')) {
+    stopVsPolling();
     renderHistory();
     return;
   }
+  stopVsPolling();
   renderHome();
 }
 
@@ -480,6 +528,50 @@ function onGlobalClick(ev) {
       location.hash = '#/taoanh';
       renderImagestudio();
     },
+    // ── MVP-04 — Video ──
+    video: () => {
+      // Đang ở đúng tab này thì `location.hash` không đổi ⇒ không có hashchange, phải tự vẽ lại.
+      if (String(location.hash || '').startsWith('#/video')) {
+        if (state.vs?.jobId || state.vs?.job) {
+          stopVsPolling();
+          vsReset();
+          location.hash = '#/video'; // rời màn job ⇒ về màn tạo mới
+        }
+        // Đang ở MÀN TẠO thì GIỮ nguyên ảnh/chữ người dùng đã chọn, chỉ vẽ lại.
+        vsRenderPage();
+      } else {
+        location.hash = '#/video';
+      }
+    },
+    vspick: () => $('#vs-file')?.click(),
+    vsclear: () => {
+      state.vs.scenes = [];
+      state.vs.fileErrors = [];
+      state.vs.error = null;
+      vsRenderPage();
+    },
+    vscreate: () => submitVideoJob(),
+    vsregen: () => regenerateVideo(false),
+    vsregenforce: () => regenerateVideo(true),
+    vsreload: () => loadVideoPresets(true),
+    vsrefresh: () => {
+      if (state.vs.jobId) openVideoJob(state.vs.jobId, { force: true });
+    },
+    vsnew: () => {
+      stopVsPolling();
+      vsReset();
+      location.hash = '#/video';
+      vsRenderPage();
+    },
+    vsmove: () => {
+      if (vsMoveScene(Number.parseInt(btn.dataset.index ?? '', 10), Number.parseInt(btn.dataset.dir ?? '', 10))) vsRenderPage();
+    },
+    vsremove: () => {
+      if (vsRemoveScene(Number.parseInt(btn.dataset.index ?? '', 10))) vsRenderPage();
+    },
+    openvideojob: () => {
+      location.hash = `#/video/${btn.dataset.id}`;
+    },
     // ── MVP-05 — Tài khoản + ví credit ──
     login: () => {
       location.hash = '#/dangnhap';
@@ -586,13 +678,15 @@ function historyItemHtml(item) {
   // N-3 (vòng 4): phân biệt job DỊCH ẢNH và dán nhãn MOCK theo dấu vết ĐÃ LƯU của chính
   // job đó (cùng luật với màn hình duyệt — không theo cấu hình máy chủ đang chạy).
   const isImagelab = item.kind === 'image_translation';
+  // MVP-04: job VIDEO cũng nằm trong lịch sử — mở bằng tab “Video” (không phải màn job MVP-01).
+  const isVideo = item.kind === 'video_generation';
   const mockSteps = Array.isArray(item.mock_steps) ? item.mock_steps : [];
   const mockBadge = (item.mock || mockSteps.length)
     ? `<span class="badge warn" title="${esc(`Bước chạy provider MOCK: ${mockSteps.join(', ') || 'có'}`)}">MOCK</span>`
     : '';
-  const kindBadge = isImagelab ? '<span class="badge">Dịch ảnh</span>' : '';
+  const kindBadge = isImagelab ? '<span class="badge">Dịch ảnh</span>' : isVideo ? '<span class="badge">Video</span>' : '';
   return `
-    <button class="hist-item" data-action="openjob" data-id="${esc(item.id)}">
+    <button class="hist-item" data-action="${isVideo ? 'openvideojob' : 'openjob'}" data-id="${esc(item.id)}">
       <span style="min-width:0">
         <span class="hist-name">${esc(item.product_name || item.source_url || '(chưa có tên)')}</span>
         <span class="hist-sub">${esc(SOURCE_LABEL[item.source] || item.source || '—')} · ${esc(new Date(item.created_at).toLocaleString('vi-VN'))}</span>
@@ -3450,6 +3544,1319 @@ function wireImagestudioGlobal() {
   }
   document.addEventListener('drop', (ev) => {
     if (ev.target.closest?.('#is-drop')) pickImagestudioFiles(ev.dataTransfer?.files);
+  });
+}
+
+/* ═════════════════════ MVP-04 — Video (videostudio) — tab thứ tư ═════════════════════
+ *
+ * Hợp đồng §0 (ba luật riêng) + §2.4 (API) + §2.5 (UI). Ba luật được UI NÓI THẲNG, không giấu:
+ *   1. KHÔNG bóp méo ảnh — chỉ `pad` (thêm viền) hoặc `crop` (cắt bớt); UI nói RÕ cảnh nào.
+ *   2. KHÔNG có tiếng thì phải NÓI RÕ — nhãn “Video KHÔNG có tiếng” nằm NGAY CẠNH kết quả và
+ *      CHỈ hiện khi `audio` thật sự là null (audio khác null ⇒ KHÔNG dán nhãn đó).
+ *   3. Chữ thiếu bằng chứng ⇒ máy chủ CHẶN (422 `VIDEO_TEXT_UNSUPPORTED_CLAIM`): UI hiện ĐỦ
+ *      `violations`, không nuốt, không tự vẽ chữ.
+ *
+ * Không có `ffmpeg` trên máy này: tệp ra là GIF động (tự chạy trong <img>), KHÔNG kèm âm thanh —
+ * UI không bao giờ quảng cáo đây là “video hoàn chỉnh để đăng ngay”.
+ *
+ * Mọi chữ đi qua `esc()` trước khi vào DOM, kể cả giá trị trong `value=""`.
+ * Hàm THUẦN, dễ trích để test (không cần DOM): vsRenderBody, vsHeaderPanel, vsRenderUpload,
+ * vsRenderScenes, vsRenderOptions, vsRenderJob, vsRenderResult, vsRenderWarnings, vsRenderSteps,
+ * vsAudioNotice, vsTotalHtml, vsJobBody, vsJobOptions, vsSetSceneSeconds, vsMoveScene, vsRemoveScene,
+ * vsClampSeconds, vsTotalSeconds, vsCanCreate, vsEncoder, vsAudio, vsTextBlockedFromError, vsErrorText.
+ */
+
+const VS_STATUS_LABEL = {
+  queued: 'Đang chờ',
+  running: 'Đang xử lý',
+  succeeded: 'Hoàn tất',
+  partial: 'Xong một phần (PARTIAL)',
+  failed: 'Thất bại',
+};
+
+const VS_STAGE_LABEL = {
+  queued: 'Xếp hàng chờ chạy',
+  storing: 'Đang lưu ảnh gốc (bất biến)',
+  planning: 'Đang lập kế hoạch khung hình',
+  rendering: 'Đang render từng khung (chữ Việt + pad/crop)',
+  encoding: 'Đang mã hoá GIF',
+  done: 'Xong',
+  failed: 'Lỗi',
+};
+
+const VS_STAGE_ORDER = ['queued', 'storing', 'planning', 'rendering', 'encoding', 'done'];
+
+const VS_STAGE_STEPS = [['storing', 'Lưu ảnh gốc (bất biến)'], ['planning', 'Lập kế hoạch khung hình'], ['rendering', 'Render từng khung (chữ Việt, pad/crop)'], ['encoding', 'Mã hoá GIF'], ['done', 'Hoàn tất']];
+
+/** Nhãn trung thực BẮT BUỘC (§0 luật 2) — chỉ dùng ở khối KẾT QUẢ, chỉ khi `audio === null`. */
+const VS_NO_AUDIO_LABEL = 'Video KHÔNG có tiếng';
+
+const VS_NO_AUDIO_NOTE = 'Tệp ra là GIF động nên KHÔNG mang âm thanh. Muốn có tiếng cần dịch vụ TTS/ffmpeg (chưa bật).';
+
+const VS_FIT_NOTE = 'Ảnh gốc chỉ được THÊM VIỀN (pad) hoặc CẮT BỚT (crop) cho vừa khung — KHÔNG kéo giãn, không bóp méo.';
+
+const VS_TEXT_CLAIM_NOTE = 'Chữ có khẳng định/số liệu mà dữ liệu ĐÃ LƯU của job (tên sản phẩm, vùng chữ OCR/bạn nhập, ghi chú) không có bằng chứng sẽ bị CHẶN, không vẽ. Sửa chữ cho khớp thứ ảnh thật có rồi gửi lại.';
+
+/** Lỗi 5xx/4xx bị máy chủ che message ⇒ UI tự dịch mã lỗi sang câu tiếng Việt (như MVP-02/03). */
+const VS_ERROR_HINT = {
+  VIDEOSTUDIO_UNAVAILABLE: 'Máy chủ chưa nạp được module video. Các tab Nội dung / Dịch ảnh / Tạo ảnh vẫn dùng bình thường.',
+  NOT_CONFIGURED: 'Bộ mã hoá video chưa được cấu hình trên máy chủ.',
+  FFMPEG_NOT_AVAILABLE: 'Máy chủ không có ffmpeg nên KHÔNG xuất được MP4 — chỉ có GIF động (không tiếng).',
+  VIDEO_TEXT_UNSUPPORTED_CLAIM: 'Chữ trên video có khẳng định không có bằng chứng trong dữ liệu job nên bị CHẶN — không vẽ.',
+  JOB_ALREADY_RUNNING: 'Job này đang chạy — chờ chạy xong rồi hãy tạo lại.',
+  RATE_LIMITED: 'Bạn thao tác quá nhanh — chờ một lát rồi thử lại.',
+  BAD_IMAGE: 'Dữ liệu ảnh không hợp lệ (máy chủ kiểm magic bytes).',
+  IMAGE_TOO_LARGE: 'Ảnh vượt giới hạn cho phép của máy chủ.',
+  UNSUPPORTED_MEDIA_TYPE: 'Ảnh không hợp lệ hoặc định dạng không được phép (chỉ nhận PNG).',
+  BAD_BODY: 'Dữ liệu gửi lên không hợp lệ (kiểm tra lại ảnh / số cảnh / thời lượng).',
+  BAD_OPTIONS: 'Tham số gửi lên không hợp lệ (preset / scenes / texts / fit).',
+  TOO_MANY_SCENES: 'Quá nhiều cảnh trong một lần gửi (máy chủ giới hạn 24) — bỏ bớt ảnh rồi thử lại.',
+  TOO_MANY_TEXTS: 'Quá nhiều đoạn chữ trong một lần gửi (máy chủ giới hạn 60) — bớt chữ rồi thử lại.',
+  VIDEOSTUDIO_NOT_VIDEO_JOB: 'Job này không phải job tạo video — mở đúng job video trong tab “Video”.',
+  VIDEOSTUDIO_NO_ORIGINAL: 'Job này chưa có ảnh gốc — hãy tạo job mới kèm ảnh.',
+  JOB_NOT_FOUND: 'Không tìm thấy job video này (có thể thuộc phiên làm việc khác).',
+};
+
+/** Số lần poll tối đa trước khi nói thẳng “có thể job bị kẹt” (1.5s × 240 ≈ 6 phút). */
+const VS_MAX_POLLS = 240;
+
+/**
+ * Trần của MÁY CHỦ cho một request (§2.4): `VIDEOSTUDIO_MAX_SCENES` / `VIDEOSTUDIO_MAX_TEXTS` /
+ * `VIDEOSTUDIO_TEXT_MAX` của `src/http/routes.js`. `/api/videostudio/presets` CHƯA trả ba số này
+ * nên UI giữ ở MỘT chỗ, chỉ để chặn trước một lần gửi chắc chắn bị 413 — không dùng để cắt bớt
+ * dữ liệu người dùng đã nhập mà không nói gì.
+ */
+const VS_SERVER_MAX_SCENES = 24;
+const VS_SERVER_MAX_TEXTS = 60;
+const VS_SERVER_TEXT_MAX = 500;
+
+/* ── Đọc preset / tham số (KHÔNG hardcode kích thước — mọi con số lấy từ máy chủ) ─────────── */
+
+/** Preset THẬT: ưu tiên `GET /api/videostudio/presets`, thiếu thì dùng khối `videostudio` của /api/config. */
+function vsPresets() {
+  const fromApi = Array.isArray(state.vs?.presets) ? state.vs.presets : null;
+  const fromCfg = Array.isArray(state.config?.videostudio?.presets) ? state.config.videostudio.presets : [];
+  const list = fromApi && fromApi.length ? fromApi : fromCfg;
+  return (Array.isArray(list) ? list : []).filter((p) => p && typeof p === 'object' && p.id);
+}
+
+function vsPresetById(id) {
+  const want = String(id ?? '');
+  if (!want) return null;
+  return vsPresets().find((p) => String(p.id) === want) || null;
+}
+
+/** Preset đang chọn; chưa chọn (hoặc id lạ) ⇒ preset ĐẦU TIÊN của máy chủ. Không có ⇒ null. */
+function vsCurrentPreset() {
+  return vsPresetById(state.vs?.preset) || vsPresets()[0] || null;
+}
+
+/** Trần thời lượng MỘT cảnh (giây) — số của máy chủ; chưa biết ⇒ null (UI không tự bịa trần). */
+function vsMaxSeconds() {
+  const n = Number(vsCurrentPreset()?.max_seconds);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** Giới hạn số cảnh của máy chủ (`limits.max_scenes`) — chưa biết ⇒ null. */
+function vsMaxScenes() {
+  const n = Number(state.vs?.limits?.max_scenes);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+}
+
+/** Giới hạn dung lượng ảnh: `limits` của videostudio trước, rồi tới limits của imagelab. */
+function vsMaxImageBytes() {
+  const a = Number(state.vs?.limits?.max_image_bytes);
+  if (Number.isFinite(a) && a > 0) return a;
+  const b = Number(state.config?.imagelab?.limits?.max_image_bytes);
+  return Number.isFinite(b) && b > 0 ? b : null;
+}
+
+/** Chi tiết preset in ra chip chọn tỉ lệ — chỉ in thứ MÁY CHỦ có, không bịa. */
+function vsPresetDetail(preset) {
+  const parts = [];
+  const w = Number(preset?.width);
+  const h = Number(preset?.height);
+  const fps = Number(preset?.fps);
+  if (Number.isFinite(w) && Number.isFinite(h)) parts.push(`${w}×${h} pixel`);
+  if (Number.isFinite(fps) && fps > 0) parts.push(`${fps} khung/giây`);
+  if (Number.isFinite(Number(preset?.max_seconds)) && Number(preset.max_seconds) > 0) {
+    parts.push(`tối đa ${Number(preset.max_seconds)} giây/cảnh`);
+  }
+  return parts.join(' · ');
+}
+
+/** Số gọn cho chữ tiếng Việt: 5 · 2.5 · 0.4 (không làm tròn thành con số khác). */
+function vsNum(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '0';
+  const s = n.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+  return s === '' || s === '-' ? '0' : s;
+}
+
+/** Kẹp thời lượng một cảnh: sàn 1 giây (UI), trần = `max_seconds` CỦA PRESET (nếu máy chủ có). */
+function vsClampSeconds(value) {
+  const raw = Number(value);
+  let s = Number.isFinite(raw) ? raw : 1;
+  if (s < 1) s = 1;
+  const max = vsMaxSeconds();
+  if (max !== null && s > max) s = max;
+  return Math.round(s * 10) / 10;
+}
+
+function vsSceneSeconds(scene) {
+  return vsClampSeconds(scene?.seconds);
+}
+
+/** Tổng thời lượng (giây) của các cảnh đang có — con số UI hiện ra và gửi lên máy chủ. */
+function vsTotalSeconds() {
+  const scenes = Array.isArray(state.vs?.scenes) ? state.vs.scenes : [];
+  let sum = 0;
+  for (const s of scenes) sum += vsSceneSeconds(s);
+  return Math.round(sum * 10) / 10;
+}
+
+function vsTotalMs() {
+  const ms = Math.round(vsTotalSeconds() * 1000);
+  return ms > 0 ? ms : 0;
+}
+
+function vsHasImages() {
+  const scenes = Array.isArray(state.vs?.scenes) ? state.vs.scenes : [];
+  return scenes.some((s) => Boolean(s?.base64));
+}
+
+/** Nút TẠO VIDEO chỉ mở khi: có ảnh · có preset THẬT của máy chủ · không đang bận. */
+function vsCanCreate() {
+  return Boolean(vsHasImages() && vsCurrentPreset() && !state.vs?.busy);
+}
+
+/* ── Sửa danh sách cảnh (thứ tự = thứ tự chọn ảnh) ───────────────────────────── */
+
+function vsMoveScene(index, delta) {
+  const scenes = Array.isArray(state.vs?.scenes) ? state.vs.scenes : null;
+  const i = Number(index);
+  const d = Number(delta);
+  if (!scenes || !Number.isInteger(i) || !Number.isFinite(d)) return false;
+  const j = i + (d < 0 ? -1 : 1);
+  if (i < 0 || i >= scenes.length || j < 0 || j >= scenes.length) return false;
+  const tmp = scenes[i];
+  scenes[i] = scenes[j];
+  scenes[j] = tmp;
+  return true;
+}
+
+function vsRemoveScene(index) {
+  const scenes = Array.isArray(state.vs?.scenes) ? state.vs.scenes : null;
+  const i = Number(index);
+  if (!scenes || !Number.isInteger(i) || i < 0 || i >= scenes.length) return false;
+  scenes.splice(i, 1);
+  return true;
+}
+
+/** Đổi thời lượng một cảnh (đã kẹp theo trần preset) — trả về số giây HIỆU LỰC + cờ bị kẹp. */
+function vsSetSceneSeconds(index, value) {
+  const scenes = Array.isArray(state.vs?.scenes) ? state.vs.scenes : [];
+  const i = Number(index);
+  const scene = scenes[i];
+  if (!scene) return null;
+  const raw = Number(value);
+  const seconds = vsClampSeconds(raw);
+  scene.seconds = seconds;
+  return { seconds, clamped: Number.isFinite(raw) && Math.round(raw * 10) / 10 !== seconds };
+}
+
+/* ── Đọc dữ liệu job (audio / encoder / vi phạm chữ) ─────────────────────────── */
+
+function vsOutputAsset(data) {
+  const renderedList = Array.isArray(data?.rendered) ? data.rendered : [];
+  const last = renderedList[renderedList.length - 1] || null;
+  if (last) return last;
+  const asset = data?.asset || null;
+  if (asset && (asset.role === 'rendered' || String(asset.mime || '') === 'image/gif')) return asset;
+  return null;
+}
+
+function vsSourceAsset(data) {
+  const asset = data?.asset || null;
+  const out = vsOutputAsset(data);
+  if (!asset) return null;
+  if (out && String(out.id) === String(asset.id)) return null;
+  return asset;
+}
+
+/** `audio` THẬT của job. Không có thông tin ⇒ null (GIF không mang âm thanh) — luật 2. */
+function vsAudio(data) {
+  data = data || {};
+  const out = vsOutputAsset(data);
+  const holders = [data, data.job, data.encode, data.last_run, out && out.meta, data.plan];
+  for (const h of holders) {
+    if (h && typeof h === 'object' && Object.prototype.hasOwnProperty.call(h, 'audio')) return h.audio;
+  }
+  return null;
+}
+
+/** Bộ mã hoá: dấu vết của JOB trước (encode / providers.encoder / meta ảnh), cấu hình máy chủ là phụ. */
+function vsEncoder(data) {
+  data = data || {};
+  const out = vsOutputAsset(data);
+  const candidates = [
+    ['encode', data.encode],
+    ['providers.encoder', data.providers && data.providers.encoder],
+    ['rendered.meta.encode', out && out.meta && out.meta.encode],
+    ['last_run.encode', data.last_run && data.last_run.encode],
+  ].filter(([, v]) => v && typeof v === 'object');
+  const current = (state.vs && state.vs.encoder) || state.config?.videostudio?.encoder || null;
+  // `encode_summary` của V3 khai `provider` (không phải `name`) — đọc CẢ HAI, không đoán bừa.
+  const nameOf = (v) => String(v?.name || v?.provider || '').trim();
+  const named = candidates.find(([, v]) => nameOf(v)) || null;
+  const source = named ? named[0] : candidates.length ? candidates[0][0] : current ? 'config' : 'none';
+  // Luật F-03 (MVP-03): dấu vết của JOB thắng cấu hình máy chủ đang chạy — job khai is_mock
+  // thì theo job; job KHÔNG khai gì mới được phép nhìn cấu hình.
+  const declared = candidates.filter(([, v]) => typeof v.is_mock === 'boolean');
+  const is_mock = declared.length ? declared.some(([, v]) => v.is_mock === true) : current?.is_mock === true;
+  const configured = [...candidates.map(([, v]) => v), ...(current ? [current] : [])].every((v) => v?.configured !== false);
+  return {
+    source,
+    fromJob: candidates.length > 0,
+    name: (named ? nameOf(named[1]) : '') || [...candidates.map(([, v]) => v), current].map(nameOf).find(Boolean) || 'không rõ',
+    is_mock,
+    configured,
+  };
+}
+
+/** 422 `VIDEO_TEXT_UNSUPPORTED_CLAIM`: gom ĐỦ + khử trùng vi phạm (dùng lại bộ đọc của MVP-03). */
+function vsErrorViolations(err) {
+  return isErrorViolations(err);
+}
+
+function vsTextBlockedFromError(err) {
+  const violations = vsErrorViolations(err);
+  const code = String(err?.code || '');
+  if (code !== 'VIDEO_TEXT_UNSUPPORTED_CLAIM' && violations.length === 0) return null;
+  return { code: code || 'VIDEO_TEXT_UNSUPPORTED_CLAIM', reason: err?.message || 'Máy chủ không nêu lý do.', violations };
+}
+
+function vsErrorText(err) {
+  if (typeof err === 'string') return err;
+  const code = String(err?.code || '');
+  if (code === 'INSUFFICIENT_CREDIT' || err?.status === 402) return creditShortfallText(err);
+  const hint = VS_ERROR_HINT[code];
+  const server = String(err?.message || (err?.status ? `HTTP ${err.status}` : 'Lỗi không xác định.'));
+  if (hint) return `${code}: ${hint}${server && server !== hint ? ` (máy chủ báo: ${server})` : ''}`;
+  return `${code ? `${code}: ` : ''}${server}`;
+}
+
+/* ── Tham số gửi lên API (§2.4) ──────────────────────────────────────────────── */
+
+/**
+ * `options` cho POST /jobs và POST /jobs/:id/generate.
+ *
+ * Hình dạng gửi lên khớp ĐÚNG `sanitizeVideostudioOptions` của V4 (§2.4):
+ *   - `image` (ngoài `options`) = ẢNH ĐẦU TIÊN — V4 chỉ ingest MỘT ảnh cho mỗi job
+ *     (`decodeImagelabImage(body.image)`), và V3 dựng cảnh từ chính các ảnh gốc ĐÃ LƯU của job.
+ *     Vì vậy KHÔNG nhét base64 của các ảnh sau vào đây: V4 bỏ object lồng trong `scenes[]`
+ *     (chỉ giữ chuỗi/số/boolean/mảng ngắn) và body chỉ được nới cho MỘT ảnh ⇒ gửi thừa là 413.
+ *   - `options.scenes[]` = metadata NGUYÊN THUỶ từng cảnh (V3 nhận `text`/`subtitle`/`duration_ms`/
+ *     `fit`/`filename`; `TEXT_KEYS` của V3 là texts|text|title|subtitle|price|cta).
+ *   - `options.texts` = MỌI đoạn chữ sẽ vẽ (tiêu đề + phụ đề, theo thứ tự cảnh). V4 kiểm chống
+ *     bịa NGAY trong request bằng danh sách này ⇒ chữ thiếu bằng chứng ra 422 TRƯỚC khi tạo job.
+ */
+function vsJobOptions() {
+  const fit = state.vs?.fit === 'crop' ? 'crop' : 'pad';
+  const preset = vsCurrentPreset();
+  const scenes = Array.isArray(state.vs?.scenes) ? state.vs.scenes : [];
+  const options = { preset: preset ? String(preset.id) : null, fit };
+  // Không có cảnh nào trong state (job mở từ lịch sử mà chưa có plan) ⇒ KHÔNG gửi `scenes`
+  // rỗng, để máy chủ dùng kế hoạch đã lưu thay vì bị ghi đè bằng danh sách trống.
+  if (scenes.length) {
+    options.scenes = scenes.slice(0, VS_SERVER_MAX_SCENES).map((s, i) => {
+      const scene = {
+        index: i,
+        text: String(s?.title ?? '').slice(0, VS_SERVER_TEXT_MAX),
+        subtitle: String(s?.subtitle ?? '').slice(0, VS_SERVER_TEXT_MAX),
+        duration_ms: Math.round(vsSceneSeconds(s) * 1000),
+        fit,
+        filename: String(s?.name ?? ''),
+      };
+      if (s?.asset_id) scene.asset_id = String(s.asset_id);
+      // §2.5 "nhiều ảnh ⇒ nhiều cảnh": ảnh của TỪNG cảnh phải đi kèm cảnh đó — máy chủ gom
+      // `scenes[i].image` theo đúng thứ tự để lưu N ảnh gốc (trước đây UI chỉ gửi ảnh đầu ở
+      // `image` ⇒ video luôn chỉ có 1 cảnh dù người dùng chọn nhiều ảnh).
+      const base64 = String(s?.base64 ?? '');
+      if (base64) scene.image = { base64, filename: String(s?.name ?? '') };
+      return scene;
+    });
+    const texts = vsTextsForServer(scenes);
+    if (texts.length) options.texts = texts;
+  }
+  return options;
+}
+
+/** Mọi đoạn chữ người dùng muốn VẼ (tiêu đề + phụ đề, theo thứ tự cảnh) — đã khử trùng. */
+function vsTextsForServer(scenes) {
+  const list = Array.isArray(scenes) ? scenes : [];
+  const out = [];
+  const seen = new Set();
+  for (const s of list) {
+    for (const raw of [s?.title, s?.subtitle]) {
+      const text = String(raw ?? '').trim().slice(0, VS_SERVER_TEXT_MAX);
+      if (!text || seen.has(text)) continue;
+      seen.add(text);
+      out.push(text);
+      if (out.length >= VS_SERVER_MAX_TEXTS) return out;
+    }
+  }
+  return out;
+}
+
+/**
+ * Máy chủ có nhận NHIỀU ảnh cho một job không?
+ *
+ * VÒNG GỘP (07/10/2026): ĐÃ BẬT — `POST /api/videostudio/jobs` nhận `image` (ảnh đầu, tương thích
+ * ngược) **và** `options.scenes[i].image` cho từng cảnh; máy chủ gom theo thứ tự, khử trùng theo
+ * sha256, dựng ĐÚNG số cảnh = số ảnh nhận được (§2.5 "nhiều ảnh ⇒ nhiều cảnh"). Trần số cảnh lấy
+ * từ `GET /api/videostudio/presets → limits.max_scenes` (không hardcode).
+ */
+function vsServerSupportsManyImages() {
+  return true;
+}
+
+/** Cảnh nào sẽ KHÔNG được gửi lên máy chủ — nay chỉ còn cảnh KHÔNG có ảnh trong trình duyệt. */
+function vsUnsentSceneIndexes(scenes) {
+  const list = Array.isArray(scenes) ? scenes : [];
+  if (vsServerSupportsManyImages()) return list.map((_, i) => i).filter((i) => !list[i]?.base64);
+  return list.map((_, i) => i).filter((i) => i > 0);
+}
+
+function vsMultiImageNotice(scenes) {
+  const list = Array.isArray(scenes) ? scenes : [];
+  const unsent = vsUnsentSceneIndexes(list);
+  if (!unsent.length) return '';
+  return `<div class="notice warn" id="vs-multi-image">
+    <strong>${esc(unsent.length)} cảnh KHÔNG có ảnh trong trình duyệt nên sẽ không được gửi lên.</strong>
+    <p style="margin:6px 0 0">Mỗi cảnh cần một ảnh: kéo-thả ảnh vào cảnh đó (hoặc xoá cảnh trống). Máy chủ dựng ĐÚNG số cảnh
+      bằng số ảnh nhận được — cảnh không có ảnh sẽ bị bỏ qua, hệ thống báo thẳng nếu kế hoạch ít cảnh hơn số bạn chọn.</p>
+  </div>`;
+}
+
+
+/**
+ * Thân POST /api/videostudio/jobs.
+ *
+ * `image` = ẢNH ĐẦU (khoá đóng băng §2.4, giữ để tương thích ngược) và mọi cảnh gửi kèm ảnh
+ * riêng trong `options.scenes[i].image` — máy chủ gom theo thứ tự, khử trùng theo sha256, và
+ * dựng ĐÚNG số cảnh bằng số ảnh nhận được (§2.5).
+ */
+function vsJobBody() {
+  const scenes = Array.isArray(state.vs?.scenes) ? state.vs.scenes : [];
+  const first = scenes.find((s) => s?.base64) || scenes[0] || null;
+  return {
+    image: first && first.base64 ? { base64: String(first.base64 ?? ''), filename: String(first.name ?? '') } : null,
+    options: vsJobOptions(),
+  };
+}
+
+/* ── Khối render (thuần, không đụng DOM) ─────────────────────────────────────── */
+
+function vsProviderBadges() {
+  const enc = vsEncoder(state.vs?.job);
+  const cls = enc.configured ? (enc.is_mock ? 'warn' : 'ok') : 'bad';
+  const mock = enc.is_mock ? ' · MOCK' : '';
+  const notReady = enc.configured ? '' : ' · chưa cấu hình';
+  const where = enc.fromJob ? 'theo job đã lưu' : 'theo cấu hình máy chủ';
+  return `<span class="badge ${cls}" title="${esc(`Bộ mã hoá: ${enc.name} (${where})`)}">Mã hoá: ${esc(enc.name)}${mock}${notReady}</span>
+    <span class="badge">Tệp ra: GIF động · audio = ${vsAudio(state.vs?.job) === null ? 'null' : 'có'}</span>`;
+}
+
+function vsMockNotice() {
+  const enc = vsEncoder(state.vs?.job);
+  if (!enc.is_mock) return '';
+  return `<div class="notice warn">
+    <strong>MOCK — bộ mã hoá video đang chạy bằng dữ liệu giả lập (${esc(enc.name)}).</strong>
+    <p style="margin:6px 0 0">Kết quả KHÔNG phải video thật (${esc(enc.fromJob ? 'theo dấu vết của job đã lưu' : 'theo cấu hình máy chủ đang chạy')}). Không dùng để đánh giá chất lượng hoặc đăng bán.</p>
+  </div>`;
+}
+
+/** Nói THẬT khi chưa lấy được preset — không bịa tỉ lệ, không hardcode kích thước. */
+function vsPresetsNotice() {
+  if (vsPresets().length) return '';
+  const err = state.vs?.presetsError;
+  return `<div class="notice warn" id="vs-presets-error">
+    <strong>Chưa lấy được danh sách tỉ lệ từ máy chủ (GET /api/videostudio/presets).</strong>
+    <p style="margin:6px 0 0">${err ? esc(err) : 'Đang tải…'}</p>
+    <p style="margin:6px 0 0">UI KHÔNG tự bịa kích thước khung — chưa có preset thì chưa tạo được video.</p>
+    <button class="btn tiny" data-action="vsreload" type="button" style="margin-top:8px">THỬ LẤY LẠI TỈ LỆ</button>
+  </div>`;
+}
+
+function vsHeaderPanel() {
+  const cfg = state.config?.videostudio || {};
+  const available = cfg.available !== false;
+  const preset = vsCurrentPreset();
+  return `<section class="panel">
+    <div class="spread">
+      <div style="min-width:0">
+        <h2 style="margin:0 0 4px">Video bán hàng ngắn từ ảnh thật</h2>
+        <p class="muted small" style="margin:0">
+          Ghép 1 hoặc nhiều ảnh thành <strong>GIF động</strong> có nhịp theo thời lượng từng cảnh, có chữ Việt.
+          ${esc(VS_FIT_NOTE)} Ảnh gốc <strong>không bị sửa</strong> (bản ghi bất biến).
+        </p>
+        <p class="muted small" style="margin:6px 0 0">
+          Tệp ra là GIF động — <strong>không kèm âm thanh</strong>${cfg.audio === false ? ' (máy chủ khai audio = false)' : ''}.
+          Đây KHÔNG phải video MP4 hoàn chỉnh để đăng ngay: hãy tự kiểm từng khung trước khi dùng.
+        </p>
+      </div>
+      <span class="badge ${available ? 'ok' : 'bad'}">${available ? 'Sẵn sàng' : 'Chưa khả dụng'}</span>
+    </div>
+    <div class="row" style="margin-top:10px">${vsProviderBadges()}</div>
+    ${preset ? `<div class="muted small" style="margin-top:8px">Tỉ lệ đang chọn (số của MÁY CHỦ): <strong>${esc(preset.label || preset.id)}</strong>${vsPresetDetail(preset) ? ` — ${esc(vsPresetDetail(preset))}` : ''}</div>` : ''}
+    ${vsMockNotice()}
+  </section>`;
+}
+
+function vsUnavailablePanel() {
+  const cfg = state.config?.videostudio || {};
+  const reason = cfg.reason || state.vs?.presetsError || null;
+  return `<section class="panel"><div class="notice error"><strong>Tính năng video chưa sẵn sàng trên máy chủ này (VIDEOSTUDIO_UNAVAILABLE).</strong>
+    <p style="margin:6px 0 0">Lý do máy chủ báo: ${esc(reason || 'không nêu lý do — xem log máy chủ (videostudio.wiring_failed).')}</p>
+    <p style="margin:6px 0 0">Các tab Nội dung / Dịch ảnh / Tạo ảnh vẫn dùng bình thường.</p></div></section>`;
+}
+
+function vsErrorBox() {
+  const err = state.vs?.error;
+  if (!err) return '';
+  // 402 có băng báo RIÊNG của MVP-05 (số cần / số có + link nạp) — hiện đúng khối đó.
+  if (err && typeof err === 'object' && (err.code === 'INSUFFICIENT_CREDIT' || err.status === 402)) {
+    return creditShortfallHtml(err);
+  }
+  return `<div class="notice error" id="vs-error">${esc(vsErrorText(err))}</div>`;
+}
+
+/** 422 khi tạo/tạo lại: hiện ĐÚNG reason + TỪNG vi phạm (đã khử trùng), không nuốt. */
+function vsTextBlockedPanel() {
+  const b = state.vs?.textBlocked;
+  if (!b) return '';
+  const violations = Array.isArray(b.violations) ? b.violations : [];
+  return `<div class="notice error" id="vs-text-blocked">
+    <strong>Chữ trên video bị CHẶN — không vẽ (${esc(b.code || 'VIDEO_TEXT_UNSUPPORTED_CLAIM')})</strong>
+    <p style="margin:6px 0 0">${esc(b.reason || 'Máy chủ không nêu lý do.')}</p>
+    ${violations.length ? `<ul>${violations.map((v) => `<li>${esc(v)}</li>`).join('')}</ul>` : ''}
+    <p class="muted small" style="margin:6px 0 0">${esc(VS_TEXT_CLAIM_NOTE)}</p>
+  </div>`;
+}
+
+function vsFileErrorsHtml() {
+  const list = Array.isArray(state.vs?.fileErrors) ? state.vs.fileErrors : [];
+  if (!list.length) return '';
+  return `<div class="notice warn" id="vs-file-errors"><strong>${esc(list.length)} tệp KHÔNG được nhận:</strong>
+    <ul>${list.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>`;
+}
+
+/** Bước 1 — chọn ảnh (nhiều ảnh = nhiều cảnh, thứ tự = thứ tự chọn). */
+function vsRenderUpload() {
+  const scenes = Array.isArray(state.vs?.scenes) ? state.vs.scenes : [];
+  const maxBytes = vsMaxImageBytes();
+  const maxMb = maxBytes ? Math.round(maxBytes / 1024 / 1024) : null;
+  const maxScenes = vsMaxScenes();
+  const busy = Boolean(state.vs?.busy || state.vs?.pendingFiles);
+  return `<section class="panel">
+    <h3 style="margin-top:0">1 · Chọn ảnh PNG cho các cảnh</h3>
+    <div class="drop" id="vs-drop" data-action="vspick">
+      <div id="vs-drop-text">Kéo 1 hoặc nhiều ảnh PNG vào đây — hoặc bấm để chọn.<br />
+        <span class="muted small">Thứ tự ảnh = thứ tự cảnh (giữ đúng thứ tự bạn chọn).</span></div>
+    </div>
+    <input id="vs-file" type="file" accept="image/png" multiple hidden />
+    <p class="muted small" style="margin-top:10px">
+      Màn này nhận <strong>PNG</strong>${maxMb ? ` · tối đa ${esc(maxMb)}MB/ảnh` : ''} · gửi tối đa ${esc(maxScenes ? Math.min(maxScenes, VS_SERVER_MAX_SCENES) : VS_SERVER_MAX_SCENES)} cảnh mỗi lần.
+      Máy chủ còn kiểm magic bytes lần nữa. Ảnh gốc được lưu thành bản ghi BẤT BIẾN (sha256 giữ nguyên trước/sau).
+      ${vsServerSupportsManyImages() ? '' : 'API hiện nhận <strong>1 ảnh cho mỗi job</strong> — chọn nhiều ảnh vẫn giữ đủ danh sách cảnh, nhưng chỉ ảnh đầu tiên vào video (UI sẽ báo thẳng).'}
+    </p>
+    ${vsFileErrorsHtml()}
+    <div class="row">
+      <button class="btn ${scenes.length ? 'ghost' : 'primary'}" data-action="vspick" type="button" ${busy ? 'disabled' : ''}>${scenes.length ? 'THÊM ẢNH' : 'CHỌN ẢNH PNG'}</button>
+      ${scenes.length ? `<button class="btn ghost" data-action="vsclear" type="button" ${busy ? 'disabled' : ''}>Xoá hết ảnh</button>` : ''}
+      ${state.vs?.pendingFiles ? '<span class="status"><span class="spinner"></span> Đang đọc ảnh…</span>' : ''}
+    </div>
+  </section>`;
+}
+
+function vsTotalHtml() {
+  const scenes = Array.isArray(state.vs?.scenes) ? state.vs.scenes : [];
+  const total = vsTotalSeconds();
+  const max = vsMaxSeconds();
+  const preset = vsCurrentPreset();
+  const over = max !== null && total > max;
+  return `<div class="vs-total" id="vs-total">
+    <strong>Tổng thời lượng: ${esc(vsNum(total))} giây</strong>
+    <span class="muted small">· ${esc(scenes.length)} cảnh${preset ? ` · ${esc(preset.label || preset.id)}${max !== null ? ` (trần ${esc(max)} giây/cảnh)` : ''}` : ''}</span>
+    ${over ? `<div class="notice warn small" style="margin:8px 0 0">Tổng ${esc(vsNum(total))} giây VƯỢT trần ${esc(max)} giây của preset ⇒ máy chủ sẽ CẮT bớt phần vượt và ghi cảnh báo (video không bao giờ dài quá trần).</div>` : ''}
+  </div>`;
+}
+
+/** Bước 2 — danh sách cảnh: thứ tự, chữ tiêu đề/phụ đề, thời lượng (kẹp theo trần preset). */
+function vsRenderScenes() {
+  const scenes = Array.isArray(state.vs?.scenes) ? state.vs.scenes : [];
+  const busy = Boolean(state.vs?.busy);
+  const max = vsMaxSeconds();
+  const fromPlan = scenes.length > 0 && scenes.every((s) => !s?.dataUrl);
+  // Cảnh KHÔNG gửi được lên máy chủ (API hiện nhận 1 ảnh/job) — dán nhãn ngay tại dòng đó.
+  const unsent = fromPlan ? [] : vsUnsentSceneIndexes(scenes);
+  const rows = scenes.map((s, i) => {
+    const seconds = vsSceneSeconds(s);
+    const note = Math.round(Number(s?.seconds) * 10) / 10 !== seconds ? ` <span class="muted small">(đã kẹp về ${esc(vsNum(seconds))} giây)</span>` : '';
+    return `<li class="vs-scene" data-index="${esc(i)}">
+      <span class="vs-scene-no">Cảnh ${esc(i + 1)}</span>
+      ${s?.dataUrl
+        ? `<img class="vs-thumb" src="${esc(s.dataUrl)}" alt="${esc(s.name || 'ảnh cảnh')}" />`
+        : `<span class="vs-thumb vs-thumb-empty" title="Ảnh gốc nằm trên máy chủ, trình duyệt không giữ lại">ảnh gốc<br />trên máy chủ</span>`}
+      <div class="vs-scene-body">
+        <div class="mono small">${esc(s?.name || '(không rõ tên tệp)')}${Number.isFinite(Number(s?.bytes)) && Number(s.bytes) > 0 ? ` · ${esc(Math.round(Number(s.bytes) / 1024))}KB` : ''}
+          ${unsent.includes(i) ? '<span class="badge warn" title="Cảnh này không có ảnh trong trình duyệt nên không gửi lên được">chưa gửi được</span>' : ''}
+          ${s?.missingText ? '<span class="badge warn" title="Plan đã lưu chỉ giữ số đoạn chữ, không giữ nội dung — nhập lại chữ nếu muốn giữ chữ">chữ cũ không đọc lại được</span>' : ''}</div>
+        <label class="vs-field"><span>Chữ (tiêu đề)</span>
+          <input type="text" maxlength="120" value="${esc(s?.title ?? '')}" data-vs-scene="title" data-index="${esc(i)}"
+            placeholder="Ví dụ: Áo thun cotton" ${busy ? 'disabled' : ''} /></label>
+        <label class="vs-field"><span>Phụ đề (tuỳ chọn)</span>
+          <input type="text" maxlength="200" value="${esc(s?.subtitle ?? '')}" data-vs-scene="subtitle" data-index="${esc(i)}"
+            placeholder="Ví dụ: 99.000đ" ${busy ? 'disabled' : ''} /></label>
+        <label class="vs-field vs-field-sec"><span>Thời lượng (giây)</span>
+          <input type="number" min="1" ${max !== null ? `max="${esc(max)}"` : ''} step="0.5" value="${esc(vsNum(seconds))}"
+            data-vs-scene="seconds" data-index="${esc(i)}" ${busy ? 'disabled' : ''} />
+          <span class="muted small">tối đa ${max !== null ? `${esc(max)} giây/cảnh` : 'chưa rõ (máy chủ chưa trả preset)'}</span>${note}</label>
+      </div>
+      <div class="vs-scene-actions">
+        <button class="btn ghost tiny" data-action="vsmove" data-index="${esc(i)}" data-dir="-1" type="button"
+          title="Đưa cảnh này lên" ${i === 0 || busy ? 'disabled' : ''}>↑</button>
+        <button class="btn ghost tiny" data-action="vsmove" data-index="${esc(i)}" data-dir="1" type="button"
+          title="Đưa cảnh này xuống" ${i === scenes.length - 1 || busy ? 'disabled' : ''}>↓</button>
+        <button class="btn ghost tiny" data-action="vsremove" data-index="${esc(i)}" type="button"
+          title="Xoá cảnh này" ${busy ? 'disabled' : ''}>✕</button>
+      </div>
+    </li>`;
+  }).join('');
+  return `<section class="panel">
+    <h3 style="margin-top:0">2 · Cảnh, chữ và thời lượng</h3>
+    ${vsMultiImageNotice(fromPlan ? [] : scenes)}
+    ${scenes.length
+      ? `<ol class="vs-scenes">${rows}</ol>
+         ${fromPlan ? `<p class="muted small">Danh sách cảnh đọc từ PLAN đã lưu của job — trình duyệt không giữ ảnh gốc, sửa chữ/thời lượng rồi bấm TẠO LẠI.${scenes.some((s) => s?.missingText) ? ' Plan đã lưu <strong>không chứa nội dung chữ</strong> (chỉ có số đoạn chữ) nên ô chữ đang TRỐNG — nhập lại nếu muốn video mới có chữ.' : ''}</p>` : ''}`
+      : `<p class="muted small">Chưa có ảnh nào. Chọn ảnh PNG ở bước 1 — mỗi ảnh là một cảnh, đúng thứ tự bạn chọn.</p>`}
+    ${vsTotalHtml()}
+  </section>`;
+}
+
+/** Bước 3 — tỉ lệ (từ presets của máy chủ) + fit + nút tạo/tạo lại. */
+function vsRenderOptions(mode) {
+  const list = vsPresets();
+  const chosen = vsCurrentPreset();
+  const chosenId = chosen ? String(chosen.id) : '';
+  const fit = state.vs?.fit === 'crop' ? 'crop' : 'pad';
+  const busy = Boolean(state.vs?.busy);
+  const running = vsJobRunning(state.vs?.job?.job);
+  const canCreate = vsCanCreate();
+  const createBtn = mode === 'regenerate'
+    ? `<button class="btn primary" data-action="vsregen" type="button" ${busy || running ? 'disabled' : ''}>${busy ? 'ĐANG GỬI…' : running ? 'ĐANG CHẠY — CHỜ XONG…' : 'TẠO LẠI'}</button>
+       <button class="btn ghost" data-action="vsregenforce" type="button" ${busy || running ? 'disabled' : ''}
+         title="Chạy lại dù máy chủ cho rằng chưa có gì đổi (force = true)">TẠO LẠI (force)</button>`
+    : `<button class="btn primary" data-action="vscreate" type="button" ${canCreate ? '' : 'disabled'}>${busy ? 'ĐANG TẠO…' : 'TẠO VIDEO'}</button>`;
+  const chips = list.map((p) => {
+    const id = String(p.id);
+    const detail = vsPresetDetail(p);
+    return `<label class="vs-preset${chosenId === id ? ' active' : ''}">
+      <input type="radio" name="vs-preset" value="${esc(id)}" data-vs-preset ${chosenId === id ? 'checked' : ''} ${busy ? 'disabled' : ''} />
+      <span class="vs-preset-label">${esc(p.label || id)}</span>
+      ${detail ? `<span class="mono muted small">${esc(detail)}</span>` : ''}
+    </label>`;
+  }).join('');
+  return `<section class="panel" id="vs-options">
+    <h3 style="margin-top:0">3 · Tỉ lệ khung và cách vừa khung</h3>
+    ${list.length
+      ? `<div class="vs-presets">${chips}</div>`
+      : vsPresetsNotice()}
+    <div class="vs-fit">
+      <label class="vs-check">
+        <input type="radio" name="vs-fit" value="pad" data-vs-fit ${fit === 'pad' ? 'checked' : ''} ${busy ? 'disabled' : ''} />
+        <span><strong>PAD — thêm viền</strong> cho vừa khung; giữ nguyên toàn bộ ảnh, <strong>không</strong> kéo giãn.</span>
+      </label>
+      <label class="vs-check">
+        <input type="radio" name="vs-fit" value="crop" data-vs-fit ${fit === 'crop' ? 'checked' : ''} ${busy ? 'disabled' : ''} />
+        <span><strong>CROP — cắt bớt</strong> phần thừa cho vừa khung; <strong>không</strong> kéo giãn (một phần ảnh sẽ bị mất).</span>
+      </label>
+      <p class="muted small" style="margin:6px 0 0">${esc(VS_FIT_NOTE)}</p>
+    </div>
+    <div class="row" style="margin-top:12px">
+      ${createBtn}
+      ${mode === 'regenerate' ? '<span class="muted small">Lượt chạy mới dùng chữ/thời lượng/fit ở trên; ảnh gốc vẫn bất biến.</span>' : ''}
+    </div>
+  </section>`;
+}
+
+function vsRenderSteps(stage) {
+  const idx = VS_STAGE_ORDER.indexOf(String(stage || '').toLowerCase());
+  return `<ol class="il-steps">${VS_STAGE_STEPS.map(([key, label]) => {
+    const i = VS_STAGE_ORDER.indexOf(key);
+    const cls = idx < 0 ? '' : i < idx ? 'done' : i === idx ? 'current' : '';
+    return `<li class="${cls}"><span class="il-dot"></span>${esc(label)}</li>`;
+  }).join('')}</ol>`;
+}
+
+function vsStageText(stage) {
+  const key = String(stage || 'queued').toLowerCase();
+  const label = VS_STAGE_LABEL[key] || `Bước lạ: ${stage}`;
+  const idx = VS_STAGE_ORDER.indexOf(key);
+  return idx < 0 ? label : `Bước ${idx + 1}/${VS_STAGE_ORDER.length} · ${label}`;
+}
+
+/** Nhãn TRUNG THỰC về tiếng (§0 luật 2): chỉ dán “Video KHÔNG có tiếng” khi audio THẬT SỰ là null. */
+function vsAudioNotice(data) {
+  const audio = vsAudio(data);
+  if (audio === null || audio === undefined) {
+    return `<div class="notice warn" id="vs-no-audio">
+      <strong>${esc(VS_NO_AUDIO_LABEL)}</strong>
+      <p style="margin:6px 0 0">${esc(VS_NO_AUDIO_NOTE)}</p>
+    </div>`;
+  }
+  const desc = typeof audio === 'object' ? (audio.format || audio.codec || audio.mime || JSON.stringify(audio)) : String(audio);
+  return `<div class="notice ok" id="vs-audio">
+    <strong>Có tiếng:</strong> ${esc(desc)}.
+    <p style="margin:6px 0 0">Vẫn phải tự kiểm âm thanh trước khi dùng.</p>
+  </div>`;
+}
+
+/** Kết quả: xem trước GIF (tự chạy) + nút tải + nhãn KHÔNG có tiếng NGAY CẠNH. */
+function vsRenderResult(data) {
+  data = data || {};
+  const out = vsOutputAsset(data);
+  const src = vsSourceAsset(data);
+  const encode = data.encode && typeof data.encode === 'object' ? data.encode : {};
+  const plan = data.plan && typeof data.plan === 'object' ? data.plan : null;
+  const enc = vsEncoder(data);
+  const assetSrc = (a) => `/api/videostudio/assets/${encodeURIComponent(String(a.id))}/file`;
+  const extOf = (mime) => ({ 'image/gif': 'gif', 'video/mp4': 'mp4', 'image/png': 'png' }[String(mime || '')] || 'gif');
+  const facts = [];
+  if (out) {
+    facts.push(`Định dạng: ${esc(out.mime || encode.mime || 'không rõ')}${out.width ? ` · ${esc(out.width)}×${esc(out.height)} pixel` : ''}`);
+    if (Number.isFinite(Number(encode.frames))) facts.push(`${esc(encode.frames)} khung`);
+    if (Number.isFinite(Number(plan?.duration_ms))) facts.push(`dài ${esc(vsNum(Number(plan.duration_ms) / 1000))} giây`);
+    if (Number.isFinite(Number(out.bytes ?? encode.bytes))) facts.push(`${esc(Math.round(Number(out.bytes ?? encode.bytes) / 1024))}KB`);
+    if (Number.isFinite(Number(encode.palette_size))) facts.push(`bảng màu ${esc(encode.palette_size)} màu`);
+  }
+  return `<section class="panel">
+    <div class="spread">
+      <h2 style="margin:0">Kết quả video</h2>
+      <div class="row">
+        ${enc.is_mock ? '<span class="badge warn" title="Bộ mã hoá tự khai is_mock = true">MOCK</span>' : ''}
+        ${out ? `<a class="btn tiny primary" href="${esc(assetSrc(out))}" download="video-${esc(String(out.id).slice(0, 8))}.${esc(extOf(out.mime || encode.mime))}">Tải video (GIF) về</a>` : ''}
+        ${out ? `<a class="btn tiny ghost" href="${esc(assetSrc(out))}" target="_blank" rel="noopener">Mở tệp trong tab mới</a>` : ''}
+      </div>
+    </div>
+    ${out
+      ? `<div class="vs-result">
+           <img src="${esc(assetSrc(out))}" alt="Video GIF kết quả (tự chạy)" />
+           <div class="vs-result-facts">
+             <div>${facts.join(' · ')}</div>
+             <div class="mono small">asset ${esc(String(out.id))}</div>
+             ${src ? `<div class="muted small">Ảnh gốc của job (bất biến): <img class="vs-thumb-inline" src="${esc(assetSrc(src))}" alt="Ảnh gốc" /></div>` : ''}
+           </div>
+         </div>`
+      : `<div class="notice warn" style="margin-top:10px">Chưa có tệp kết quả. Job đang chạy hoặc lượt chạy chưa tạo được GIF — xem cảnh báo bên dưới.</div>`}
+    ${vsAudioNotice(data)}
+  </section>`;
+}
+
+/**
+ * Ghi chú về `fit` (luật 1): ưu tiên SỰ THẬT trong `plan.scenes[].fit` của máy chủ; chưa có plan
+ * thì nói rõ là theo lựa chọn của người dùng, KHÔNG dám khẳng định.
+ */
+function vsFitNotes(data) {
+  data = data || {};
+  const plan = (data.plan && typeof data.plan === 'object' ? data.plan : null) || (data.last_run?.plan ?? null);
+  const planScenes = Array.isArray(plan?.scenes) ? plan.scenes : null;
+  const local = Array.isArray(state.vs?.scenes) ? state.vs.scenes : [];
+  const preset = vsCurrentPreset();
+  const frame = preset && Number.isFinite(Number(preset.width)) ? `${Number(preset.width)}×${Number(preset.height)}` : null;
+  if (!planScenes || !planScenes.length) {
+    if (!local.length) return [];
+    const fit = state.vs?.fit === 'crop' ? 'crop' : 'pad';
+    return [`Bạn chọn “${fit}” cho ${local.length} cảnh nhưng máy chủ CHƯA trả về plan — UI không dám khẳng định từng cảnh đã đúng; hãy tự mở GIF kiểm tra.`];
+  }
+  const groups = { pad: [], crop: [] };
+  planScenes.forEach((s, i) => {
+    const mode = String(s?.fit || '').toLowerCase();
+    if (mode !== 'pad' && mode !== 'crop') return;
+    // `plan_summary` KHÔNG giữ tên tệp ⇒ lùi về tên cảnh UI đang giữ, rồi tới asset_id (vẫn
+    // chỉ ĐÚNG cảnh đó, không đoán cảnh khác).
+    const name = s?.filename || s?.source_filename || local[i]?.name || (s?.asset_id ? `asset ${String(s.asset_id).slice(0, 8)}…` : null);
+    const size = s?.source && Number.isFinite(Number(s.source.width)) ? `${Number(s.source.width)}×${Number(s.source.height)}` : null;
+    groups[mode].push(`Cảnh ${i + 1}${name ? ` (${name})` : ''}${size ? ` — ảnh gốc ${size}` : ''}`);
+  });
+  const items = [];
+  if (groups.crop.length) items.push(`${groups.crop.join(', ')}: bị CẮT BỚT (crop) cho vừa khung${frame ? ` ${frame}` : ''} — phần thừa đã mất, KHÔNG kéo giãn.`);
+  if (groups.pad.length) items.push(`${groups.pad.join(', ')}: được THÊM VIỀN (pad) cho vừa khung${frame ? ` ${frame}` : ''} — ảnh gốc giữ nguyên tỉ lệ, KHÔNG kéo giãn.`);
+  return items;
+}
+
+/** Thời lượng bị CẮT do vượt trần (luật: không bao giờ vượt trần, phải ghi cảnh báo). */
+function vsDurationNotes(data) {
+  data = data || {};
+  const plan = (data.plan && typeof data.plan === 'object' ? data.plan : null) || (data.last_run?.plan ?? null);
+  const planMs = Number(plan?.duration_ms);
+  const reqMs = vsTotalMs();
+  const max = vsMaxSeconds();
+  const local = Array.isArray(state.vs?.scenes) ? state.vs.scenes : [];
+  const planScenes = Array.isArray(plan?.scenes) ? plan.scenes : [];
+  const items = [];
+  // Thời lượng ngắn hơn yêu cầu có HAI nguyên nhân khác hẳn nhau: (1) vượt trần preset ⇒ cắt,
+  // (2) máy chủ bỏ bớt cảnh (ví dụ chỉ nhận 1 ảnh/job) ⇒ số cảnh khớp mới được phép quy cho trần.
+  const sameSceneCount = local.length > 0 && planScenes.length === local.length;
+  if (Number.isFinite(planMs) && reqMs > 0 && planMs < reqMs && sameSceneCount) {
+    items.push(`Bạn yêu cầu ${vsNum(reqMs / 1000)} giây nhưng máy chủ chỉ chạy ${vsNum(planMs / 1000)} giây — phần vượt trần${max !== null ? ` ${max} giây/cảnh` : ''} đã bị CẮT (video không bao giờ dài quá trần).`);
+  } else if (Number.isFinite(planMs) && planMs > 0) {
+    items.push(`Tổng thời lượng máy chủ chạy: ${vsNum(planMs / 1000)} giây (${vsNum(plan?.frame_count)} khung${Number.isFinite(Number(plan?.fps)) ? ` @ ${vsNum(plan.fps)} khung/giây` : ''}).`);
+  }
+  return items;
+}
+
+/** Số cảnh gửi lên vs số cảnh máy chủ lập kế hoạch — lệch thì NÓI THẲNG (có ảnh bị bỏ). */
+function vsSceneCountNote(data) {
+  const plan = (data?.plan && typeof data.plan === 'object' ? data.plan : null) || (data?.last_run?.plan ?? null);
+  const planScenes = Array.isArray(plan?.scenes) ? plan.scenes : null;
+  const local = Array.isArray(state.vs?.scenes) ? state.vs.scenes : [];
+  if (!planScenes || !local.length) return [];
+  if (planScenes.length === local.length) return [];
+  return [`Bạn gửi ${local.length} cảnh nhưng kế hoạch của máy chủ có ${planScenes.length} cảnh — có cảnh KHÔNG được dùng. Kiểm tra lại danh sách cảnh rồi tạo lại.`];
+}
+
+/** Mọi cảnh báo THẬT (§2.5) — không giấu cảnh báo nào; chỉ bỏ dòng TRÙNG NGUYÊN VĂN. */
+function vsRenderWarnings(data) {
+  data = data || {};
+  const audio = vsAudio(data);
+  const enc = vsEncoder(data);
+  const plan = data.plan && typeof data.plan === 'object' ? data.plan : null;
+  const lastRun = data.last_run && typeof data.last_run === 'object' ? data.last_run : null;
+  const renderedList = Array.isArray(data.rendered) ? data.rendered : [];
+  const out = vsOutputAsset(data);
+  const seen = new Set();
+  const warnLines = [];
+  const addWarn = (value) => {
+    const line = String(value ?? '').trim();
+    if (!line) return;
+    // Nhãn “không có tiếng” đã hiện NGAY CẠNH kết quả ⇒ không in lại y hệt lần hai.
+    if (audio === null && (line === VS_NO_AUDIO_LABEL || line === VS_NO_AUDIO_NOTE)) return;
+    if (seen.has(line)) return;
+    seen.add(line);
+    warnLines.push(line);
+  };
+  for (const w of Array.isArray(data.warnings) ? data.warnings : []) addWarn(w);
+  for (const w of Array.isArray(plan?.warnings) ? plan.warnings : []) addWarn(w);
+  for (const w of Array.isArray(data.encode?.warnings) ? data.encode.warnings : []) addWarn(w);
+  for (const w of Array.isArray(lastRun?.warnings) ? lastRun.warnings : []) addWarn(w);
+
+  const blocks = [];
+  if (enc.is_mock) {
+    blocks.push({
+      cls: 'warn',
+      title: `MOCK — bộ mã hoá video đang chạy dữ liệu giả lập (${enc.name})`,
+      items: [
+        `Dấu vết MOCK đọc từ ${enc.fromJob ? 'chính job đã lưu' : 'cấu hình máy chủ đang chạy'}; provider tự khai is_mock = true.`,
+        'Kết quả KHÔNG phải video thật — không dùng để đánh giá chất lượng hoặc đăng bán.',
+      ],
+    });
+  }
+  const fitItems = vsFitNotes(data);
+  if (fitItems.length) blocks.push({ cls: 'warn', title: 'Ảnh bị pad/crop cho vừa khung (không kéo giãn)', items: fitItems });
+  const durItems = vsDurationNotes(data);
+  if (durItems.length) blocks.push({ cls: 'muted', title: 'Thời lượng thật của video', items: durItems });
+  const countItems = vsSceneCountNote(data);
+  if (countItems.length) blocks.push({ cls: 'error', title: 'Số cảnh KHÔNG khớp', items: countItems });
+
+  const blocked = plan?.texts_blocked || data.texts_blocked || null;
+  if (blocked) {
+    const violations = Array.isArray(blocked.violations) ? blocked.violations.map(isViolationText).filter(Boolean) : [];
+    blocks.push({
+      cls: 'error',
+      title: 'Chữ trên video bị CHẶN — không vẽ',
+      items: [String(blocked.reason || VS_ERROR_HINT.VIDEO_TEXT_UNSUPPORTED_CLAIM), ...violations],
+    });
+  }
+  // Mã hoá lỗi (ví dụ thiếu ffmpeg khi xuất MP4) — đọc thẳng `encode.error_code` của lượt đã lưu.
+  const encode = data.encode && typeof data.encode === 'object' ? data.encode : {};
+  if (encode.error_code) {
+    blocks.push({
+      cls: 'error',
+      title: `Mã hoá video LỖI (${String(encode.error_code)})`,
+      items: [vsErrorText({ code: encode.error_code, message: encode.error_message })],
+    });
+  }
+  if (warnLines.length) blocks.push({ cls: 'warn', title: 'Cảnh báo thật từ máy chủ', items: warnLines });
+
+  const lastItems = [];
+  if (lastRun && String(lastRun.status || '') && String(lastRun.rendered_asset_id ?? '') !== String(out?.id ?? '')) {
+    lastItems.push(`Lượt chạy mới nhất: ${String(lastRun.status)}${lastRun.error_code ? ` (mã lỗi ${String(lastRun.error_code)})` : ''} — lượt này KHÔNG (hoặc chưa) tạo ra GIF đang hiện.`);
+  }
+  if (lastRun?.error_message) lastItems.push(String(lastRun.error_message));
+  if (lastItems.length) blocks.push({ cls: 'warn', title: 'Lượt chạy mới nhất của job', items: lastItems });
+  if (lastRun?.error_code && !warnLines.length) {
+    blocks.push({ cls: 'warn', title: `Lỗi của lượt chạy mới nhất: ${String(lastRun.error_code)}`, items: [vsErrorText({ code: lastRun.error_code, message: lastRun.error_message })] });
+  }
+
+  if (!blocks.length) return '';
+  return `<section class="panel">
+    <h2>Cảnh báo thật từ hệ thống</h2>
+    ${blocks
+      .map(
+        (b) => `<div class="notice ${b.cls}">
+          <strong>${esc(b.title)}</strong>
+          ${b.items && b.items.length ? `<ul>${b.items.map((i) => `<li>${esc(i)}</li>`).join('')}</ul>` : ''}
+        </div>`,
+      )
+      .join('')}
+  </section>`;
+}
+
+function vsRenderJob() {
+  const data = state.vs?.job || {};
+  const job = data.job || {};
+  const stage = String(job.stage || 'queued').toLowerCase();
+  const status = String(job.status || 'queued').toLowerCase();
+  const running = vsJobRunning(job);
+  const statusCls = status === 'succeeded' ? 'ok' : status === 'failed' ? 'bad' : 'warn';
+  const failCode = job.error_code ? ` (${esc(job.error_code)})` : '';
+  return `
+    <section class="panel">
+      <div class="spread">
+        <div style="min-width:0">
+          <h2 style="margin:0 0 4px">Job video <span class="mono small">${esc(String(job.id || '').slice(0, 8))}</span></h2>
+          <div class="muted small">Bước: ${esc(vsStageText(stage))} <span class="mono">(${esc(stage)})</span></div>
+        </div>
+        <div class="row">
+          <span class="badge ${statusCls}">${esc(VS_STATUS_LABEL[status] || job.status || 'Đang chờ')}</span>
+          <button class="btn ghost tiny" data-action="vsrefresh" type="button">Kiểm tra lại</button>
+          <button class="btn ghost tiny" data-action="vsnew" type="button">Video khác</button>
+        </div>
+      </div>
+      ${running ? vsRenderSteps(stage) : ''}
+      ${running
+        ? `<div class="status" style="margin-top:10px"><span class="spinner"></span>
+             <span>${esc(VS_STAGE_LABEL[stage] || stage || 'Đang xử lý')}… <span class="muted small">(tự cập nhật mỗi 1.5 giây — không có tiếng ở mọi bước)</span></span></div>`
+        : ''}
+      ${status === 'failed'
+        ? `<div class="notice error"><strong>Job thất bại${failCode}</strong>
+             <p style="margin:6px 0 0">${esc(job.error_message || 'Máy chủ không nêu nguyên nhân.')}</p>
+             ${VS_ERROR_HINT[String(job.error_code || '')] ? `<p style="margin:6px 0 0">${esc(VS_ERROR_HINT[String(job.error_code || '')])}</p>` : ''}</div>`
+        : ''}
+    </section>
+    ${vsRenderResult(data)}
+    ${vsRenderWarnings(data)}
+    ${vsRenderScenes()}
+    ${vsRenderOptions('regenerate')}`;
+}
+
+/** Thân màn “Video” — hàm THUẦN để test trích ra chạy không cần DOM. */
+function vsRenderBody() {
+  const cfg = state.config?.videostudio || {};
+  const available = cfg.available !== false;
+  if (!available) return `${vsHeaderPanel()}${vsUnavailablePanel()}${vsErrorBox()}`;
+  const job = state.vs?.job;
+  return `${vsHeaderPanel()}
+    ${job ? vsRenderJob() : `${vsRenderUpload()}${vsRenderScenes()}${vsRenderOptions('create')}`}
+    ${vsTextBlockedPanel()}
+    ${vsErrorBox()}`;
+}
+
+/* ── Vẽ màn hình (có DOM) ────────────────────────────────────────────────────── */
+
+function vsRenderPage() {
+  state.view = 'video';
+  stopPolling();
+  stopIlPolling();
+  stopIsPolling();
+  app.innerHTML = `${vsRenderBody()}${authHintHtml()}`;
+  const cfg = state.config?.videostudio || {};
+  if (cfg.available !== false && !vsPresets().length && !state.vs.presetsLoading && !state.vs.presetsError) {
+    loadVideoPresets(false);
+  }
+}
+
+/* ── Nạp preset THẬT từ máy chủ ──────────────────────────────────────────────── */
+
+/** Giữ preset đang chọn hợp lệ; chưa chọn ⇒ preset đầu tiên (không hardcode id nào). */
+function ensureVsPreset() {
+  const list = vsPresets();
+  if (!list.length) return;
+  if (vsPresetById(state.vs.preset)) return;
+  state.vs.preset = String(list[0].id);
+}
+
+async function loadVideoPresets(force) {
+  if (!force && (vsPresets().length || state.vs.presetsLoading)) return;
+  state.vs.presetsLoading = true;
+  if (force) state.vs.presetsError = null;
+  try {
+    const res = await api('/api/videostudio/presets');
+    state.vs.presets = Array.isArray(res?.presets) ? res.presets : [];
+    state.vs.encoder = res?.encoder || state.vs.encoder || null;
+    state.vs.limits = res?.limits || state.vs.limits || null;
+    state.vs.presetsError = null;
+    ensureVsPreset();
+  } catch (err) {
+    // Máy chủ chưa nối module (§2.4 ⇒ 503/404) — dùng khối `videostudio` của /api/config, KHÔNG bịa tỉ lệ.
+    const cfg = state.config?.videostudio || {};
+    if (Array.isArray(cfg.presets) && cfg.presets.length) {
+      state.vs.presets = cfg.presets;
+      state.vs.encoder = cfg.encoder || state.vs.encoder || null;
+      ensureVsPreset();
+    }
+    state.vs.presetsError = vsErrorText(err);
+  } finally {
+    state.vs.presetsLoading = false;
+  }
+  if (state.view === 'video') vsRenderPage();
+}
+
+/** GET job cũng trả `presets` + `providers` (§2.4) — dùng luôn, khỏi phụ thuộc một lần gọi. */
+function vsAdoptMeta(data) {
+  if (!data || typeof data !== 'object') return;
+  if (Array.isArray(data.presets) && data.presets.length) {
+    state.vs.presets = data.presets;
+    ensureVsPreset();
+  }
+  if (data.providers?.encoder) state.vs.encoder = data.providers.encoder;
+  else if (data.encode && typeof data.encode === 'object' && data.encode.name) state.vs.encoder = data.encode;
+  if (data.limits && typeof data.limits === 'object') state.vs.limits = data.limits;
+}
+
+/** Mở job đã có: dựng lại danh sách cảnh từ PLAN (không có ảnh) để “TẠO LẠI” bắt đầu từ đó. */
+function vsSyncScenesFromJob(data) {
+  if (!data || typeof data !== 'object') return;
+  if (Array.isArray(state.vs.scenes) && state.vs.scenes.length) return;
+  const plan = (data.plan && typeof data.plan === 'object' ? data.plan : null) || (data.last_run?.plan ?? null);
+  const planScenes = Array.isArray(plan?.scenes) ? plan.scenes : [];
+  if (!planScenes.length) return;
+  state.vs.scenes = planScenes.map((s) => {
+    // `plan_summary` của V3 CHỈ giữ `text_count` (không giữ nội dung chữ) ⇒ chữ đã vẽ KHÔNG đọc
+    // lại được: UI nói thẳng điều đó và để người dùng nhập lại, KHÔNG bịa lại chữ cũ.
+    const items = Array.isArray(s?.texts) ? s.texts : null;
+    const title = items && items.length ? String(items[0]?.text ?? '') : '';
+    const subtitle = items && items.length > 1 ? String(items[1]?.text ?? '') : '';
+    const count = Number(s?.text_count);
+    const assetName = s?.asset_id ? `asset ${String(s.asset_id).slice(0, 8)}…` : '';
+    return {
+      name: String(s?.filename || s?.source_filename || assetName || ''),
+      bytes: 0,
+      mime: 'image/png',
+      base64: '',
+      dataUrl: '',
+      title,
+      subtitle,
+      seconds: Math.round((Number(s?.duration_ms) || 0) / 100) / 10 || 1,
+      asset_id: s?.asset_id ? String(s.asset_id) : undefined,
+      missingText: !items && Number.isFinite(count) && count > 0,
+    };
+  });
+  if (plan?.preset_id && vsPresetById(plan.preset_id)) state.vs.preset = String(plan.preset_id);
+  const firstFit = String(planScenes[0]?.fit || '').toLowerCase();
+  if (firstFit === 'crop' || firstFit === 'pad') state.vs.fit = firstFit;
+}
+
+/* ── Chọn ảnh + tạo job ──────────────────────────────────────────────────────── */
+
+async function pickVideoFiles(files) {
+  const list = [...(files || [])];
+  if (!list.length) return;
+  const maxBytes = vsMaxImageBytes();
+  const maxScenes = vsMaxScenes();
+  const scenes = Array.isArray(state.vs.scenes) ? state.vs.scenes : (state.vs.scenes = []);
+  const errors = [];
+  const accepted = [];
+  for (const file of list) {
+    const name = String(file?.name || 'tệp không tên');
+    const mime = String(file?.type || '');
+    if (mime && mime !== 'image/png') {
+      errors.push(`${name}: định dạng “${mime}” — màn này chỉ nhận PNG.`);
+      continue;
+    }
+    if (maxBytes && Number(file?.size) > maxBytes) {
+      errors.push(`${name}: ${Math.round(Number(file.size) / 1024 / 1024)}MB vượt giới hạn ${Math.round(maxBytes / 1024 / 1024)}MB.`);
+      continue;
+    }
+    if (maxScenes !== null && scenes.length + accepted.length >= maxScenes) {
+      errors.push(`${name}: đã đủ ${maxScenes} cảnh (giới hạn của máy chủ).`);
+      continue;
+    }
+    accepted.push(file);
+  }
+  state.vs.pendingFiles = true;
+  state.vs.fileErrors = errors;
+  vsRenderPage();
+  const read = await Promise.all(
+    accepted.map(async (file) => {
+      try {
+        const dataUrl = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result));
+          reader.onerror = () => reject(new Error('Không đọc được tệp ảnh.'));
+          reader.readAsDataURL(file);
+        });
+        return { ok: true, scene: {
+          name: String(file.name || 'image.png'),
+          bytes: Number(file.size) || 0,
+          mime: String(file.type || 'image/png'),
+          base64: dataUrl.slice(dataUrl.indexOf(',') + 1),
+          dataUrl,
+          title: '',
+          subtitle: '',
+          seconds: vsClampSeconds(2),
+        } };
+      } catch (err) {
+        return { ok: false, name: String(file?.name || 'tệp không tên'), message: String(err?.message || 'lỗi đọc tệp') };
+      }
+    }),
+  );
+  state.vs.pendingFiles = false;
+  for (const item of read) {
+    if (item.ok) scenes.push(item.scene);
+    else errors.push(`${item.name}: ${item.message}`);
+  }
+  state.vs.fileErrors = errors;
+  state.vs.error = null;
+  vsRenderPage();
+}
+
+async function submitVideoJob() {
+  if (!vsCanCreate()) {
+    if (!vsHasImages()) state.vs.error = 'Hãy chọn ít nhất một ảnh PNG trước khi tạo video.';
+    else if (!vsCurrentPreset()) state.vs.error = 'Chưa có tỉ lệ khung từ máy chủ — chưa tạo được video.';
+    vsRenderPage();
+    return;
+  }
+  state.vs.busy = true;
+  state.vs.error = null;
+  state.vs.textBlocked = null;
+  vsRenderPage();
+  try {
+    const res = await api('/api/videostudio/jobs', { method: 'POST', body: vsJobBody() });
+    state.vs.busy = false;
+    state.vs.jobId = res?.job_id || null;
+    state.vs.job = null;
+    if (state.vs.jobId) {
+      location.hash = `#/video/${state.vs.jobId}`;
+      await openVideoJob(state.vs.jobId);
+    } else {
+      state.vs.error = 'Máy chủ nhận job nhưng không trả `job_id` — không theo dõi được tiến trình.';
+      vsRenderPage();
+    }
+  } catch (err) {
+    state.vs.busy = false;
+    const blocked = vsTextBlockedFromError(err);
+    if (blocked) {
+      state.vs.textBlocked = blocked;
+      state.vs.error = null;
+      toast('Chữ trên video bị chặn — xem vi phạm trong khối cảnh báo.');
+    } else {
+      state.vs.error = err;
+    }
+    vsRenderPage();
+  }
+}
+
+/** §2.4 — “TẠO LẠI” ⇒ POST /api/videostudio/jobs/:id/generate (mỗi lượt có run_key riêng). */
+async function regenerateVideo(force) {
+  const jobId = state.vs?.jobId || state.vs?.job?.job?.id;
+  if (!jobId || state.vs.busy) return;
+  state.vs.busy = true;
+  state.vs.error = null;
+  state.vs.textBlocked = null;
+  vsRenderPage();
+  try {
+    await api(`/api/videostudio/jobs/${encodeURIComponent(String(jobId))}/generate`, {
+      method: 'POST',
+      body: { options: vsJobOptions(), force: Boolean(force) },
+    });
+    state.vs.busy = false;
+    toast(force ? 'Đang tạo lại (force)…' : 'Đang tạo lại video với tham số này…');
+    startVsPolling();
+    vsRenderPage();
+  } catch (err) {
+    state.vs.busy = false;
+    const blocked = vsTextBlockedFromError(err);
+    if (blocked) {
+      state.vs.textBlocked = blocked;
+      toast('Chữ trên video bị chặn — xem vi phạm trong khối cảnh báo.');
+    } else {
+      state.vs.error = err;
+    }
+    vsRenderPage();
+  }
+}
+
+/* ── Theo dõi tiến trình (poll theo `stage`) ─────────────────────────────────── */
+
+function vsReset() {
+  stopVsPolling();
+  state.vs.jobId = null;
+  state.vs.job = null;
+  state.vs.busy = false;
+  state.vs.error = null;
+  state.vs.textBlocked = null;
+  state.vs.scenes = [];
+  state.vs.fileErrors = [];
+  state.vs.pendingFiles = false;
+  state.vs.pollCount = 0;
+}
+
+async function openVideoJob(id, { force = false } = {}) {
+  if (!id) return;
+  if (!force && state.vs.jobId === id && state.vs.job) {
+    vsRenderPage();
+    startVsPollIfRunning();
+    return;
+  }
+  if (!force && state.vs.loading === id) return;
+  state.vs.loading = id;
+  state.vs.jobId = id;
+  if (!state.vs.job || state.vs.job?.job?.id !== id) {
+    app.innerHTML = '<section class="panel"><div class="status"><span class="spinner"></span> Đang tải job video…</div></section>';
+  }
+  try {
+    const data = await api(`/api/videostudio/jobs/${encodeURIComponent(String(id))}`);
+    state.vs.job = data;
+    state.vs.error = null;
+    state.vs.textBlocked = null;
+    vsAdoptMeta(data);
+    vsSyncScenesFromJob(data);
+  } catch (err) {
+    state.vs.job = null;
+    state.vs.error = err;
+  } finally {
+    state.vs.loading = null;
+  }
+  vsRenderPage();
+  startVsPollIfRunning();
+}
+
+function startVsPollIfRunning() {
+  if (vsJobRunning(state.vs.job?.job)) startVsPolling();
+  else stopVsPolling();
+}
+
+/** Đang gõ trong form cảnh thì vòng poll KHÔNG vẽ lại (mất focus/chữ đang gõ). */
+function vsFormHasFocus() {
+  const el = document.activeElement;
+  if (!el || typeof el.tagName !== 'string') return false;
+  if (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') return false;
+  return Boolean(el.closest?.('#vs-options') || el.dataset?.vsScene !== undefined || el.dataset?.vsPreset !== undefined || el.dataset?.vsFit !== undefined);
+}
+
+function vsJobRunning(job) {
+  if (!job || typeof job !== 'object') return false;
+  const stage = String(job.stage || '').toLowerCase();
+  const status = String(job.status || '').toLowerCase();
+  if (stage === 'done' || stage === 'failed') return false;
+  if (status === 'succeeded' || status === 'failed' || status === 'partial') return false;
+  return true;
+}
+
+function startVsPolling() {
+  stopVsPolling();
+  state.vs.pollCount = 0;
+  state.vs.poll = setInterval(async () => {
+    // Rời khỏi tab Video thì tự dừng, không kéo người dùng về trang cũ.
+    if (state.view !== 'video' || !state.vs.jobId) {
+      stopVsPolling();
+      return;
+    }
+    state.vs.pollCount += 1;
+    if (state.vs.pollCount > VS_MAX_POLLS) {
+      stopVsPolling();
+      const stage = String(state.vs.job?.job?.stage || '').toLowerCase();
+      state.vs.error = `Job vẫn ở bước “${VS_STAGE_LABEL[stage] || stage || 'không rõ'}” sau ${VS_MAX_POLLS} lần kiểm tra — có thể job bị kẹt. Bấm “Kiểm tra lại” hoặc xem log máy chủ.`;
+      vsRenderPage();
+      return;
+    }
+    try {
+      const data = await api(`/api/videostudio/jobs/${encodeURIComponent(String(state.vs.jobId))}`);
+      state.vs.job = data;
+      vsAdoptMeta(data);
+      if (!vsJobRunning(data?.job)) stopVsPolling();
+      if (vsFormHasFocus()) state.vs.dirtyPaint = true;
+      else vsRenderPage();
+    } catch (err) {
+      stopVsPolling();
+      state.vs.error = `Mất kết nối khi theo dõi tiến trình: ${vsErrorText(err)}`;
+      vsRenderPage();
+    }
+  }, 1500);
+}
+
+function stopVsPolling() {
+  if (state.vs?.poll) clearInterval(state.vs.poll);
+  if (state.vs) state.vs.poll = null;
+}
+
+/* ── Gắn sự kiện cho tab Video (chỉ gắn một lần) ─────────────────────────────── */
+
+/** Giữ giá trị người dùng đang gõ trong `state` để render lại KHÔNG mất chữ. */
+function vsSyncField(target) {
+  if (!target || !target.dataset) return;
+  const key = target.dataset.vsScene;
+  if (key !== undefined) {
+    const index = Number.parseInt(target.dataset.index ?? '', 10);
+    const scene = (Array.isArray(state.vs?.scenes) ? state.vs.scenes : [])[index];
+    if (!scene) return;
+    if (key === 'seconds') {
+      const res = vsSetSceneSeconds(index, target.value);
+      const out = document.getElementById('vs-total');
+      if (out && res) out.innerHTML = vsTotalHtml(); // nội dung đều đã qua esc()
+      return;
+    }
+    if (key === 'title') scene.title = String(target.value ?? '');
+    if (key === 'subtitle') scene.subtitle = String(target.value ?? '');
+    return;
+  }
+  if (target.dataset.vsPreset !== undefined) {
+    state.vs.preset = String(target.value || '');
+    ensureVsPreset();
+    vsRenderPage();
+    return;
+  }
+  if (target.dataset.vsFit !== undefined) {
+    state.vs.fit = target.value === 'crop' ? 'crop' : 'pad';
+    vsRenderPage();
+  }
+}
+
+function wireVideostudioGlobal() {
+  document.addEventListener('change', (ev) => {
+    const t = ev.target;
+    if (t instanceof HTMLInputElement && t.id === 'vs-file') pickVideoFiles(t.files);
+    vsSyncField(t);
+  });
+  document.addEventListener('input', (ev) => vsSyncField(ev.target));
+  document.addEventListener('focusout', (ev) => {
+    if (!state.vs?.dirtyPaint) return;
+    if (ev.relatedTarget?.closest?.('#vs-options') || ev.relatedTarget?.dataset?.vsScene !== undefined) return;
+    state.vs.dirtyPaint = false;
+    if (state.view === 'video') vsRenderPage();
+  });
+  for (const name of ['dragenter', 'dragover']) {
+    document.addEventListener(name, (ev) => {
+      if (ev.target.closest?.('#vs-drop')) {
+        ev.preventDefault();
+        $('#vs-drop')?.classList.add('hover');
+      }
+    });
+  }
+  for (const name of ['dragleave', 'drop']) {
+    document.addEventListener(name, (ev) => {
+      if (ev.target.closest?.('#vs-drop')) {
+        ev.preventDefault();
+        $('#vs-drop')?.classList.remove('hover');
+      }
+    });
+  }
+  document.addEventListener('drop', (ev) => {
+    if (ev.target.closest?.('#vs-drop')) pickVideoFiles(ev.dataTransfer?.files);
   });
 }
 

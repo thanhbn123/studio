@@ -247,7 +247,7 @@ describe('MVP-05 · A2 — bảng giá & ước tính', () => {
     await ctx.store.close();
   });
 
-  test('seed pricing đủ 10 USAGE_OPERATIONS — CONTENT_REPAIR PHẢI có giá', async () => {
+  test('seed pricing đủ MỌI USAGE_OPERATIONS — CONTENT_REPAIR PHẢI có giá', async () => {
     const pricing = await ctx.store.listPricing();
     assert.equal(pricing.length, USAGE_OPERATIONS.length, 'seed phải đủ mọi operation của hợp đồng §2.1');
     const byOp = new Map(pricing.map((row) => [row.operation, row]));

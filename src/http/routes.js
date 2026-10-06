@@ -5,7 +5,7 @@
  * không lộ secret, không lộ chi tiết nội bộ).
  */
 
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { Router, HttpError, sendJson, readJson, sessionId, presentedSessionId, parseCookies, MAX_BODY_BYTES_DEFAULT, SECURITY_HEADERS } from './server.js';
 import { scrubPaths } from '../logger.js';
 import { tryDetectSource } from '../sources/detect.js';
@@ -25,7 +25,7 @@ const UUID_RE = /^[0-9a-fA-F-]{36}$|^[A-Za-z0-9_-]{8,64}$/;
  */
 
 /** Tiền tố route NGHIỆP VỤ — chỉ những route này mới bị cổng "bắt buộc đăng nhập" chạm tới. */
-const BUSINESS_PATH_RE = /^\/api\/(?:jobs|imagelab|imagestudio|uploads|detect)(?:\/|$)/;
+const BUSINESS_PATH_RE = /^\/api\/(?:jobs|imagelab|imagestudio|videostudio|uploads|detect)(?:\/|$)/;
 
 const ANON_EXEMPT_PATHS = new Set(['/api/health', '/api/config']);
 
@@ -43,6 +43,8 @@ const USAGE_GROUP_BY = Object.freeze(['day', 'operation', 'user']);
 const PRICING_OPERATIONS = Object.freeze([
   'SOURCE_EXTRACT', 'VISION_ANALYSIS', 'TRANSLATION', 'CONTENT_GENERATE', 'CONTENT_REPAIR',
   'OCR_DETECT', 'IMAGE_RENDER', 'IMAGE_MATTING', 'IMAGE_COMPOSE', 'IMAGE_RETOUCH',
+  // MVP-04 — video offline (đường DỰ PHÒNG khi store không có `listPricing`).
+  'VIDEO_RENDER', 'VIDEO_ENCODE',
 ]);
 
 /** Câu DUY NHẤT cho mọi ca sai thông tin đăng nhập (khớp hằng số trong `buildRouter`). */
@@ -520,6 +522,342 @@ export function buildRouter(app) {
       });
     } catch (inner) {
       logger?.warn?.('imagestudio.fail_mark_failed', { job_id: jobId, error_name: inner?.name || 'Error' });
+    }
+  };
+
+  /* ─────────────── MVP-04 · tiện ích dùng chung cho videostudio ─────────────── */
+
+  // §2.4 — V1 (kịch bản) / V2 (mã hoá) / V3 (pipeline) do agent khác viết song song nên có
+  // thể CHƯA có mặt lúc máy chủ khởi động. Mọi route /api/videostudio/* phải kiểm trước và
+  // trả 503 gọn gàng, tuyệt đối không để MVP-04 làm chết server của MVP-01/02/03/05.
+  const VIDEOSTUDIO_MODULE_MESSAGE =
+    'Không nạp được module kịch bản video của MVP-04 — tính năng tạo video chưa sẵn sàng. Chi tiết ở log máy chủ (videostudio.module_load_failed).';
+
+  /**
+   * MVP-04 có bị TẮT bằng cấu hình không: tôn trọng cờ riêng `videostudio.enabled` (nếu V3
+   * thêm) VÀ dùng chung công tắc `imagelab.enabled`, vì video dùng CHUNG kho tệp
+   * (`src/imagelab/storage.js`) + trần ảnh với MVP-02/MVP-03. Thiếu cả hai khoá ⇒ coi như bật.
+   */
+  const videostudioEnabled = () => config.videostudio?.enabled !== false && config.imagelab?.enabled !== false;
+
+  /** Kho để ĐỌC tệp: ưu tiên kho dùng chung MVP-02, thiếu thì lấy kho riêng mà V3 bơm vào pipeline. */
+  const videostudioStorage = () => app.storage || app.videostudioPipeline?.storage || null;
+
+  /** "Khả dụng" = có pipeline V3 + không bị tắt bằng cấu hình (KHÔNG lấy kho làm điều kiện). */
+  const videostudioAvailable = () => Boolean(app.videostudioPipeline) && videostudioEnabled();
+
+  /** Lý do THẬT (câu tiếng Việt, không lộ đường dẫn nội bộ) khiến MVP-04 không chạy được. */
+  const videostudioUnavailableReason = () => {
+    if (app.videostudioUnavailableReason) return String(app.videostudioUnavailableReason);
+    if (!videostudioEnabled()) return 'Tính năng tạo video đang bị tắt bằng cấu hình (IMAGELAB_ENABLED/VIDEOSTUDIO_ENABLED = false).';
+    return 'Không nạp được pipeline tạo video MVP-04 — tính năng tạo video bị tắt. Chi tiết ở log máy chủ (videostudio.wiring_failed).';
+  };
+
+  const requireVideostudio = () => {
+    if (!videostudioAvailable()) throw HttpError.safe(503, 'VIDEOSTUDIO_UNAVAILABLE', videostudioUnavailableReason());
+  };
+
+  const requireVideostudioMethod = (name) => {
+    requireVideostudio();
+    if (typeof app.videostudioPipeline?.[name] !== 'function') {
+      throw HttpError.safe(503, 'VIDEOSTUDIO_UNAVAILABLE', `Pipeline tạo video thiếu phương thức "${name}" — tính năng chưa sẵn sàng.`);
+    }
+  };
+
+  const requireVideostudioStoreMethod = (name) => {
+    if (typeof store[name] !== 'function') {
+      throw HttpError.safe(503, 'VIDEOSTUDIO_UNAVAILABLE', `Kho dữ liệu thiếu phương thức "${name}" — tính năng tạo video chưa sẵn sàng.`);
+    }
+  };
+
+  /**
+   * Thông tin bộ mã hoá — ĐÚNG ba field hợp đồng §2.2/§2.4 (`name`, `is_mock`, `configured`).
+   * Nhận cả `isMock` (hợp đồng V2) và `is_mock` (bản đã chuyển) để không lệch tên field.
+   */
+  const videostudioEncoderInfo = () => {
+    const enc = app.videoEncoder || app.videostudioPipeline?.encoder || null;
+    return {
+      name: enc?.name || 'none',
+      is_mock: Boolean(enc?.isMock ?? enc?.is_mock),
+      configured: Boolean(enc?.configured),
+    };
+  };
+  const videostudioProviders = () => ({ encoder: videostudioEncoderInfo() });
+
+  /**
+   * Nạp module của V1 — nạp PHÒNG THỦ như MVP-02/03: module anh em có thể chưa tồn tại lúc
+   * các agent chạy song song, và lỗi nạp KHÔNG được làm sập server. Thiếu ⇒ `null`, KHÔNG
+   * bịa giá trị thay thế (danh sách preset giả sẽ khiến UI dựng ra video sai tỉ lệ).
+   */
+  const videostudioModules = new Map();
+  const loadVideostudioModule = (specifier) => {
+    if (!videostudioModules.has(specifier)) {
+      videostudioModules.set(specifier, (async () => {
+        try {
+          return await import(specifier);
+        } catch (err) {
+          logger?.error?.('videostudio.module_load_failed', {
+            module: specifier,
+            error_name: err?.name || 'Error',
+            error_code: err?.code || null,
+            // Không đưa cả object lỗi vào log: message/stack của Node chứa đường dẫn tuyệt đối.
+            error_message: String(err?.message || err).replace(/\/(?:Users|home|private|tmp|var|opt|mnt|Volumes)\/\S*/g, '<path>'),
+          });
+          return null;
+        }
+      })());
+    }
+    return videostudioModules.get(specifier);
+  };
+
+  /**
+   * Nguồn preset THẬT: ưu tiên `VIDEO_PRESETS` của V1 (`src/videostudio/plan/index.js` — nguồn
+   * ĐÓNG BĂNG của §2.1). Chỉ khi V1 chưa nạp được mới dùng `app.videostudioPresets` do tầng gộp
+   * bơm vào — đó là đường để test/gộp chạy được TRƯỚC khi V1 có mặt, KHÔNG phải bản chép luật
+   * trong file này. Không có nguồn nào ⇒ `null` (route báo 503, không bịa danh sách).
+   */
+  const videostudioPresets = async () => {
+    const mod = await loadVideostudioModule('../videostudio/plan/index.js');
+    if (Array.isArray(mod?.VIDEO_PRESETS) && mod.VIDEO_PRESETS.length > 0) return mod.VIDEO_PRESETS;
+    const injected = app.videostudioPresets;
+    if (Array.isArray(injected) && injected.length > 0) return injected;
+    return null;
+  };
+
+  const requireVideostudioPresets = async () => {
+    const presets = await videostudioPresets();
+    if (!presets) throw HttpError.safe(503, 'VIDEOSTUDIO_UNAVAILABLE', VIDEOSTUDIO_MODULE_MESSAGE);
+    return presets;
+  };
+
+  /**
+   * Trần đầu vào của MVP-04 (§2.4 `limits`): dùng chung trần ảnh MVP-02/MVP-03 trừ khi V3
+   * khai riêng trong `config.videostudio`. `max_seconds` lấy từ cấu hình; thiếu thì lấy trần
+   * CAO NHẤT trong preset THẬT của V1 — KHÔNG bịa một con số mặc định (30 giây là số của
+   * preset, không phải của route).
+   */
+  const videostudioLimits = (presets = null) => {
+    const configured = Number(config.videostudio?.maxSeconds);
+    let seconds = Number.isFinite(configured) && configured > 0 ? configured : null;
+    if (seconds === null && Array.isArray(presets)) {
+      const list = presets.map((p) => Number(p?.max_seconds)).filter((n) => Number.isFinite(n) && n > 0);
+      if (list.length > 0) seconds = Math.max(...list);
+    }
+    return {
+      max_image_bytes: config.videostudio?.maxImageBytes ?? config.imagelab?.maxImageBytes ?? config.net.maxUploadBytes,
+      max_pixels: config.videostudio?.maxPixels ?? config.imagelab?.maxPixels ?? DEFAULT_MAX_PIXELS,
+      max_seconds: seconds,
+      // §2.5: UI cần biết trần số cảnh để chặn TRƯỚC khi gửi (trước đây V5 phải đoán).
+      max_scenes: VIDEOSTUDIO_MAX_SCENES,
+    };
+  };
+
+  /** Trần để GIẢI MÃ ảnh đầu vào — thêm danh sách MIME cho phép (dùng chung với MVP-02). */
+  const videostudioImageLimits = (presets = null) => ({
+    ...videostudioLimits(presets),
+    allowed_image_mime: config.net.allowedImageMime || [],
+  });
+
+  /** Quyền sở hữu job: job của tài khoản/session khác trả 404 y như job không tồn tại (§2.4). */
+  const requireVideostudioJob = async (id, sid, req = null) => {
+    requireVideostudio();
+    if (!UUID_RE.test(id)) throw new HttpError(400, 'BAD_JOB_ID', 'Mã job không hợp lệ.');
+    const job = await store.getJob(id);
+    if (!job) throw new HttpError(404, 'JOB_NOT_FOUND', 'Không tìm thấy job.');
+    // MVP-05: job của TÀI KHOẢN khác ⇒ 404 (không xác nhận sự tồn tại).
+    if (assertAccountOwnership(job, req)) return job;
+    if (job.session_id !== sid) throw new HttpError(404, 'JOB_NOT_FOUND', 'Không tìm thấy job.');
+    return job;
+  };
+
+  /** Quyền sở hữu TỆP theo session/tài khoản — cùng luật với `requireImagestudioAsset`. */
+  const requireVideostudioAsset = async (id, sid, req = null) => {
+    requireVideostudio();
+    requireVideostudioStoreMethod('getImageAsset');
+    if (!UUID_RE.test(id)) throw new HttpError(400, 'BAD_ASSET_ID', 'Mã tệp không hợp lệ.');
+    const asset = await store.getImageAsset(id);
+    if (!asset) throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy tệp video.');
+
+    const ownerJob = asset.job_id ? await store.getJob(asset.job_id) : null;
+
+    // (1) MVP-05 — tệp HOẶC job sở hữu gắn `user_id`: chỉ chủ đọc được.
+    const accountOwner = asset.user_id ?? ownerJob?.user_id ?? null;
+    if (accountOwner !== null && accountOwner !== undefined && accountOwner !== '') {
+      if (String(req?.user?.id ?? '') !== String(accountOwner)) {
+        throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy tệp video.');
+      }
+      return asset;
+    }
+
+    // (2) Tệp ẩn danh: giữ nguyên luật theo `session_id`; tắt ẩn danh ⇒ không phục vụ.
+    if (!anonymousAllowed()) throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy tệp video.');
+    if (asset.session_id) {
+      if (asset.session_id !== sid) throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy tệp video.');
+    } else if (asset.job_id) {
+      if (!ownerJob || ownerJob.session_id !== sid) throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy tệp video.');
+    } else {
+      // Không xác định được chủ sở hữu → fail-closed, không trả dữ liệu.
+      throw new HttpError(404, 'ASSET_NOT_FOUND', 'Không tìm thấy tệp video.');
+    }
+    return asset;
+  };
+
+  /**
+   * "Bằng chứng" của job video (§0 luật 3) — GOM ĐÚNG như `#evidenceText` của V3 để route và
+   * pipeline không bao giờ phán hai kết luận khác nhau:
+   *   · `jobs.product_name`;
+   *   · vùng chữ trong DB (`store.listOcrRegions`) — gồm vùng do NGƯỜI DÙNG nhập tay;
+   *   · ghi chú ĐÃ LƯU trong `content_meta` (`notes`/`note`/`user_note`/`source_text`).
+   *
+   * TUYỆT ĐỐI không lấy chữ người dùng vừa gửi trong request làm bằng chứng (bài học "bằng
+   * chứng vòng" của MVP-03: chữ tự khai không chứng minh chính nó). Job chưa tồn tại ⇒ bằng
+   * chứng RỖNG ⇒ mọi khẳng định/số liệu bị chặn.
+   */
+  const collectVideostudioEvidence = async (job) => {
+    // Một giá trị bằng chứng có thể là chuỗi, mảng chuỗi hoặc object có `text` — đọc cả ba.
+    const textFrom = (value) => {
+      if (typeof value === 'string') return value.trim();
+      if (Array.isArray(value)) return value.map(textFrom).filter(Boolean).join('\n');
+      if (value && typeof value === 'object' && typeof value.text === 'string') return value.text.trim();
+      return '';
+    };
+
+    const parts = [];
+    const productName = String(job?.product_name ?? '').trim();
+    if (productName) parts.push(productName);
+
+    if (job?.id && typeof store.listOcrRegions === 'function') {
+      try {
+        for (const region of asArray(await store.listOcrRegions(job.id))) {
+          const text = String(region?.text ?? region?.text_original ?? '').trim();
+          if (text) parts.push(text);
+        }
+      } catch (err) {
+        logger?.warn?.('videostudio.evidence_failed', {
+          job_id: job.id,
+          error_name: err?.name || 'Error',
+          error_code: err?.code || null,
+        });
+      }
+    }
+
+    const meta = job?.content_meta && typeof job.content_meta === 'object' ? job.content_meta : {};
+    for (const holder of [meta.videostudio, meta.imagelab, meta.imagestudio]) {
+      if (!holder || typeof holder !== 'object') continue;
+      for (const key of VIDEOSTUDIO_EVIDENCE_KEYS) {
+        const text = textFrom(holder[key]);
+        if (text) parts.push(text);
+      }
+    }
+    return parts.join('\n');
+  };
+
+  /** Bộ kiểm khẳng định của V1 (`collectClaimViolations` — §2.1) — nạp phòng thủ, chưa có ⇒ `null`. */
+  const loadVideostudioClaimCollector = async () => {
+    const plan = await loadVideostudioModule('../videostudio/plan/index.js');
+    if (typeof plan?.collectClaimViolations === 'function') return plan.collectClaimViolations;
+    const claims = await loadVideostudioModule('../videostudio/plan/claims.js');
+    return typeof claims?.collectClaimViolations === 'function' ? claims.collectClaimViolations : null;
+  };
+
+  /**
+   * Gọi bộ kiểm khẳng định của V1 cho TỪNG đoạn chữ (chữ ký ĐÓNG BĂNG của
+   * `src/videostudio/plan/claims.js`: `collectClaimViolations(text, { evidence })`).
+   *
+   * Nếu vì lý do nào đó lời gọi hỏng ở MỌI câu (chữ ký đổi ở bản V1 khác), hàm trả `null` =
+   * "không kiểm được" để tầng gọi quyết định — TUYỆT ĐỐI không đoán thành "đạt" (fail-closed
+   * thuộc về V1/V3, nơi luôn kiểm lại trước khi vẽ).
+   */
+  const callClaimCollector = (fn, { evidence, texts }) => {
+    const out = [];
+    let answered = 0;
+    for (const text of texts) {
+      try {
+        out.push(...asArray(fn(text, { evidence })));
+        answered += 1;
+      } catch {
+        /* câu này không gọi được ⇒ thử câu kế tiếp */
+      }
+    }
+    return answered > 0 ? out : null;
+  };
+
+  /**
+   * Mọi đoạn chữ sẽ được VẼ lên video: `options` + `options.scenes[]`, đúng các khoá mà V3 gom
+   * để đưa cho V1 (`TEXT_KEYS` của `videostudio/pipeline.js`) — nhờ vậy thứ được KIỂM và thứ
+   * được VẼ là MỘT danh sách, không lệch.
+   */
+  const videostudioTextsOf = (options) => {
+    const out = [];
+    const push = (source) => {
+      if (!source || typeof source !== 'object') return;
+      for (const key of VIDEOSTUDIO_TEXT_KEYS) {
+        const value = source[key];
+        if (value === undefined || value === null) continue;
+        for (const item of Array.isArray(value) ? value : [value]) {
+          const text = typeof item === 'string' ? item : typeof item?.text === 'string' ? item.text : '';
+          const trimmed = text.trim();
+          if (trimmed) out.push(trimmed);
+        }
+      }
+    };
+    push(options);
+    for (const scene of asArray(options?.scenes)) push(scene);
+    return [...new Set(out)];
+  };
+
+  /**
+   * Kiểm chữ TRƯỚC khi xếp hàng (§0 luật 3 + §2.5): trả 422 ngay thay vì 202 rồi người dùng
+   * ngồi chờ một video không bao giờ có chữ.
+   *
+   * Đây KHÔNG phải hàng rào duy nhất: V1/V3 vẫn kiểm lại lúc dựng kế hoạch và ném
+   * `VIDEO_TEXT_UNSUPPORTED_CLAIM` — route chỉ chuyển kết quả kiểm thành mã HTTP đúng hợp đồng.
+   * Không nạp được bộ kiểm của V1 ⇒ BỎ QUA bước kiểm sớm (có log) và để V1/V3 phán quyết: route
+   * cố ý KHÔNG chép luật chống bịa của module khác vào đây (bản sao luật là thứ dễ lệch nhất).
+   *
+   * @returns {Promise<{code:string,message:string,violations:string[]}|null>} null = không có gì bị chặn
+   */
+  const preflightVideostudioTexts = async (job, options) => {
+    const texts = videostudioTextsOf(options);
+    if (texts.length === 0) return null; // không có chữ ⇒ không có gì để chặn
+
+    const collector = await loadVideostudioClaimCollector();
+    if (!collector) {
+      logger?.warn?.('videostudio.text_check_skipped', { reason: 'chưa nạp được collectClaimViolations của V1' });
+      return null;
+    }
+
+    const evidence = await collectVideostudioEvidence(job);
+    const violations = callClaimCollector(collector, { evidence, texts });
+    if (violations === null) {
+      logger?.warn?.('videostudio.text_check_unreadable', { reason: 'collectClaimViolations không trả lời được cho đoạn chữ nào' });
+      return null;
+    }
+    const list = [...new Set(violations.map(violationText).filter(Boolean))];
+    if (list.length === 0) return null;
+
+    const shown = texts.join(' · ');
+    const trimmed = shown.length > 120 ? `${shown.slice(0, 120)}…` : shown;
+    return {
+      code: 'VIDEO_TEXT_UNSUPPORTED_CLAIM',
+      message: `Chữ trên video “${trimmed}” chứa khẳng định/số liệu không có bằng chứng trong dữ liệu đã lưu của job — KHÔNG vẽ (mục 0 luật 3).`,
+      violations: list,
+    };
+  };
+
+  /** Đánh dấu job hỏng (best-effort) — không để job treo 'queued' khi ingest ném lỗi. */
+  const markVideostudioJobFailed = async (jobId, err) => {
+    if (typeof store.updateJob !== 'function') return;
+    try {
+      await store.updateJob(jobId, {
+        status: JOB_STATUS.FAILED,
+        stage: 'failed',
+        error_code: err?.code || 'VIDEOSTUDIO_INGEST_FAILED',
+        error_message: scrubPaths(String(err?.message || 'Không lưu được ảnh tải lên.')),
+        finished_at: new Date().toISOString(),
+      });
+    } catch (inner) {
+      logger?.warn?.('videostudio.fail_mark_failed', { job_id: jobId, error_name: inner?.name || 'Error' });
     }
   };
 
@@ -1314,6 +1652,10 @@ export function buildRouter(app) {
     // hỏng /api/config mà MVP-01/MVP-02 đang dùng.
     const isModules = await imagestudioStaticModules();
     const isReady = imagestudioAvailable() && Boolean(isModules.templates && isModules.retouchLimits);
+    // MVP-04: preset + bộ mã hoá cho tab "Video". Module V1 có thể chưa có mặt ⇒ `presets: []`
+    // + `available: false` + `reason` nói thẳng — KHÔNG làm hỏng /api/config mà MVP-01/02/03 dùng.
+    const vsPresets = await videostudioPresets();
+    const vsReady = videostudioAvailable() && Array.isArray(vsPresets) && vsPresets.length > 0;
     sendJson(res, 200, {
       styles: Object.values(STYLES).map((s) => ({ id: s.id, label: s.label, description: s.description })),
       lengths: Object.values(LENGTHS).map((l) => ({ id: l.id, label: l.label })),
@@ -1353,6 +1695,17 @@ export function buildRouter(app) {
         retouch_limits: isModules.retouchLimits || null,
         matting: imagestudioProviderInfo(app.mattingProvider),
         retouch: imagestudioProviderInfo(app.retouchProvider),
+      },
+      // §2.4 — khối MVP-04 cho UI (tab "Video"): `presets` chỉ id+label (UI không cần kích
+      // thước), `encoder` đúng ba field hợp đồng, và `audio: false` là SỰ THẬT của bản offline
+      // (GIF không có tiếng; TTS/nhạc là phần trả tiền) — UI phải hiện "video KHÔNG có tiếng".
+      videostudio: {
+        available: vsReady,
+        reason: vsReady ? null : videostudioAvailable() ? VIDEOSTUDIO_MODULE_MESSAGE : videostudioUnavailableReason(),
+        enabled: videostudioEnabled(),
+        presets: (vsPresets || []).map((p) => ({ id: p.id, label: p.label })),
+        encoder: videostudioEncoderInfo(),
+        audio: false,
       },
       // MVP-05 (§3.3) — khối `auth`/`billing` cho UI: CHỈ cờ + giới hạn, TUYỆT ĐỐI không
       // lộ bí mật (không token, không khoá ký, không chi tiết nội bộ của dịch vụ).
@@ -2348,6 +2701,273 @@ export function buildRouter(app) {
     res.end(buffer);
   });
 
+  /* ══════════ MVP-04 · Video Studio (tạo video ngắn, hợp đồng §2.4) ══════════ */
+
+  /* ── Danh mục preset + bộ mã hoá + trần đầu vào (UI dựng form từ đây) ──
+   * Route này KHÔNG trả dữ liệu của ai cả (chỉ danh mục), nhưng vẫn nằm sau cổng "khả dụng"
+   * để khi thiếu module thì UI nhận 503 thẳng thắn thay vì một danh sách rỗng gây hiểu sai.
+   */
+
+  router.get('/api/videostudio/presets', async (req, res) => {
+    requireVideostudio();
+    const presets = await requireVideostudioPresets();
+    sendJson(res, 200, {
+      // §2.1: trả NGUYÊN `VIDEO_PRESETS` (id/label/width/height/fps/max_seconds/synthetic).
+      presets,
+      encoder: videostudioEncoderInfo(),
+      // §2.4: đúng ba khoá `max_image_bytes`/`max_pixels`/`max_seconds`.
+      limits: videostudioLimits(presets),
+    });
+  });
+
+  /* ── Tạo job video: nhận ảnh base64 đã kiểm magic bytes, ingest NGAY trong request ── */
+
+  router.post('/api/videostudio/jobs', async (req, res) => {
+    requireVideostudioMethod('ingest');
+    requireVideostudioMethod('generate');
+    requireVideostudioStoreMethod('createJob');
+
+    const sid = sessionId(req, res);
+    enforce(rateLimiters.jobs, `videostudio:${sid}`);
+
+    const limits = videostudioImageLimits();
+    // base64 phình ~4/3 so với nhị phân — nới body vừa đủ cho một ảnh (giống MVP-02/03).
+    const body = await readJson(req, {
+      maxBytes: Math.min(MAX_BODY_BYTES_DEFAULT, Math.ceil((limits.max_image_bytes * 4) / 3) + 64 * 1024),
+    });
+
+    // Kiểm ảnh y như MVP-02/03 (dùng lại ĐÚNG một hàm): không tin Content-Type client khai
+    // (magic bytes), chặn theo allowedImageMime + maxImageBytes + maxPixels ⇒ 400/413/415
+    // kèm câu tiếng Việt. Ảnh gốc bất biến là việc của V3 (kiểm sha256 cuối lượt).
+    const images = collectVideostudioImages(body, limits);
+    const options = sanitizeVideostudioOptions(body.options);
+
+    // §0 luật 3 — chữ thiếu bằng chứng thì KHÔNG nhận job rồi để pipeline chạy mà không vẽ:
+    // trả 422 ngay, CHƯA tạo job nào (không để lại rác). Job chưa tồn tại nên "dữ liệu đã lưu"
+    // đúng bằng RỖNG ⇒ mọi khẳng định/số liệu trong `options.texts` đều bị chặn.
+    const blocked = await preflightVideostudioTexts(null, options);
+    if (blocked) return sendVideostudioTextBlocked(res, blocked);
+
+    // MVP-05 (§0 luật 2 + §3.4b): cổng ví chạy NGAY TRONG REQUEST và TRƯỚC khi ghi job ⇒ thiếu
+    // credit thì DB KHÔNG tăng dòng nào (`job_id` sinh trước để hook giữ tiền theo đúng job đó).
+    const userId = req.user?.id ?? null;
+    const jobId = randomUUID();
+    const hold = await holdCreditBeforeJob(req, jobId, VIDEOSTUDIO_KIND);
+
+    try {
+      await withHoldRelease(req, jobId, hold, () =>
+        store.createJob({
+          id: jobId,
+          sessionId: sid,
+          userId,
+          source: 'manual',
+          inputMode: 'manual',
+          kind: VIDEOSTUDIO_KIND,
+        }));
+    } catch (err) {
+      throw mapVideostudioError(err, 'Không tạo được job tạo video.');
+    }
+
+    // Ingest chạy NGAY trong request (như MVP-02/03) để `asset_id` trả về là THẬT và ảnh
+    // hỏng/không hỗ trợ ra HTTP ngay, không biến thành job chết trong hàng đợi. Mỗi ảnh là MỘT
+    // cảnh (V3 đánh số cảnh theo thứ tự đã lưu).
+    const ingested = [];
+    try {
+      await withHoldRelease(req, jobId, hold, async () => {
+        for (const image of images) {
+          ingested.push(await app.videostudioPipeline.ingest(jobId, { image, sessionId: sid, userId, options }));
+        }
+      });
+    } catch (err) {
+      // Ingest lỗi SAU khi job đã tạo ⇒ đánh dấu `failed` (KHÔNG treo `queued`) rồi mới trả lỗi;
+      // `withHoldRelease` đã hoàn khoản giữ nên không ai bị trừ tiền cho một job không chạy.
+      await markVideostudioJobFailed(jobId, err);
+      const mapped = mapVideostudioError(err, 'Không lưu được ảnh tải lên.');
+      if (mapped.status === 422 && mapped.code === 'VIDEO_TEXT_UNSUPPORTED_CLAIM') {
+        return sendVideostudioTextBlocked(res, {
+          code: mapped.code,
+          message: mapped.message,
+          violations: asArray(mapped.details?.violations),
+        });
+      }
+      throw mapped;
+    }
+
+    // Mỗi LƯỢT CHẠY có `run_key` riêng (§2.3). Ưu tiên `run_key` của khoản giữ (hook A3 sinh
+    // theo `<jobId>#<n>`) để usage của V3 quy được về ĐÚNG lượt đã mở trong sổ ví; khách ẩn
+    // danh (không ví) thì tự sinh một khoá duy nhất cho lượt này.
+    const runKey = hold?.run_key || randomUUID();
+    try {
+      await withHoldRelease(req, jobId, hold, async () => {
+        queue.enqueue(jobId, () => app.videostudioPipeline.generate(jobId, { sessionId: sid, options, runKey }));
+      });
+    } catch (err) {
+      throw mapVideostudioError(err, 'Không xếp được lượt tạo video.');
+    }
+
+    sendJson(res, 202, {
+      job_id: jobId,
+      // `asset_id` = ẢNH GỐC ĐẦU TIÊN (cảnh 1) — field ĐÓNG BĂNG của §2.4; `asset_ids` là danh
+      // sách đầy đủ khi yêu cầu mang nhiều ảnh (UI V5 cần để biết job có mấy cảnh).
+      asset_id: ingested[0]?.asset_id ?? null,
+      asset_ids: ingested.map((item) => item?.asset_id ?? null).filter(Boolean),
+      status: JOB_STATUS.QUEUED,
+      poll: `/api/videostudio/jobs/${jobId}`,
+    });
+  });
+
+  /* ── Trạng thái job + ảnh gốc + các video đã tạo + kế hoạch/mã hoá của video mới nhất ── */
+
+  router.get('/api/videostudio/jobs/:id', async (req, res, params) => {
+    requireVideostudio();
+    requireVideostudioStoreMethod('listImageAssets');
+
+    const sid = sessionId(req, res);
+    const job = await requireVideostudioJob(params.id, sid, req);
+
+    const list = asArray(await store.listImageAssets(job.id, {}));
+    const originals = list.filter((a) => a.role === 'original');
+    const rendered = list.filter((a) => a.role === 'rendered');
+    const asset = originals.find((a) => !a.parent_id) || originals[0] || null;
+    const latest = rendered[rendered.length - 1] || null;
+
+    // V3 ghi kế hoạch / tóm tắt mã hoá / cảnh báo vào `meta` của video `rendered` MỚI NHẤT
+    // (§2.3 lưu `meta.plan_summary` + `meta.encode_summary`; §2.4 gọi ra là `plan`/`encode`).
+    // Đọc ĐÚNG những gì đã lưu — chưa chạy tới bước nào thì `null`/`[]`, KHÔNG suy diễn, KHÔNG bịa.
+    const meta = latest?.meta && typeof latest.meta === 'object' ? latest.meta : {};
+    const blob = meta.videostudio && typeof meta.videostudio === 'object' ? { ...meta, ...meta.videostudio } : meta;
+    const run =
+      job.content_meta?.videostudio && typeof job.content_meta.videostudio === 'object' ? job.content_meta.videostudio : null;
+    const presets = await videostudioPresets();
+
+    sendJson(res, 200, {
+      job: jobJson(job),
+      asset: assetJson(asset),
+      // Mọi video đã tạo (không ghi đè cái cũ) — ảnh gốc nằm ở `asset`, không trộn vào đây.
+      rendered: rendered.map(assetJson),
+      plan: blob.plan ?? blob.plan_summary ?? null,
+      encode: blob.encode ?? blob.encode_summary ?? null,
+      // §0 luật 2: video offline KHÔNG có tiếng — trả ĐÚNG giá trị đã lưu, thiếu ⇒ null.
+      audio: blob.audio ?? null,
+      warnings: asArray(blob.warnings).map(String),
+      providers: videostudioProviders(),
+      presets: Array.isArray(presets) ? presets : null,
+      last_run: videostudioLastRun(run),
+    });
+  });
+
+  /* ── Chạy lượt MỚI (mở `run_key` mới) — video cũ KHÔNG bị ghi đè ── */
+
+  router.post('/api/videostudio/jobs/:id/generate', async (req, res, params) => {
+    requireVideostudioMethod('generate');
+    requireVideostudioStoreMethod('listImageAssets');
+    requireVideostudioStoreMethod('updateJob');
+
+    const sid = sessionId(req, res);
+    enforce(rateLimiters.jobs, `videostudio-generate:${sid}`);
+    const job = await requireVideostudioJob(params.id, sid, req);
+
+    if (String(job.kind ?? '') !== VIDEOSTUDIO_KIND) {
+      throw HttpError.safe(409, 'VIDEOSTUDIO_NOT_VIDEO_JOB', 'Job này không phải job tạo video (`video_generation`) — không chạy tạo video được.');
+    }
+
+    const body = await readJson(req, { maxBytes: 256 * 1024 });
+    const options = sanitizeVideostudioOptions(body.options);
+    // `force` chỉ có nghĩa "chạy lại dù chưa đổi gì" — KHÔNG bao giờ miễn kiểm chống bịa (§0 luật 3).
+    const force = body.force === true;
+
+    // Thứ tự kiểm CỐ Ý: thiếu ảnh gốc TRƯỚC (lỗi cụ thể, người dùng biết phải làm gì), rồi mới
+    // tới "đang chạy". Job đang chạy thật thì LUÔN đã có ảnh gốc, nên không có ca nào bị che.
+    const originals = asArray(await store.listImageAssets(job.id, { role: 'original' }));
+    if (originals.length === 0) {
+      throw HttpError.safe(409, 'VIDEOSTUDIO_NO_ORIGINAL', 'Job này chưa có ảnh gốc — hãy tải ảnh lên trước khi tạo video.');
+    }
+
+    // BR-02 (MVP-05): job ĐANG CHẠY/đang chờ ⇒ lượt thứ hai bị chặn bằng 409, không mở hai lượt
+    // song song trên cùng một job. Hook ví cũng chặn ca này, nhưng khách ẨN DANH không có ví nên
+    // route phải tự chặn — nếu không, ẩn danh sẽ chạy được nhiều lượt chồng nhau.
+    if (job.status === JOB_STATUS.QUEUED || job.status === JOB_STATUS.RUNNING) {
+      throw HttpError.safe(409, 'JOB_ALREADY_RUNNING', 'Job này đang chạy một lượt khác — chờ lượt đó xong rồi hãy chạy lại.', {
+        job_id: job.id,
+        run_key: null,
+      });
+    }
+
+    // 422 TRƯỚC khi xếp hàng: người dùng biết ngay chữ sẽ không được vẽ, thay vì 202 rồi chờ
+    // một video không có chữ. Bằng chứng lấy từ dữ liệu ĐÃ LƯU của job, không lấy từ body.
+    const blocked = await preflightVideostudioTexts(job, options);
+    if (blocked) return sendVideostudioTextBlocked(res, blocked);
+
+    // MVP-05 (§3.4b): chạy tạo video là bước TIÊU credit ⇒ cổng ví chạy NGAY trong request;
+    // thiếu ⇒ 402 (hoặc 409 nếu lượt cũ còn mở) TRƯỚC khi xếp hàng, job giữ nguyên trạng thái.
+    const hold = await holdCreditBeforeJob(req, job.id, VIDEOSTUDIO_KIND);
+    const runKey = hold?.run_key || randomUUID();
+
+    try {
+      await store.updateJob(job.id, {
+        status: JOB_STATUS.QUEUED,
+        stage: 'queued',
+        error_code: null,
+        error_message: null,
+      });
+
+      // Video MỚI: V3 ghi asset role `rendered` với `parent_id` = ảnh gốc; video cũ còn nguyên.
+      queue.enqueue(job.id, () => app.videostudioPipeline.generate(job.id, { sessionId: sid, options, runKey }));
+    } catch (err) {
+      await withHoldRelease(req, job.id, hold, async () => { throw err; }).catch(() => {});
+      throw mapVideostudioError(err, 'Không chạy được lượt tạo video mới.');
+    }
+
+    sendJson(res, 202, {
+      job_id: job.id,
+      status: JOB_STATUS.QUEUED,
+      run_key: runKey,
+      force,
+      poll: `/api/videostudio/jobs/${job.id}`,
+    });
+  });
+
+  /* ── Tệp nhị phân (GIF/MP4) — kiểm quyền sở hữu, KHÔNG BAO GIỜ lộ `storage_path` ── */
+
+  router.get('/api/videostudio/assets/:id/file', async (req, res, params) => {
+    const sid = sessionId(req, res);
+    const asset = await requireVideostudioAsset(params.id, sid, req);
+    const storage = videostudioStorage();
+    if (!storage || typeof storage.read !== 'function') {
+      throw HttpError.safe(503, 'VIDEOSTUDIO_UNAVAILABLE', 'Không có kho tệp để đọc — tính năng tạo video chưa sẵn sàng.');
+    }
+
+    // `Content-Type` THẬT của tệp: ảnh/GIF theo `ALLOWED_IMAGE_MIME`, thêm `video/mp4` cho
+    // provider `ffmpeg`. Ngoài danh sách ⇒ 415 (không đoán bừa định dạng để trình duyệt tự hiểu).
+    const mime = String(asset.mime || '');
+    const allowed = [...(config.net.allowedImageMime || []), ...VIDEOSTUDIO_EXTRA_MIME];
+    if (!mime || !allowed.includes(mime)) {
+      throw new HttpError(415, 'UNSUPPORTED_MEDIA_TYPE', 'Định dạng tệp này không được phép trả về.');
+    }
+
+    let buffer;
+    try {
+      buffer = await storage.read(asset);
+    } catch (err) {
+      logger?.warn?.('videostudio.asset_read_failed', { asset_id: asset.id, error_name: err?.name || 'Error' });
+      throw new HttpError(404, 'ASSET_FILE_NOT_FOUND', 'Không tìm thấy tệp video.');
+    }
+    if (!buffer || buffer.length === 0) {
+      throw new HttpError(404, 'ASSET_FILE_NOT_FOUND', 'Không tìm thấy tệp video.');
+    }
+
+    res.writeHead(200, {
+      ...SECURITY_HEADERS,
+      'content-type': mime,
+      'content-length': buffer.length,
+      // Tệp riêng của từng phiên/tài khoản — cấm mọi cache dùng chung.
+      'cache-control': 'private, no-store',
+      'x-content-type-options': 'nosniff',
+      'content-disposition': `inline; filename="videostudio-${asset.role || 'video'}-${String(asset.id).slice(0, 8)}.${videostudioExtForMime(mime)}"`,
+    });
+    res.end(buffer);
+  });
+
   /**
    * MVP-05 — gắn middleware `attachUser` (+ cổng "bắt buộc đăng nhập" khi chủ hệ thống tắt
    * chế độ ẩn danh) cho MỌI route đã đăng ký ở trên.
@@ -2371,17 +2991,17 @@ export function buildRouter(app) {
 }
 
 /**
- * Khi `AUTH_ANONYMOUS_ALLOWED=false`: các route NGHIỆP VỤ (jobs/imagelab/imagestudio/uploads/
- * detect) bắt buộc đăng nhập. Miễn trừ theo hợp đồng §2.3/§3.3:
+ * Khi `AUTH_ANONYMOUS_ALLOWED=false`: các route NGHIỆP VỤ (jobs/imagelab/imagestudio/
+ * videostudio/uploads/detect) bắt buộc đăng nhập. Miễn trừ theo hợp đồng §2.3/§3.3/§2.4:
  *  - `/api/auth/*` (nếu không thì không ai đăng nhập được),
  *  - `/api/health`, `/api/config` (giám sát + UI khởi động),
- *  - route FILE ẢNH: tự kiểm quyền sở hữu và trả 404 cho ảnh không thuộc mình,
+ *  - route FILE ẢNH/VIDEO: tự kiểm quyền sở hữu và trả 404 cho tệp không thuộc mình,
  *    KHÔNG trả 401 (đúng câu "route file ảnh nếu ảnh thuộc chính user (còn lại 404)").
  */
 function requiresLoginWhenAnonymousOff(req) {
   const path = String(req?.url || '').split('?')[0];
   if (ANON_EXEMPT_PATHS.has(path)) return false;
-  if (/^\/api\/(?:imagelab|imagestudio)\/assets\/[^/]+\/file\/?$/.test(path)) return false;
+  if (/^\/api\/(?:imagelab|imagestudio|videostudio)\/assets\/[^/]+\/file\/?$/.test(path)) return false;
   return BUSINESS_PATH_RE.test(path);
 }
 
@@ -3447,6 +4067,355 @@ function mapImagestudioError(err, fallbackMessage = 'Không tạo được ảnh
   // Lỗi provider của MVP-03: KHÔNG dội chi tiết provider ra client (có thể chứa đường dẫn).
   if (/^(MATTING|COMPOSE|RETOUCH)/.test(code)) {
     return new HttpError(502, code, `Provider xử lý ảnh MVP-03 báo lỗi (${code}). Vui lòng thử lại hoặc kiểm tra cấu hình provider.`);
+  }
+  // Còn lại dùng chung bảng ánh xạ của MVP-02 (đã xử lý MISSING_IMAGE/BAD_IMAGE/NOT_CONFIGURED/…).
+  return mapImagelabError({ code: err?.code, message, details }, fallbackMessage);
+}
+
+/* ══════════════════ MVP-04 · hằng số + bộ làm sạch dùng chung ══════════════════ */
+
+/** Loại job của MVP-04 (§2.3, giá trị ĐÓNG BĂNG — V3 export cùng tên ở `videostudio/pipeline.js`). */
+const VIDEOSTUDIO_KIND = 'video_generation';
+
+/**
+ * MIME NGOÀI danh sách ảnh mà route tệp của MVP-04 được phép trả về: `video/mp4` (đầu ra của
+ * provider `ffmpeg`). Danh sách ảnh/GIF vẫn lấy từ `ALLOWED_IMAGE_MIME` của cấu hình — nới
+ * cấu hình là nới luôn cho video, không phải sửa hai chỗ.
+ */
+const VIDEOSTUDIO_EXTRA_MIME = Object.freeze(['video/mp4']);
+
+/** Trần số cảnh / số đoạn chữ mỗi request — chặn body rác phình vô hạn (V1 vẫn kẹp tiếp). */
+const VIDEOSTUDIO_MAX_SCENES = 24;
+const VIDEOSTUDIO_MAX_TEXTS = 60;
+/** Trần ký tự mỗi đoạn chữ sẽ vẽ lên video (khớp `IMAGESTUDIO_OVERLAY_TEXT_MAX`). */
+const VIDEOSTUDIO_TEXT_MAX = 500;
+
+/**
+ * Khoá chứa chữ sẽ VẼ lên video — GIỮ KHỚP `TEXT_KEYS` của `src/videostudio/pipeline.js`
+ * (`texts`, `text`, `title`, `subtitle`, `price`, `cta`). Route đọc đúng bộ khoá đó để (a) chuyển
+ * tiếp chữ xuống V1/V3 và (b) kiểm chống bịa trên ĐÚNG những câu sẽ được vẽ.
+ */
+const VIDEOSTUDIO_TEXT_KEYS = Object.freeze(['texts', 'text', 'title', 'subtitle', 'price', 'cta']);
+
+/**
+ * Khoá ghi chú ĐÃ LƯU được coi là bằng chứng — GIỮ KHỚP `#evidenceText` của
+ * `src/videostudio/pipeline.js` (nếu route rộng hơn V3 thì preflight cho qua rồi V3 chặn;
+ * nếu hẹp hơn thì route chặn oan câu V3 sẽ vẽ được — cả hai đều sai).
+ */
+const VIDEOSTUDIO_EVIDENCE_KEYS = Object.freeze(['notes', 'note', 'user_note', 'source_text']);
+
+/** Phần mở rộng cho tên tệp tải về — `video/mp4` không nằm trong bảng của MVP-02. */
+function videostudioExtForMime(mime) {
+  return mime === 'video/mp4' ? 'mp4' : extForMime(mime);
+}
+
+/** Một mục `image` của client có kèm base64 không (mục rỗng/thiếu ⇒ bỏ qua, không đoán). */
+const hasImageBase64 = (value) =>
+  Boolean(value) && typeof value === 'object' && typeof value.base64 === 'string' && value.base64.trim() !== '';
+
+/**
+ * Gom MỌI ảnh của một yêu cầu tạo video thành danh sách cảnh, theo ĐÚNG thứ tự:
+ *   1. `body.image` — cảnh 1, khoá ĐÓNG BĂNG của §2.4 (thiếu ⇒ 400 như trước giờ);
+ *   2. `body.options.scenes[i].image` — ảnh của từng cảnh, dạng mà UI V5 gửi (§2.5: "nhiều ảnh
+ *      ⇒ nhiều cảnh, thứ tự = thứ tự chọn"; V5 ghi rõ nếu V4 chốt khoá khác thì chỉ sửa ở V5).
+ *
+ * Mọi ảnh đi qua CÙNG một bộ kiểm (`decodeImagelabImage`) nên 400/413/415 áp dụng như nhau,
+ * không có đường lách qua cảnh phụ. Ảnh TRÙNG BYTE (UI gửi cùng một ảnh ở cả `image` lẫn
+ * `scenes[0].image`) chỉ được nhận MỘT lần — nếu không, người dùng sẽ thấy cảnh lặp.
+ */
+function collectVideostudioImages(body, limits) {
+  const out = [];
+  const seen = new Set();
+  const add = (raw) => {
+    const decoded = decodeImagelabImage(raw, limits);
+    const key = createHash('sha256').update(decoded.buffer).digest('hex');
+    if (seen.has(key)) return; // khử trùng theo sha256 (§2.5: cùng một ảnh chỉ là MỘT cảnh)
+    seen.add(key);
+    out.push(decoded);
+  };
+  const scenes = asArray(body?.options?.scenes);
+  const scenesCarryFirstImage = hasImageBase64(scenes[0]?.image);
+  // THỨ TỰ ẢNH = THỨ TỰ CẢNH (§2.5). Hai kiểu yêu cầu:
+  //   · `scenes[0].image` có mặt ⇒ `scenes` là NGUỒN THỨ TỰ (UI V5 gửi như vậy); `image` chỉ là
+  //     ảnh đầu tương thích ngược — nếu nó KHÁC byte với mọi ảnh của cảnh thì bị BỎ QUA (không
+  //     chèn thêm cảnh lạ làm lệch thứ tự người dùng đã chọn) và ghi log để còn truy vết;
+  //   · không có ảnh nào trong `scenes` ⇒ `image` là ảnh đầu (hành vi cũ, tương thích ngược),
+  //     rồi mới tới ảnh của từng cảnh theo thứ tự.
+  // Ảnh trùng byte luôn bị khử (một ảnh = một cảnh).
+  if (scenesCarryFirstImage) {
+    for (const scene of scenes) {
+      if (hasImageBase64(scene?.image)) add(scene.image);
+    }
+    if (hasImageBase64(body?.image)) {
+      const key = createHash('sha256').update(Buffer.from(String(body.image.base64), 'base64')).digest('hex');
+      if (!seen.has(key)) {
+        logger?.warn?.('videostudio.extra_image_ignored', {
+          reason: '`image` khác byte với mọi `options.scenes[i].image` — bỏ qua để giữ ĐÚNG thứ tự cảnh người dùng chọn.',
+        });
+      }
+    }
+  } else {
+    if (hasImageBase64(body?.image)) add(body.image);
+    for (const scene of scenes) {
+      if (hasImageBase64(scene?.image)) add(scene.image);
+    }
+  }
+  if (out.length === 0) decodeImagelabImage(body?.image, limits); // ném 400 MISSING_IMAGE có sẵn
+  if (out.length > VIDEOSTUDIO_MAX_SCENES) {
+    throw new HttpError(
+      413,
+      'TOO_MANY_SCENES',
+      `Quá nhiều ảnh trong một yêu cầu (${out.length}; tối đa ${VIDEOSTUDIO_MAX_SCENES} cảnh mỗi video).`,
+    );
+  }
+  return out;
+}
+
+/**
+ * Body `options` của MVP-04 (`{ preset?, scenes?, texts?, fit? }`).
+ *
+ * Nguyên tắc giống `sanitizeImagestudioOptions`: route KIỂM KIỂU và LÀM SẠCH, nhưng KHÔNG áp
+ * luật nghiệp vụ thay V1 — thời lượng/kẹp trần/tỉ lệ/pad-crop là luật của `buildVideoPlan`,
+ * chép lại ở đây là thêm một bản dễ lệch. Kiểu SAI rõ ràng (không phải object/mảng) ⇒ 400 ngay.
+ */
+function sanitizeVideostudioOptions(raw) {
+  const options = {};
+  if (raw === undefined || raw === null) return options;
+  if (!isPlainObject(raw)) {
+    throw HttpError.safe(400, 'BAD_OPTIONS', '`options` phải là một object.');
+  }
+
+  const preset = sanitizeText(raw.preset, { maxLength: 64 });
+  if (preset) options.preset = preset;
+
+  // `fit` lạ KHÔNG bị từ chối ở đây: V1 đã fail-closed về `FIT_MODES` (§2.1) — chỉ nhận chuỗi.
+  const fit = sanitizeText(raw.fit, { maxLength: 16 });
+  if (fit) options.fit = fit;
+
+  if (raw.scenes !== undefined && raw.scenes !== null) options.scenes = sanitizeVideostudioScenes(raw.scenes);
+  if (raw.texts !== undefined && raw.texts !== null) options.texts = sanitizeVideostudioTexts(raw.texts);
+
+  // Chữ ở cấp CHUNG (`text`/`title`/`subtitle`/`price`/`cta`) — V3 đọc chúng cho cảnh không tự
+  // khai chữ, nên route phải chuyển tiếp chứ không được nuốt.
+  for (const key of VIDEOSTUDIO_TEXT_KEYS) {
+    if (key === 'texts') continue;
+    const value = sanitizeVideostudioTextField(raw[key]);
+    if (value !== undefined) options[key] = value;
+  }
+  return options;
+}
+
+/** Một mục chữ (`string` | `{ text, … }`) → giá trị đã làm sạch, `null` nếu không có gì để vẽ. */
+function sanitizeVideostudioTextItem(item) {
+  if (typeof item === 'string' || typeof item === 'number') {
+    return sanitizeText(item, { maxLength: VIDEOSTUDIO_TEXT_MAX }) || null;
+  }
+  if (!isPlainObject(item)) return null;
+  const entry = {};
+  const text = sanitizeText(item.text, { maxLength: VIDEOSTUDIO_TEXT_MAX });
+  if (text) entry.text = text;
+  for (const [key, value] of Object.entries(item).slice(0, 24)) {
+    if (key === 'text' || DANGEROUS_KEYS.has(key)) continue;
+    const name = sanitizeText(key, { maxLength: 32 });
+    if (!name) continue;
+    if (typeof value === 'string') {
+      const v = sanitizeText(value, { maxLength: 120 });
+      if (v) entry[name] = v;
+    } else if (typeof value === 'number' && Number.isFinite(value)) {
+      entry[name] = value;
+    } else if (typeof value === 'boolean') {
+      entry[name] = value;
+    }
+  }
+  return Object.keys(entry).length > 0 ? entry : null;
+}
+
+/** Trường chữ ở cấp chung: giữ nguyên dạng (chuỗi ⇒ chuỗi, mảng ⇒ mảng), rỗng ⇒ `undefined`. */
+function sanitizeVideostudioTextField(value) {
+  if (value === undefined || value === null) return undefined;
+  const list = (Array.isArray(value) ? value : [value]).slice(0, VIDEOSTUDIO_MAX_TEXTS);
+  const out = list.map(sanitizeVideostudioTextItem).filter((item) => item !== null);
+  if (out.length === 0) return undefined;
+  return Array.isArray(value) ? out : out[0];
+}
+
+/**
+ * `scenes`: mảng mô tả cảnh (mỗi ảnh người dùng tải lên ⇒ một cảnh, thứ tự = thứ tự chọn).
+ * Chỉ giữ giá trị NGUYÊN THUỶ (chuỗi đã làm sạch / số hữu hạn / boolean / mảng ngắn), bỏ khoá
+ * nguy hiểm (prototype pollution) và bỏ mục rác — KHÔNG đoán giá trị thiếu.
+ */
+function sanitizeVideostudioScenes(raw) {
+  if (!Array.isArray(raw)) throw HttpError.safe(400, 'BAD_OPTIONS', '`options.scenes` phải là một mảng.');
+  if (raw.length > VIDEOSTUDIO_MAX_SCENES) {
+    throw new HttpError(413, 'TOO_MANY_SCENES', `Quá nhiều cảnh trong một yêu cầu (tối đa ${VIDEOSTUDIO_MAX_SCENES}).`);
+  }
+  const out = [];
+  for (const item of raw) {
+    if (!isPlainObject(item)) continue;
+    const scene = {};
+    // Chữ của cảnh (`text`/`title`/`subtitle`/`price`/`cta`/`texts`) đi qua ĐÚNG bộ làm sạch chữ.
+    for (const key of VIDEOSTUDIO_TEXT_KEYS) {
+      const value = sanitizeVideostudioTextField(item[key]);
+      if (value !== undefined) scene[key] = value;
+    }
+    for (const [key, value] of Object.entries(item).slice(0, 24)) {
+      if (VIDEOSTUDIO_TEXT_KEYS.includes(key) || DANGEROUS_KEYS.has(key)) continue;
+      const name = sanitizeText(key, { maxLength: 32 });
+      if (!name) continue;
+      if (typeof value === 'string') {
+        const text = sanitizeText(value, { maxLength: 300 });
+        if (text) scene[name] = text;
+      } else if (typeof value === 'number' && Number.isFinite(value)) {
+        scene[name] = value;
+      } else if (typeof value === 'boolean') {
+        scene[name] = value;
+      } else if (Array.isArray(value)) {
+        const list = value
+          .slice(0, 50)
+          .filter((v) => typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean')
+          .map((v) => (typeof v === 'string' ? sanitizeText(v, { maxLength: 300 }) : v));
+        if (list.length > 0) scene[name] = list;
+      }
+    }
+    if (Object.keys(scene).length > 0) out.push(scene);
+  }
+  return out;
+}
+
+/**
+ * `texts`: các đoạn chữ sẽ VẼ lên video (tiêu đề/giá/CTA/phụ đề). Nhận chuỗi hoặc object
+ * `{ text, … }`; giữ các khoá định vị/kiểu chữ mà UI gửi kèm để V1 khỏi phải đoán lại.
+ */
+function sanitizeVideostudioTexts(raw) {
+  if (!Array.isArray(raw)) throw HttpError.safe(400, 'BAD_OPTIONS', '`options.texts` phải là một mảng.');
+  if (raw.length > VIDEOSTUDIO_MAX_TEXTS) {
+    throw new HttpError(413, 'TOO_MANY_TEXTS', `Quá nhiều đoạn chữ trong một yêu cầu (tối đa ${VIDEOSTUDIO_MAX_TEXTS}).`);
+  }
+  return raw.map(sanitizeVideostudioTextItem).filter((item) => item !== null);
+}
+
+/**
+ * 422 khi chữ trên video bị chặn vì thiếu bằng chứng (§0 luật 3).
+ *
+ * Trả CẢ HAI hình dạng: phong bì lỗi chuẩn của repo (`{ error: { code, message, details } }`)
+ * và các trường phẳng `{ code, message, violations }` mà hợp đồng §2.4 yêu cầu — UI/test đọc
+ * kiểu nào cũng đúng, và KHÔNG lộ stack/đường dẫn nội bộ.
+ */
+function sendVideostudioTextBlocked(res, { code, message, violations } = {}) {
+  const list = asArray(violations).map(String);
+  const errorCode = code || 'VIDEO_TEXT_UNSUPPORTED_CLAIM';
+  sendJson(res, 422, {
+    error: { code: errorCode, message, details: { violations: list } },
+    code: errorCode,
+    message,
+    violations: list,
+  });
+}
+
+/**
+ * Một vi phạm chống bịa (chuỗi, hoặc object `{ rule, code, message, text }` của V1) → câu tiếng
+ * Việt để UI hiện thẳng. Hàm THUẦN ở cấp module vì cả route (422) lẫn `last_run` đều dùng.
+ */
+function violationText(v) {
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'string') return v.trim();
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  const detail = v.message ?? v.detail ?? v.reason ?? '';
+  const where = v.text ?? v.word ?? '';
+  return [where, detail].map((x) => String(x ?? '').trim()).filter(Boolean).join(' — ');
+}
+
+/**
+ * Lượt chạy MỚI NHẤT của job video (V3 lưu ở `jobs.content_meta.videostudio`) — kể cả khi lượt
+ * đó KHÔNG tạo được video. Chỉ trả field UI cần, đã LỌC đường dẫn nội bộ (`scrubPaths`).
+ */
+function videostudioLastRun(run) {
+  if (!isPlainObject(run)) return null;
+  const text = (v) => (typeof v === 'string' && v ? scrubPaths(v) : null);
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+  // `content_meta.videostudio.preset` của V3 là OBJECT mô tả preset (không phải id) — lấy id ra.
+  const presetId = typeof run.preset === 'string' ? run.preset : run.preset_id ?? run.preset?.id ?? null;
+  return {
+    status: run.status ?? null,
+    stage: run.stage ?? null,
+    run_key: run.run_key ?? null,
+    error_code: run.error_code ?? null,
+    error_message: text(run.error_message),
+    updated_at: run.updated_at ?? null,
+    rendered_asset_id: run.rendered_asset_id ?? run.asset?.id ?? null,
+    original_asset_id: run.original_asset_id ?? null,
+    preset_id: presetId,
+    duration_ms: num(run.duration_ms),
+    frames: num(run.frames),
+    // §0 luật 2: `audio` LUÔN là null ở bản offline — trả đúng giá trị đã lưu, không suy diễn.
+    audio: run.audio ?? null,
+    no_audio: run.no_audio === true,
+    warnings: asArray(run.warnings).map(String),
+    // V3 lưu bản mô tả plan/encode của LƯỢT NÀY ở `content_meta` — chuyển tiếp để UI đọc được
+    // cả khi lượt đó KHÔNG tạo ra video (nhờ vậy không phải suy từ ảnh cũ).
+    plan: run.plan ?? run.plan_summary ?? null,
+    encode: run.encode ?? run.encode_summary ?? null,
+    providers: isPlainObject(run.providers) ? run.providers : null,
+    violations: asArray(run.violations).map(violationText).filter(Boolean),
+    evidence_used: isPlainObject(run.evidence_used) ? run.evidence_used : null,
+    failures: asArray(run.failures)
+      .slice(0, 20)
+      .map((f) => ({ step: f?.step ?? null, code: f?.code ?? null, message: text(f?.message) })),
+  };
+}
+
+/**
+ * Lỗi pipeline/mã hoá MVP-04 → HTTP an toàn, giữ mã lỗi THẬT của tầng dưới.
+ * Mọi câu chữ đều đi qua `scrubPaths` trước khi ra client (chặn rò đường dẫn nội bộ).
+ */
+function mapVideostudioError(err, fallbackMessage = 'Không tạo được video.') {
+  if (err instanceof HttpError) return err;
+  // MVP-05: thiếu credit ⇒ 402 (cùng một cách hiểu với MVP-01/02/03), KHÔNG phải 500.
+  const billing = mapBillingError(err);
+  if (billing) return billing;
+  const code = typeof err?.code === 'string' && err.code ? err.code : 'VIDEOSTUDIO_FAILED';
+  const message = scrubPaths(typeof err?.message === 'string' && err.message ? err.message : fallbackMessage);
+  const details = isPlainObject(err?.details) ? err.details : {};
+
+  // §0 luật 3 — chữ thiếu bằng chứng: 422 kèm danh sách vi phạm (KHÔNG BAO GIỜ là 500).
+  if (code === 'VIDEO_TEXT_UNSUPPORTED_CLAIM') {
+    return HttpError.safe(422, code, message, { violations: asArray(details.violations).map(String) });
+  }
+  if (code === 'VIDEO_TEXT_NOT_TRANSLATED') return HttpError.safe(422, code, message, { violations: [] });
+  // Xung đột trạng thái: chưa có ảnh gốc / sai loại job / job đang chạy (MVP-05 §BR-02).
+  if (
+    code === 'VIDEOSTUDIO_NO_ORIGINAL' ||
+    code === 'VIDEOSTUDIO_NOT_VIDEO_JOB' ||
+    code === 'VIDEOSTUDIO_JOB_RUNNING' ||
+    code === 'JOB_ALREADY_RUNNING' ||
+    code === 'ALREADY_INGESTED'
+  ) {
+    return HttpError.safe(409, code, message, details);
+  }
+  // Bộ mã hoá chưa cấu hình / thiếu `ffmpeg` ⇒ nói thẳng là chưa chạy được, KHÔNG bịa kết quả.
+  if (code === 'VIDEO_NOT_CONFIGURED' || code === 'NOT_CONFIGURED' || code === 'FFMPEG_NOT_AVAILABLE') {
+    return HttpError.safe(502, code, message, details);
+  }
+  if (code === 'BAD_PRESET' || code === 'UNSUPPORTED_PRESET' || code === 'PRESET_NOT_FOUND') {
+    return new HttpError(400, code, message);
+  }
+  // Lỗi do CHÍNH ảnh người dùng gửi lên (ingest chạy trong request) — đúng loại 4xx, không gộp 502.
+  if (code === 'UNSUPPORTED_IMAGE') return new HttpError(415, code, message);
+  if (
+    code === 'IMAGE_TOO_LARGE' ||
+    code === 'PIXELS_EXCEEDED' ||
+    code === 'OUTPUT_TOO_LARGE' ||
+    code === 'TOO_MANY_SCENES' ||
+    code === 'TOO_MANY_TEXTS'
+  ) {
+    return new HttpError(413, code, message);
+  }
+  if (code === 'MISSING_IMAGE' || code === 'BAD_IMAGE' || code === 'INVALID_IMAGE' || code === 'INVALID_INPUT' || code === 'BAD_OPTIONS') {
+    return new HttpError(400, code, message);
+  }
+  // Lỗi provider mã hoá/vẽ khung: KHÔNG dội chi tiết provider ra client (có thể chứa đường dẫn).
+  if (/^(VIDEO|GIF|FRAME|ENCODE|RENDER)/.test(code)) {
+    return new HttpError(502, code, `Bộ mã hoá/vẽ video báo lỗi (${code}). Vui lòng thử lại hoặc kiểm tra cấu hình provider.`);
   }
   // Còn lại dùng chung bảng ánh xạ của MVP-02 (đã xử lý MISSING_IMAGE/BAD_IMAGE/NOT_CONFIGURED/…).
   return mapImagelabError({ code: err?.code, message, details }, fallbackMessage);

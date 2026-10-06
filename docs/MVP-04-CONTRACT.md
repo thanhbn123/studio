@@ -146,7 +146,13 @@ asset role `rendered`, `parent_id` = asset gốc, `meta.kind='video_generation'`
 ```
 GET  /api/videostudio/presets → { presets: VIDEO_PRESETS, encoder: {name,is_mock,configured}, limits }
 POST /api/videostudio/jobs    { image:{base64,filename?}, options:{preset?, scenes?, texts?, fit?} }
-                              → 202 { job_id, asset_id, status, poll }        (402 nếu thiếu credit — MVP-05)
+                              → 202 { job_id, asset_id, asset_ids:[…], status, poll }   (402 nếu thiếu credit)
+                              NHIỀU ẢNH (chốt ở vòng gộp): `options.scenes[i].image = {base64, filename?}`
+                              là NGUỒN THỨ TỰ — N ảnh ⇒ N cảnh. `image` vẫn là ảnh đầu (tương thích
+                              ngược) và bị BỎ QUA nếu khác byte với mọi ảnh của cảnh; ảnh trùng byte
+                              bị khử theo sha256; quá `VIDEOSTUDIO_MAX_SCENES = 24` ⇒ 413
+                              `TOO_MANY_SCENES`; không có ảnh nào ⇒ 400 `MISSING_IMAGE`.
+                              `GET /presets → limits.max_scenes = 24` (UI không phải đoán).
 GET  /api/videostudio/jobs/:id → { job, asset, rendered:[], plan, encode, warnings, providers, presets, last_run }
 POST /api/videostudio/jobs/:id/generate { options?, force? } → 202
 GET  /api/videostudio/assets/:id/file → nhị phân (Content-Type thật, private/no-store, nosniff)
@@ -158,7 +164,8 @@ Luật: quyền theo session **và** theo tài khoản (MVP-05: khác chủ ⇒ 
 
 ### 2.5 V5 — UI
 
-Tab **“Video”** (thứ tư): kéo-thả ảnh (nhiều ảnh ⇒ nhiều cảnh, thứ tự = thứ tự chọn) → chọn tỉ lệ
+Tab **“Video”** (thứ tư): kéo-thả ảnh (**nhiều ảnh ⇒ nhiều cảnh** — ĐÃ chạy thật end-to-end từ
+vòng gộp: UI gửi ảnh của TỪNG cảnh trong `options.scenes[i].image`, xem §2.4) → chọn tỉ lệ
 (9:16/1:1/16:9) → nhập chữ cho từng cảnh (tiêu đề/giá/CTA; có ô “phụ đề”) → thời lượng mỗi cảnh →
 **TẠO VIDEO** → poll theo `stage` → xem trước bằng `<img src=...gif>` + nút tải + hiện **mọi** cảnh báo
 (không có tiếng · chữ bị chặn vì thiếu bằng chứng · ảnh bị crop/pad · vượt trần thời lượng).
@@ -177,3 +184,18 @@ Nhãn trung thực: **“video KHÔNG có tiếng”** hiện **cạnh** kết q
 - `usage_event` chỉ ghi bước **chạy thật**; evidence `MANUAL_INPUT`.
 - Ẩn danh vẫn dùng được (không ví); có tài khoản ⇒ thu theo **lượt** đúng chi phí lượt đó.
 - `npm test` xanh + `node tools/verify.mjs` xanh.
+
+---
+
+## 4. VÒNG GỘP (07/10/2026) — những gì đã CHỐT lại sau khi 5 agent land
+
+| Điểm | Trước (5 agent) | Sau vòng gộp |
+|---|---|---|
+| Nhiều ảnh ⇒ nhiều cảnh (§2.5) | UI chỉ gửi ảnh ĐẦU ở `image` ⇒ video **luôn 1 cảnh**; UI phải tự nói “chưa gửi được” cho cảnh 2+ | UI gửi ảnh của TỪNG cảnh (`options.scenes[i].image`); V4 gom **theo thứ tự cảnh**, khử trùng sha256, 413 khi quá 24; V3 dựng ĐÚNG N cảnh. **Đo thật: 3 ảnh ⇒ `plan.scene_count = 3`, GIF 9 khung (3 × 250 ms × 12 fps), `asset_id` mỗi cảnh khác nhau** |
+| `image` bắt buộc | chỉ nhận `image` | nhận `image` **hoặc** `scenes[i].image` (hoặc cả hai); không có ảnh nào ⇒ 400 `MISSING_IMAGE` |
+| Cảnh báo “không có tiếng” | V1 và V3 mỗi bên phát một câu KHÁC CHỮ ⇒ trùng 2 câu | `dedupeWarnings()` trong `pipeline.js`: mọi biến thể quy về MỘT câu của V3, khử trùng cả danh sách trước khi trả/lưu |
+| `plan_summary` | KHÔNG giữ nội dung chữ ⇒ mở lại job, ô chữ trống | thêm `scenes[].texts` (text + x/y/size/align/color/start_ms/end_ms/animation) — **không** kèm base64/đường dẫn/token |
+| `limits` của `/presets` | thiếu `max_scenes` ⇒ UI đoán | thêm `max_scenes = 24` |
+| `last_run.run_key` | luôn `null` | ghi `run_key` của lượt vào `content_meta.videostudio` ⇒ `last_run.run_key` đối chiếu được sổ ví |
+| `PRICING_OPERATIONS` (đường dự phòng) | thiếu `VIDEO_RENDER`/`VIDEO_ENCODE` | đã thêm (khớp `USAGE_OPERATIONS` của store) |
+| Test `pricing.length` | hardcode `10` ⇒ vỡ khi thêm operation | so với `USAGE_OPERATIONS.length` (nguồn sự thật duy nhất) |

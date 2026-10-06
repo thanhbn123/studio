@@ -41,6 +41,11 @@ export const USAGE_OPERATIONS = Object.freeze([
   'IMAGE_MATTING',
   'IMAGE_COMPOSE',
   'IMAGE_RETOUCH',
+  // MVP-04 — video offline: `VIDEO_RENDER` (dựng khung) và `VIDEO_ENCODE` (mã hoá GIF/MP4).
+  // Chỉ ghi khi bước THẬT SỰ chạy (chữ thiếu bằng chứng ⇒ không dựng khung, không mã hoá ⇒
+  // KHÔNG có dòng usage nào).
+  'VIDEO_RENDER',
+  'VIDEO_ENCODE',
 ]);
 
 /** Loại job: MVP-01 sinh nội dung, MVP-02 dịch chữ trên ảnh, MVP-03 tạo ảnh. */
@@ -113,6 +118,11 @@ export const DEFAULT_PRICING = Object.freeze({
   IMAGE_MATTING: 0.002,
   IMAGE_COMPOSE: 0.0005,
   IMAGE_RETOUCH: 0.0005,
+  // MVP-04 — video offline (dựng khung + mã hoá GIF bằng CPU của máy chủ). Cùng quy ước:
+  // GIÁ MẶC ĐỊNH CỦA REPO, KHÔNG phải giá nhà cung cấp. Phải > 0 vì giá 0 = "miễn phí"
+  // (sai nghiệp vụ) và `mvp05-billing` khẳng định mọi operation đều có giá > 0.
+  VIDEO_RENDER: 0.0006,
+  VIDEO_ENCODE: 0.0004,
 });
 
 export const VERIFICATION_LEVELS = Object.freeze([
