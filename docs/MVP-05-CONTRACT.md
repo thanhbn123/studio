@@ -219,3 +219,29 @@ GET  /api/admin/usage?from&to&group_by=day|operation|user → 200 { rows }
 
 **KHÔNG thuộc MVP-05:** cổng thanh toán thật, hoá đơn, webhook (MVP-06 — cần Owner quyết nhà cung cấp
 và pháp nhân nhận tiền). Nạp credit ở MVP-05 chỉ bằng **admin cấp tay** (có ghi sổ).
+
+---
+
+## 2.3 KHOÁ CẤU HÌNH (A1 sở hữu `src/config.js` + `.env.example`)
+
+```js
+auth: {
+  enabled: true,              // AUTH_ENABLED
+  cookieName: 'vauth',        // AUTH_COOKIE_NAME
+  sessionDays: 30,            // AUTH_SESSION_DAYS
+  passwordMinLength: 10,      // AUTH_PASSWORD_MIN_LENGTH
+  anonymousAllowed: true,     // AUTH_ANONYMOUS_ALLOWED  (false ⇒ mọi route cần đăng nhập, TRỪ /api/auth/*)
+  secureCookie: false,        // AUTH_SECURE_COOKIE (bật khi chạy https)
+},
+billing: {
+  enabled: true,              // BILLING_ENABLED
+  currency: 'USD',            // CREDIT_CURRENCY  (đã có ở MVP-01 — dùng lại, KHÔNG tạo khoá thứ hai)
+  defaultGrant: 0,            // BILLING_DEFAULT_GRANT (credit tặng khi đăng ký; 0 = không tặng)
+  holdBeforeJob: true,        // BILLING_HOLD_BEFORE_JOB (giữ tiền trước khi chạy job)
+  pricingFromCost: true,      // BILLING_PRICING_FROM_COST (seed bảng pricing từ config.cost hiện có)
+},
+```
+
+Luật: **không** tạo khoá tiền tệ thứ hai; `config.cost.*` của MVP-01 vẫn là nguồn giá mặc định.
+`AUTH_ANONYMOUS_ALLOWED=false` chỉ được dùng khi Owner muốn đóng hoàn toàn chế độ ẩn danh — mặc định
+giữ `true` để mọi test cũ xanh.
