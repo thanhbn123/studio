@@ -1086,8 +1086,12 @@ $ node /tmp/mvp05-atk/atk7-race.mjs
 - **Chưa sửa được / giới hạn đã biết:**
   · `run_key` khoá theo LƯỢT CHẠY dựa trên sổ + trạng thái job: nếu hai lượt chạy **chồng thời gian**
     trên cùng job (route gọi `beforeJob` khi lượt trước CHƯA settle) thì hook coi là CÙNG lượt ⇒ lượt
-    thứ hai không mở hold mới. Đường UI bình thường bị cổng trạng thái chặn; chưa đo với nhiều tiến
-    trình (`#locks` vẫn trong bộ nhớ — giới hạn đã ghi từ vòng 1).
+    thứ hai không mở hold mới. **Ca đo được còn lại: `atk8-confirm.mjs` §8.1 — retry TỰ ĐỘNG của hàng
+    đợi sau khi job lỗi**: lượt retry chạy khi dòng `job_refund` của lượt trước CHƯA kịp ghi ⇒ hook
+    thấy lượt cũ còn mở ⇒ chạy lại KHÔNG mở hold mới (`rows=3 sum=1 balance=1`). Đường người dùng bấm
+    (`regenerate`/`render`/`generate` sau khi job đã dừng) thì ĐÃ thu đúng — xem §16.2. Sửa triệt để
+    cần cho hàng đợi chờ `afterJob` xong trước khi retry (thay đổi tầng queue/pipeline, ngoài phạm vi
+    vòng này). Chưa đo với nhiều tiến trình (`#locks` vẫn trong bộ nhớ — giới hạn đã ghi từ vòng 1).
   · `BILLING_HOLD_BEFORE_JOB=false` ở chế độ nhiều tiến trình: lượt settle-only dựa vào sổ để suy ra
     `run_key`, hai tiến trình có thể cùng mở một lượt ⇒ chưa đo.
   · Chưa đo: PostgreSQL thật cho partial unique index (chỉ chạy SQLite), reverse proxy thật cho
