@@ -245,3 +245,39 @@ billing: {
 Luật: **không** tạo khoá tiền tệ thứ hai; `config.cost.*` của MVP-01 vẫn là nguồn giá mặc định.
 `AUTH_ANONYMOUS_ALLOWED=false` chỉ được dùng khi Owner muốn đóng hoàn toàn chế độ ẩn danh — mặc định
 giữ `true` để mọi test cũ xanh.
+
+---
+
+## 3.4b HOOK GIỮ TIỀN GỌI ĐƯỢC TỪ ROUTE (bổ sung, ĐÓNG BĂNG)
+
+**Vấn đề thật (A4 phát hiện):** `POST /api/jobs` xếp hàng qua `queue.enqueue(jobId, () => pipeline.run(...))`;
+handler chạy trong `#runItem` có try/catch ⇒ lỗi `INSUFFICIENT_CREDIT` ném từ **trong** pipeline
+**không bao giờ** ra tới HTTP ⇒ client nhận 202 rồi job `failed`, tức là **đã tiêu thời gian của người
+dùng rồi mới báo thiếu tiền** — trái luật “chặn TRƯỚC khi chạy”.
+
+**Hợp đồng đóng băng (A3 hiện thực, A4 gọi):**
+
+```js
+app.billingHook = {
+  async beforeJob({ userId, jobId, kind, sessionId }) → { held: number, balance_after, currency }
+      // - userId rỗng/null (ẩn danh) ⇒ KHÔNG làm gì, trả { held: 0, balance_after: null }
+      // - đủ tiền ⇒ giữ tiền (dòng `job_hold`) rồi trả về
+      // - thiếu tiền ⇒ ném BillingError code 'INSUFFICIENT_CREDIT' + details { required, balance, currency }
+      // - IDEMPOTENT theo jobId (gọi 2 lần không giữ 2 lần)
+      // - billingService null ⇒ bỏ qua (trả { held: 0, balance_after: null }) + log 1 lần
+  async afterJob({ userId, jobId, status, actualCost }) → { settled: boolean, refunded: number }
+      // status 'failed' ⇒ hoàn 100% phần đã giữ; ngược lại ⇒ quyết toán theo actualCost
+      // idempotent theo jobId; billingService null ⇒ bỏ qua
+};
+```
+
+- **A4 gọi `await app.billingHook.beforeJob(...)` NGAY TRONG REQUEST**, **sau** `store.createJob` và
+  **TRƯỚC** `queue.enqueue`, ở **5 chỗ**: `POST /api/jobs`, `POST /api/imagelab/jobs`,
+  `PUT /api/imagelab/jobs/:id/regions`, `POST /api/imagestudio/jobs`,
+  `POST /api/imagestudio/jobs/:id/generate`. Lỗi ⇒ map **402** `INSUFFICIENT_CREDIT` +
+  `details { required, balance, currency }`; **không** job/ảnh nào được tạo (kiểm: DB không tăng).
+- **A3 gọi `afterJob`** ở cuối mỗi pipeline (đúng một lần cho mỗi lượt chạy thật).
+- Cả hai hàm **không bao giờ** làm hỏng luồng cũ: bọc try/catch, log `billing.hook_failed` mức warn —
+  **trừ** `INSUFFICIENT_CREDIT` ở `beforeJob` (đó là fail-closed có chủ ý, phải ném ra).
+- `billingHook` là **object hằng** trên `app` (không phải hàm), để A4 gọi ổn định kể cả khi
+  `billingService` là `null`.
