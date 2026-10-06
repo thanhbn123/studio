@@ -254,7 +254,10 @@ function clampBox(box, width, height) {
 }
 
 export class ImageTranslationPipeline {
-  constructor({ config, logger, store, storage, ocrProvider = null, translator = null, renderProvider = null } = {}) {
+  /** Cảnh báo `billing.disabled` chỉ được ghi MỘT LẦN cho mỗi pipeline (không spam log). */
+  #billingDisabledLogged = false;
+
+  constructor({ config, logger, store, storage, ocrProvider = null, translator = null, renderProvider = null, billingService = null, billingHook = null } = {}) {
     this.config = config ?? {};
     this.logger = logger;
     this.store = store;
@@ -262,6 +265,10 @@ export class ImageTranslationPipeline {
     this.ocrProvider = ocrProvider;
     this.translator = translator;
     this.renderProvider = renderProvider;
+    // MVP-05: dịch vụ ví credit (A2) + hook dùng chung với route (§3.4b). Cả hai `null`
+    // ⇒ hook tính tiền bỏ qua hoàn toàn.
+    this.billingService = billingService || null;
+    this.billingHook = billingHook || null;
   }
 
   /** Khối cấu hình `imagelab` (C1). Thiếu khối → dùng mặc định an toàn, không bịa. */
@@ -327,6 +334,155 @@ export class ImageTranslationPipeline {
     } catch (err) {
       this.logger?.warn('imagelab.evidence_record_failed', { job_id: jobId, error: err });
     }
+  }
+
+  /* ═════════════════ MVP-05 — HOOK TÍNH TIỀN (hợp đồng §3.4) ═════════════════
+   *
+   * LUẬT #1 — ẨN DANH KHÔNG BỊ PHÁ: job không có `user_id` đi thẳng vào thân bước chạy,
+   * KHÔNG gọi một hàm billing nào (MVP-02 vẫn chạy y hệt cho khách chưa đăng nhập).
+   *
+   * LUẬT #2 — SỔ APPEND-ONLY: mỗi BƯỚC chạy thật của một job có tài khoản đi qua chu kỳ
+   * `app.billingHook.beforeJob` → `afterJob` (bên dưới là `holdForJob`/`settleForJob`/
+   * `refundForJob` của A2). Job chỉ có MỘT chu kỳ: bước sau (render sau khi duyệt, nhập vùng
+   * tay…) thấy sổ đã khép thì chạy tiếp mà không ghi sổ thêm — thà không thu còn hơn thu hai
+   * lần (quyết toán luôn đối chiếu usage THẬT của cả job).
+   *
+   * FAIL-CLOSED Ở ĐÚNG MỘT CHỖ: thiếu credit khi giữ tiền ⇒ ném `INSUFFICIENT_CREDIT` để
+   * bước chạy KHÔNG diễn ra (route map thành 402). Lỗi billing khác chỉ ghi log mức warn.
+   */
+
+  /** Ghi log lỗi billing ở mức warn — KHÔNG bao giờ làm hỏng job vì một sự cố ví tiền. */
+  #warnHook(step, jobId, err) {
+    this.logger?.warn('billing.hook_failed', {
+      job_id: jobId,
+      step,
+      error_name: err?.name || 'Error',
+      error_code: err?.code || null,
+      error_message: String(err?.message || err).slice(0, 300),
+    });
+  }
+
+  /** Chi phí THẬT của job = tổng `estimated_cost` của mọi `usage_events` (hợp đồng §3.4). */
+  async #actualCost(jobId) {
+    try {
+      const summary = await this.store?.usageSummary?.(jobId);
+      return Number(summary?.estimated_cost ?? 0);
+    } catch (err) {
+      this.#warnHook('usage_summary', jobId, err);
+      return 0;
+    }
+  }
+
+  /** Giữ tiền khi pipeline tự dựng với BillingService thô (test/demo) — không giữ hai lần. */
+  async #holdDirect(billing, userId, jobId, operations) {
+    if (typeof this.store?.listLedger === 'function') {
+      const rows = await this.store.listLedger({ userId, jobId, limit: 200 });
+      if (Array.isArray(rows) && rows.some((r) => r?.reason === 'job_hold')) return;
+    }
+    const estimate = await billing.estimate({ userId, operations });
+    await billing.holdForJob({ userId, jobId, estimate, operations });
+  }
+
+  /** Kết thúc chu kỳ khi dùng BillingService thô — bỏ qua nếu job đã settle/refund. */
+  async #closeDirect(billing, userId, jobId, { failed = false, actualCost = 0, reason = 'JOB_FAILED' } = {}) {
+    let rows = [];
+    if (typeof this.store?.listLedger === 'function') {
+      rows = await this.store.listLedger({ userId, jobId, limit: 200 }) || [];
+    }
+    if (rows.some((r) => r?.reason === 'job_settle' || r?.reason === 'job_refund')) return;
+    if (failed) {
+      if (!rows.some((r) => r?.reason === 'job_hold')) return; // chưa giữ gì ⇒ không có gì để hoàn
+      await billing.refundForJob({ userId, jobId, reason });
+      return;
+    }
+    await billing.settleForJob({ userId, jobId, actualCost });
+  }
+
+  /**
+   * Bọc một bước chạy job bằng chu kỳ: giữ tiền (nếu chưa giữ) → chạy → quyết toán/hoàn tiền.
+   *
+   * Nguồn ví ưu tiên `billingHook` — CHÍNH object A4 gọi trong request (§3.4b): A4 đã giữ
+   * tiền cho `POST /api/imagelab/jobs`, `PUT .../regions`, `POST .../render`; hook tự ĐỌC SỔ
+   * THẬT theo `jobId` nên lần gọi ở đây KHÔNG giữ thêm đồng nào. Nó là lưới an toàn cho
+   * đường không qua route (demo/tool) và cho job xếp hàng trước khi hook ra đời.
+   */
+  async #withBilling(jobId, operations, run) {
+    const hook = this.billingHook;
+    const billing = this.billingService;
+    if (!hook && !billing) {
+      if (!this.#billingDisabledLogged) {
+        this.#billingDisabledLogged = true;
+        this.logger?.warn('billing.disabled', {
+          reason: 'Không có billingService — hook tính tiền bị bỏ qua, job vẫn chạy và không ai bị chặn.',
+        });
+      }
+      return run();
+    }
+
+    let job = null;
+    try {
+      job = await this.store?.getJob?.(jobId);
+    } catch (err) {
+      this.#warnHook('read_job', jobId, err);
+      return run();
+    }
+    const userId = job?.user_id || null;
+    if (!userId) return run(); // ẩn danh ⇒ bỏ qua HOÀN TOÀN (luật #1)
+
+    try {
+      if (hook) {
+        await hook.beforeJob({
+          userId,
+          jobId,
+          kind: job?.kind || 'image_translation',
+          sessionId: job?.session_id || '',
+          operations,
+        });
+      } else {
+        await this.#holdDirect(billing, userId, jobId, operations);
+      }
+    } catch (err) {
+      if (err?.code === 'INSUFFICIENT_CREDIT') throw err; // fail-closed có chủ ý (route map thành 402)
+      this.#warnHook('before_job', jobId, err);
+      return run();
+    }
+
+    let result;
+    let failure = null;
+    try {
+      result = await run();
+    } catch (err) {
+      failure = err;
+    }
+
+    // Trạng thái THẬT lấy từ DB: `#failJob` đánh dấu failed mà KHÔNG ném lỗi.
+    let status = failure ? JOB_STATUS.FAILED : (result?.status ?? null);
+    if (!failure) {
+      try {
+        const fresh = await this.store?.getJob?.(jobId);
+        status = fresh?.status ?? status;
+      } catch {
+        /* không đọc được trạng thái ⇒ dùng status pipeline trả về */
+      }
+    }
+    const actualCost = await this.#actualCost(jobId);
+
+    try {
+      if (hook) {
+        await hook.afterJob({ userId, jobId, status: status || JOB_STATUS.AWAITING_REVIEW, actualCost });
+      } else {
+        await this.#closeDirect(billing, userId, jobId, {
+          failed: status === JOB_STATUS.FAILED,
+          actualCost,
+          reason: 'IMAGELAB_FAILED',
+        });
+      }
+    } catch (err) {
+      this.#warnHook('after_job', jobId, err);
+    }
+
+    if (failure) throw failure;
+    return result;
   }
 
   /** Đánh dấu job thất bại kèm `error_code` + `finished_at` — không bao giờ treo `running`. */
@@ -502,6 +658,8 @@ export class ImageTranslationPipeline {
         id: assetId,
         jobId,
         sessionId: sid,
+        // MVP-05 §2.2: đã đăng nhập ⇒ mọi asset mới gắn `user_id`; ẩn danh ⇒ null.
+        userId: job.user_id || null,
         role: 'original',
         parentId: null,
         mime,
@@ -557,8 +715,18 @@ export class ImageTranslationPipeline {
   /**
    * OCR → dịch → lưu regions + lines → `awaiting_review`, `finished_at = null`.
    * KHÔNG tự render. Lỗi provider → `failed` + `error_code` + `finished_at`.
+   *
+   * MVP-05 §3.4: đây là một bước chạy thật của job ⇒ đi qua hook tính tiền (job ẩn danh
+   * bỏ qua hoàn toàn).
    */
-  async runOcr(jobId, { sessionId, options = {} } = {}) {
+  async runOcr(jobId, opts = {}) {
+    const operations = ['OCR_DETECT'];
+    if (this.translator) operations.push('TRANSLATION');
+    return this.#withBilling(jobId, operations, () => this.#runOcr(jobId, opts));
+  }
+
+  /** Thân của `runOcr()` — chỉ gọi qua `runOcr()` để luôn đi qua hook tính tiền. */
+  async #runOcr(jobId, { sessionId, options = {} } = {}) {
     const started = Date.now();
     const log = this.#log(jobId);
     const cfg = this.imagelabConfig;
@@ -927,7 +1095,14 @@ export class ImageTranslationPipeline {
    * Lỗi translator KHÔNG làm job treo: kết quả `FAILED`/`NOT_CONFIGURED` của C2 vẫn được
    * ghi thành lines (FAILED) rồi job về `awaiting_review` — người dùng thấy đúng sự thật.
    */
-  async setManualRegions(jobId, {
+  async setManualRegions(jobId, opts = {}) {
+    // MVP-05 §3.4: nhập vùng tay cũng gọi translator ⇒ cũng là một bước chạy thật của job.
+    const operations = ['TRANSLATION'];
+    return this.#withBilling(jobId, operations, () => this.#setManualRegions(jobId, opts));
+  }
+
+  /** Thân của `setManualRegions()` — chỉ gọi qua đó để luôn đi qua hook tính tiền. */
+  async #setManualRegions(jobId, {
     sessionId = '',
     regions = [],
     replace = true,
@@ -1273,8 +1448,15 @@ export class ImageTranslationPipeline {
   /**
    * Dựng RenderOp từ các dòng ĐÃ DUYỆT rồi render ra ảnh mới (role `rendered`,
    * `parent_id` = ảnh gốc). Ảnh gốc chỉ được đọc.
+   *
+   * MVP-05 §3.4: render là một bước chạy thật (tốn `IMAGE_RENDER`) ⇒ đi qua hook tính tiền.
    */
-  async renderApproved(jobId, { sessionId, onlyRegionIds, force = false, unknownRegionIds = [] } = {}) {
+  async renderApproved(jobId, opts = {}) {
+    return this.#withBilling(jobId, ['IMAGE_RENDER'], () => this.#renderApproved(jobId, opts));
+  }
+
+  /** Thân của `renderApproved()` — chỉ gọi qua đó để luôn đi qua hook tính tiền. */
+  async #renderApproved(jobId, { sessionId, onlyRegionIds, force = false, unknownRegionIds = [] } = {}) {
     const started = Date.now();
     const log = this.#log(jobId);
     const cfg = this.imagelabConfig;
@@ -1666,6 +1848,8 @@ export class ImageTranslationPipeline {
         id: renderedId,
         jobId,
         sessionId: sid,
+        // MVP-05 §2.2: ảnh render thuộc cùng chủ sở hữu với job.
+        userId: job.user_id || null,
         role: 'rendered',
         parentId: original.id,
         mime: outMime,

@@ -207,6 +207,38 @@ export function loadConfig(env = process.env) {
       IMAGE_RETOUCH: Number(env.COST_IMAGE_RETOUCH ?? 0.0005),
       currency: toStr(env.CREDIT_CURRENCY, 'USD'),
     },
+
+    // ── MVP-05: tài khoản + ví credit (§2.3 của hợp đồng) ───────────────────
+    // Đây là ĐƯỜNG CẤU HÌNH DUY NHẤT của MVP-05. A1 đọc `auth.*`, A2 đọc `billing.*`,
+    // A4 đọc cả hai để dựng cookie và `/api/config`. Tên khoá ĐÓNG BĂNG — đổi là vỡ hợp đồng.
+    auth: {
+      enabled: toBool(env.AUTH_ENABLED, true),
+      cookieName: /^[A-Za-z0-9._-]+$/.test(toStr(env.AUTH_COOKIE_NAME, 'vauth'))
+        ? toStr(env.AUTH_COOKIE_NAME, 'vauth')
+        : 'vauth', // tên cookie sai định dạng ⇒ rơi về mặc định, không đưa rác vào header
+      sessionDays: Math.max(1, toInt(env.AUTH_SESSION_DAYS, 30)),
+      // ⚠️ CHỈ SIẾT ĐƯỢC, KHÔNG NỚI: sàn 10 là hằng số hợp đồng
+      // (`PASSWORD_MIN_LENGTH` §3.1). Khai `AUTH_PASSWORD_MIN_LENGTH=4` KHÔNG hạ được sàn.
+      passwordMinLength: Math.max(10, toInt(env.AUTH_PASSWORD_MIN_LENGTH, 10)),
+      // Mặc định an toàn: bật `Secure` khi PUBLIC_BASE_URL là https, kể cả khi
+      // AUTH_SECURE_COOKIE không được khai (cookie phiên không bao giờ đi qua http thường).
+      secureCookie:
+        toBool(env.AUTH_SECURE_COOKIE, false) || /^https:/i.test(toStr(env.PUBLIC_BASE_URL, '')),
+      // `false` ⇒ mọi route cần đăng nhập (TRỪ /api/auth/*). Mặc định `true` để luật #1
+      // "không phá người dùng ẩn danh" và toàn bộ test MVP-01/02/03 vẫn xanh.
+      anonymousAllowed: toBool(env.AUTH_ANONYMOUS_ALLOWED, true),
+    },
+
+    billing: {
+      enabled: toBool(env.BILLING_ENABLED, true),
+      // KHÔNG tạo khoá tiền tệ thứ hai: dùng CHUNG `CREDIT_CURRENCY` với `cost.currency`.
+      currency: toStr(env.CREDIT_CURRENCY, 'USD'),
+      // Credit tặng khi đăng ký. Kẹp >= 0: số âm là "thu tiền lúc đăng ký" — vô nghĩa.
+      defaultGrant: Math.max(0, toNum(env.BILLING_DEFAULT_GRANT, 0)),
+      holdBeforeJob: toBool(env.BILLING_HOLD_BEFORE_JOB, true),
+      // Seed bảng `pricing` từ `config.cost.*` của MVP-01 (nguồn giá mặc định).
+      pricingFromCost: toBool(env.BILLING_PRICING_FROM_COST, true),
+    },
   };
 
   if (!AI_PROVIDERS.includes(cfg.vision.provider)) {

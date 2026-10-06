@@ -55,7 +55,10 @@ export function determineVerificationLevel(master, { usedSession = false } = {})
 }
 
 export class Pipeline {
-  constructor({ config, logger, store, registry, visionProvider, contentEngine, usage }) {
+  /** Cảnh báo `billing.disabled` chỉ được ghi MỘT LẦN cho mỗi pipeline (không spam log). */
+  #billingDisabledLogged = false;
+
+  constructor({ config, logger, store, registry, visionProvider, contentEngine, usage, billingService = null, billingHook = null }) {
     this.config = config;
     this.logger = logger;
     this.store = store;
@@ -63,6 +66,179 @@ export class Pipeline {
     this.visionProvider = visionProvider;
     this.contentEngine = contentEngine;
     this.usage = usage;
+    // MVP-05: dịch vụ ví credit (A2) và hook dùng chung với route (§3.4b). Cả hai `null`
+    // ⇒ hook tính tiền bỏ qua hoàn toàn.
+    this.billingService = billingService || null;
+    this.billingHook = billingHook || null;
+  }
+
+  /* ═════════════════ MVP-05 — HOOK TÍNH TIỀN (hợp đồng §3.4) ═════════════════
+   *
+   * LUẬT #1 — ẨN DANH KHÔNG BỊ PHÁ: job không có `user_id` (khách chưa đăng nhập) đi thẳng
+   * vào thân pipeline, KHÔNG gọi một hàm billing nào. Toàn bộ MVP-01 vẫn "dán link là chạy".
+   *
+   * LUẬT #2 — SỔ APPEND-ONLY: mỗi lượt chạy của một job có tài khoản là MỘT chu kỳ
+   * `app.billingHook.beforeJob` (giữ tiền trước) → `afterJob` (quyết toán theo usage THẬT,
+   * hoặc hoàn 100% khi job hỏng). Bên dưới hook là `holdForJob`/`settleForJob`/`refundForJob`
+   * của A2. Chu kỳ đã khép lại thì không thu lại lần nữa (idempotent theo `jobId`).
+   *
+   * FAIL-CLOSED Ở ĐÚNG MỘT CHỖ: thiếu credit (`INSUFFICIENT_CREDIT`) khi giữ tiền ⇒ NÉM ra
+   * để job KHÔNG chạy (route map thành 402). Mọi lỗi billing khác chỉ ghi log mức warn —
+   * không được biến một sự cố ví tiền thành một job hỏng.
+   */
+
+  /** Ước tính các operation lượt chạy này sẽ dùng (cơ sở để giữ tiền trước). */
+  #estimateOperations(input = {}) {
+    const ops = [];
+    if (input?.url) ops.push('SOURCE_EXTRACT');
+    if (this.visionProvider?.configured && (input?.url || (input?.manual?.images?.length || 0) > 0)) {
+      ops.push('VISION_ANALYSIS');
+    }
+    if (this.contentEngine?.configured) {
+      ops.push('TRANSLATION', 'CONTENT_GENERATE');
+    }
+    return ops;
+  }
+
+  /** Ghi log lỗi billing ở mức warn — KHÔNG bao giờ làm hỏng job vì một sự cố ví tiền. */
+  #warnHook(step, jobId, err) {
+    this.logger?.warn('billing.hook_failed', {
+      job_id: jobId,
+      step,
+      error_name: err?.name || 'Error',
+      error_code: err?.code || null,
+      error_message: String(err?.message || err).slice(0, 300),
+    });
+  }
+
+  /** Chi phí THẬT của job = tổng `estimated_cost` của mọi `usage_events` (hợp đồng §3.4). */
+  async #actualCost(jobId) {
+    try {
+      const summary = await this.store?.usageSummary?.(jobId);
+      return Number(summary?.estimated_cost ?? 0);
+    } catch (err) {
+      this.#warnHook('usage_summary', jobId, err);
+      return 0;
+    }
+  }
+
+  /** Giữ tiền khi pipeline tự dựng với BillingService thô (test/demo) — không giữ hai lần. */
+  async #holdDirect(billing, userId, jobId, operations) {
+    if (typeof this.store?.listLedger === 'function') {
+      const rows = await this.store.listLedger({ userId, jobId, limit: 200 });
+      if (Array.isArray(rows) && rows.some((r) => r?.reason === 'job_hold')) return;
+    }
+    const estimate = await billing.estimate({ userId, operations });
+    await billing.holdForJob({ userId, jobId, estimate, operations });
+  }
+
+  /** Kết thúc chu kỳ khi dùng BillingService thô — bỏ qua nếu job đã settle/refund. */
+  async #closeDirect(billing, userId, jobId, { failed = false, actualCost = 0 } = {}) {
+    let rows = [];
+    if (typeof this.store?.listLedger === 'function') {
+      rows = await this.store.listLedger({ userId, jobId, limit: 200 }) || [];
+    }
+    if (rows.some((r) => r?.reason === 'job_settle' || r?.reason === 'job_refund')) return;
+    if (failed) {
+      if (!rows.some((r) => r?.reason === 'job_hold')) return; // chưa giữ gì ⇒ không có gì để hoàn
+      await billing.refundForJob({ userId, jobId, reason: 'JOB_FAILED' });
+      return;
+    }
+    await billing.settleForJob({ userId, jobId, actualCost });
+  }
+
+  /**
+   * Bọc một lượt chạy job bằng chu kỳ: giữ tiền (nếu chưa giữ) → chạy → quyết toán/hoàn tiền.
+   *
+   * Nguồn ví ưu tiên `billingHook` — CHÍNH object mà A4 gọi trong request (§3.4b). Nhờ dùng
+   * chung một object, việc "route đã giữ tiền rồi" được phát hiện bằng một lần ĐỌC SỔ THẬT
+   * theo `jobId` (xem `app.billingHook.beforeJob`), nên KHÔNG bao giờ giữ tiền hai lần; lần
+   * gọi ở đây là lưới an toàn cho đường không đi qua route (tool/demo) và cho job được xếp
+   * hàng trước khi hook ra đời. Không có hook (test dựng pipeline trực tiếp) ⇒ dùng
+   * `billingService` thô với cùng luật.
+   */
+  async #withBilling(jobId, operations, run, userIdHint = null) {
+    const hook = this.billingHook;
+    const billing = this.billingService;
+    if (!hook && !billing) {
+      // Không có dịch vụ ví (module A2 chưa nạp được / bị tắt) ⇒ KHÔNG chặn ai. Cảnh báo
+      // đúng MỘT LẦN cho mỗi pipeline để log không bị spam theo từng job.
+      if (!this.#billingDisabledLogged) {
+        this.#billingDisabledLogged = true;
+        this.logger?.warn('billing.disabled', {
+          reason: 'Không có billingService — hook tính tiền bị bỏ qua, job vẫn chạy và không ai bị chặn.',
+        });
+      }
+      return run();
+    }
+
+    // Chủ sở hữu job: ưu tiên `userId` do route truyền vào, còn lại đọc `jobs.user_id`.
+    let job = null;
+    if (!userIdHint) {
+      try {
+        job = await this.store?.getJob?.(jobId);
+      } catch (err) {
+        this.#warnHook('read_job', jobId, err);
+        return run();
+      }
+    }
+    const userId = userIdHint || job?.user_id || null;
+    if (!userId) return run(); // ẩn danh ⇒ bỏ qua HOÀN TOÀN (luật #1)
+
+    // ── Giữ tiền TRƯỚC khi chạy ────────────────────────────────────────────
+    try {
+      if (hook) {
+        await hook.beforeJob({
+          userId,
+          jobId,
+          kind: job?.kind || 'content',
+          sessionId: job?.session_id || '',
+          operations,
+        });
+      } else {
+        await this.#holdDirect(billing, userId, jobId, operations);
+      }
+    } catch (err) {
+      if (err?.code === 'INSUFFICIENT_CREDIT') throw err; // fail-closed có chủ ý (route map thành 402)
+      this.#warnHook('before_job', jobId, err);
+      return run();
+    }
+
+    // ── Chạy job ──────────────────────────────────────────────────────────
+    let result;
+    let failure = null;
+    try {
+      result = await run();
+    } catch (err) {
+      failure = err;
+    }
+
+    // Trạng thái THẬT lấy từ DB: pipeline có thể tự đánh dấu `failed` mà không ném lỗi.
+    let status = failure ? JOB_STATUS.FAILED : (result?.status ?? null);
+    if (!failure) {
+      try {
+        const fresh = await this.store?.getJob?.(jobId);
+        status = fresh?.status ?? status;
+      } catch {
+        /* không đọc được trạng thái ⇒ dùng status pipeline trả về */
+      }
+    }
+    const actualCost = await this.#actualCost(jobId);
+
+    // ── Kết thúc chu kỳ ───────────────────────────────────────────────────
+    try {
+      if (hook) {
+        await hook.afterJob({ userId, jobId, status: status || JOB_STATUS.SUCCEEDED, actualCost });
+      } else {
+        await this.#closeDirect(billing, userId, jobId, { failed: status === JOB_STATUS.FAILED, actualCost });
+      }
+    } catch (err) {
+      // Bước kết thúc chỉ ghi log: job đã chạy xong, lỗi ví KHÔNG được làm hỏng kết quả.
+      this.#warnHook('after_job', jobId, err);
+    }
+
+    if (failure) throw failure;
+    return result;
   }
 
   /** Ghi một usage_event, không bao giờ để lỗi ghi làm hỏng pipeline. */
@@ -90,10 +266,21 @@ export class Pipeline {
   }
 
   /**
+   * Chạy pipeline cho một job (đã được tạo TRƯỚC đó bởi route).
+   *
+   * MVP-05 §3.4: đây là một "lượt chạy job" ⇒ bọc bằng hook tính tiền. Job ẩn danh
+   * (`user_id = NULL`) đi thẳng vào thân hàm, không chạm tới ví.
+   *
    * @param {string} jobId
    * @param {object} input { url?, manual?, style?, length?, sessionId? }
    */
   async run(jobId, input = {}) {
+    // `input.userId` do route (A4) truyền khi đã đăng nhập — khỏi phải đọc lại job chỉ để biết chủ.
+    return this.#withBilling(jobId, this.#estimateOperations(input), () => this.#runJob(jobId, input), input.userId || null);
+  }
+
+  /** Thân của `run()` — chỉ gọi qua `run()` để mọi lượt chạy đều đi qua hook tính tiền. */
+  async #runJob(jobId, input = {}) {
     const startedAt = Date.now();
     const sessionId = input.sessionId || '';
     const style = input.style;
@@ -413,9 +600,23 @@ export class Pipeline {
 
   /**
    * Chạy pipeline cho một job đã có sẵn Product Master (dùng cho "thử lại" và
-   * cho luồng manual-only).
+   * cho luồng manual-only). Cũng là một lượt chạy job ⇒ đi qua hook tính tiền;
+   * job đã có chu kỳ settle/refund thì hook tự bỏ qua (không thu hai lần).
    */
-  async resumeFromMaster(jobId, master, { sessionId = '', style, length, extraInstructions = '' } = {}) {
+  async resumeFromMaster(jobId, master, { sessionId = '', style, length, extraInstructions = '', userId = null } = {}) {
+    const operations = [];
+    if (this.visionProvider?.configured) operations.push('VISION_ANALYSIS');
+    if (this.contentEngine?.configured) operations.push('TRANSLATION', 'CONTENT_GENERATE');
+    return this.#withBilling(
+      jobId,
+      operations,
+      () => this.#resumeJob(jobId, master, { sessionId, style, length, extraInstructions }),
+      userId || null,
+    );
+  }
+
+  /** Thân của `resumeFromMaster()` — chỉ gọi qua đó để luôn đi qua hook tính tiền. */
+  async #resumeJob(jobId, master, { sessionId = '', style, length, extraInstructions = '' } = {}) {
     await this.store.updateJob(jobId, { status: JOB_STATUS.RUNNING, stage: 'resuming' });
     return this.#continueFromMaster(jobId, {
       master: recomputeEvidence(master),

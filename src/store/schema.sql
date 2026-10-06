@@ -136,3 +136,91 @@ CREATE TABLE IF NOT EXISTS translation_lines (
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 
 CREATE INDEX IF NOT EXISTS idx_translation_lines_job ON translation_lines (job_id);
+
+-- ============================================================================
+-- MVP-05 — TÀI KHOẢN + VÍ CREDIT (hợp đồng §2.1)
+--
+-- Bốn bảng dưới đây cũng chỉ dùng TEXT/INTEGER/REAL + ISO-8601 trong TEXT nên CÙNG
+-- file schema chạy được trên cả SQLite (node:sqlite) và PostgreSQL 16.
+--
+-- Hai luật riêng của MVP-05 được phản ánh ngay ở đây:
+--   #1 Ẩn danh KHÔNG bị phá: `jobs.user_id` / `image_assets.user_id` là cột CỘNG THÊM,
+--      NULL = job ẩn danh (xem #applyAdditiveMigrations trong src/store/index.js).
+--   #2 Sổ credit APPEND-ONLY: `wallet_ledger` KHÔNG có cột `balance` sửa tay; số dư là
+--      tổng `amount`, còn `balance_after` chỉ để đối soát dòng cuối. Không có UPDATE/DELETE
+--      nào lên bảng này trong toàn bộ mã nguồn.
+-- ============================================================================
+
+-- Người dùng. `email` đã chuẩn hoá lowercase ở tầng store (UNIQUE).
+-- `password_hash` là scrypt dạng "scrypt$N$r$p$salt$hash" — KHÔNG BAO GIỜ là mật khẩu thô.
+CREATE TABLE IF NOT EXISTS users (
+  id            TEXT PRIMARY KEY,
+  email         TEXT NOT NULL UNIQUE,
+  display_name  TEXT,
+  role          TEXT NOT NULL DEFAULT 'member',   -- 'owner' | 'admin' | 'member'
+  password_hash TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'active',   -- 'active' | 'disabled'
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL,
+  last_login_at TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users (email);
+
+-- Phiên đăng nhập. DB chỉ lưu `token_hash` (sha256 của token trong cookie) — KHÔNG lưu
+-- token thô, nên rò rỉ DB cũng không dùng lại được phiên.
+CREATE TABLE IF NOT EXISTS user_sessions (
+  id           TEXT PRIMARY KEY,
+  user_id      TEXT NOT NULL,
+  token_hash   TEXT NOT NULL,
+  created_at   TEXT NOT NULL,
+  expires_at   TEXT NOT NULL,
+  last_seen_at TEXT,
+  revoked_at   TEXT,
+  user_agent   TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_sessions_token ON user_sessions (token_hash);
+CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions (user_id);
+
+-- Sổ credit — APPEND-ONLY. Mỗi lần trừ/hoàn là MỘT DÒNG MỚI:
+--   amount < 0: giữ tiền (job_hold) / quyết toán phần vượt (job_settle)
+--   amount > 0: cấp credit (grant/admin_grant) / hoàn tiền (job_refund/job_settle)
+-- `balance_after` = tổng `amount` của user NGAY SAU dòng này, tính trong CÙNG transaction
+-- với lần chèn (xem Store#appendLedger) nên không bao giờ lệch khi 2 request cùng lúc.
+-- TIỀN TỆ LÀM TRÒN 6 CHỮ SỐ (`roundMoney`) ngay khi ghi và khi đọc tổng — nếu cộng float
+-- thô thì sổ sẽ có 1.9000000000000001 và mọi phép so sánh số dư đều lệch ~1e-15.
+-- `seq`: số thứ tự TĂNG DẦN trong phạm vi một user, cấp ngay trong transaction của lần
+-- chèn. Nhiều dòng có thể cùng mili-giây (`created_at`) nên chỉ sắp theo thời gian là
+-- KHÔNG ổn định (uuid ngẫu nhiên ⇒ trang sổ nhảy cóc, phân trang trùng/sót). `seq` cho
+-- thứ tự xác định trên CẢ SQLite lẫn PostgreSQL mà không cần sequence của từng driver.
+CREATE TABLE IF NOT EXISTS wallet_ledger (
+  id            TEXT PRIMARY KEY,
+  user_id       TEXT NOT NULL,
+  seq           INTEGER NOT NULL DEFAULT 0,
+  amount        REAL NOT NULL,
+  currency      TEXT NOT NULL DEFAULT 'USD',
+  reason        TEXT NOT NULL,   -- 'grant'|'admin_grant'|'job_hold'|'job_settle'|'job_refund'|'adjustment'
+  job_id        TEXT,
+  operation     TEXT,
+  meta          TEXT,
+  balance_after REAL NOT NULL,
+  created_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_wallet_ledger_user ON wallet_ledger (user_id);
+-- LƯU Ý: index trên `seq` KHÔNG đặt ở đây. DB tạo bởi bản trước đã có bảng `wallet_ledger`
+-- nhưng CHƯA có cột `seq`; `CREATE TABLE IF NOT EXISTS` là no-op nên câu index này sẽ chạy
+-- TRƯỚC migration thêm cột và làm chết `init()`. Index `(user_id, seq)` do
+-- `#applyAdditiveMigrations()` tạo SAU khi cột đã tồn tại (xem src/store/index.js).
+CREATE INDEX IF NOT EXISTS idx_wallet_ledger_job ON wallet_ledger (job_id);
+
+-- Bảng giá theo operation. `config.cost.*` (MVP-01) vẫn là nguồn giá MẶC ĐỊNH; bảng này
+-- để quản trị viên chỉnh giá mà không phải deploy lại (A2 seed từ config khi cần).
+CREATE TABLE IF NOT EXISTS pricing (
+  operation  TEXT PRIMARY KEY,
+  unit_price REAL NOT NULL,
+  currency   TEXT NOT NULL DEFAULT 'USD',
+  note       TEXT,
+  updated_at TEXT NOT NULL
+);
