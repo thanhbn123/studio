@@ -408,3 +408,42 @@ Phán quyết vòng 2: **FAIL** (`docs/MVP-05-REVIEW.md` mục “VÒNG 2”). B
   lỗi đã hoàn tiền **không** tính ⇒ job chưa từng thành công không bị 429 oan.
 - **BR-06**: `ingest` lỗi ở route ImageLab ⇒ job `failed` + `error_code` + `finished_at`
   (hết treo `running`), tiền vẫn hoàn đủ.
+
+---
+
+# VÒNG 4 — SỬA THEO PHẢN BIỆN VÒNG 3 (BR-08, BR-09)
+
+Phán quyết vòng 3: **PASS CÓ ĐIỀU KIỆN** (2 lỗ mới trước khi merge).
+
+## 7.1 BR-08 — thu hồi LƯỢT TREO (reconciliation)
+
+- **Định nghĩa lượt TREO**: có dòng `job_hold` mang `run_key` mà **không** có dòng ĐÓNG
+  (`close_kind IS NOT NULL`) cùng `(user_id, job_id, run_key)` — xảy ra khi tiến trình chết trước
+  `afterJob`, hoặc `settle` lỗi (`LEDGER_BUSY`) và không ai thử lại.
+- `store.listOpenJobHolds({ olderThanIso, limit, userId })` liệt kê các lượt đó (cũ nhất trước).
+- `BillingService.reconcileStuckRuns({ userId?, olderThanMs?, limit? })`:
+  · chỉ lấy lượt CŨ HƠN `olderThanMs` (mặc định `config.billing.stuckRunMs` = `BILLING_STUCK_RUN_MS`,
+    15 phút) ⇒ **không** cắt ngang job đang chạy thật;
+  · HOÀN 100% phần đang giữ (`job_refund`, `meta.reconciled = true`, `meta.stuck_ms`) ⇒ **đóng lượt**;
+  · trả `{ reconciled, refunded, older_than_ms, runs[] }`; lỗi một lượt không chặn các lượt khác.
+- **Gọi ở 3 nơi**: (i) **lúc boot** (`src/app.js`, best-effort, log WARN khi có thu hồi);
+  (ii) **trước khi trả 409 `JOB_ALREADY_RUNNING`** (`holdCreditBeforeJob` trong `routes.js`: nếu lượt
+  đang mở đã quá hạn ⇒ thu hồi rồi thử lại, chỉ 409 khi lượt vẫn CÒN MỚI);
+  (iii) route bảo trì `POST /api/admin/billing/reconcile` (owner/admin; body tuỳ chọn
+  `{ older_than_ms }`) ⇒ `{ reconciled, refunded, older_than_ms }`.
+- `GET /api/config.billing` công bố `stuck_run_ms`.
+
+## 7.2 BR-09 — KHÔNG thu lại usage của lượt đã hoàn
+
+- `settleForJob` quy chi phí **theo TỪNG DÒNG `usage_events`**, không bao giờ lấy tổng của job:
+  · dòng có `run_key` == lượt này ⇒ tính; dòng của lượt KHÁC (kể cả lượt đã `job_refund`) ⇒ bỏ;
+  · dòng KHÔNG gắn `run_key` (DB cũ / caller không truyền) ⇒ quy theo **bộ đếm xác định**:
+    mỗi dòng settle/refund ghi `meta.legacy_usage_counted` = số dòng không-gắn-lượt đã tính tích luỹ;
+    lượt này chỉ nhận các dòng CÒN LẠI sau mốc đó. Không dùng mốc thời gian (nhiều dòng cùng
+    mili-giây ⇒ vừa có thể thu thừa, vừa có thể bỏ sót).
+  · `refundForJob` cũng ghi `meta.legacy_usage_counted` ⇒ usage của lượt ĐÃ HOÀN không bao giờ bị
+    thu lại ở lượt sau.
+- Không quy được dòng usage nào về lượt ⇒ **thu 0** + `meta.usage_unavailable = true` + log WARN
+  `billing.settle_usage_unavailable` (thà thu thiếu còn hơn thu thừa).
+- Hệ quả chấp nhận: usage đến MUỘN của một lượt đã khép **không** được truy thu (đo: `u6` —
+  tổng thu 0,4 trên tổng usage thật 0,6).

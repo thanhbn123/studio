@@ -244,6 +244,10 @@ export function loadConfig(env = process.env) {
       maxRunsPerJob: Math.max(1, toInt(env.BILLING_MAX_RUNS_PER_JOB, 10)),
       // PB-06: trần credit cho MỘT thao tác cấp/điều chỉnh (chặn `grant(1e308)` ⇒ sổ ghi 0).
       maxAmount: Math.max(1, toNum(env.BILLING_MAX_AMOUNT, 1e9)),
+      // BR-08 (vòng 4): ngưỡng coi một lượt chạy là TREO (có `job_hold` mà không có dòng đóng).
+      // Quá ngưỡng ⇒ `reconcileStuckRuns` HOÀN 100% khoản giữ và đóng lượt (job chạy lại được).
+      // Mặc định 15 phút — đủ dài để không cắt ngang job đang chạy thật.
+      stuckRunMs: Math.max(0, toNum(env.BILLING_STUCK_RUN_MS, 15 * 60 * 1000)),
       // Seed bảng `pricing` từ `config.cost.*` của MVP-01 (nguồn giá mặc định).
       pricingFromCost: toBool(env.BILLING_PRICING_FROM_COST, true),
     },

@@ -1229,6 +1229,34 @@ export class Store {
     return rows.map((row) => this.#hydrateLedgerRow(row));
   }
 
+  /**
+   * BR-08 (vòng 4) — LIỆT KÊ CÁC LƯỢT CHẠY ĐANG MỞ: dòng `job_hold` có `run_key` mà **không** có
+   * dòng ĐÓNG (`close_kind IS NOT NULL`) nào cùng `(user_id, job_id, run_key)`.
+   *
+   * `olderThanIso` (tuỳ chọn) chỉ lấy các khoản giữ CŨ HƠN mốc đó — nhờ vậy reconciliation không
+   * cắt ngang một job đang chạy thật. Sắp xếp cũ nhất trước để xử lý dần.
+   */
+  async listOpenJobHolds({ olderThanIso = null, limit = 200, userId = null } = {}) {
+    const where = [
+      "h.reason = 'job_hold'",
+      'h.run_key IS NOT NULL',
+      'h.job_id IS NOT NULL',
+      `NOT EXISTS (SELECT 1 FROM wallet_ledger c
+                     WHERE c.user_id = h.user_id AND c.job_id = h.job_id
+                       AND c.run_key = h.run_key AND c.close_kind IS NOT NULL)`,
+    ];
+    const params = [];
+    if (olderThanIso) { where.push('h.created_at < ?'); params.push(String(olderThanIso)); }
+    if (userId) { where.push('h.user_id = ?'); params.push(String(userId)); }
+    params.push(Math.min(Math.max(Number(limit) || 200, 1), 1000));
+    const rows = await this.driver.all(
+      `SELECT h.* FROM wallet_ledger h WHERE ${where.join(' AND ')}
+       ORDER BY h.created_at ASC, h.seq ASC LIMIT ?`,
+      params,
+    );
+    return rows.map((row) => this.#hydrateLedgerRow(row));
+  }
+
   /** Số dư = TỔNG SỔ (không có cột balance sửa tay). Chưa có dòng nào ⇒ 0. */
   async ledgerBalance(userId) {
     const uid = String(userId ?? '');

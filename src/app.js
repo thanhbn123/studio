@@ -577,6 +577,27 @@ export async function createApp(opts = {}) {
    * (`billing.service = null`) để A4 gọi ổn định. Cùng object này cũng được bơm vào cả 3
    * pipeline để bước kết thúc (`afterJob`) chỉ có MỘT bản luật duy nhất.
    */
+  // BR-08 (vòng 4) — THU HỒI LƯỢT TREO lúc khởi động (best-effort): lượt có `job_hold` mà không
+  // có dòng đóng (tiến trình chết trước `afterJob`, settle lỗi…) sẽ được HOÀN tiền và đóng lại,
+  // nếu không job đó khoá vĩnh viễn bằng 409 và tiền nằm đọng.
+  if (billing.service && typeof billing.service.reconcileStuckRuns === 'function') {
+    try {
+      const reconciled = await billing.service.reconcileStuckRuns({});
+      if (reconciled?.reconciled > 0) {
+        rootLogger.warn('billing.stuck_runs_reconciled_at_boot', {
+          reconciled: reconciled.reconciled,
+          refunded: reconciled.refunded,
+          older_than_ms: reconciled.older_than_ms,
+        });
+      }
+    } catch (err) {
+      rootLogger.warn('billing.reconcile_at_boot_failed', {
+        error_name: err?.name || 'Error',
+        error_code: err?.code || null,
+      });
+    }
+  }
+
   const billingHook = createBillingHook({ service: billing.service, store, logger: rootLogger, config, BillingError: BillingErrorClass });
 
   /* ── MVP-02 (ImageLab) — nạp phòng thủ, không được làm chết boot MVP-01 ─── */

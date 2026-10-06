@@ -884,20 +884,51 @@ export function buildRouter(app) {
     }
   };
 
+  /**
+   * BR-08 — thu hồi các lượt TREO (chỉ những lượt cũ hơn `config.billing.stuckRunMs`).
+   * Trả về SỐ lượt đã thu hồi; nuốt lỗi (đây là đường phục hồi, không được làm hỏng request).
+   */
+  const reconcileStuckRunsFor = async (req, { userId = null } = {}) => {
+    const service = app?.billingService;
+    if (!service || typeof service.reconcileStuckRuns !== 'function' || !billingEnabled()) return 0;
+    try {
+      const res = await service.reconcileStuckRuns({ userId: userId || req?.user?.id || null });
+      const n = Number(res?.reconciled) || 0;
+      if (n > 0) logger?.warn?.('billing.stuck_runs_reconciled', { reconciled: n, refunded: res?.refunded ?? 0 });
+      return n;
+    } catch (err) {
+      logger?.warn?.('billing.reconcile_failed', { error_name: err?.name || 'Error', error_code: err?.code || null });
+      return 0;
+    }
+  };
+
   const holdCreditBeforeJob = async (req, jobId, kind) => {
     const userId = req?.user?.id ?? null;
     if (!userId || !billingEnabled()) return null; // ẩn danh: không ví, không trừ credit (§2.2)
     const hook = billingHook();
     if (hook) {
       try {
-        const result = (await hook.beforeJob({ userId, jobId, kind, sessionId: presentedSessionId(req) })) ?? null;
-        // BR-02 (vòng 3): lượt chạy của job này ĐANG MỞ ⇒ request thứ hai KHÔNG được dùng chung
-        // khoản giữ rồi chạy thật (K lượt chạy / 1 lượt bị thu). Chặn rõ ràng bằng 409.
+        let result = (await hook.beforeJob({ userId, jobId, kind, sessionId: presentedSessionId(req) })) ?? null;
+        // BR-08 (vòng 4): nếu lượt "đang mở" thực ra đã TREO (quá `billing.stuckRunMs`) thì THU HỒI
+        // (hoàn 100% khoản giữ + đóng lượt) rồi cho chạy tiếp — thay vì 409 vĩnh viễn.
+        if (result?.skipped === true) {
+          const reconciled = await reconcileStuckRunsFor(req, { userId });
+          if (reconciled > 0) {
+            result = (await hook.beforeJob({ userId, jobId, kind, sessionId: presentedSessionId(req) })) ?? null;
+          }
+        }
+        // BR-02 (vòng 3): lượt chạy của job này ĐANG MỞ (và còn MỚI) ⇒ request thứ hai KHÔNG được
+        // dùng chung khoản giữ rồi chạy thật (K lượt chạy / 1 lượt bị thu). Chặn rõ ràng bằng 409.
         if (result?.skipped === true && result?.hold_disabled !== true) {
           throw HttpError.safe(409, 'JOB_ALREADY_RUNNING', 'Job này đang chạy một lượt khác — chờ lượt đó xong rồi hãy chạy lại.', {
             job_id: jobId,
             run_key: result?.run_key ?? null,
           });
+        }
+        if (result?.skipped === true && result?.hold_disabled === true) {
+          // Chế độ không giữ tiền trước: lượt treo cũng phải được thu hồi rồi mở lượt mới.
+          const reconciled = await reconcileStuckRunsFor(req, { userId });
+          if (reconciled > 0) result = (await hook.beforeJob({ userId, jobId, kind, sessionId: presentedSessionId(req) })) ?? null;
         }
         return result;
       } catch (err) {
@@ -1160,6 +1191,33 @@ export function buildRouter(app) {
     sendJson(res, 201, { ledger: ledgerJson(ledger), balance: balanceJson(balance) });
   });
 
+  /**
+   * BR-08 (vòng 4) — BẢO TRÌ: thu hồi các lượt chạy TREO (có `job_hold` mà không có dòng đóng).
+   * Chỉ owner/admin. Trả `{ reconciled, refunded, older_than_ms }`.
+   */
+  router.post('/api/admin/billing/reconcile', async (req, res) => {
+    requireAdmin(req);
+    const service = app?.billingService;
+    if (!service || typeof service.reconcileStuckRuns !== 'function') {
+      throw HttpError.safe(503, 'BILLING_UNAVAILABLE', 'Ví credit chưa sẵn sàng — chưa thu hồi được lượt treo.');
+    }
+    const body = await readJson(req, { maxBytes: 8 * 1024 }).catch(() => ({}));
+    const rawMs = Number(body?.older_than_ms);
+    const olderThanMs = Number.isFinite(rawMs) && rawMs >= 0 ? rawMs : null;
+    let out;
+    try {
+      out = await service.reconcileStuckRuns({ olderThanMs });
+    } catch (err) {
+      throw mapBillingError(err) || err;
+    }
+    logger?.warn?.('billing.reconcile_requested', { reconciled: out?.reconciled ?? 0 });
+    sendJson(res, 200, {
+      reconciled: Number(out?.reconciled) || 0,
+      refunded: Number(out?.refunded) || 0,
+      older_than_ms: out?.older_than_ms ?? null,
+    });
+  });
+
   router.post('/api/admin/users/:id/role', async (req, res, params) => {
     requireAdmin(req);
     const svc = requireAuthFeature();
@@ -1303,6 +1361,8 @@ export function buildRouter(app) {
         // PB-02: trần số lượt chạy có tính tiền cho mỗi job (vượt ⇒ 429 RERUN_LIMIT_EXCEEDED).
         max_runs_per_job: Number.isFinite(Number(billingConfig().maxRunsPerJob)) ? Number(billingConfig().maxRunsPerJob) : 10,
         max_amount: Number.isFinite(Number(billingConfig().maxAmount)) ? Number(billingConfig().maxAmount) : null,
+        // BR-08: ngưỡng coi một lượt chạy là TREO (ms) — quá ngưỡng thì được thu hồi tự động.
+        stuck_run_ms: Number.isFinite(Number(billingConfig().stuckRunMs)) ? Number(billingConfig().stuckRunMs) : null,
       },
       // §3.4 — trạng thái thật của dịch vụ tài khoản/ví để người vận hành biết VÌ SAO tắt.
       accounts: { available: accountsAvailable(), reason: accountsAvailable() ? null : AUTH_UNAVAILABLE_MESSAGE },

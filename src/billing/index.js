@@ -233,32 +233,6 @@ function nextRunKeyOf(rows, jobId) {
   return `${jobId}#${max + 1}`;
 }
 
-/**
- * BR-07 — tổng credit ĐÃ THU của các lượt chạy TRƯỚC (không tính lượt đang xét): với mỗi lượt
- * đã `job_settle`, phần đã thu = `|job_hold|` trừ phần được hoàn trong dòng settle (settle dương
- * = hoàn phần giữ thừa; settle âm = thu thêm). Lượt bị `job_refund` coi như thu 0.
- */
-function alreadyChargedOf(rows, exceptRunKey) {
-  const byRun = new Map();
-  for (const row of rows) {
-    const key = runKeyOf(row);
-    if (!key || key === exceptRunKey) continue;
-    const entry = byRun.get(key) || { hold: 0, settle: null, refunded: false };
-    if (row.reason === 'job_hold') entry.hold += Math.abs(toFiniteNumber(row.amount) ?? 0);
-    else if (row.reason === 'job_settle') entry.settle = toFiniteNumber(row.amount);
-    else if (row.reason === 'job_refund') entry.refunded = true;
-    byRun.set(key, entry);
-  }
-  let total = 0;
-  for (const entry of byRun.values()) {
-    if (entry.settle === null) continue; // lượt đang mở hoặc đã hoàn ⇒ chưa thu đồng nào
-    // Dòng settle = `held − actual` (dương: hoàn phần giữ thừa; âm: thu thêm) ⇒ đã thu =
-    // `hold − settle`, không bao giờ âm.
-    total += Math.max(0, entry.hold - entry.settle);
-  }
-  return roundMoney(total);
-}
-
 /** Phần credit ĐANG GIỮ của MỘT lượt chạy (chỉ tính dòng mang đúng `run_key` đó). */
 function heldOfRun(rows, runKey) {
   const amounts = [];
@@ -292,6 +266,9 @@ export class BillingService {
     // PB-06: trần credit cho một thao tác cấp/điều chỉnh (mặc định 1e9 — xem `money.js`).
     const cap = toFiniteNumber(config?.billing?.maxAmount);
     this.maxAmount = cap !== null && cap > 0 ? cap : DEFAULT_MAX_AMOUNT;
+    // BR-08 (vòng 4): ngưỡng TREO của một lượt chạy (mặc định 15 phút) — xem `reconcileStuckRuns`.
+    const stuck = toFiniteNumber(config?.billing?.stuckRunMs);
+    this.stuckRunMs = stuck !== null && stuck >= 0 ? stuck : 15 * 60 * 1000;
     this.logger = logger;
     this.config = config;
   }
@@ -809,10 +786,21 @@ export class BillingService {
       }
 
       let actual = toFiniteNumber(actualCost);
+      let usageUnavailable = false;
+      let legacyCounted = null; // BR-09: số dòng usage KHÔNG gắn lượt đã tính (tích luỹ)
       if (actual === null && (actualCost === undefined || actualCost === null)) {
         // BR-07 (vòng 3): chi phí THẬT của **RIÊNG LƯỢT NÀY** — trước đây lấy tổng usage của
         // cả job nên lượt thứ n thu luôn chi phí của mọi lượt trước (đo được: +100…+150%).
-        actual = await this.#usageCostOfRun(jid, targetRun, rows);
+        // BR-09 (vòng 4): không quy được usage về lượt ⇒ KHÔNG thu (thà thu thiếu) + ghi vết.
+        const usage = await this.#usageCostOfRun(jid, targetRun, rows);
+        if (!usage) {
+          usageUnavailable = true;
+          actual = 0;
+          this.logger?.warn?.('billing.settle_usage_unavailable', { user_id: uid, job_id: jid, run_key: targetRun });
+        } else {
+          actual = usage.cost;
+          legacyCounted = usage.legacy_counted;
+        }
       }
       if (actual === null || actual < 0) {
         throw new BillingError(
@@ -846,7 +834,10 @@ export class BillingService {
       }
 
       const meta = { held, actual_cost: actual, delta, run_key: targetRun };
+      // BR-09: đánh dấu đã tính bao nhiêu dòng usage KHÔNG gắn lượt (để lượt sau không thu lại).
+      if (legacyCounted !== null) meta.legacy_usage_counted = Math.trunc(legacyCounted);
       if (shortfall > 0) meta.shortfall = shortfall;
+      if (usageUnavailable) meta.usage_unavailable = true; // BR-09: thu 0 vì không quy được usage
       return this.#append({ userId: uid, amount, reason: 'job_settle', jobId: jid, runKey: targetRun, meta, balanceBefore });
     });
   }
@@ -862,7 +853,7 @@ export class BillingService {
    * `reason` ở đây là LÝ DO NGHIỆP VỤ (lưu ở `meta.reason`, mặc định 'job_failed');
    * cột `reason` của sổ LUÔN là 'job_refund' vì đó là giá trị đã đóng băng ở §2.1.
    */
-  async refundForJob({ userId, jobId, reason = '', runKey = null } = {}) {
+  async refundForJob({ userId, jobId, reason = '', runKey = null, meta: extraMeta = null } = {}) {
     const uid = this.#requireUserId(userId);
     const jid = requireJobId(jobId);
     const note = typeof reason === 'string' && reason.trim() ? reason.trim() : 'job_failed';
@@ -888,13 +879,28 @@ export class BillingService {
         return findLast(runRows, (row) => row.reason === 'job_refund') ?? null; // không có gì để hoàn ⇒ không ghi
       }
       const balanceBefore = await this.#balanceLocked(uid);
+      // BR-09: lượt bị HOÀN ⇒ mọi dòng usage KHÔNG gắn lượt đang tồn tại bị coi là của (các) lượt
+      // đã khép, KHÔNG được thu lại ở lượt sau. Đếm bằng số dòng thật tại thời điểm hoàn.
+      let refundLegacy = null;
+      if (typeof this.store?.listUsage === 'function') {
+        try {
+          const list = await this.store.listUsage(jid);
+          if (Array.isArray(list)) refundLegacy = list.filter((e) => !String(e?.run_key || '')).length;
+        } catch { /* không đọc được ⇒ bỏ qua, chỉ là tối ưu chống thu thừa */ }
+      }
       return this.#append({
         userId: uid,
         amount: remaining,
         reason: 'job_refund',
         jobId: jid,
         runKey: targetRun,
-        meta: { reason: note, refunded: remaining, run_key: targetRun },
+        meta: {
+          reason: note,
+          refunded: remaining,
+          run_key: targetRun,
+          ...(refundLegacy !== null ? { legacy_usage_counted: refundLegacy } : {}),
+          ...(extraMeta && typeof extraMeta === 'object' ? extraMeta : {}),
+        },
         balanceBefore,
       });
     });
@@ -931,6 +937,67 @@ export class BillingService {
       byRun.set(key, entry);
     }
     return [...byRun.entries()].filter(([, e]) => e.settle || (!e.refund && e.hold)).map(([key]) => key);
+  }
+
+  /**
+   * BR-08 (vòng 4) — THU HỒI CÁC LƯỢT CHẠY TREO.
+   *
+   * Vì sao cần: một lượt có `job_hold` mà KHÔNG có dòng đóng (settle lỗi `LEDGER_BUSY`, tiến trình
+   * chết trước `afterJob`, mất điện…) để lại khoản giữ ĐỌNG và khoá job vĩnh viễn (mọi lần chạy
+   * lại đều 409 `JOB_ALREADY_RUNNING`) — không có đường phục hồi nào. Hàm này quét các lượt mở
+   * CŨ HƠN `olderThanMs` (mặc định `config.billing.stuckRunMs`, 15 phút) rồi:
+   *   · HOÀN 100% phần đang giữ (`job_refund`, `meta.reconciled = true`, `meta.stuck_ms`),
+   *   · ĐÓNG lượt ⇒ job chạy lại được.
+   *
+   * KHÔNG đụng tới lượt còn mới (tránh cắt ngang job đang chạy thật).
+   *
+   * @returns {Promise<{reconciled:number, refunded:number, older_than_ms:number, runs:object[]}>}
+   */
+  async reconcileStuckRuns({ userId = null, olderThanMs = null, limit = 200 } = {}) {
+    const store = this.store;
+    const out = { reconciled: 0, refunded: 0, older_than_ms: this.stuckRunMs, runs: [] };
+    if (typeof store?.listOpenJobHolds !== 'function') return out; // store không hỗ trợ ⇒ không làm gì
+    const ms = toFiniteNumber(olderThanMs);
+    const older = ms !== null && ms >= 0 ? ms : this.stuckRunMs;
+    out.older_than_ms = older;
+    const cutoffIso = new Date(Date.now() - older).toISOString();
+
+    const holds = await this.#callStore(
+      () => store.listOpenJobHolds({ olderThanIso: cutoffIso, limit, userId: userId || null }),
+      { code: 'LEDGER_READ_FAILED', message: 'Không đọc được danh sách lượt chạy đang mở.' },
+    );
+    if (!Array.isArray(holds) || holds.length === 0) return out;
+
+    for (const hold of holds) {
+      const owner = String(hold?.user_id || '');
+      const jid = String(hold?.job_id || '');
+      const runKey = runKeyOf(hold);
+      if (!owner || !jid || !runKey) continue;
+      try {
+        const stuckMs = Math.max(0, Date.now() - Date.parse(String(hold?.created_at || '')) || 0);
+        const row = await this.refundForJob({
+          userId: owner,
+          jobId: jid,
+          runKey,
+          reason: 'STUCK_RUN_RECONCILE',
+          meta: { reconciled: true, stuck_ms: Number.isFinite(stuckMs) ? stuckMs : null },
+        });
+        const amount = Math.abs(toFiniteNumber(row?.amount) ?? 0);
+        out.reconciled += 1;
+        out.refunded = roundMoney(out.refunded + amount);
+        out.runs.push({ job_id: jid, run_key: runKey, refunded: amount });
+        this.logger?.warn?.('billing.stuck_run_reconciled', { job_id: jid, run_key: runKey, refunded: amount, stuck_ms: stuckMs });
+      } catch (err) {
+        // Một lượt lỗi KHÔNG được chặn các lượt còn lại.
+        this.logger?.warn?.('billing.stuck_run_reconcile_failed', {
+          job_id: jid,
+          run_key: runKey,
+          error_name: err?.name || 'Error',
+          error_code: err?.code || null,
+        });
+      }
+    }
+    return out;
   }
 
   /** BR-07/BR-01 — `run_key` KẾ TIẾP cho một job (dùng khi không giữ tiền trước). */
@@ -988,18 +1055,63 @@ export class BillingService {
    * thu của các lượt trước** — vẫn không bao giờ thu lại tiền của lượt cũ:
    *   chi_phí_lượt = max(0, tổng_usage_của_job − Σ(đã_thu của các lượt trước)).
    */
+  /**
+   * BR-07 + BR-09 — chi phí của MỘT LƯỢT CHẠY, quy theo TỪNG DÒNG `usage_events`.
+   *
+   * Quy tắc (không bao giờ thu thừa):
+   *   1. dòng CÓ `run_key` == lượt này ⇒ tính;
+   *   2. dòng CÓ `run_key` của lượt khác (kể cả lượt đã được HOÀN) ⇒ KHÔNG tính;
+   *   3. dòng KHÔNG gắn lượt (DB cũ / caller không truyền `runKey`) ⇒ quy theo thứ tự xác định:
+   *      mỗi lần settle/refund ghi `meta.legacy_usage_counted` = số dòng không-gắn-lượt đã tính
+   *      tích luỹ; lượt này chỉ nhận các dòng CÒN LẠI sau mốc đó.
+   *   Không quy được dòng nào ⇒ chi phí 0 (thà thu thiếu còn hơn thu thừa — BR-09).
+   *
+   * @returns {Promise<{cost:number, legacy_counted:number, unavailable:boolean}|null>} `null` khi
+   *          không đọc được usage (tầng gọi coi như KHÔNG thu + ghi vết).
+   */
   async #usageCostOfRun(jobId, runKey, rows) {
     const store = this.store;
-    if (typeof store?.usageSummary !== 'function') return null;
+    if (typeof store?.listUsage !== 'function') return null; // không xác định được ⇒ không thu
+    let list = null;
     try {
-      const ofRun = await store.usageSummary(jobId, { runKey });
-      if (Number(ofRun?.events) > 0) return toFiniteNumber(ofRun.estimated_cost);
+      list = await store.listUsage(jobId);
     } catch (err) {
-      this.logger?.warn?.('billing.usage_of_run_failed', { job_id: jobId, run_key: runKey, error_name: err?.name || 'Error' });
+      this.logger?.warn?.('billing.usage_list_failed', { job_id: jobId, run_key: runKey, error_name: err?.name || 'Error' });
+      return null;
     }
-    const total = await this.#usageCostOfJob(jobId);
-    if (total === null) return null;
-    return roundMoney(Math.max(0, total - alreadyChargedOf(rows, runKey)));
+    if (!Array.isArray(list)) return null;
+
+    // (3) mốc "đã tính bao nhiêu dòng không gắn lượt" của các lượt TRƯỚC (settle/refund).
+    // KHÔNG dùng mốc thời gian: nhiều dòng có thể cùng mili-giây ⇒ vừa có thể thu thừa, vừa có
+    // thể bỏ sót. Bộ đếm tích luỹ là xác định (deterministic) trên mọi driver.
+    let legacySkip = 0;
+    for (const row of rows ?? []) {
+      if (!['job_settle', 'job_refund'].includes(row?.reason)) continue;
+      if (runKeyOf(row) === runKey) continue;
+      const counted = toFiniteNumber(row?.meta?.legacy_usage_counted);
+      if (counted !== null && counted > legacySkip) legacySkip = Math.trunc(counted);
+    }
+    const legacyRows = list
+      .filter((event) => !String(event?.run_key || ''))
+      .sort((a, b) => {
+        const at = String(a?.created_at ?? '').localeCompare(String(b?.created_at ?? ''));
+        return at !== 0 ? at : String(a?.id ?? '').localeCompare(String(b?.id ?? ''));
+      });
+    const mineLegacy = legacyRows.slice(legacySkip);
+
+    let cost = 0;
+    let counted = 0;
+    for (const event of list) {
+      const key = String(event?.run_key || '');
+      if (!key || key !== runKey) continue; // (1) và (2)
+      cost += toFiniteNumber(event?.estimated_cost ?? event?.estimatedCost ?? 0) ?? 0;
+      counted += 1;
+    }
+    for (const event of mineLegacy) {
+      cost += toFiniteNumber(event?.estimated_cost ?? event?.estimatedCost ?? 0) ?? 0;
+      counted += 1;
+    }
+    return { cost: counted > 0 ? roundMoney(cost) : 0, legacy_counted: legacySkip + mineLegacy.length, unavailable: false };
   }
 
   async #usageCostOfJob(jobId) {

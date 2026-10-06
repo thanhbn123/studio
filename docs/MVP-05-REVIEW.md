@@ -538,3 +538,112 @@ node /tmp/mvp05-atk2/t13-overcharge-unit.mjs      # BR-07 tất định: 3 lư�
 for f in /tmp/mvp05-atk/atk*.mjs; do node "$f" > "/tmp/mvp05-atk2/$(basename $f .mjs)-r2.txt" 2>&1; done
 npm test && node tools/verify.mjs && node tools/imagelab-demo.mjs
 ```
+
+---
+---
+
+# VÒNG 3 — CHẤM CUỐI TẠI COMMIT `b22697f`
+
+*Phản biện viên độc lập (không sửa mã nguồn, không sửa `test/**`) · commit chấm: `b22697f` · script vòng 3:
+`/tmp/mvp05-atk3/` (`u1…u7`, output `out-u*.txt`) · chạy lại toàn bộ script vòng 1+2 trên mã mới:
+`/tmp/mvp05-atk3/atk*-r3.txt` + `t*-r3.txt`. **Lần này có PostgreSQL 16.15 thật** (`DATABASE_URL` sẵn trong
+môi trường) nên phần "chưa kiểm được PG" của vòng 1–2 đã được đo thật ở `u7`.*
+
+## PHÁN QUYẾT VÒNG 3: **PASS CÓ ĐIỀU KIỆN**
+
+**7/7 lỗi của vòng 1–2 đã được vá thật và tôi tự đo lại được** — kể cả BR-07 (thu thừa) và BR-03 (2 tiến
+trình) trên **PostgreSQL thật**. Hai điều kiện còn lại (không nằm ở đường hạnh phúc, nhưng là tiền):
+
+1. **BR-08 (mới, TRUNG BÌNH)** — một lượt chạy **không khép được** (settle lỗi `LEDGER_BUSY`, DB lỗi, tiến
+   trình chết trước `afterJob`) để lại **lượt MỞ**: mọi yêu cầu chạy lại sau đó bị **409 `JOB_ALREADY_RUNNING`
+   vĩnh viễn**, khoản giữ **không được hoàn**, không có đường tự phục hồi (không route nào refund được).
+   Cần: reconciliation lúc boot/định kỳ, hoặc route `cancel/release`, hoặc cho `beforeJob` tự hoàn lượt mở
+   quá hạn.
+2. **BR-09 (mới, THẤP–TB)** — công thức dự phòng `max(0, tổng_usage − đã_thu)` **thu lại phần usage của lượt
+   ĐÃ ĐƯỢC HOÀN**: lượt #1 lỗi (usage 0.3) → hoàn 100%; lượt #2 **không có usage riêng** ⇒ bị thu 0.3 (đảo
+   ngược chính sách "job lỗi ⇒ hoàn 100%"). Cần: trừ cả usage của các lượt đã `job_refund`.
+
+## 1. Bảng đối chiếu BR-01…BR-07 (+ 2 lỗ hổng mới)
+
+| # | Kết luận | Bằng chứng 1 dòng (lệnh · output thật) |
+|---|---|---|
+| **BR-07** thu thừa theo usage tích luỹ | ✅ **ĐÃ VÁ THẬT** | `u1 §U1.1` (tất định, 3 lượt × 0.1): `settle=0.4/0.4/0.4` ⇒ **thu 0.3 cho 0.3 thật**; `§U1.2` (HTTP 4 lượt): mỗi lượt thu đúng `0.0018`, `run_key` gắn vào **usage_events** `#1…#4`, tổng thu `0.0072` = tổng thật; `u7 §U7.2` trên **PostgreSQL thật** cũng khớp (`0.3`/`0.3`); DB cũ: usage `NULL` được quy cho lượt `#1` (`§U1.3`, `u5 §U5.1`); client **không** chèn được `run_key` (`§U1.6`) |
+| **BR-01** `holdBeforeJob=false` | ✅ **ĐÃ VÁ THẬT** | `u2 §U2.1`: ví 0 → 202, **1 dòng `job_settle`** `amount=0` + `meta.shortfall=0.0018`, `MIN(balance_after)=0`; `§U2.2`: mỗi lượt thu **đúng chi phí lượt** (`1 → 0.9982 → 0.9964 → 0.9946`), lượt 4-5 ⇒ **429** (trần áp thật); `§U2.3`: 3 request song song → 4 lượt, mỗi lượt `run_key` riêng, thu `0.0072` = thật; `t7-r3 §T7.1` xác nhận lại |
+| **BR-02** request chồng nhau | ✅ **ĐÃ VÁ THẬT** | `u3 §U3.2`: render 3 request song song → **202 / 409 `JOB_ALREADY_RUNNING` / 409**; `t9-r3`: `A=202 B=409`, usage dừng ở 2 lượt; `u3 §U3.1`: 5 request song song → tất cả đều được mở **lượt riêng** và **đều bị thu** (`6 hold / 6 lượt`, chênh đúng bằng chi phí thật) ⇒ không còn "K lượt chạy / 1 lượt thu" |
+| **BR-03** lỗi sổ bị nuốt (fail-open) | ✅ **ĐÃ VÁ THẬT** (SQLite **và PostgreSQL**) | `u4 §U4.5`: `store.appendLedger` ném `database is locked` ⇒ hook `BILLING_UNAVAILABLE` `{cause_code: LEDGER_BUSY, retryable: true}` ⇒ route **503**, **không** tạo job, **không** ghi sổ; `t4-r3`: 2 tiến trình SQLite ⇒ 1 bên `LEDGER_BUSY` (không còn `ERR_SQLITE_ERROR` thô), sổ vẫn 1 dòng đóng/0 âm; **`u7 §U7.4` PostgreSQL 2 tiến trình**: `settle` ‖ `refund` ⇒ bên thua `23505 duplicate key … uniq_wallet_ledger_run_close`, sổ **chỉ 1 dòng đóng**, số dư `0.9` (không tạo tiền); `§U7.5` 2 settle ⇒ 1 dòng; index partial có thật trên PG (`§U7.1`) |
+| **BR-04** spraying qua nhiều email | ✅ **ĐÃ VÁ THẬT** | `u4 §U4.1`: 70 email × 1 lần sai ⇒ `{"401":60,"429":10}`, 429 đầu tiên ở lần **61**, `Retry-After: 298`; **đăng nhập ĐÚNG sau đó → 200** và xoá luôn bucket IP (lần sai kế tiếp của người lạ → 401) |
+| **BR-05** lượt lỗi ăn vào trần | ✅ **ĐÃ VÁ THẬT** | `u4 §U4.2`: job lỗi 2 lượt (2 hold + 2 refund, hoàn đủ) ⇒ chạy lại **202**; `§U4.3`: 2 lượt **có thu** ⇒ lượt 3 **429** `{runs:2,max_runs:2}` (không nới lỏng quá); `t10-r3` xác nhận |
+| **BR-06** ingest lỗi ⇒ job treo `running` | ✅ **ĐÃ VÁ THẬT** | `u4 §U4.4`: `storage.save` ném ⇒ cả 2 job `{"status":"failed","error_code":"ENOSPC","finished_at":"…"}`; **0 job** còn `running/queued`; tiền hoàn đủ (`hold=2 refund=2`) |
+| **BR-08** lượt mở không khép ⇒ kẹt 409 + tiền đọng | ❌ **CHƯA VÁ (mới)** | `u3b-stuck.mjs`: bơm lỗi `afterJob` cho lượt #2 ⇒ `hold@#2 = −0.0083` **không có dòng đóng**; 3 lần chạy lại ⇒ **409 `JOB_ALREADY_RUNNING` (run_key #2) cả 3 lần**, `usage_events` **không tăng**, số dư vẫn bị trừ `0.0083`; job khác vẫn tạo được (chỉ job này chết) |
+| **BR-09** thu lại usage của lượt ĐÃ HOÀN | ❌ **CHƯA VÁ (mới)** | `u1 §U1.4` (tất định): lượt #1 lỗi có usage `0.3` → `job_refund +0.5` (hoàn 100%); lượt #2 **không có usage riêng** → `job_settle +0.2` ⇒ **thu 0.3**, đảo ngược chính sách hoàn tiền. Cùng cơ chế: usage đến **muộn** của lượt đã khép bị thu ở lượt sau (`u6-late-usage.mjs`) |
+
+## 2. Đã cố phá ở vòng 3 mà KHÔNG phá được
+
+- **BR-07**: job có usage `NULL` từ DB cũ rồi chạy lượt mới (`u1 §U1.3`, `u5 §U5.1` trên DB migrate thật),
+  job trộn đường, `run_key` do client (`§U1.6`), usage ghi sau settle (`u6`), ví mỏng + nhiều settle liên tiếp
+  (`§U1.5`: `MIN(balance_after)=0`, shortfall ghi vào `meta`) — **không** thu thừa, **không** âm ví.
+- **BR-01**: ví 0, trần lượt, 3 request song song, lượt bị lỗi settle (`u2 §U2.1–U2.4`) — tổng thu luôn = tổng
+  chi phí thật; trần chặn đúng; không âm ví.
+- **BR-02**: 5 request chồng nhau (`u3 §U3.1`), render chồng nhau (`§U3.2`), `force=true`, retry hàng đợi —
+  mỗi lượt chạy thật đều có hold riêng và bị thu.
+- **BR-03**: LEDGER_BUSY ở tầng store ⇒ 503 fail-closed, không tạo job, không ghi sổ (`u4 §U4.5`); 2 tiến
+  trình trên **cả SQLite và PostgreSQL** không tạo được dòng đóng thứ hai (`t4-r3`, `u7 §U7.4/§U7.5`).
+- **Hồi quy**: `npm test` = **836 · 835 pass · 0 fail · 1 skipped** (exit 0) · `node tools/verify.mjs` =
+  **836 · 835 pass · 0 fail · 1 skipped** (exit 0) · `node tools/imagelab-demo.mjs` exit 0 (`job succeeded`);
+  **ẩn danh 3 loại job** 0 cookie ⇒ 202/`succeeded`/`awaiting_review` + **0 dòng sổ** (`u5 §U5.2`); **IDOR**
+  21 đường bị chặn 404/403 (2 "LỌT" là dữ liệu của chính B) (`atk2-r3`); **bất biến sổ** trên SQLite
+  (`u5 §U5.3`: 0 nhảy cóc, 0 âm, số dư = tổng sổ; `atk1-r3` 100 thao tác đồng thời = `103.75` đúng kỳ vọng)
+  và trên **PostgreSQL** (`u7 §U7.6`: 32 dòng/8 user, 0 nhảy cóc, 0 âm, 0 lệch); **`init()` 2 lần** trên DB cũ
+  (schema trước MVP-05 + bảng ví kiểu vòng 2 + `usage_events` chưa có `run_key`) ⇒ thêm cột + 4 index mới,
+  dòng cũ nguyên vẹn (`u5 §U5.1`).
+
+## 3. Chưa kiểm được (vòng 3)
+
+1. **Đa tiến trình ở tầng HTTP** — tôi đo 2 tiến trình ở tầng dịch vụ (SQLite + PG thật) và ánh xạ 503 ở
+   tầng route bằng bơm lỗi; **chưa** dựng 2 server cùng trỏ một DB và bắn request thật song song.
+2. **Proxy/`trustProxy`** — bucket login theo IP vẫn phụ thuộc cấu hình proxy (đã ghi ở `docs/SECURITY.md`);
+   chưa đo sau nginx/Cloudflare thật.
+3. **Provider thật** (AI/OCR/render) — mọi thí nghiệm dùng mock; chi phí thật và độ trễ thật (ảnh hưởng tới
+   cửa sổ chồng request) chưa đo.
+4. **UI trong trình duyệt thật** — mới đọc mã (`esc()` mọi chỗ render dữ liệu người dùng); luồng 429
+   `RERUN_LIMIT_EXCEEDED`, 409 `JOB_ALREADY_RUNNING` và 503 `BILLING_UNAVAILABLE` trên UI chưa bấm tay.
+5. **Tải/độ bền & sổ dài** — chưa load test; ca sổ dài hơn `LEDGER_MAX_SCAN = 5000` dòng/job vẫn chưa đo;
+   `pendingRuns` trong hook (chế độ không giữ tiền) là Map **trong bộ nhớ, không có TTL/dọn** — chưa đo rò rỉ
+   khi chạy dài.
+6. **Cổng thanh toán/th hoá đơn (MVP-06)** — ngoài phạm vi, chưa có.
+
+## 4. PASS CÓ ĐIỀU KIỆN nghĩa là gì — và KHÔNG nghĩa là gì
+
+**CÓ nghĩa:** với cấu hình mặc định **và** với `BILLING_HOLD_BEFORE_JOB=false`, trên SQLite **và PostgreSQL
+thật**, tôi **không còn dựng được** đường nào để: chạy job mà không trả tiền; thu thừa/thiếu so với usage
+thật của từng lượt; làm số dư âm; tự phong owner; đọc dữ liệu tài khoản khác; phá người ẩn danh; hay để lỗi
+sổ biến thành "chạy miễn phí" (nay fail-closed 503). Bảy lỗi của vòng 1–2 đều được vá **có bằng chứng đo
+lại**, trong đó 3 lỗi được kiểm bằng bơm lỗi, 2 bằng đua nhiều tiến trình, và toàn bộ đường tiền được đo lại
+trên PostgreSQL.
+
+**KHÔNG có nghĩa:**
+- **Không** miễn nhiễm với **lượt chạy không khép được**: settle lỗi ⇒ job kẹt 409 + tiền giữ đọng, không có
+  đường phục hồi (BR-08) — cần reconciliation trước khi vận hành thật.
+- **Không** nói công thức dự phòng usage là hoàn hảo: nó có thể **thu lại usage của lượt đã hoàn** (BR-09).
+- **Không** phải "an toàn khi mở rộng ngang" chỉ vì PG đã đo: khoá tiền theo user vẫn là `#locks` **trong bộ
+  nhớ 1 tiến trình**; PG chỉ chặn được *ghi trùng một lượt*, chưa có khoá/mutux liên tiến trình cho cả chu kỳ.
+- **Không** bao gồm **retry tự động của hàng đợi** như một đường đã kiểm tiền (đã đo: lượt chạy lại có bị
+  thu; nhưng lượt lỗi giữa chừng + retry vẫn là vùng mờ về mặt đối soát).
+- **Không** xác nhận provider thật, proxy thật, UI thật, tải lớn, và **chưa có cổng thanh toán/th hoá đơn**
+  (MVP-06).
+
+## 5. Phụ lục — lệnh tái lập vòng 3
+
+```bash
+cd "/Users/viporder/Library/CloudStorage/SynologyDrive-Macbook/Thành bộ não/production/vip-product-studio"
+node /tmp/mvp05-atk3/u1-br07.mjs            # BR-07: tất định + HTTP + DB cũ + ví mỏng + run_key của client
+node /tmp/mvp05-atk3/u2-br01.mjs            # BR-01: ví 0, trần, 3 request song song, settle lỗi
+node /tmp/mvp05-atk3/u3-br02-03.mjs         # BR-02 (409) + LEDGER_BUSY/503
+node /tmp/mvp05-atk3/u3b-stuck.mjs          # BR-08: lượt mở không khép ⇒ kẹt 409 + tiền đọng
+node /tmp/mvp05-atk3/u4-br04-06.mjs         # BR-04/05/06 + LEDGER_BUSY⇒503
+node /tmp/mvp05-atk3/u5-regression.mjs      # DB cũ (usage chưa có run_key), ẩn danh, bất biến sổ
+node /tmp/mvp05-atk3/u6-late-usage.mjs      # usage đến muộn sau settle
+node /tmp/mvp05-atk3/u7-postgres.mjs        # POSTGRESQL THẬT: migration, thu theo lượt, 2 tiến trình đua
+for f in /tmp/mvp05-atk/t*.mjs /tmp/mvp05-atk2/t*.mjs; do node "$f"; done   # chạy lại toàn bộ vòng 1+2
+npm test && node tools/verify.mjs && node tools/imagelab-demo.mjs
+```

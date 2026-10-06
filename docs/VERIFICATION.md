@@ -1194,3 +1194,81 @@ $ node /tmp/mvp05-atk2/t7-regression.mjs §T7.2/§T7.3
   · BR-02 chặn bằng 409 khi lượt đang mở: nếu client chạy **hai tiến trình** cùng job (không qua
     route) thì vẫn phụ thuộc trạng thái sổ (đã có unique index bảo vệ, chưa đo đa tiến trình).
   · Chưa đo: reverse proxy thật cho `trust proxy`, hàng đợi đa tiến trình, PG partial unique index.
+
+---
+
+## 18. MVP-05 — vòng 4: sửa BR-08 + BR-09 của phản biện vòng 3
+
+Phán quyết vòng 3: **PASS CÓ ĐIỀU KIỆN** (2 lỗ mới). Đã sửa cả hai.
+`npm test` → **842 test · 841 pass · 0 fail · 1 skipped**; `verify.mjs` EXIT=0; `imagelab-demo.mjs`
+→ `succeeded`.
+
+### 18.1 BR-08 — lượt TREO (hold không có dòng đóng) ⇒ thu hồi, hết 409 vĩnh viễn
+
+`store.listOpenJobHolds()` + `BillingService.reconcileStuckRuns()` (hoàn 100% + `meta.reconciled`,
+`meta.stuck_ms`), gọi lúc boot, trước 409, và qua `POST /api/admin/billing/reconcile`.
+
+```
+$ node /tmp/mvp05-atk3/u3b-stuck.mjs        (ngưỡng MẶC ĐỊNH 15 phút = ĐỐI CHỨNG ÂM)
+  SAU khi settle lượt 2 bị lỗi: balance=1.9899 sổ=["job_hold@#1","job_settle@#1","job_hold@#2"]
+  chạy lại lần 3/4/5 → HTTP 409 JOB_ALREADY_RUNNING run_key=#2
+  ⇒ lượt CÒN MỚI: KHÔNG bị thu hồi, vẫn 409 (không cắt ngang job đang chạy thật) ✔
+
+$ node /tmp/gop13/u3b-low.mjs               (cùng kịch bản, hạ ngưỡng qua configOverrides)
+  SAU khi settle lượt 2 bị lỗi: balance=1.9899 sổ=[... "job_hold@#2"]
+  chạy lại lần 3 → HTTP 202
+    sau lần 3: balance=1.9964 sổ=[hold#1, settle#1, hold#2, job_refund@#2=0.0083, hold#3, settle#3]
+  chạy lại lần 4 → HTTP 202 · sau lần 4: balance=1.9946 (hold#4, settle#4)
+  POST /api/admin/billing/reconcile → HTTP 200 {"reconciled":0,"refunded":0,"older_than_ms":50}
+  ⇒ 4 hold, 4 dòng đóng ⇒ MỌI lượt đều đã khép (không còn kẹt) ✔
+
+$ node --test test/mvp05-round4-hardening.test.js
+  ✔ lượt quá hạn ⇒ hoàn 100% + có dòng đóng; lượt CÒN MỚI ⇒ không đụng
+  ✔ HTTP: lượt treo quá hạn ⇒ request sau KHÔNG còn 409, tiền được hoàn, lượt mới bị thu
+  ✔ route bảo trì: member ⇒ 403, owner ⇒ 200 kèm {reconciled, refunded}
+```
+
+Ghi chú trung thực: harness của phản biện (`/tmp/mvp05-atk3/lib3.mjs`) dựng config từ một object env
+cố định nên **không** đọc biến môi trường `BILLING_STUCK_RUN_MS`; muốn chạy ca "thu hồi" với script
+của họ phải truyền `configOverrides` — đó chính là `/tmp/gop13/u3b-low.mjs` (bản sao 1:1 kịch bản,
+chỉ khác ngưỡng).
+
+### 18.2 BR-09 — không thu lại usage của lượt ĐÃ HOÀN
+
+```
+$ node /tmp/mvp05-atk3/u1-br07.mjs
+  U1.1: TỔNG THẬT=0.3 · TỔNG ĐÃ THU=0.3 ⇒ KHÔNG thu thừa ✔
+  U1.2 (HTTP 4 lượt): TỔNG THẬT=0.0072 · TỔNG ĐÃ THU=0.0072 ⇒ KHÔNG thu thừa ✔
+  U1.3: #1 (usage NULL) thu 0.5 · #2 (usage gắn #2) thu 0.2 · #3 (không usage riêng) thu 0
+  U1.4: lượt #1 LỖI → refund 0.5 (hoàn 100%) · lượt #2 (KHÔNG usage riêng): thu 0 ⇒ KHÔNG thu lại ✔
+        (vòng 3: thu 0.3 — tức thu lại đúng phần vừa hoàn)
+
+$ node /tmp/mvp05-atk3/u6-late-usage.mjs
+  lượt 1: thu 0.1 · ghi thêm usage 0.2 cho LƯỢT 1 SAU khi đã settle
+  lượt 2 (usage riêng 0.3): thu 0.3 (KHÔNG thu phần đến muộn của lượt 1)
+  lượt 3 (không usage riêng): thu 0 ⇒ không thu      (vòng 3: thu 0.2 của lượt 1)
+  tổng chi phí THẬT đã ghi = 0.6 · tổng ĐÃ THU = 0.4  ← thu THIẾU 0.2 (có chủ ý: thà thiếu hơn thừa)
+```
+
+### 18.3 Không hồi quy (script phản biện vòng 2)
+
+```
+$ node /tmp/mvp05-atk2/t13-overcharge-unit.mjs   → TỔNG ĐÃ THU = 0.5 ⇒ không thu thừa
+$ node /tmp/mvp05-atk2/t12-overcharge.mjs        → TỔNG ĐÃ THU = 0.0072 ⇒ không thu thừa
+$ node /tmp/mvp05-atk2/t9-overlap.mjs            → A=202 B=409 · mỗi lượt chạy đều bị giữ tiền
+$ node /tmp/mvp05-atk2/t7-regression.mjs §T7.1   → lượt 4 HTTP 429 · "⇒ có thu tiền"
+```
+
+### 18.4 Test thêm & phần chưa sửa được
+
+- **Thêm** `test/mvp05-round4-hardening.test.js` (**6 test**: BR-08 ba chiều — thu hồi lượt cũ, không
+  đụng lượt mới (409), route bảo trì 403/200; BR-09 ba ca — lượt đã hoàn, usage đến muộn, DB cũ).
+- **Chưa sửa được / còn đo được:**
+  · Thu hồi lượt treo dựa trên **ngưỡng thời gian**: một job bị treo vẫn phải chờ tới
+    `BILLING_STUCK_RUN_MS` (mặc định 15 phút) mới chạy lại được (trước đó vẫn 409).
+  · Thứ tự `created_at` giữa các dòng trong cùng mili-giây là ngẫu nhiên; BR-09 vì vậy dùng bộ đếm
+    xác định thay cho so sánh thời gian, nhưng usage ghi bởi **tiến trình khác** (không qua
+    `recordUsage` của repo) vẫn có thể bị quy nhầm lượt — chưa đo.
+  · Usage đến muộn của lượt đã khép bị **bỏ** (thu thiếu) — cố ý, đã ghi trong hợp đồng §7.2.
+  · Chưa đo: PostgreSQL thật cho `listOpenJobHolds` (NOT EXISTS + partial index) và cho
+    `reconcileStuckRuns`; chưa có job định kỳ (cron) gọi reconcile — hiện chỉ boot/409/route tay.
