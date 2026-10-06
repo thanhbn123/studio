@@ -4,9 +4,9 @@
 > Số liệu lấy từ lệnh chạy thật trên máy anh ngày **06/10/2026**.
 
 - Nhánh: `feat/mvp05-accounts` → PR [#22](https://github.com/thanhbn123/studio/pull/22) vào `develop`
-- Bộ test: **826 test · 825 pass · 0 fail · 1 skipped** · `node tools/verify.mjs` EXIT=0
+- Bộ test: **849 test · 848 pass · 0 fail · 1 skipped** · `node tools/verify.mjs` EXIT=0
 - CI: **5/5 job PASS** (Linux · PostgreSQL 16 · smoke server thật · Docker · quét secret)
-- Phản biện độc lập: vòng 1 **FAIL** (4 lỗi CAO về **vòng đời tiền**) → đã vá hết → vòng 2 (đang chấm)
+- Phản biện độc lập **4 vòng**: vòng 1 **FAIL** (4 lỗi CAO về **vòng đời tiền**) → vòng 2 **FAIL** (thu thừa +150%…) → vòng 3 **PASS CÓ ĐIỀU KIỆN** → **vòng 4: PASS** (đo lại trên **SQLite và PostgreSQL 16 thật**)
   — nguyên văn: [`MVP-05-REVIEW.md`](MVP-05-REVIEW.md)
 
 ---
@@ -24,7 +24,7 @@ link là chạy vẫn hoạt động; chỉ khi đăng nhập thì job mới g�
 ## 2. Ba lệnh anh chạy
 
 ```bash
-npm test          # 826 test · 825 pass · 0 fail · 1 skipped
+npm test          # 849 test · 848 pass · 0 fail · 1 skipped
 npm run verify    # kiểm cú pháp + test → EXIT 0
 npm start         # http://127.0.0.1:3000
 ```
@@ -48,7 +48,7 @@ Trên giao diện: **Đăng nhập** → **Tài khoản** (số dư + lịch s�
 
 | # | Điều cần kiểm | Cách kiểm | Kỳ vọng | ☐ |
 |---|---|---|---|---|
-| 1 | Test xanh | `npm test` | 825 pass · 0 fail · 1 skip | ☐ |
+| 1 | Test xanh | `npm test` | 848 pass · 0 fail · 1 skip | ☐ |
 | 2 | Verify xanh | `npm run verify` | EXIT 0 | ☐ |
 | 3 | **Ẩn danh KHÔNG bị chặn** | chưa đăng nhập, dán link 1688 rồi chạy | job chạy được, ví **không** bị trừ | ☐ |
 | 4 | Đăng ký / đăng nhập | `#/dangnhap` | đăng ký xong tự đăng nhập; sai mật khẩu báo chung một câu | ☐ |
@@ -69,8 +69,11 @@ Trên giao diện: **Đăng nhập** → **Tài khoản** (số dư + lịch s�
    Credit ở MVP-05 **chỉ do quản trị cấp tay** (có ghi sổ, không sửa/xoá dòng).
 2. **Khoá tuần tự hoá tiền nằm trong bộ nhớ** (đúng khi chạy **1 tiến trình**). Chạy nhiều instance
    cần khoá ở tầng DB — đã ghi `docs/VERIFICATION.md`.
-3. **Retry tự động của hàng đợi** ngay sau lỗi có thể chạy khi dòng hoàn tiền của lượt trước chưa ghi
-   ⇒ hook coi là **cùng lượt** (không mở hold mới). Đã ghi `§16.6`; cần hàng đợi chờ `afterJob` xong.
+3. **Thu hồi lượt treo (reconcile) không có cron** — chỉ chạy lúc khởi động, ở request kế tiếp của
+   chính job đó, hoặc khi quản trị gọi `POST /api/admin/billing/reconcile`. Mặc định phải chờ
+   **15 phút** (`BILLING_STUCK_RUN_MS`); nếu tiến trình chết để lại job `running` vĩnh viễn thì cần
+   `force: true` (đã ghi `docs/VERIFICATION.md`). **Thu thiếu có chủ ý** với usage đến muộn (thà thu
+   thiếu còn hơn thu thừa) — mọi lần như vậy đều có `meta.usage_source`/`usage_unavailable` + WARN.
 4. **Chưa đo**: PostgreSQL thật cho các bảng mới (CI mới chứng minh **schema + migration**), reverse
    proxy thật (`trust proxy`), provider thật, trình duyệt thật (UI chạy hàm thật trong Node).
 5. **Chưa có**: đổi/quên mật khẩu, xác thực email, 2FA, chuyển credit giữa người dùng, hoá đơn.

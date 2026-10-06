@@ -113,6 +113,16 @@ Phạm vi dự kiến:
 
 ## MVP-05 — Customer Accounts + Credit
 
+**Trạng thái: ĐÃ XONG PHẦN CODE, CHỜ MERGE + OWNER NGHIỆM THU** (PR [#22](https://github.com/thanhbn123/studio/pull/22), nhánh `feat/mvp05-accounts`, commit cuối `dcd429e`, 06/10/2026).
+
+Bằng chứng: **849 test · 848 pass · 0 fail · 1 skipped** · `node tools/verify.mjs` EXIT=0 · **CI 5/5 xanh** · **4 vòng phản biện độc lập** (FAIL → FAIL → PASS CÓ ĐIỀU KIỆN → **PASS**, đo lại trên **SQLite và PostgreSQL 16 thật**) với **11 lỗ hổng vòng đời tiền** đã vá: giữ tiền rồi lỗi mà không hoàn · chạy lại **miễn phí** · **thu thừa theo usage tích luỹ (+150%)** · không có đường tạo owner đầu tiên · hoàn luôn phần đã tiêu · khoá cấu hình chết · grant `1e308` ghi dòng 0 · UI mời số âm mà API chối · chống brute-force mỏng · **kẹt lượt 409 vĩnh viễn** · thu lại usage đã hoàn · reconcile cắt ngang lượt đang chạy. Hồ sơ: [`MVP-05-ACCEPTANCE.md`](MVP-05-ACCEPTANCE.md) · [`MVP-05-CONTRACT.md`](MVP-05-CONTRACT.md) · [`MVP-05-REVIEW.md`](MVP-05-REVIEW.md).
+
+Đã làm: tài khoản thật (scrypt, token chỉ lưu sha256, cookie HttpOnly) · ví credit **append-only** (số dư = tổng sổ, không bao giờ âm, mọi dòng có `reason`/`job_id`/`run_key`/`balance_after`) · **chặn 402 TRƯỚC khi chạy** (DB không tăng) · lỗi sau khi giữ tiền ⇒ hoàn · **mỗi lượt chạy lại thu đúng chi phí lượt đó** + trần 429 · tách dữ liệu theo tài khoản (khác chủ ⇒ 404) · **ẩn danh không bị phá** · `#/dangnhap` · `#/taikhoan` · `#/quantri` · `OWNER_EMAIL` + `npm run make-owner`.
+
+Giới hạn THẬT: khoá tiền **trong bộ nhớ** (1 tiến trình) · reconcile **không có cron** · **thu thiếu có chủ ý** với usage đến muộn · chưa đo đa tiến trình tầng HTTP / proxy / provider thật / trình duyệt thật · **chưa có cổng thanh toán** (MVP-06).
+
+## MVP-05 — Customer Accounts + Credit
+
 **Mục tiêu:** nhiều người dùng, mỗi người có ví credit.
 
 Phạm vi dự kiến:
