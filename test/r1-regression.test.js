@@ -102,7 +102,8 @@ describe('R1 · §5 — DB "thời trước R1": init() hai lần, nâng cấp t
       await store.enqueueJob({ id: 'q-moi', jobId: oldJobId, kind: 'content', handler: 'run' });
       const claimed = await store.claimNextJob({ workerId: 'w-sau-nang-cap' });
       assert.equal(claimed.id, 'q-moi');
-      await store.completeQueueItem('q-moi');
+      // B1 (vòng 3): `epoch` bắt buộc.
+      await store.completeQueueItem('q-moi', { epoch: (await store.getQueueItemById('q-moi')).epoch });
       assert.deepEqual(await store.queueStats(), { queued: 0, running: 0, done: 1, failed: 0 });
     } finally {
       await store.close();

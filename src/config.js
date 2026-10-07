@@ -281,6 +281,11 @@ export function loadConfig(env = process.env) {
       lockTimeoutMs: Math.max(100, toInt(env.QUEUE_LOCK_TIMEOUT_MS, 5000)),
       // F3: nhịp NHẶT VIỆC định kỳ (ms) — tiến trình đang sống tự cứu việc của tiến trình đã chết.
       pollMs: Math.max(200, toInt(env.QUEUE_POLL_MS, 1000)),
+      // B2 (R1 vòng 3): NGÂN SÁCH TỔNG cho các pragma lúc `connect()` (WAL dễ gặp khoá khi nhiều
+      // tiến trình boot). Hết ngân sách ⇒ bỏ qua WAL và đi tiếp, KHÔNG chặn boot hàng chục giây.
+      initBudgetMs: Math.max(200, toInt(env.QUEUE_INIT_BUDGET_MS, 5000)),
+      // Số lần thử lại của `Store.init()` khi DB bận (bị chặn thêm bởi `lockTimeoutMs`).
+      initRetries: Math.max(1, toInt(env.QUEUE_INIT_RETRIES, 10)),
       // Số lần thử tối đa cho một mục hàng đợi (kẹp >= 1: 0 sẽ không bao giờ chạy).
       maxAttempts: Math.max(1, toInt(env.QUEUE_MAX_ATTEMPTS, 3)),
       // Backoff cơ sở: lần thử thứ n chờ `retryBaseMs * n` (mặc định 2000ms).

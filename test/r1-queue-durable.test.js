@@ -91,7 +91,11 @@ describe('R1 · §2.2 — method hàng đợi bền ở tầng store', () => {
       assert.equal(row.status, 'done');
       assert.ok(row.finished_at, 'mục xong phải có `finished_at`');
       assert.equal(row.locked_at, null, 'mục xong phải nhả khoá');
-      assert.equal(await store.completeQueueItem(row.id), false, 'mục đã `done` ⇒ complete lần hai trả false');
+      assert.equal(
+        await store.completeQueueItem(row.id, { epoch: (await store.getQueueItemById(row.id)).epoch }),
+        false,
+        'mục đã `done` ⇒ complete lần hai trả false',
+      );
       assert.deepEqual(await store.queueStats(), { queued: 0, running: 0, done: 1, failed: 0 });
     } finally {
       await queue.close().catch(() => {});
@@ -135,7 +139,11 @@ describe('R1 · §2.2 — method hàng đợi bền ở tầng store', () => {
       await store.enqueueJob({ id: 'q-retry', jobId: 'j-retry', maxAttempts: 2 });
       await store.claimNextJob({ workerId: 'w-1' });
 
-      const retry = await store.failQueueItem('q-retry', { error: Object.assign(new Error('hỏng tạm'), { code: 'TAM' }), retryDelayMs: 5000 });
+      const retry = await store.failQueueItem('q-retry', {
+        error: Object.assign(new Error('hỏng tạm'), { code: 'TAM' }),
+        retryDelayMs: 5000,
+        epoch: (await store.getQueueItemById('q-retry')).epoch,
+      });
       assert.equal(retry.status, 'queued', 'attempts 1 < max 2 ⇒ trả về `queued`');
       assert.equal(retry.attempts, 1);
       let row = await store.getQueueItemById('q-retry');
@@ -150,7 +158,11 @@ describe('R1 · §2.2 — method hàng đợi bền ở tầng store', () => {
       // Tới hạn (giả lập đồng hồ) ⇒ nhặt được, attempts = 2 = max.
       const secondClaim = await store.claimNextJob({ workerId: 'w-1', now: new Date(Date.now() + 6000).toISOString() });
       assert.equal(secondClaim.attempts, 2);
-      const dead = await store.failQueueItem('q-retry', { error: new Error('hỏng hẳn'), retryDelayMs: 5000 });
+      const dead = await store.failQueueItem('q-retry', {
+        error: new Error('hỏng hẳn'),
+        retryDelayMs: 5000,
+        epoch: (await store.getQueueItemById('q-retry')).epoch,
+      });
       assert.equal(dead.status, 'failed', 'hết lượt ⇒ `failed`');
       row = await store.getQueueItemById('q-retry');
       assert.equal(row.status, 'failed');

@@ -35,9 +35,32 @@ export class SqliteDriver {
     // FK phải bật thủ công trong SQLite; lỗi ở đây KHÔNG được làm mất timeout đã đặt.
     this.#pragma('foreign_keys', 'PRAGMA foreign_keys = ON;');
     // WAL cho phép đọc/ghi song song tốt hơn — nhưng là pragma "đổi chế độ ghi", có thể gặp
-    // SQLITE_BUSY khi tiến trình khác đang mở; thử lại vài lần rồi mới chịu thua (không chết).
-    this.#pragmaWithRetry('journal_mode', 'PRAGMA journal_mode = WAL;', { attempts: 10, baseMs: 100, maxMs: 500 });
+    // SQLITE_BUSY khi tiến trình khác đang mở.
+    //
+    // B2 (phản biện R1 vòng 3, THẤP–VỪA): phải có NGÂN SÁCH TỔNG. Trước đây 10 lần thử ×
+    // `busy_timeout` 5s ⇒ `connect()` có thể chặn tới **~56 giây** khi WAL bị chặn. Nay hết
+    // `config.queue.initBudgetMs` (mặc định 5000ms) thì **BỎ QUA WAL** (chạy chế độ journal mặc
+    // định vẫn ĐÚNG, chỉ kém song song) và ĐI TIẾP — boot không bị chặn lâu. Log warn MỘT lần.
+    const wal = this.#pragmaWithRetry('journal_mode', 'PRAGMA journal_mode = WAL;', {
+      attempts: 10,
+      baseMs: 100,
+      maxMs: 500,
+      budgetMs: this.initBudgetMs,
+    });
+    if (wal === false) {
+      this.logger?.warn('store.wal_deferred', {
+        message: 'Không bật được WAL trong ngân sách — tiếp tục với journal mặc định (hệ thống vẫn chạy đúng).',
+        budget_ms: this.initBudgetMs,
+      });
+    }
     return this;
+  }
+
+  /** B2 — ngân sách TỔNG cho các pragma có thể gặp khoá (`config.queue.initBudgetMs`, mặc định 5000). */
+  get initBudgetMs() {
+    const raw = Number(this.config?.queue?.initBudgetMs ?? this.config?.queue?.lockTimeoutMs);
+    if (Number.isFinite(raw) && raw > 0) return Math.min(60000, Math.trunc(raw));
+    return 5000;
   }
 
   /** Số ms chờ khoá ghi của SQLite (A1/A5): `config.queue.lockTimeoutMs` hoặc 5000. */
@@ -60,13 +83,17 @@ export class SqliteDriver {
   }
 
   /** Pragma có thể gặp SQLITE_BUSY khi nhiều tiến trình boot: thử lại với backoff. @private */
-  #pragmaWithRetry(name, sql, { attempts = 10, baseMs = 100, maxMs = 500 } = {}) {
+  #pragmaWithRetry(name, sql, { attempts = 10, baseMs = 100, maxMs = 500, budgetMs = 5000 } = {}) {
     let last = null;
+    const startedAt = Date.now();
+    const budget = Number.isFinite(Number(budgetMs)) && Number(budgetMs) > 0 ? Number(budgetMs) : 5000;
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       if (this.#pragma(name, sql)) return true;
       last = attempt;
+      // B2: hết NGÂN SÁCH TỔNG ⇒ dừng thử (trả `false` để tầng gọi bỏ qua pragma này).
+      if (Date.now() - startedAt >= budget) break;
       // `Atomics.wait` đồng bộ: hàm này chạy trong `connect()` (đồng bộ) nên không await được.
-      const wait = Math.min(maxMs, baseMs * attempt);
+      const wait = Math.min(maxMs, baseMs * attempt, Math.max(0, budget - (Date.now() - startedAt)));
       try {
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, wait);
       } catch {

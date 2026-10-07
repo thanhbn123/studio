@@ -265,3 +265,36 @@ Phán quyết vòng 2: **PASS CÓ ĐIỀU KIỆN** (`docs/R1-REVIEW.md` mục �
 - A6: `touchQueueItem` **bắt buộc** `workerId` (thiếu/rỗng ⇒ `false` + log
   `store.touch_missing_worker`); kèm `epoch` nếu caller biết.
 - F6: đủ **8/8** chỗ `queue.enqueue` truyền `meta.runKey` (bổ sung `POST /api/jobs/:id/regenerate`).
+
+---
+
+# VÒNG 4 — B1…B3 (chốt R1)
+
+## 8.1 B1 — FENCING KHÔNG TUỲ CHỌN: `epoch` bắt buộc
+
+- `completeQueueItem(id, { epoch })`: **thiếu epoch ⇒ `false`** + log `store.complete_missing_epoch`
+  (trạng thái KHÔNG đổi). Chỉ đường VẬN HÀNH mới dùng `{ force: true }` (log `store.complete_forced`).
+- `failQueueItem(id, { epoch })`: **thiếu epoch ⇒ `{ stale: true, missing_epoch: true }`** + log
+  `store.fail_missing_epoch`, không ghi gì. `{ force: true }` dành cho dọn mục rác (queue dùng cho
+  mục chạm trần/quá hạn).
+- Mọi chỗ gọi nội bộ (`JobQueue.#runItem`, `#handleFailure`, `reclaimStale`, `pumpQueued`) truyền
+  `entry.epoch` / `row.epoch`. Test cũ đã cập nhật theo hợp đồng mới.
+
+## 8.2 B2 — NGÂN SÁCH TỔNG cho pragma lúc `connect()`
+
+- `config.queue.initBudgetMs` (`QUEUE_INIT_BUDGET_MS`, mặc định **5000ms**) chặn tổng thời gian thử
+  lại của `journal_mode = WAL` (trước đây 10 lần × `busy_timeout` 5s ⇒ `connect()` chặn **~56s**).
+- Hết ngân sách ⇒ **BỎ QUA WAL**, chạy chế độ journal mặc định (vẫn đúng, chỉ kém song song) và
+  **đi tiếp**; log warn **một lần** `store.wal_deferred`.
+- `config.queue.initRetries` (`QUEUE_INIT_RETRIES`, mặc định 10) cho số lần thử của `Store.init()`
+  (vẫn bị chặn thêm bởi `queue.lockTimeoutMs`).
+
+## 8.3 B3 + R3 — số liệu và giới hạn (tài liệu)
+
+- §22.7 của `docs/VERIFICATION.md` đã sửa: trần chờ liên tiến trình là
+  **`số lần thử × lockTimeoutMs`** (không phải một lần), kèm số đo của phản biện (tệ nhất **31,5s**,
+  trong tiến trình **30,4s**, đặt 300ms ⇒ **2,2s**) và cách giảm.
+- **R3 (giới hạn của mô hình lease):** khi lease mất (SIGSTOP/máy ngủ), **hai tiến trình có thể
+  THỰC THI cùng một mục** ⇒ chi phí provider có thể nhân đôi, dù tiền/trạng thái đã được fenced.
+  Ghi rõ ở `docs/VERIFICATION.md` §22.7 mục 2 kèm 4 cách giảm (heartbeat dày hơn, `stale_ms` lớn
+  hơn, **idempotency key phía provider**, chỉ gọi provider sau khi xác nhận còn lease).

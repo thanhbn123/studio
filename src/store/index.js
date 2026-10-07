@@ -2018,11 +2018,22 @@ export class Store {
   }
 
   /** Đánh dấu mục đã XONG. Trả `true` nếu thật sự có dòng đổi trạng thái. */
-  async completeQueueItem(id, { epoch = null } = {}) {
+  async completeQueueItem(id, { epoch = null, force = false } = {}) {
     const qid = String(id ?? '').trim();
     if (!qid) return false;
     const ts = nowIso();
     const wantsEpoch = normalizeEpoch(epoch);
+    // B1 (phản biện R1 vòng 3, VỪA): `epoch` là BẮT BUỘC — thiếu epoch thì KHÔNG được chốt `done`.
+    // Trước đây lời gọi thiếu epoch vẫn chốt được mục của runner KHÁC (fencing chỉ có tác dụng khi
+    // tầng gọi tự nguyện truyền epoch ⇒ "fencing tuỳ chọn"). `force: true` chỉ dành cho đường VẬN
+    // HÀNH (dọn mục rác) và luôn ghi log.
+    if (wantsEpoch === null) {
+      if (force !== true) {
+        this.logger?.warn('store.complete_missing_epoch', { queue_item_id: qid });
+        return false;
+      }
+      this.logger?.warn('store.complete_forced', { queue_item_id: qid });
+    }
     // A3 (fencing): runner ĐÃ BỊ CƯỚP (epoch lệch) không được chốt `done` — nếu không, kết quả của
     // nó ghi đè trạng thái của runner mới.
     const res = await this.driver.run(
@@ -2054,8 +2065,13 @@ export class Store {
     if (!qid) throw Object.assign(new Error('failQueueItem thiếu id mục hàng đợi.'), { code: 'INVALID_QUEUE_ITEM' });
     const row = await this.driver.get('SELECT * FROM job_queue WHERE id = ?', [qid]);
     if (!row) return { status: 'failed', attempts: 0, missing: true, last_error: errorText(error) };
-    // A3 (fencing): mục đã được claim bởi LƯỢT KHÁC (epoch khác) ⇒ kết quả của runner cũ bị BỎ.
+    // B1: `epoch` BẮT BUỘC (trừ đường vận hành `force: true`) — thiếu epoch thì từ chối.
     const wantsEpoch = normalizeEpoch(epoch);
+    if (wantsEpoch === null && force !== true) {
+      this.logger?.warn('store.fail_missing_epoch', { queue_item_id: qid });
+      return { status: row.status, attempts: Number(toNum(row.attempts, 0)), stale: true, missing_epoch: true, last_error: errorText(error) };
+    }
+    // A3 (fencing): mục đã được claim bởi LƯỢT KHÁC (epoch khác) ⇒ kết quả của runner cũ bị BỎ.
     if (wantsEpoch !== null && Number(toNum(row.epoch, 0)) !== wantsEpoch) {
       return { status: row.status, attempts: Number(toNum(row.attempts, 0)), stale: true, last_error: errorText(error) };
     }

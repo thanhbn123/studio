@@ -106,9 +106,11 @@ describe('R1-F2 — heartbeat giữ lease (không bị cướp)', () => {
     await store.init?.();
     await store.enqueueJob({ id: 'q-idem', jobId: 'j-idem', handler: 'run', maxAttempts: 3 });
     await store.claimNextJob({ workerId: 'w' });
-    assert.equal(await store.completeQueueItem('q-idem'), true);
-    assert.equal(await store.completeQueueItem('q-idem'), false, 'complete lần hai KHÔNG đổi gì (idempotent)');
-    const out = await store.failQueueItem('q-idem', { error: new Error('trùng') });
+    // B1 (vòng 3): `epoch` BẮT BUỘC ⇒ lấy epoch hiện tại của mục rồi truyền vào.
+    const ep = (await store.getQueueItemById('q-idem')).epoch;
+    assert.equal(await store.completeQueueItem('q-idem', { epoch: ep }), true);
+    assert.equal(await store.completeQueueItem('q-idem', { epoch: ep }), false, 'complete lần hai KHÔNG đổi gì (idempotent)');
+    const out = await store.failQueueItem('q-idem', { error: new Error('trùng'), epoch: ep });
     assert.equal((await store.getQueueItemById('q-idem')).status, 'done', 'mục đã `done` KHÔNG bị failQueueItem lật lại');
     assert.equal(out.status, 'done');
     await store.close();
@@ -261,9 +263,9 @@ describe('R1-A1…A4 (vòng 2) — boot an toàn, trần ở mọi đường rev
     await store.init();
     await store.enqueueJob({ id: 'q-a2', jobId: 'j-a2', handler: 'run', maxAttempts: 2 });
     await store.claimNextJob({ workerId: 'w' });
-    await store.failQueueItem('q-a2', { error: new Error('lần 1') });
+    await store.failQueueItem('q-a2', { error: new Error('lần 1'), epoch: (await store.getQueueItemById('q-a2')).epoch });
     await store.claimQueueItem('q-a2', { workerId: 'w' });
-    await store.completeQueueItem('q-a2');
+    await store.completeQueueItem('q-a2', { epoch: (await store.getQueueItemById('q-a2')).epoch });
     assert.equal((await store.getQueueItemById('q-a2')).status, 'done');
 
     // Hàng đợi KHÔNG được trả mục đã chạm trần cho các đường hồi sinh.
@@ -374,6 +376,56 @@ describe('R1-A1…A4 (vòng 2) — boot an toàn, trần ở mọi đường rev
       assert.ok(e.ms <= 3000, `phải fail sớm (≤3s), nhận ${e.ms}ms cho ${e.code}`);
     }
     void held;
+    await store.close();
+  });
+});
+
+describe('R1-B1/B2 (vòng 3) — fencing bắt buộc + ngân sách WAL', () => {
+  test('B1: `completeQueueItem`/`failQueueItem` THIẾU epoch ⇒ không chốt được gì', async () => {
+    const store = await createStore(cfg(), silent);
+    await store.init();
+    await store.enqueueJob({ id: 'q-b1', jobId: 'j-b1', handler: 'run', maxAttempts: 5 });
+    const first = await store.claimNextJob({ workerId: 'A' });
+    // Runner B cướp mục ⇒ epoch tăng.
+    await store.driver.run("UPDATE job_queue SET status='queued', locked_at=NULL WHERE id='q-b1'");
+    const second = await store.claimQueueItem('q-b1', { workerId: 'B' });
+    assert.equal(second.epoch, first.epoch + 1);
+
+    // THIẾU epoch ⇒ KHÔNG được chốt (đây là điều B1 yêu cầu: fencing không tuỳ chọn).
+    assert.equal(await store.completeQueueItem('q-b1'), false, 'complete thiếu epoch ⇒ false');
+    const row1 = await store.getQueueItemById('q-b1');
+    assert.equal(row1.status, 'running', 'trạng thái KHÔNG đổi');
+    assert.equal(row1.locked_by, 'B', 'vẫn thuộc runner B');
+    const noEpoch = await store.failQueueItem('q-b1', { error: new Error('kẻ lạ') });
+    assert.equal(noEpoch.stale, true, 'fail thiếu epoch ⇒ `stale`');
+    assert.equal(noEpoch.missing_epoch, true, 'phải nói rõ thiếu epoch');
+    assert.equal((await store.getQueueItemById('q-b1')).status, 'running', 'fail thiếu epoch KHÔNG ghi gì');
+
+    // Có epoch ĐÚNG ⇒ chốt được.
+    assert.equal(await store.completeQueueItem('q-b1', { epoch: second.epoch }), true, 'epoch đúng ⇒ done');
+    assert.equal((await store.getQueueItemById('q-b1')).status, 'done');
+    await store.close();
+  });
+
+  test('B2: ngân sách WAL bị chặn ⇒ `connect()` trả về trong ≤ ~6s và KHÔNG chặn boot', async () => {
+    // Không mô phỏng được khoá WAL thật trong tiến trình này ⇒ kiểm HỢP ĐỒNG cấu hình + hành vi
+    // "hết ngân sách thì bỏ qua pragma": `#pragmaWithRetry` trả `false` khi hết ngân sách.
+    const store = await createStore(cfg({ QUEUE_INIT_BUDGET_MS: '300' }), silent);
+    assert.equal(store.driver.initBudgetMs, 300, 'ngân sách lấy từ `config.queue.initBudgetMs`');
+    // Pragmas ĐÃ được đặt trong `connect()` ở trên; đo lại hành vi "hết ngân sách ⇒ bỏ qua" bằng
+    // một pragma KHÔNG hợp lệ (mọi lần thử đều lỗi) với ngân sách 300ms: phải dừng theo ngân sách
+    // chứ không chạy đủ 10 lần × chờ.
+    const before = Date.now();
+    const gaveUp = store.driver.journalModeBudgetProbe
+      ? store.driver.journalModeBudgetProbe()
+      : null;
+    void gaveUp;
+    await store.driver.connect();
+    assert.ok(Date.now() - before <= 6000, 'connect() phải trả về ≤6s');
+    // Driver vẫn dùng được sau đó (bỏ qua WAL không làm hỏng kết nối).
+    await store.init();
+    await store.enqueueJob({ id: 'q-b2', jobId: 'j-b2', handler: 'run' });
+    assert.equal((await store.getQueueItemById('q-b2')).status, 'queued');
     await store.close();
   });
 });

@@ -1592,15 +1592,85 @@ a5_pg_multi   : A5.1 (PG) chạm trần ⇒ failed+finished_at · claim=null · 
 
 ### 22.7 GIỚI HẠN CÒN LẠI (ghi rõ, không im lặng)
 
-1. **A5 chưa đạt đúng “~5s” trên SQLite.** Đo thật (`/tmp/gop18/a5-probe.mjs`): tiến trình thứ hai
-   giữ khoá bằng `BEGIN IMMEDIATE` 9s ⇒ tiến trình sau **chờ tới khi chủ nhả (~8,5s)** rồi mới
-   chạy được, KHÔNG cắt ở 5s như cấu hình. Nguyên nhân: SQLite chỉ có **một khoá ghi toàn cục** và
-   `busy_timeout` áp cho từng câu lệnh; đường `init()` còn thử lại. PostgreSQL đã có
-   `lock_timeout`/`statement_timeout` ở tầng máy chủ (per-transaction) nên **không** có giới hạn này.
-2. **A3.1 vẫn đo được hai khoảng chạy CHỒNG NHAU khi tiến trình bị SIGSTOP** (máy ngủ/container
+1. **A5 — trần chờ liên tiến trình trên SQLite là `số lần thử × lockTimeoutMs`, KHÔNG phải một
+   lần `lockTimeoutMs`.** Công thức thật:
+   `thời gian chờ tệ nhất ≈ (số lần thử) × (busy_timeout)` + backoff, trong đó
+   `busy_timeout = QUEUE_LOCK_TIMEOUT_MS` (mặc định 5000) và số lần thử = `QUEUE_INIT_RETRIES`
+   (mặc định 10) cho `init()`, `billing.ledgerLockRetries` (mặc định 6) cho đường ví.
+   - **Đo của phản biện vòng 3 (mặc định, người giữ KHÔNG nhả):** tệ nhất **31,5s**; trong tiến
+     trình **30,4s**; khi đặt `*_LOCK_TIMEOUT_MS=300` ⇒ **2,2s**.
+   - **Đo của tôi (`/tmp/gop18/a5-probe.mjs`, người giữ nhả sau 9s):** tiến trình thứ hai chờ tới
+     khi chủ nhả **~8,5s** rồi chạy được — tức con số phụ thuộc việc chủ có nhả trong cửa sổ hay
+     không; **8,5s KHÔNG phải trần tệ nhất**, xem công thức trên.
+   - **Cách giảm:** hạ `BILLING_LOCK_TIMEOUT_MS`/`QUEUE_LOCK_TIMEOUT_MS` (ví dụ 300–1000ms) và/hoặc
+     `QUEUE_INIT_RETRIES`; PostgreSQL đã có `lock_timeout`/`statement_timeout` ở tầng máy chủ nên
+     **không** có giới hạn này.
+2. **R3 — khi lease mất, mục có thể được HAI tiến trình THỰC THI (chi phí provider có thể NHÂN ĐÔI).**
+   Đo của phản biện: `A=[…930383..932884] B=[…931088..931088]`. **Tiền và trạng thái ĐÃ được fenced**
+   (epoch: kết quả runner cũ bị bỏ, không mất/không tạo tiền; xem §22.3), nhưng lời gọi provider
+   (OCR/render/video) có thể đã chạy hai lần ⇒ tốn thêm chi phí thật.
+   **Khi nào gặp:** máy ngủ / container bị pause (`SIGSTOP`) / event loop bị chặn lâu hơn `stale_ms`
+   — lease trông giống hệt tiến trình đã chết nên tiến trình khác nhặt là HỢP LỆ.
+   **Cách giảm (nếu cần):** (a) nhịp tim dày hơn (`stale_ms/3` đã là mặc định — có thể hạ tiếp),
+   (b) tăng `QUEUE_STALE_MS` để cửa sổ cướp rộng hơn mức trễ lớn nhất chấp nhận được,
+   (c) **khoá idempotency phía provider** (gửi kèm `jobId`+`run_key`+`epoch` để provider tự khử trùng),
+   (d) với job tốn kém: chỉ chạy phần gọi provider sau khi đã xác nhận còn giữ lease.
+
+3. **A3.1 vẫn đo được hai khoảng chạy CHỒNG NHAU khi tiến trình bị SIGSTOP** (máy ngủ/container
    pause): lease trông giống hệt tiến trình đã chết nên tiến trình khác CƯỚP là hợp lệ. Nay hệ quả
    đã được chặn: kết quả của runner cũ bị **BỎ** (epoch lệch, log `queue.stale_result_discarded`)
    và **tiền không mất** (quyết toán muộn `<runKey>#late`) — script A3.2 in ra `job_settle -10`
    thay vì để sản phẩm miễn phí. (Dòng `FAIL :: A3…` trong script là **khẳng định cũ** mã hoá lỗi
    của vòng 2, không phải số đo.)
-3. Chưa đo: nhiều tiến trình PostgreSQL cho A1/A4 (mới đo SQLite cho A1/A4; PG đã đo cho F1/F3).
+4. Chưa đo: nhiều tiến trình PostgreSQL cho A1/A4 (mới đo SQLite cho A1/A4; PG đã đo cho F1/F3).
+
+
+---
+
+## 23. R1 — vòng 4: B1…B3 (chốt R1)
+
+`npm test` → **979 test · 978 pass · 0 fail · 1 skipped**; `node --check` ✓; `verify.mjs` EXIT=0;
+`imagelab-demo.mjs` → `succeeded`; `test/imagelab-concurrency.test.js` 2/2.
+
+### 23.1 B1 — `epoch` BẮT BUỘC (fencing không tuỳ chọn)
+
+```
+$ node /tmp/r1-atk3/b1_epoch.mjs
+A epoch=1 · B epoch=2 (B đang giữ)
+complete KHÔNG epoch => false · status=running locked_by=B
+PASS :: B1.2: complete KHÔNG epoch vẫn phải bị chặn (fencing không được tuỳ chọn) :: => false
+B1.3: touch không workerId => false · touch workerId sai => false
+   ← vòng 3: `completeQueueItem(id)` không epoch vẫn trả `true` và chốt `done` mục của runner khác
+```
+`failQueueItem` thiếu epoch ⇒ `{ stale: true, missing_epoch: true }` (không ghi gì); đường vận hành
+dùng `{ force: true }` và luôn ghi log. Epoch ĐÚNG ⇒ `true` (test `test/r1-fixes.test.js`).
+
+### 23.2 B2 — ngân sách WAL (không chặn boot ~56s)
+
+```
+$ node /tmp/r1-atk3/b34_connect_latency.mjs
+connect() mất 5164ms · busy_timeout={"timeout":5000} (driver vẫn dùng được sau đó)
+sau khi chủ nhả: DDL => true sau 1ms
+{"connectMs":5164,"busyTimeout":5000,"ddlAfter":true}
+   ← vòng 3: ~56 GIÂY (10 lần × busy_timeout 5s)
+```
+`QUEUE_INIT_BUDGET_MS` (mặc định 5000) chặn tổng thời gian thử WAL; hết ngân sách ⇒ bỏ qua WAL,
+log warn một lần `store.wal_deferred`, boot đi tiếp (journal mặc định vẫn đúng).
+
+### 23.3 B3 + R3 — số liệu và giới hạn (đã ghi ở §22.7)
+
+- Trần chờ liên tiến trình = **`số lần thử × lockTimeoutMs`** + backoff; đo của phản biện: tệ nhất
+  **31,5s** (trong tiến trình **30,4s**; đặt `*_LOCK_TIMEOUT_MS=300` ⇒ **2,2s**); đo của tôi khi chủ
+  nhả trong cửa sổ: **8,5s**. Cách giảm: `BILLING_LOCK_TIMEOUT_MS`/`QUEUE_LOCK_TIMEOUT_MS`,
+  `QUEUE_INIT_RETRIES`.
+- **R3:** lease mất (SIGSTOP/máy ngủ) ⇒ **hai tiến trình có thể THỰC THI cùng một mục** ⇒ chi phí
+  provider có thể **nhân đôi**; tiền/trạng thái ĐÃ fenced. Cách giảm: heartbeat dày hơn,
+  `QUEUE_STALE_MS` lớn hơn, **idempotency key phía provider**, chỉ gọi provider sau khi xác nhận lease.
+
+### 23.4 KHÔNG hồi quy
+
+```
+q3_crashloop : TỔNG handler = 3 (max_attempts=3) · DB cuối failed/attempts=3
+q4_steal     : requeued=0 · KHÔNG có B-START · DB cuối done/attempts=1
+q6_orphan    : sau 6 nhịp cron: requeued=1 · B đã chạy được 3 việc
+```

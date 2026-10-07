@@ -275,3 +275,76 @@ QUEUE_DURABLE=false:                              durable=false · 0 dòng job_q
 **Điều kiện để chuyển sang PASS đầy đủ**: vá A1 (init/PRAGMA), A2 (revive + bỏ qua mục chạm trần khi list), A3 (fencing/epoch hoặc từ chối chạy lại khi chưa xác nhận chủ cũ chết), A4 (mã lỗi chuẩn hoá + không nhường mutex khi transaction còn mở), và ghi rõ A5/A6 vào tài liệu vận hành.
 
 *Bằng chứng thô vòng 2: `/tmp/r1-atk2/{a1_boot_race,a2_revive,a23_phantom_loop,a3_lease_sigstop,a4_lock_timeout,a44_poison,a45_poison_recover,a5_pg_multi,a6_touch_forge}.mjs` + `npmtest.out`, `l6_clean.out`, `r1reg.out`, `verify.out`, `demo.out`.*
+
+═══════════════════════════════════════════════════════════════════════════════
+
+# VÒNG 3 — CHẤM CUỐI TẠI COMMIT `0b29668`
+
+**PHÁN QUYẾT CUỐI: PASS CÓ ĐIỀU KIỆN**
+
+> Chấm cuối ĐỘC LẬP trên `feat/r1-reliability`, commit **`0b29668`** (PR #24).
+> Script vòng 3: `/tmp/r1-atk3/**`; chạy lại toàn bộ `/tmp/r1-atk/**` (vòng 1) + `/tmp/r1-atk2/**` (vòng 2).
+> `git status` chỉ có `docs/R1-REVIEW.md` bị sửa; không commit, không sửa mã nguồn/`test/**`.
+> Hash mã nguồn khi đo: `queue.js a854ffec01219742 · store/index.js a86ba20017381310 ·
+> billing/index.js 37783b1d2afcaac2 · sqlite-driver.js 120abfd57fd45527 · config.js fe9c4815ec9efd28 ·
+> routes.js eda3a5f95d66ae7a`.
+
+## V3.1 — Bảng A1…A6 và F1…F6 (đã vá thật hay chưa)
+
+| # | Kết luận vòng 3 | Bằng chứng đo lại (số liệu, không đọc lời khai) |
+|---|---|---|
+| **A1** | **ĐÃ VÁ THẬT** | `a1_boot_race.mjs`: **0/16** tiến trình chết trên DB trắng (vòng 2: 6/16). `b3_boot4.mjs`: **4 tiến trình × 6 vòng = 0/24 chết**; DB đã có dữ liệu, 4 tiến trình × 4 vòng = **0/16 chết**, mục cũ còn nguyên `queued`. Tầng driver (B3.1): WAL bị chặn nhưng `busy_timeout=1200` VẪN được đặt (vòng 2: `timeout=0`), DDL chờ **1261ms** rồi mới báo bận (trước: 0ms). Còn **B2** (độ trễ boot). |
+| **A2** | **ĐÃ VÁ THẬT** | `a2_revive.mjs`: revive ⇒ `attempts=0/2`, `claim` **NHẶT ĐƯỢC**, handler chạy thật 1 lần, `events=["done(skipped=false)"]`. `a23_phantom_loop.mjs`: poll 200ms trong 2s ⇒ **1 lần dựng handler + 1 lần chạy thật** (vòng 2: 10 `done` giả, 0 lần chạy). `b5_revive_cap.mjs` (`maxAttempts=1`, revive 3 lượt): mỗi lượt chạy đúng 1 lần, `attempts=1/1`, **0 mục vượt trần**, epoch 1→3→5. |
+| **A3** | **ĐÃ VÁ THẬT** (fencing + tiền) | `b1_epoch.mjs`: A(epoch cũ).`complete`=**false**, B(epoch mới).`complete`=**true**; A.fail(epoch cũ) trả `{stale:true}`. `b4_fence_live.mjs` (thực chiến): SIGSTOP A → B cướp và **thất bại** → A tỉnh chốt `done` ⇒ log `A-EVENT skipped reason=stale_epoch`, DB giữ nguyên `failed/THIEF_FAILED/epoch=5`. Tiền (`a3_lease_sigstop.mjs`): hold −10 → refund +10 → `job_settle -10@rk-1#late` ⇒ **balance 90 = thu đúng 1 lần**. Còn **R3** (chạy trùng thể xác). |
+| **A4** | **ĐÃ VÁ THẬT** | `a45_poison_recover.mjs` (người giữ chậm 3s, timeout 300ms): `withLedgerLock(u2)` → **2207ms `LEDGER_BUSY`** (vòng 2: `ERR_SQLITE_ERROR` thô), `claimNextJob` → **694ms OK** (chờ chủ xong rồi chạy, không fail dây chuyền), sau khi chủ commit: 0ms OK. `a44_poison.mjs`: `LEDGER_BUSY`/`QUEUE_BUSY` có `retryable`, **không còn mã thô**, `claimNextJob #2` → **1615ms OK**. |
+| **A5** | **ĐÃ VÁ MỘT PHẦN** | Trần nay nằm ở tầng DB (`PRAGMA busy_timeout = queue.lockTimeoutMs`, PG `SET LOCAL lock_timeout/statement_timeout`) + ngân sách cho `init()`. NHƯNG worst case mặc định vẫn **31,5s** (`a4_lock_timeout.mjs` A4.3, người giữ 60s) và **30,4s** trong tiến trình (A4.1) — vì `#retryOnBusy` thử 6 lần × `busy_timeout` 5s; đặt `*_LOCK_TIMEOUT_MS=300` ⇒ **2,2s**. Tài liệu §22.7 ghi "~8,5s" (ca người giữ nhả trong cửa sổ) ⇒ xem **B3**. |
+| **A6** | **ĐÃ VÁ THẬT** | `a6_touch_forge.mjs` + `b1.3`: `touchQueueItem(id, {})` (thiếu `workerId`) ⇒ **false** (vòng 2: true); `workerId` sai ⇒ false; đúng ⇒ true. |
+| **F1** | ĐÃ VÁ (giữ nguyên) | `q3_crashloop.mjs`: kill -9 × 8 vòng, `max_attempts=3` ⇒ handler **3 lần**, DB cuối `failed/attempts=3`. PG thật (`a5_pg_multi.mjs`): chạm trần ⇒ `failed` + `finished_at`, claim sau `null`. |
+| **F2** | ĐÃ VÁ (ca thường) | `q4_steal.mjs`: `requeued:0`, **không `B-START`**, DB cuối `done/attempts=1`. |
+| **F3** | ĐÃ VÁ | `q6_orphan.mjs`: B sống chạy **3/3** việc không cần restart; PG thật (`a5.2`): **3/3**. |
+| **F4** | ĐÃ VÁ | `l6_pg_rehold.mjs` (DB sạch): SQLite + PG16.15 ⇒ `errCode=null · holds=1 · balance=100`. `l5_race_err.mjs`: **0/100 lỗi** trên cả 2 driver, cả hold-race và settle-vs-refund. |
+| **F5** | VÁ MỘT PHẦN | Mã lỗi đã đúng (`LEDGER_BUSY`/`QUEUE_BUSY` + `retryable`), hết "nhiễm độc" connection; trần mặc định vẫn ~30s (xem A5/B3). |
+| **F6** | **ĐÃ VÁ THẬT 8/8** | `grep`: 8 `queue.enqueue` / **8 chỗ truyền `runKey`** (kể cả `POST /api/jobs/:id/regenerate` — vòng 2 còn thiếu). `q5_dupkey.mjs`: cùng `runKey` ⇒ **1 mục/1 lần**; khác lượt ⇒ 4 mục/4 lần (không nuốt lượt). |
+
+## V3.2 — Lỗ hổng mới & tồn dư (đều nhỏ, không chặn)
+
+| # | Mức | Phát hiện | Bằng chứng | Gợi ý sửa |
+|---|---|---|---|---|
+| **B1** | **VỪA** | **Fencing ở tầng store là TUỲ CHỌN.** `completeQueueItem(id)` **không truyền `epoch`** vẫn chốt được `done` cho mục đang thuộc runner KHÁC (`normalizeEpoch(null) === null` ⇒ bỏ điều kiện `AND epoch = ?`). Đường app luôn truyền epoch (`queue.js`) nên chưa khai thác được từ app — nhưng chốt chặn mà A3 dựng lên không được cưỡng chế. | `b1_epoch.mjs`: A epoch=1, B epoch=2 (đang giữ) ⇒ `complete KHÔNG epoch => true · status=done locked_by=null` | Bắt buộc `epoch` cho `complete/fail/touch` (fail-closed khi thiếu) — cùng cách A6 đã bắt buộc `workerId`; hoặc mặc định "phải khớp epoch hiện tại". |
+| **B2** | **THẤP–VỪA** | **`connect()` có thể chặn ~56s khi boot.** WAL bị tiến trình khác giữ khoá ⇒ `#pragmaWithRetry` thử 10 lần, MỖI lần còn chịu `busy_timeout` (mặc định 5000ms) ⇒ tổng ~52–56s trước khi bỏ cuộc (không chết, `busy_timeout` vẫn đúng). Có thể vượt healthcheck/liveness khi boot trong container. | `b34_connect_latency.mjs`: `connect() mất **55777ms** · busy_timeout=5000`; với `lockTimeoutMs=1200` ⇒ 17852ms | Cho `#pragmaWithRetry` một NGÂN SÁCH TỔNG (như `init()`), và/hoặc hạ `busy_timeout` riêng cho lần chuyển WAL (ví dụ 200ms). |
+| **B3** | **THẤP** | **Số liệu tài liệu lệch worst case.** §22.7 ghi "~8,5s" cho trần chờ khoá (đúng cho ca người giữ nhả trong cửa sổ) nhưng worst case đo được là **31,5s** (mặc định) / **2,2s** (khi `*_LOCK_TIMEOUT_MS=300`). | `a4_lock_timeout.mjs`: A4.3 `withLedgerLock ... 31531ms err=LEDGER_BUSY`; A4.2 `worst=2218ms` | Ghi công thức `retries × lockTimeoutMs` (và khuyến nghị hạ `QUEUE/BILLING_LOCK_TIMEOUT_MS` cho API có SLA). |
+| **R3** | **THẤP (chấp nhận)** | **Lease mất ⇒ mục vẫn được HAI tiến trình THỰC THI** (tiền và trạng thái đã được fencing bảo vệ, nhưng chi phí provider có thể nhân đôi). Không tránh được nếu không huỷ được handler đang chạy. | `a3_lease_sigstop.mjs`: `A=[…930383..932884] B=[…931088..931088]` chồng nhau; `b4` cho thấy kết quả A bị bỏ | Handler tự kiểm epoch trước khi gọi provider/ghi kết quả, và/hoặc coi `stale_ms` là "chi phí chấp nhận". |
+
+Tồn dư giữ nguyên từ vòng 1/2: SQLite chỉ có MỘT khoá ghi toàn cục (khoá ví chặn hàng đợi và ngược lại); tham số theo request (`manual`, `onlyRegionIds`, `force`, `options`…) không được lưu ⇒ lượt khôi phục chạy bằng mặc định an toàn; chống trùng liên tiến trình chỉ có khi caller truyền `runKey`.
+
+## V3.3 — Đã cố phá mà KHÔNG phá được (vòng 3)
+
+1. **Quyết toán muộn (`<runKey>#late`) — 6 đòn, không đòn nào thu hai lần / tạo tiền** (`b2_late_settle.mjs`): (a) hold→refund→settle ⇒ `balance 90`, đúng 1 dòng late; (b) gọi settle lại ⇒ idempotent, vẫn 90; (c) 3 lượt liên tiếp bị cướp ⇒ `70` (mỗi lượt thu 1 lần); (d) job `failed` ⇒ TỪ CHỐI (vẫn 70); (e) ví cạn với chi phí 1e6 ⇒ `INSUFFICIENT_CREDIT`, **0 dòng âm**, SUM không đổi; (f) **2 tiến trình cùng** quyết toán muộn ⇒ đúng **1 dòng `rk-r#late`**, `balance=90=SUM`, 0 lỗi.
+2. **Fencing**: epoch cũ không chốt được `done`/`failed`; kẻ cướp thất bại giữ nguyên kết cục; chủ cũ nhận `skipped(stale_epoch)` thay vì `done`.
+3. **Boot**: 4 tiến trình × 6 vòng trên DB trắng (0/24 chết), DB có dữ liệu 4×4 (0/16 chết, dữ liệu nguyên), boot lặp nhiều lần.
+4. **F1–F4 + A6** trên SQLite **và PostgreSQL 16.15 thật**; nhặt trùng 200/100 mục; mồ côi SQLite + PG.
+5. **Hồi quy**: `npm test` **977 · 976 pass · 0 fail · 1 skipped**; `tools/verify.mjs` **EXIT 0**; `tools/imagelab-demo.mjs` **EXIT 0**; `imagelab-concurrency` **2/2**; nhóm tiền/ẩn danh MVP-05 **86/86**; `init()` 2 lần nguyên dữ liệu; `QUEUE_DURABLE=false` không chạm DB.
+
+## V3.4 — Chưa kiểm được (vòng 3)
+
+1. **Chưa đo HTTP/app thật** cho chuỗi "bị cướp → hoàn tiền → thu muộn" trong pipeline ImageLab/Video (mới đo ở `BillingService` + `JobQueue` thật, không phải end-to-end qua route).
+2. **Chưa đo PG cho lease/epoch dưới 2 tiến trình** (SIGSTOP/fencing mới trên SQLite; PG mới đo F1/F3 + sổ cái).
+3. **Chưa đo mất điện/fsync**, tải lớn (hàng nghìn mục, nhiều worker) và chi phí CPU/DB của vòng poll 1s khi hàng đợi lớn.
+4. **Chưa đo A1/B2 trong container** (volume mạng, k8s liveness): con số 55,8s là trên APFS cục bộ.
+
+## V3.5 — PASS (có điều kiện) NGHĨA LÀ gì — và KHÔNG nghĩa là gì
+
+**NGHĨA LÀ**: bốn điều kiện của vòng 2 (**A1, A2, A3, A4**) đã được **vá thật và đo lại độc lập**; A5/A6 vá một phần/đủ và đã ghi tài liệu; **F1…F6 đều xanh trên cả SQLite lẫn PostgreSQL thật**; tiền đúng trong MỌI đòn tôi thử (kể cả quyết toán muộn, ví cạn, 2 tiến trình đua, các lượt bị cướp liên tiếp) — số dư luôn = tổng sổ, không dòng âm, không tạo/mất tiền; hồi quy **977 test · 0 fail** + `verify` EXIT 0.
+
+**KHÔNG NGHĨA LÀ**:
+1. **SQLite vẫn chỉ có MỘT khoá ghi toàn cục** — khoá ví chặn hàng đợi và ngược lại; trần timeout chỉ có tác dụng thật khi hạ `QUEUE/BILLING_LOCK_TIMEOUT_MS` (mặc định worst case ~30s).
+2. **Tham số theo request KHÔNG được lưu** (`manual`, `onlyRegionIds`, `force`, `options`…) ⇒ lượt khôi phục chạy bằng mặc định an toàn, không phải "chạy lại y hệt".
+3. **Chống trùng liên tiến trình chỉ có khi caller truyền `runKey`** — nay 8/8 routes đã truyền, nhưng code mới gọi `queue.enqueue` mà quên `runKey` là mất bảo vệ.
+4. **Lease mất vẫn cho phép hai tiến trình THỰC THI** cùng một mục (tiền/trạng thái đã fenced) ⇒ chi phí provider có thể nhân đôi (R3).
+5. **Fencing ở tầng store là tuỳ chọn** — caller không truyền `epoch` sẽ bỏ qua chốt chặn (B1).
+6. **Boot có thể chậm tới ~56s** khi WAL bị chặn ở cấu hình mặc định (B2) — cần để ý healthcheck.
+7. **Chưa đo** nhiều tiến trình PG cho lease, mất điện/fsync, tải lớn (V3.4).
+
+**Ba việc nhỏ còn lại (không chặn sprint)**: B1 — bắt buộc `epoch` cho `complete/fail/touch`; B2 — ngân sách tổng cho `#pragmaWithRetry`; B3 — ghi worst case `retries × lockTimeoutMs` vào `docs/VERIFICATION.md` §22.7. Nếu đội chấp nhận ba mục này như giới hạn đã ghi tài liệu (và R3 là chi phí chấp nhận của mô hình lease), thì R1 có thể đọc là **PASS**.
+
+*Bằng chứng thô vòng 3: `/tmp/r1-atk3/{b1_epoch,b2_late_settle,b3_boot4,b34_connect_latency,b4_fence_live,b5_revive_cap,late_worker,fence_worker}.mjs` + `npmtest.out`, `verify.out`, `demo.out`; chạy lại `/tmp/r1-atk/{q3,q4,q5,q6,l5,l6}.mjs` và `/tmp/r1-atk2/{a1,a2,a23,a3,a4,a45,a44,a5,a6}*.mjs`.*

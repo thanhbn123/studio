@@ -591,7 +591,7 @@ export class JobQueue extends EventEmitter {
         new Error(`Mục hàng đợi của job ${row.job_id} đã chạm trần số lần thử — không nhặt lại.`),
         { code: 'QUEUE_ATTEMPTS_EXHAUSTED' },
       );
-      await this.store.failQueueItem?.(row.id, { error: err, force: true }).catch((e2) => {
+      await this.store.failQueueItem?.(row.id, { error: err, force: true, epoch: Number(row.epoch) || null }).catch((e2) => {
         this.logger?.error('queue.exhausted_mark_failed_error', { queue_item_id: row.id, error: e2 });
       });
       if (typeof this.store.updateJob === 'function') {
@@ -716,6 +716,7 @@ export class JobQueue extends EventEmitter {
           { code: 'QUEUE_HANDLER_UNKNOWN' },
         );
         this.logger?.error('queue.handler_missing', { job_id: row.job_id, handler: row.handler, queue_item_id: row.id });
+        // B1: đường vận hành ⇒ `force: true` (đã ghi log trong store).
         await this.store.failQueueItem(row.id, { error: err, force: true }).catch((e2) => {
           this.logger?.error('queue.handler_missing_mark_failed_error', { queue_item_id: row.id, error: e2 });
         });
@@ -845,6 +846,7 @@ export class JobQueue extends EventEmitter {
           await this.store.failQueueItem?.(item.queueItemId, {
             error: Object.assign(new Error('Mục đã chạm trần số lần thử — không chạy lại.'), { code: 'QUEUE_ATTEMPTS_EXHAUSTED' }),
             force: true,
+            epoch: Number(row?.epoch) || null,
           }).catch((err) => this.logger?.warn('queue.exhausted_mark_failed', { queue_item_id: item.queueItemId, error: err }));
           this.logger?.error('queue.attempts_exhausted', { job_id: item.id, queue_item_id: item.queueItemId });
           this.emit('failed', {
