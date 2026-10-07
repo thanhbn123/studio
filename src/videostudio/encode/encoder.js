@@ -90,6 +90,11 @@ export function createEncodeResult(partial = {}) {
     warnings: Array.isArray(partial.warnings) ? partial.warnings.filter((w) => typeof w === 'string') : [],
     elapsed_ms: toCount(partial.elapsed_ms),
     error_code: partial.error_code ?? null,
+    // N2 (vòng 4): PHẢI copy sang kết quả, nếu không thì dù đã có tên trong ENCODE_RESULT_FIELDS
+    // tầng trên vẫn nhận `null` (đúng lỗi phản biện bắt được).
+    playback_ms: Number.isFinite(Number(partial.playback_ms)) ? Math.round(Number(partial.playback_ms)) : null,
+    requested_ms: Number.isFinite(Number(partial.requested_ms)) ? Math.round(Number(partial.requested_ms)) : null,
+    delay_drift_ms: Number.isFinite(Number(partial.delay_drift_ms)) ? Math.round(Number(partial.delay_drift_ms)) : null,
   };
 }
 

@@ -377,12 +377,38 @@ export function fallbackViolations(texts, evidenceText) {
    * nên các biến thể sau LỌT và vẫn được VẼ: "mien phi" (không dấu), "miễn phі" (homoglyph Cyrillic),
    * "ｍｉễｎ ｐｈí" (full-width), "miễn\nphí" (xuống dòng), "MIỄN PHÍ"…
    */
+  // Lookalike Latin ngoài bảng gộp chung (ı→i, ɑ→a, ɡ→g, ʟ→l, ⅰ→i) — vòng 4 phát hiện vẫn lọt.
+  const LOOKALIKE = { '\u0131': 'i', '\u0251': 'a', '\u0261': 'g', '\u029f': 'l', '\u2170': 'i', '\u217c': 'l' };
   const norm = (value) =>
     deaccent(normalizeForMatch(String(value ?? '')))
       .toLowerCase()
+      .replace(/[\u0131\u0251\u0261\u029f\u2170\u217c]/g, (ch) => LOOKALIKE[ch] ?? ch)
       .replace(/[\s\u00a0\u200b-\u200d\u2060]+/g, ' ') // gộp khoảng trắng + bỏ ký tự vô hình
       .trim();
+  /**
+   * Vòng 4: so khớp trên dạng ĐÃ BỎ MỌI KÝ TỰ KHÔNG PHẢI CHỮ/SỐ và NỐI TẤT CẢ các đoạn chữ.
+   * Nhờ vậy các biến thể sau đều bị chặn: dấu câu chen trong cụm ("miễn-phí", "miễn.phí",
+   * "miễn/phí", "miễn_phí", "miễn(phí)"), dính chữ ("miễnphí"), và cụm bị TÁCH sang hai mục
+   * ("Miễn" + "phí vận chuyển") — trước đây đều lọt và vẫn được vẽ.
+   */
+  const squash = (value) => norm(value).replace(/[^a-z0-9]+/g, '');
+  /**
+   * Regex "bỏ qua dấu câu GIỮA CÁC TỪ" của một cụm: `miễn phí` ⇒ /mien[^a-z0-9]*phi/.
+   * Bắt được dấu câu chen trong cụm ("miễn-phí", "miễn.phí", "miễn(phí)"), dính chữ ("miễnphí")
+   * và cụm bị tách sang hai mục — nhưng KHÔNG khớp oan giữa một từ dài
+   * (ví dụ "Suy tin hieu camera": "uy tin" bị chặn bởi chữ "s" đứng trước ⇒ không khớp).
+   */
+  const phraseRe = (phrase) => {
+    const words = norm(phrase).split(' ').filter(Boolean).map((w) => w.replace(/[^a-z0-9]+/g, '')).filter(Boolean);
+    if (words.length === 0) return null;
+    const body = words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('[^a-z0-9]*');
+    // Ranh giới hai đầu: "uy tín" KHÔNG được khớp bên trong "suy tin hieu camera".
+    return new RegExp(`(^|[^a-z0-9])${body}([^a-z0-9]|$)`, 'u');
+  };
   const haystack = ` ${norm(evidenceText)} `;
+  const haystackSquashed = squash(evidenceText);
+  // Nối mọi đoạn chữ của video (chuẩn hoá, giữ khoảng trắng) để bắt cụm bị TÁCH giữa các mục.
+  const joinedNorm = norm(texts.map((t) => String(t ?? '')).join(' '));
   const out = [];
   for (const text of texts) {
     const value = String(text ?? '').trim();
@@ -402,11 +428,19 @@ export function fallbackViolations(texts, evidenceText) {
     }
     for (const phrase of CLAIM_PHRASES) {
       const needle = norm(phrase);
-      // Khớp theo RANH GIỚI TỪ: tránh chặn oan câu lành chứa chuỗi con tình cờ
-      // (ví dụ "Suy tin hieu camera" chứa "uy tin", "Also mot chiec ao" chứa "so mot").
-      const re = needle ? new RegExp(`(^|[^\\p{L}\\p{N}])${needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^\\p{L}\\p{N}]|$)`, 'u') : null;
-      const hit = re ? re.test(lower) : false;
-      if (hit && !haystack.includes(needle)) {
+      const needleSquashed = squash(phrase);
+      if (!needle || !needleSquashed) continue;
+      // Khớp theo RANH GIỚI TỪ (tránh chặn oan "Suy tin hieu camera" chứa "uy tin")…
+      const re = new RegExp(`(^|[^\\p{L}\\p{N}])${needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^\\p{L}\\p{N}]|$)`, 'u');
+      // …HOẶC khớp "bỏ qua dấu câu giữa các từ" (bắt "miễn-phí", "miễnphí", cụm tách 2 mục)
+      // nhưng vẫn tôn trọng ranh giới từ nên không chặn oan câu lành.
+      const flexible = phraseRe(phrase);
+      const hit = re.test(lower) || Boolean(flexible && flexible.test(joinedNorm));
+      const evidenced =
+        haystack.includes(needle) ||
+        haystackSquashed.includes(needleSquashed) ||
+        Boolean(flexible && flexible.test(norm(evidenceText)));
+      if (hit && !evidenced) {
         out.push({ rule: 'CLAIM_WORD_UNSUPPORTED', text: value.slice(0, 200), detail: `Khẳng định "${phrase}" không có trong dữ liệu đã lưu của job.` });
       }
     }

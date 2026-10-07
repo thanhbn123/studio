@@ -414,3 +414,68 @@ N1 (lỗ hổng CRITICAL của vòng 2 — chữ khẳng định **viết không
 **Nghĩa là**: với mọi cách viết mà người dùng thật có thể gõ (kể cả không dấu, HOA, full-width, dán ký tự vô hình), chữ khẳng định/số liệu thiếu bằng chứng **không được vẽ**, đã đo bằng pixel trên 120+ ca; video 30s ở cả 3 preset tạo được và mở được bằng 4 bộ giải mã độc lập; cảnh báo alpha/`fit_box`/thứ tự cảnh khớp pixel thật; tiền/IDOR/quyền sở hữu/ảnh gốc bất biến đúng; 929 test xanh. **Điều kiện kèm theo**: (1) vá homoglyph Greek, (2) vá số `\p{Nl}`/`\p{No}`/`№`, (3) xử lý N3 (mảng lồng bị bỏ im lặng + `[object Object]`), (4) bổ sung trường `playback_ms` thật (N2) — cả bốn đều đã có bằng chứng đo được trong mục C2/C3.
 
 **KHÔNG nghĩa là**: (a) hàng rào chống bịa là **kín tuyệt đối** — đây là danh sách từ khoá + luật số, vẫn còn 6 ca đối kháng vẽ được chữ bịa (C2) và vẫn có thể chặn oan vài câu chứa chuỗi con (C3); (b) video có tiếng — bản offline là GIF **không tiếng**, mọi kết quả đều mang `audio: null`; (c) MP4/ffmpeg đã đo — chưa từng chạy; (d) chất lượng màu đã kiểm ngoài GIF 256 màu; (e) UI đã kiểm trên trình duyệt thật; (f) nhịp phát khớp tuyệt đối — vẫn lệch ~4% vì GIF chỉ ghi delay bội số 10ms; (g) bằng chứng là "khách quan" — bằng chứng = **dữ liệu người dùng đã lưu** (tên sản phẩm, ghi chú, vùng chữ nhập tay), nên người dùng vẫn có thể tự khai rồi tự vẽ (đã ghi trong hợp đồng, có `evidence_used.sources` để truy vết).
+
+---
+
+# VÒNG 4 — xác nhận chốt tại commit `5a53da0`
+
+**PHÁN QUYẾT CUỐI: FAIL** (hẹp — 2/5 mục người điều phối khai đã vá **không hoạt động**, 1 mục vá nửa, và **17 ca chữ bịa mới vẫn được VẼ**).
+
+Hai họ biến thể của vòng 3 **đã kín thật** (Hy Lạp/Cyrillic, số `\p{No}`/`\p{Nl}`/`№`) — 6/6 ca vòng 3 nay **422** và 6 biến thể Hy Lạp/Cyrillic mới cũng bị chặn. Nhưng: **(a) N2 và N3 mà người điều phối khai đã vá thì đo ra CHƯA** (số nhịp phát vẫn `null`; `{text:{label}}` vẫn vẽ `[object Object]` 17.400 px), **(b) 1 ca chặn oan vẫn còn**, **(c) bộ kiểm từ khoá vẫn hở trước dấu câu/dính chữ/lookalike Latin** ⇒ tiêu chí của chính vòng này ("không ca nào vẽ được chữ bịa, false positive cũng là lỗi") **không đạt**.
+
+- Commit `5a53da0` · người chấm **độc lập**, **không sửa mã nguồn/`test/**`**; `git status --short` cuối phiên: chỉ `docs/MVP-04-REVIEW.md`.
+- Script vòng 4: `/tmp/mvp04-atk5/**` (`attack4.mjs`, `probe4.mjs`, `punct.mjs`, `extra.mjs` + decoder Python độc lập `gifmask.py`/`gifdec2.py` + vân tay mực `ink.mjs`).
+- Tự chạy lại rig vòng 2 trên commit này: `{"total":98,"http_422":74,"late_fail_202":[],"leaks":[]}`, đối chứng `benign` 202 + 12.288 px, `notext` 0 px — **khớp** lời khai của người điều phối.
+
+## D1. Bảng N1/N2/N3 + F1…F10
+
+| # | Trạng thái vòng 4 | Bằng chứng (1 dòng) |
+|---|---|---|
+| **N1** | **2 họ vòng 3: ĐÃ KÍN. Nhưng phát sinh 3 họ mới (⇒ FAIL)** | Đã kín: `miễn phοí` · `μιễn phí` · `giảm ν giá` · `sản phẩm Ⅰ` · `top Ⅻ` · `№ một` ⇒ **422** cả 6; thêm `miễn βhí`, `giảm θ giá`, `uy tín ω`, `ΜΙỄΝ ΡΗÍ`, `miễn phí cho mọі người`, `Nguуên ѕeal`, `top Ⅷ`, `№ mot`, ZWJ, BOM+ZWSP ⇒ **422**. **Nhưng 17 ca mới vẫn 202 + `succeeded` + chữ được VẼ** (xem D2) |
+| **N2** | **CHƯA VÁ (lời khai sai)** | `encode.playback_ms = requested_ms = delay_drift_ms = null` ở `data.encode` **và** `last_run.encode`; đo in-process: `encodeGif()` trả `{playback_ms:960, requested_ms:996, delay_drift_ms:3}` nhưng kết quả provider chỉ còn `[…,"warnings","elapsed_ms","error_code"]` ⇒ **`createEncodeResult()` (encoder.js:82) không copy 3 field** dù `ENCODE_RESULT_FIELDS` đã thêm tên |
+| **N3** | **CHƯA VÁ (lời khai sai)** | `{text:{label:"nguyen seal"}}` ⇒ 202 + vẽ **`[object Object]` 17.400 px** (vân tay mực khớp; cảnh báo của repo ghi đúng chuỗi đó). Nguyên nhân: `sanitizeText({label:…})` = `"[object Object]"` (đo trực tiếp) — sanitize ở route biến object thành chuỗi TRƯỚC khi `plan/texts.js` kịp từ chối. `texts=[[str]]` / `[[[str]]]` ⇒ 202 + 0 px nhưng **không một cảnh báo** nào nói chữ đã bị bỏ |
+| **Chặn oan** | **CÒN 1/2** | `"Suy tin hieu camera"` ⇒ 202 + **vẽ 9.702 px** ✔ (hết oan); `"Also mot chiec ao"` ⇒ **vẫn 422** — tách bộ: `V3=0, V1=1` với thông báo *"Khẳng định “so mot” (nhóm số 1) không có trong chữ gốc"* (regex của `guardrails.js` không có ranh giới từ; `"Also, mot chiec ao"` có dấu phẩy thì **qua**) |
+| **F1** | ĐÃ VÁ (giữ) | 19/19 từ khoá gốc ⇒ 422; không dấu/Cyrillic/full-width/HOA/ký tự vô hình/`①②③`/`１９９` ⇒ 422 |
+| **F2** | ĐÃ VÁ (giữ) | vòng 3: 30s 16:9 ⇒ 360 khung/331.776.000 px, `file`+`sips`+`magick`+decoder Python OK (patch vòng 4 không đụng tầng mã hoá) |
+| **F3** | ĐÃ VÁ (giữ) | cảnh báo alpha `120000/120000` + khung 0 đúng màu nền `#00FF00` (đo vòng 3, tầng `frames.js` không đổi) |
+| **F4** | ĐÃ VÁ theo thoả thuận | `evidence_used.sources:["product_name"]` + `chars` |
+| **F5** | ĐÃ VÁ (giữ) | 8×8/64×64/256×256 ⇒ `inspectGif.valid=true` + decoder nghiêm ngặt chấp nhận |
+| **F6** | **CHƯA** (= N2) | cảnh báo chữ vẫn đúng, nhưng số máy đọc vẫn `null` |
+| **F7** | ĐÃ VÁ | 15/17 dạng field ⇒ 422; đệ quy `{text:['…']}` ⇒ 422; 0 ca `202 → failed` |
+| **F8** | ĐÃ VÁ | chữ 800 ký tự ⇒ vẽ 500, `plan_summary` 500 |
+| **F9** | ĐÃ VÁ | job `failed` ⇒ `data.warnings` có câu không-tiếng |
+| **F10** | ĐÃ VÁ (giữ) | `fit_box={359,140,1,1000}` = bbox vẽ thật |
+| **Thứ tự cảnh** | ĐÃ VÁ (giữ) | cùng mili-giây + gửi ngược ⇒ plan + màu tâm khung đúng thứ tự gửi |
+
+**Hồi quy tự đo**: `npm test` → **929 · 928 pass · 0 fail · 1 skipped**, EXIT=0; `node tools/verify.mjs` → **929 · 928 · 0 · 1**, EXIT=0; ảnh gốc **bất biến** (`sha_before = sha_after = db_sha = 0fd335ccb14ef8b8…`); 402 `INSUFFICIENT_CREDIT` với `jobs_created=0`; usage theo bước (`VIDEO_RENDER:0.0006` + `VIDEO_ENCODE:0.0004`); **thu theo lượt** (`#1` → `#2`, ledger 4,999 → 4,998); IDOR job/GIF ⇒ **404** cho phiên khác, chủ 200.
+
+## D2. 17 ca chữ bịa MỚI vẫn được vẽ (202 + `succeeded`, đo pixel + vân tay mực)
+
+| Họ | Ca đo được (px trắng khung 0) | Vì sao lọt |
+|---|---|---|
+| **A. Dấu câu chen TRONG cụm từ** (11 ca) | `miễn-phí vận chuyển` 10.780 · `miễn - phí` · `miễn.phí` 31.752 · `miễn/phí` 32.724 · `miễn_phí` 32.076 · `miễn•phí` 30.456 · `miễn(phí)` 27.648 · `miễn…phí` · `miễn–phí` (en dash) · `khuyến-mãi` · `nguyên-seal` | `norm()` chỉ gộp **khoảng trắng**; dấu câu nằm giữa hai chữ nên needle `"mien phi"` không còn là chuỗi con. Dấu câu ở **ngoài** cụm (`"Miễn phí vận chuyển!"`, `"(Miễn phí vận chuyển)"`, `"Giá rẻ nhất — sốc"`) **vẫn bị chặn đúng** |
+| **B. Dính chữ** (1 ca) | `miễnphí` (202 + succeeded, có mực) | Bỏ khoảng trắng ⇒ `"mienphi"` không chứa `"mien phi"` — lỗi gõ rất thường gặp |
+| **C. Lookalike Latin ngoài bảng gộp** (4 ca) | `Mıễn phí` (dotless ı U+0131) · `miễn phı` · `khuyến mãı` · `giɑ re nhat` (ɑ U+0251) | `HOMOGLYPH_MAP` có Greek/Cyrillic nhưng **thiếu lookalike Latin**; chúng vẫn thuộc `\p{Script=Latin}` nên `FOREIGN_SCRIPT_RE` không bắt |
+| **D. Cụm bị TÁCH thành nhiều mục chữ** (1 ca) | 2 mục `"Miễn"` + `"phí vận chuyển"` ⇒ 202 + **63.700 px** mực | Bộ kiểm chạy **theo từng mục**; không kiểm văn bản GHÉP của cả cảnh |
+
+**Không tính là rò**: `ⓐ bán chạy` (21.825 px) và `Ⓐ sale` (29.376 px) — ký tự trang trí `\p{So}`, **không chứa khẳng định/số liệu nào**; ngược lại claim viết bằng chữ khoanh `ⓜⓘⓔⓝ ⓟⓗⓘ` **bị chặn 422** (NFKC gỡ đúng).
+
+**Gợi ý vá (đều là sửa nhỏ, có bằng chứng ở trên)**: (1) `createEncodeResult` copy thêm `playback_ms/requested_ms/delay_drift_ms`; (2) chặn ở route: object lồng ⇒ 400/422 **hoặc** bỏ kèm cảnh báo, tuyệt đối không `String(object)` thành `"[object Object]"`, và mảng lồng bị bỏ phải có cảnh báo; (3) so khớp từ khoá trên bản **đã bỏ mọi ký tự không phải chữ/số** (`mienphi`) song song với bản có khoảng trắng, và thêm `ı→i, ɑ→a` vào `HOMOGLYPH_MAP`; (4) kiểm thêm văn bản **ghép** của `scene.texts`; (5) `guardrails.checkClaimWords` cũng cần ranh giới từ cho nhánh không dấu.
+
+## D3. Đã cố phá mà KHÔNG phá được (vòng 4)
+
+1. **Hy Lạp/Cyrillic**: 12 biến thể (β, θ, ω, Ο hoa, trộn giữa từ, `ѕ`/`у`/`і`, hoa) ⇒ **422 hết**.
+2. **Số/ký hiệu đặc biệt**: `Ⅰ`, `Ⅻ`, `Ⅷ`, `№ mot`, `①②③`, `½`, `²`, `¹⁹⁹`, `١٩٩`, `१९९` ⇒ **422 hết** (dùng lại luật guardrails).
+3. **Ký tự vô hình/không gian đặc biệt**: ZWJ, ZWSP, BOM, U+2060, NBSP, ideographic space U+3000, tab, CRLF, nhiều dòng ⇒ **422 hết**.
+4. **Chữ khoanh/full-width**: `ⓜⓘⓔⓝ ⓟⓗⓘ`, `ｇｉá ｒẻ ｎｈấｔ` ⇒ **422** (NFKC).
+5. **Dấu câu NGOÀI cụm**: `"Miễn phí vận chuyển!"`, `"(Miễn phí vận chuyển)"`, `"GIÁ RẺ NHẤT?"`, `"Giá rẻ nhất — sốc"` ⇒ **422** (ranh giới từ hoạt động đúng chiều này).
+6. **Đối chứng dương**: 5/6 câu lành ⇒ 202 **và được vẽ** (`"Ao thun (cotton) - size M"` 8.532 px · `"Suy tin hieu camera"` 9.702 px · `"Giay the thao, mau trang!"` 9.324 px · `"Tui xach da bo"` 13.800 px · `"Mien thue va phi van chuyen"` 6.825 px) — **không** chặn bừa.
+7. **Hồi quy**: `npm test` 929/928/0/1 · `verify.mjs` y hệt · ảnh gốc bất biến · tiền/usage/thu theo lượt · IDOR 404/200.
+
+## D4. Chưa kiểm được (vòng 4)
+
+1. **Tiếng**: không có TTS/ffmpeg ⇒ chỉ đọc được `audio: null` + cảnh báo. 2. **MP4/ffmpeg**: chưa chạy được. 3. **GIF 256 màu**: mọi phép đo pixel là trên GIF đã lượng tử hoá. 4. **UI trình duyệt thật**: chưa mở Chrome/Safari. 5. **Nhịp phát thật trên thiết bị**: chỉ đo `Σ delay` trong GIF (960ms cho video khai 1.000ms ≈ −4%). 6. **Postgres** (toàn bộ chạy SQLite in-memory) và **nhiều job 30s song song** (chỉ chạy tuần tự). 7. **Bằng chứng "vòng"**: người dùng vẫn tự khai `product_name`/ghi chú rồi lấy đó làm bằng chứng (đã ghi trong hợp đồng; `evidence_used.sources` nói ra nguồn) — chưa kiểm với người dùng thật.
+
+## D5. Muốn PASS thì cần gì (điều kiện đo được, không phải ý kiến)
+
+(1) `{text:{label:…}}` **không** vẽ `[object Object]` (422 hoặc bỏ + cảnh báo) và `texts=[[str]]` bị bỏ **có cảnh báo**; (2) `encode.playback_ms` là **số** khớp `Σ delay` GIF; (3) `"Also mot chiec ao"` và `"Suy tin hieu camera"` đều **202 + được vẽ**, còn `"Miễn phí vận chuyển"` vẫn **422**; (4) 17 ca ở D2 **không ca nào** được vẽ (422 hoặc `failed` + 0 px). Khi đó PASS sẽ nghĩa là: chữ khẳng định/số liệu thiếu bằng chứng không được vẽ với mọi cách viết thường gặp **và** chữ lành vẫn vẽ được; video 30s ở 3 preset mở được bằng 4 bộ giải mã độc lập; cảnh báo alpha/`fit_box`/thứ tự cảnh khớp pixel; tiền/IDOR/ảnh gốc bất biến đúng; 929 test xanh. PASS **KHÔNG** nghĩa là: có tiếng · MP4/ffmpeg đã đo · màu đã kiểm ngoài GIF 256 màu · UI đã kiểm trên trình duyệt thật · nhịp phát khớp tuyệt đối · bằng chứng khách quan (vẫn là dữ liệu người dùng tự lưu) · hàng rào từ khoá kín tuyệt đối trước mọi cách viết sáng tạo.

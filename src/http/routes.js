@@ -839,7 +839,10 @@ export function buildRouter(app) {
         if (item[key] === undefined || item[key] === null) continue;
         videostudioTextValueOf(item[key], out);
       }
+      return out;
     }
+    // Giá trị không phải string/số/mảng/object chữ (vd object lồng sâu) ⇒ KHÔNG dùng: trước đây bị
+    // `sanitizeText` biến thành "[object Object]" rồi VẼ LÊN VIDEO (17.400 px — phản biện vòng 4).
     return out;
   };
 
