@@ -84,15 +84,24 @@ export function fitImageInFrame({ source_width: sw, source_height: sh, width: W,
   }
 
   // CONTAIN (mặc định): phóng vừa khung, phần dư là viền `pad_color`.
+  //
+  // F10 (phản biện MVP-04, MINOR): `w`/`h` phải suy từ CÙNG MỘT `scale` hiệu dụng SAU khi làm tròn,
+  // nếu không tỉ lệ `fit_box` lệch tỉ lệ nguồn và V2 (tự tính `contain` bên trong hộp) vẽ ảnh NHỎ
+  // HƠN hộp ⇒ metadata nói sai vị trí/kích thước ảnh (đo được: ảnh 1×1000 khai `h=1280`, vẽ `h=1000`).
   const scale = Math.min(W / sw, H / sh);
   const w = Math.max(1, Math.min(W, Math.round(sw * scale)));
   const h = Math.max(1, Math.min(H, Math.round(sh * scale)));
-  const x = Math.floor((W - w) / 2);
-  const y = Math.floor((H - h) / 2);
-  const scaled = { x, y, w, h };
+  // `scale` hiệu dụng = tỉ lệ THẬT SỰ dùng để vẽ trong hộp (sau làm tròn) — V2 vẽ đúng theo nó.
+  const effectiveScale = Math.min(w / sw, h / sh);
+  // Thu hộp về đúng phần ảnh sẽ phủ (bỏ phần viền thừa do làm tròn) ⇒ `fit_box` == vùng vẽ thật.
+  const drawW = Math.max(1, Math.min(w, Math.round(sw * effectiveScale)));
+  const drawH = Math.max(1, Math.min(h, Math.round(sh * effectiveScale)));
+  const x = Math.floor((W - drawW) / 2);
+  const y = Math.floor((H - drawH) / 2);
+  const scaled = { x, y, w: drawW, h: drawH };
   return {
     fit: 'pad',
-    scale,
+    scale: effectiveScale,
     scaled,
     // `intersectBoxWithImage` ở đây là lưới an toàn: hộp đã nằm trong khung nên giao = chính nó.
     fit_box: intersectBoxWithImage(scaled, W, H) ?? { x: 0, y: 0, w: W, h: H },

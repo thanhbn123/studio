@@ -761,6 +761,22 @@ export function buildRouter(app) {
   };
 
   /**
+   * Bộ kiểm DỰ PHÒNG của V3 (`fallbackViolations` trong `src/videostudio/pipeline.js`).
+   *
+   * F7 (phản biện MVP-04): preflight ở route chỉ dùng bộ của V1 — mà bộ V1 **hẹp hơn** bộ dự phòng
+   * của V3 (13/19 từ khoá như “giá rẻ nhất”, “miễn phí”, “nguyên seal” chỉ có ở V3). Hệ quả trước đây:
+   * route trả **202** rồi job mới `failed` ⇒ người dùng chờ vô ích. Nay route dùng **cùng** hai bộ mà
+   * pipeline dùng (hợp + khử trùng) ⇒ 422 NGAY, không còn đường "202 rồi failed".
+   */
+  const loadVideostudioFallbackViolations = async () => {
+    for (const spec of ['../videostudio/pipeline.js', '../videostudio/pipeline']) {
+      const mod = await loadVideostudioModule(spec);
+      if (typeof mod?.fallbackViolations === 'function') return mod.fallbackViolations;
+    }
+    return null;
+  };
+
+  /**
    * Gọi bộ kiểm khẳng định của V1 cho TỪNG đoạn chữ (chữ ký ĐÓNG BĂNG của
    * `src/videostudio/plan/claims.js`: `collectClaimViolations(text, { evidence })`).
    *
@@ -787,6 +803,41 @@ export function buildRouter(app) {
    * để đưa cho V1 (`TEXT_KEYS` của `videostudio/pipeline.js`) — nhờ vậy thứ được KIỂM và thứ
    * được VẼ là MỘT danh sách, không lệch.
    */
+  /**
+   * Mọi đoạn chữ SẼ ĐƯỢC VẼ theo cách V1 đọc (`readTextValue` của `plan/texts.js`):
+   * `string` | `number` | `{ text | content | label | value }` — kể cả `scene.texts` dạng MẢNG
+   * các object đó.
+   *
+   * ⚠️ F7 (phản biện MVP-04, MINOR): trước đây chỉ đọc `item.text` ⇒ `{content}`, `{label}`,
+   * `{value}` và số LỌT qua preflight (route trả 202) rồi mới chết ở pipeline (`failed`) — người
+   * dùng trả giá bằng một job + một lượt chạy chỉ để nhận lỗi muộn. Nay đọc ĐÚNG bộ khoá của V1.
+   */
+  const VIDEOSTUDIO_TEXT_VALUE_KEYS = Object.freeze(['text', 'content', 'label', 'value']);
+  const videostudioTextValueOf = (item) => {
+    if (typeof item === 'string') return item.trim();
+    if (typeof item === 'number' && Number.isFinite(item)) return String(item);
+    if (item && typeof item === 'object') {
+      for (const key of VIDEOSTUDIO_TEXT_VALUE_KEYS) {
+        const value = item[key];
+        if (typeof value === 'string' && value.trim()) return value.trim();
+        if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+      }
+    }
+    return '';
+  };
+
+  /** Trần độ dài chữ: ưu tiên hằng CỦA V1 (`VIDEOSTUDIO_TEXT_MAX`), fallback cùng giá trị. */
+  const videostudioTextMax = async () => {
+    try {
+      const mod = await loadVideostudioModule('../videostudio/plan/texts.js');
+      const value = Number(mod?.VIDEOSTUDIO_TEXT_MAX);
+      if (Number.isFinite(value) && value > 0) return Math.trunc(value);
+    } catch {
+      /* V1 chưa nạp được ⇒ dùng giá trị dự phòng (không chặn đường) */
+    }
+    return VIDEOSTUDIO_TEXT_MAX;
+  };
+
   const videostudioTextsOf = (options) => {
     const out = [];
     const push = (source) => {
@@ -795,9 +846,8 @@ export function buildRouter(app) {
         const value = source[key];
         if (value === undefined || value === null) continue;
         for (const item of Array.isArray(value) ? value : [value]) {
-          const text = typeof item === 'string' ? item : typeof item?.text === 'string' ? item.text : '';
-          const trimmed = text.trim();
-          if (trimmed) out.push(trimmed);
+          const text = videostudioTextValueOf(item);
+          if (text) out.push(text);
         }
       }
     };
@@ -829,11 +879,26 @@ export function buildRouter(app) {
 
     const evidence = await collectVideostudioEvidence(job);
     const violations = callClaimCollector(collector, { evidence, texts });
-    if (violations === null) {
+
+    // F7: hợp thêm bộ dự phòng của V3 (pipeline) — nếu thiếu, preflight sẽ hẹp hơn hàng rào thật.
+    const evidenceText = typeof evidence === 'string' ? evidence : '';
+    const fallback = await loadVideostudioFallbackViolations();
+    let fallbackList = [];
+    if (fallback) {
+      try {
+        fallbackList = asArray(fallback(texts, evidenceText)).map(violationText).filter(Boolean);
+      } catch (err) {
+        logger?.warn?.('videostudio.text_check_fallback_failed', { error_name: err?.name || 'Error' });
+      }
+    } else {
+      logger?.warn?.('videostudio.text_check_fallback_missing', { reason: 'chưa nạp được fallbackViolations của V3' });
+    }
+
+    if (violations === null && fallbackList.length === 0) {
       logger?.warn?.('videostudio.text_check_unreadable', { reason: 'collectClaimViolations không trả lời được cho đoạn chữ nào' });
       return null;
     }
-    const list = [...new Set(violations.map(violationText).filter(Boolean))];
+    const list = [...new Set([...(violations ?? []).map(violationText), ...fallbackList].filter(Boolean))];
     if (list.length === 0) return null;
 
     const shown = texts.join(' · ');
@@ -2847,9 +2912,18 @@ export function buildRouter(app) {
       rendered: rendered.map(assetJson),
       plan: blob.plan ?? blob.plan_summary ?? null,
       encode: blob.encode ?? blob.encode_summary ?? null,
+      // F4: BẰNG CHỨNG đã dùng để cho phép vẽ chữ (`{sources, region_ids, chars}`) — người duyệt
+      // nhìn là biết vì sao chữ này được vẽ (product_name / ocr_region / user_region / job_notes).
+      evidence_used: blob.evidence_used ?? run?.evidence_used ?? null,
       // §0 luật 2: video offline KHÔNG có tiếng — trả ĐÚNG giá trị đã lưu, thiếu ⇒ null.
       audio: blob.audio ?? null,
-      warnings: asArray(blob.warnings).map(String),
+      // F9 (phản biện MVP-04, MINOR): đường job LỖI không có asset `rendered` ⇒ `blob.warnings` rỗng
+      // dù `content_meta.videostudio.warnings` đã có (ví dụ câu “Video KHÔNG có tiếng…”). Gộp cả hai
+      // nguồn (khử trùng, giữ thứ tự) để mọi đường trả cùng một danh sách cảnh báo.
+      warnings: [...new Set([
+        ...asArray(blob.warnings).map(String),
+        ...asArray(run?.warnings).map(String),
+      ])].filter(Boolean),
       providers: videostudioProviders(),
       presets: Array.isArray(presets) ? presets : null,
       last_run: videostudioLastRun(run),
@@ -4088,7 +4162,11 @@ const VIDEOSTUDIO_EXTRA_MIME = Object.freeze(['video/mp4']);
 const VIDEOSTUDIO_MAX_SCENES = 24;
 const VIDEOSTUDIO_MAX_TEXTS = 60;
 /** Trần ký tự mỗi đoạn chữ sẽ vẽ lên video (khớp `IMAGESTUDIO_OVERLAY_TEXT_MAX`). */
-const VIDEOSTUDIO_TEXT_MAX = 500;
+/**
+ * F8: trần độ dài chữ — LẤY TỪ V1 (`plan/texts.js → VIDEOSTUDIO_TEXT_MAX`) khi nạp được, để chỉ
+ * còn MỘT con số cho cả sanitize → plan/summary → UI. Không nạp được ⇒ 500 (cùng giá trị).
+ */
+const VIDEOSTUDIO_TEXT_MAX = 500; // giá trị dự phòng; `videostudioTextMax()` ưu tiên hằng của V1
 
 /**
  * Khoá chứa chữ sẽ VẼ lên video — GIỮ KHỚP `TEXT_KEYS` của `src/videostudio/pipeline.js`

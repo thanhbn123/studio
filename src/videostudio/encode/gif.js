@@ -239,12 +239,14 @@ export function encodeGif({
   const defaultDelay = Number.isFinite(Number(delayMs)) && Number(delayMs) >= 0 ? Number(delayMs) : 100;
   const parts = [header, lsd, gct, netscape];
   let delayDrift = 0; // lệch lớn nhất giữa delay yêu cầu và delay GIF thật ghi được (ms)
+  let playbackMs = 0; // F6: TỔNG thời gian phát THẬT theo delay đã ghi vào GCE
 
   for (let index = 0; index < list.length; index += 1) {
     const rawDelay = list[index].delayMs ?? defaultDelay;
     // GIF lưu delay theo đơn vị 1/100 giây; 0 bị nhiều trình xem hiểu thành 100ms ⇒ tối thiểu 1.
     const units = Math.max(1, Math.min(0xffff, Math.round(rawDelay / 10)));
     delayDrift = Math.max(delayDrift, Math.abs(units * 10 - rawDelay));
+    playbackMs += units * 10;
 
     const gce = Buffer.alloc(8);
     gce[0] = 0x21;
@@ -269,8 +271,20 @@ export function encodeGif({
   parts.push(Buffer.from([0x3b])); // trailer
 
   const buffer = Buffer.concat(parts);
-  if (delayDrift >= 5) {
-    // Chỉ cảnh báo khi lệch ĐÁNG KỂ (≥ 5ms/khung): GIF chỉ có độ phân giải delay 10ms.
+  // F6 (phản biện MVP-04, MINOR): nhịp phát THẬT ngắn hơn khai báo tới ~4% (83,33ms → 80ms) mà
+  // trước đây KHÔNG hề nói ra (ngưỡng cảnh báo cũ 5ms/khung > 3,33ms thực tế). Nay:
+  //   · luôn trả `playback_ms` (tổng thời gian phát thật) để tầng trên ghi vào `encode_summary`;
+  //   · cảnh báo khi lệch ≥ 3ms/khung (thay vì 5ms) — vẫn trên độ phân giải 10ms của GIF.
+  const requestedMs = list.reduce((sum, entry, index) => sum + (entry.delayMs ?? defaultDelay), 0);
+  const playbackDriftMs = playbackMs - requestedMs;
+  if (Math.abs(playbackDriftMs) >= 1) {
+    warnings.push(
+      `Nhịp phát THẬT của GIF là ${(playbackMs / 1000).toFixed(2)}s (khai báo ${(requestedMs / 1000).toFixed(2)}s; ` +
+        `lệch ${playbackDriftMs > 0 ? '+' : ''}${(playbackDriftMs / 1000).toFixed(2)}s) — GIF chỉ ghi được delay theo bội số 10ms.`,
+    );
+  }
+  if (delayDrift >= 3) {
+    // Chỉ cảnh báo khi lệch ĐÁNG KỂ (≥ 3ms/khung): GIF chỉ có độ phân giải delay 10ms.
     warnings.push(
       `Delay bị làm tròn về bội số 10ms của GIF — lệch tối đa ${delayDrift.toFixed(1)}ms mỗi khung ` +
         `(nhịp thật có thể nhanh/chậm hơn yêu cầu).`,
@@ -285,6 +299,11 @@ export function encodeGif({
     frames: list.length,
     bytes: buffer.length,
     palette_size: paletteColors,
+    // F6: nhịp phát THẬT (tổng delay đã ghi) + yêu cầu — để tầng trên ghi `encode_summary` và UI
+    // hiện “nhịp thật ≈ X giây” thay vì lặng lẽ nói sai.
+    playback_ms: playbackMs,
+    requested_ms: requestedMs,
+    delay_drift_ms: delayDrift,
     warnings,
   };
 }

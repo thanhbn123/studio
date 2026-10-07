@@ -18,7 +18,9 @@
 
 // ── Hợp đồng §2.2 ──
 export { encodeGif, COLOR_ERROR_THRESHOLD, MAX_GIF_FRAMES, MAX_GIF_PIXELS, normalizeGifFrames } from './gif.js';
-export { inspectGif, decodeLzwCount, INSPECT_MAX_FRAMES, INSPECT_MAX_PIXELS } from './inspect.js';
+export {
+  inspectGif, decodeLzwCount, INSPECT_MAX_FRAMES, INSPECT_MAX_PIXELS, INSPECT_MIN_BUDGET_PIXELS,
+} from './inspect.js';
 export { writeFrameSequence, resolveSequenceRoot, MAX_SEQUENCE_FRAMES } from './sequence.js';
 export {
   VideoEncoder,

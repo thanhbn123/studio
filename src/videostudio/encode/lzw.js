@@ -114,6 +114,13 @@ export function encodeLzw(indices, minCodeSize) {
       curCode = k;
     }
     emit(curCode);
+    // F5 (phản biện MVP-04, MINOR): BIÊN ĐỘ DÀI MÃ TRƯỚC EOI.
+    // Bộ giải mã tự nới `codeSize` ngay khi từ điển của nó chạm `2^codeSize` (tức lúc nó nhận
+    // được mã cuối cùng của dải mã cũ). Nếu ta ghi mã kết thúc bằng độ dài CŨ thì dòng bit bị
+    // lệch đúng 1 bit ⇒ decoder nghiêm ngặt báo “hết bit trước khi gặp mã kết thúc” (đo được ở
+    // ảnh 8×8 đơn sắc: file repo 66 byte, ImageMagick ghi cùng dòng mã + 1 byte `0x00`).
+    // Nới ĐỐI XỨNG với nhánh gán mã ở trên, rồi mới ghi `endCode`.
+    if (nextCode === 1 << codeSize && codeSize < 12) codeSize += 1;
     emit(endCode);
   }
 

@@ -40,6 +40,15 @@ const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
  * KHÔNG đọc bất cứ khoá bằng chứng nào trong đó (xem `claims.js`).
  * @returns {string}
  */
+/**
+ * Trần ĐỘ DÀI một đoạn chữ được vẽ (ký tự) — MỘT hằng dùng chung cho cả chuỗi:
+ * route sanitize (`src/http/routes.js`) → plan/`summarizePlan` (V3) → UI (`public/app.js`).
+ *
+ * F8 (phản biện MVP-04, MINOR): `plan_summary` từng cắt ở 300 trong khi video vẽ tới 500 ⇒ mở lại
+ * job thấy chữ KHÁC chữ trên video. Không được để hai con số khác nhau cho cùng một dữ liệu.
+ */
+export const VIDEOSTUDIO_TEXT_MAX = 500;
+
 export function readTextValue(raw) {
   if (typeof raw === 'string') return raw;
   if (typeof raw === 'number' && Number.isFinite(raw)) return String(raw);

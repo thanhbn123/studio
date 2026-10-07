@@ -103,6 +103,22 @@ function copyRgba(image) {
  * Nhận: Buffer/Uint8Array PNG (tự giải mã), ảnh đã giải mã `{width,height,channels,data}`,
  * hoặc `{width,height,rgba}`.
  */
+/**
+ * F3 — đếm điểm ảnh có `alpha < 255` của một ảnh nguồn đã chuẩn hoá (`{ width, height, rgba }`).
+ * Trả `{ transparent, total }`; ảnh không có kênh alpha ⇒ `transparent = 0`.
+ * @private
+ */
+function countSourceAlpha(source) {
+  const total = Math.max(0, Number(source?.width) || 0) * Math.max(0, Number(source?.height) || 0);
+  const rgba = source?.rgba;
+  if (!rgba || total === 0) return { transparent: 0, total };
+  let transparent = 0;
+  for (let i = 3; i < rgba.length; i += 4) {
+    if (rgba[i] < 255) transparent += 1;
+  }
+  return { transparent, total };
+}
+
 function normalizeSource(loaded, assetId, { maxPixels, maxBytes } = {}) {
   if (!loaded) {
     throw new VideoEncodeError(
@@ -532,6 +548,26 @@ export function renderFrames(plan, deps = {}) {
       const source = normalizeSource(loaded, scene.asset_id, options);
       cache.set(scene.asset_id, source);
       scene.source = source;
+    }
+
+    // ── (2b) F3 (phản biện MVP-04, MAJOR): ALPHA CỦA ẢNH NGUỒN ──
+    // GIF không có kênh alpha ⇒ pixel `alpha < 255` bị LÀM PHẲNG lên màu nền của cảnh
+    // (`pad_color`) ngay trong `drawSceneImage`. Trước đây KHÔNG có cảnh báo nào ⇒ PNG trong suốt
+    // (ví dụ đầu ra đã tách nền của MVP-03, alpha = 0) cho ra video NỀN ĐEN mà người dùng không
+    // biết vì sao. Đếm MỘT LẦN cho mỗi ảnh nguồn (theo `asset_id`) rồi cảnh báo cho từng cảnh.
+    const alphaWarned = new Set();
+    for (const scene of scenes) {
+      if (!scene.source || !scene.asset_id || alphaWarned.has(scene.asset_id)) continue;
+      alphaWarned.add(scene.asset_id);
+      const stats = countSourceAlpha(scene.source);
+      if (stats.transparent === 0) continue;
+      const hex = `#${[scene.pad[0], scene.pad[1], scene.pad[2]].map((v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0')).join('')}`;
+      const fully = stats.transparent === stats.total;
+      warnings.push(
+        `Cảnh #${scene.index}: ảnh nguồn có ${stats.transparent}/${stats.total} điểm ảnh TRONG SUỐT hoặc bán trong suốt (alpha < 255)` +
+          `${fully ? ' — ảnh trong suốt HOÀN TOÀN' : ''}. GIF không có kênh alpha nên các điểm ảnh đó đã được LÀM PHẲNG lên màu nền ${hex}` +
+          ` (đặt \`plan.scenes[${scene.index}].pad_color\` để đổi màu nền).`,
+      );
     }
 
     // ── (3) Vẽ từng khung ──

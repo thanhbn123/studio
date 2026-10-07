@@ -362,7 +362,7 @@ function normalizeViolations(raw) {
  *   · từ khẳng định (bảo hành, chính hãng…) ⇒ cụm từ phải xuất hiện trong bằng chứng.
  * Không có bằng chứng ⇒ MỌI khẳng định/số liệu bị chặn (fail-closed).
  */
-function fallbackViolations(texts, evidenceText) {
+export function fallbackViolations(texts, evidenceText) {
   const haystack = ` ${String(evidenceText || '').toLowerCase().normalize('NFC')} `;
   const out = [];
   for (const text of texts) {
@@ -409,12 +409,27 @@ function moduleViolations(planModule, texts, evidenceText) {
 }
 
 /**
- * Gộp vi phạm: ưu tiên luật của V1 (một bản luật duy nhất, dùng lại guardrail của MVP-02/03);
- * chỉ khi V1 vắng/hỏng mới dùng bộ dự phòng của V3. Khử trùng theo (rule, text, detail).
+ * API KIỂM CHỐNG BỊA (dùng cho test + công cụ): trả MỌI vi phạm của HỢP hai bộ luật.
+ * Không phải đường mới — chỉ mở đúng hàm `collectViolations` ở trên cho tầng test gọi được.
+ */
+export function findUnsupportedClaims(texts, evidenceText = '', planModule = null) {
+  return collectViolations(planModule, Array.isArray(texts) ? texts : [texts], evidenceText);
+}
+
+/**
+ * Gộp vi phạm: **HỢP CỦA HAI BỘ LUẬT** — luật của V1 (dùng lại guardrail MVP-02/03) VÀ bộ dự phòng
+ * của V3. V1 chỉ có thể THÊM vi phạm, KHÔNG BAO GIỜ nới lỏng bộ dự phòng.
+ *
+ * ⚠️ F1 (phản biện MVP-04, CRITICAL): trước đây là `viaV1 ?? fallbackViolations(...)` — khi V1 trả
+ * về (kể cả mảng RỖNG) thì bộ dự phòng KHÔNG BAO GIỜ chạy ⇒ 13/19 từ khoá trong `CLAIM_PHRASES`
+ * của chính V3 (`đảm bảo`, `uy tín`, `miễn phí`, `freeship`, `giảm giá`, `khuyến mãi`, `hàng đầu`,
+ * `chất lượng cao`, `nguyên seal`, `nguyên đai`, `duy nhất`, `giá rẻ nhất`, `nhập khẩu`) LỌT và
+ * được VẼ lên video (đo được: 10 535 pixel chữ trắng, job `succeeded`) — vi phạm luật riêng #3.
+ * Nay hai bộ chạy SONG SONG rồi hợp lại, khử trùng theo (rule, text, detail).
  */
 function collectViolations(planModule, texts, evidenceText) {
   const viaV1 = moduleViolations(planModule, texts, evidenceText);
-  const all = [...(viaV1 ?? fallbackViolations(texts, evidenceText))];
+  const all = [...(viaV1 ?? []), ...fallbackViolations(texts, evidenceText)];
   const seen = new Set();
   const out = [];
   for (const item of all) {
@@ -452,6 +467,12 @@ function textValueOf(item) {
   return '';
 }
 
+/**
+ * F8: trần độ dài chữ của `plan_summary` phải BẰNG trần mà video vẽ (route sanitize + V1).
+ * Một nguồn số duy nhất — không để summary cắt ngắn hơn nội dung đã vẽ.
+ */
+const VIDEO_TEXT_MAX = 500;
+
 /** Bản mô tả JSON-safe của `VideoPlan` — V4 trả thẳng trong `GET /api/videostudio/jobs/:id`. */
 export function summarizePlan(plan) {
   if (!plan || typeof plan !== 'object') return null;
@@ -482,7 +503,7 @@ export function summarizePlan(plan) {
       // hoặc đã bị chặn; không kèm gì nhạy cảm (không token, không đường dẫn, không base64).
       texts: Array.isArray(scene?.texts)
         ? scene.texts.slice(0, 20).map((t) => ({
-          text: String(t?.text ?? '').slice(0, 300),
+          text: String(t?.text ?? '').slice(0, VIDEO_TEXT_MAX),
           x: toInt(t?.x, 0),
           y: toInt(t?.y, 0),
           size: toInt(t?.size, 0),
@@ -533,6 +554,11 @@ export function summarizeEncode(result, { encoder = null, inspection = null, sha
     provider: String(encoder?.name || result.provider || ''),
     sha256: sha ?? out.sha256 ?? (out.buffer ? sha256(out.buffer) : null),
     gif: inspection ? jsonSafe(inspection) : null,
+    // F6: nhịp phát THẬT (tổng delay đã ghi vào GIF) — plan nói `duration_ms`, GIF phát
+    // `playback_ms`; hai số phải cùng hiện để không có con số nào nói sai một mình.
+    playback_ms: toInt(result.playback_ms, null),
+    requested_ms: toInt(result.requested_ms, null),
+    delay_drift_ms: toInt(result.delay_drift_ms, null),
     warnings: Array.isArray(result.warnings) ? result.warnings.map(String).slice(0, 50) : [],
     error_code: result.error_code ?? null,
     elapsed_ms: toInt(result.elapsed_ms),
@@ -622,6 +648,10 @@ async function collectFrames(source) {
   if (typeof source?.[Symbol.asyncIterator] === 'function') {
     const out = [];
     for await (const frame of source) out.push(frame);
+    // Giữ cảnh báo mà V2 gắn trên iterable (F3) — nếu không thì chúng biến mất khi thu thành mảng.
+    if (Array.isArray(source?.warnings) && out.length >= 0) {
+      Object.defineProperty(out, 'warnings', { value: source.warnings, enumerable: false });
+    }
     return out;
   }
   if (typeof source?.[Symbol.iterator] === 'function') return [...source];
@@ -998,9 +1028,32 @@ export class VideoStudioPipeline {
   }
 
   /** Ảnh gốc của job (role `original`) theo ĐÚNG thứ tự đã tải lên — mỗi ảnh là một cảnh. */
+  /**
+   * Ảnh gốc của job THEO ĐÚNG THỨ TỰ ĐÃ GỬI LÊN.
+   *
+   * F10 (agent test báo): `store.listImageAssets` sắp `created_at ASC, id ASC`; khi nhiều ảnh được
+   * lưu trong CÙNG một mili-giây thì thứ tự rơi vào UUID NGẪU NHIÊN ⇒ cảnh bị ĐẢO so với thứ tự
+   * người dùng chọn (đo được: tải `ffff…, aaaa…, cccc…` → plan ra `aaaa…, cccc…, ffff…`).
+   * `ingest()` đã ghi `meta.scene_index` (0,1,2…) — dùng nó làm khoá sắp xếp CHÍNH; ảnh cũ không có
+   * `scene_index` xếp sau, giữ nguyên thứ tự store trả về (ổn định, không bịa thứ tự).
+   */
   async #originalAssets(jobId) {
     const list = await this.store.listImageAssets(jobId, { role: 'original' });
-    return Array.isArray(list) ? list : [];
+    if (!Array.isArray(list)) return [];
+    return list
+      .map((asset, position) => {
+        const raw = asset?.meta && typeof asset.meta === 'object' ? asset.meta.scene_index : null;
+        const index = Number.isFinite(Number(raw)) ? Number(raw) : null;
+        return { asset, index, position };
+      })
+      .sort((a, b) => {
+        if (a.index === null && b.index === null) return a.position - b.position;
+        if (a.index === null) return 1; // ảnh cũ (không có scene_index) xuống cuối, thứ tự nội bộ giữ nguyên
+        if (b.index === null) return -1;
+        if (a.index !== b.index) return a.index - b.index;
+        return a.position - b.position;
+      })
+      .map((entry) => entry.asset);
   }
 
   /**
@@ -1763,6 +1816,12 @@ export class VideoStudioPipeline {
       throw wrapped;
     }
     const frames = await collectFrames(source);
+    // F3: `renderFrames` gắn cảnh báo THẬT của bước vẽ (alpha bị làm phẳng, ô chữ quá nhỏ, glyph
+    // thiếu, pad_color sai…) vào mảng/iterable — phải đẩy lên `warnings` của job, không được nuốt.
+    const frameWarnings = Array.isArray(source?.warnings)
+      ? source.warnings
+      : (Array.isArray(frames?.warnings) ? frames.warnings : []);
+    if (frameWarnings.length > 0) warnings.push(...frameWarnings.map(String).slice(0, 20));
     if (frames.length === 0) {
       const err = new VideoStudioError('VIDEO_NO_FRAMES', 'V2 không dựng được khung nào — không mã hoá (fail-closed).');
       await this.#failJob(jobId, err, { warnings });

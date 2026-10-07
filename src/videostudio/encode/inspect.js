@@ -22,8 +22,20 @@ import { Buffer } from 'node:buffer';
 
 /** Trần số khung khi kiểm (chống file khổng lồ). */
 export const INSPECT_MAX_FRAMES = 2000;
-/** Trần tổng điểm ảnh giải mã khi kiểm (chống bom nén). */
-export const INSPECT_MAX_PIXELS = 64_000_000;
+/**
+ * Trần tổng điểm ảnh giải mã khi kiểm (chống bom nén).
+ *
+ * ⚠️ F2 (phản biện MVP-04, MAJOR): trần cũ `64_000_000` NHỎ HƠN năng lực thật của preset
+ * (`max_seconds: 30` × `fps: 12` × 1280×720 = **331 776 000** điểm ảnh) ⇒ mọi video dài hơn
+ * ~5,75–6,58 giây bị `inspectGif` coi là HỎNG và job `failed` với `VIDEO_GIF_INVALID` **đổ lỗi cho
+ * GIF trong khi GIF hợp lệ** (4 công cụ ngoài đọc đủ 360 khung).
+ *
+ * Trần mới bao trùm MỌI preset ở thời lượng tối đa, vẫn là rào chống tệp khổng lồ:
+ *   30s × 12fps × 1280×720 = 331,8M ⇒ đặt 512M (dư ~54%).
+ */
+export const INSPECT_MAX_PIXELS = 512_000_000;
+/** Ngân sách kiểm TỐI THIỂU phải bao trùm một video ở trần preset (dùng cho kiểm trước render). */
+export const INSPECT_MIN_BUDGET_PIXELS = 30 * 12 * 1280 * 720;
 /** Trần dữ liệu ảnh một khung. */
 export const INSPECT_MAX_IMAGE_BYTES = 64 * 1024 * 1024;
 
