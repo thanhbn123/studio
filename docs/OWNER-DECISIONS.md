@@ -56,17 +56,25 @@ Hiện trạng: nội dung (MVP-01), ảnh (MVP-02/03), video (MVP-04), tài kho
 
 ---
 
-## 4. Việc kỹ thuật còn nợ (không cần anh quyết, em có thể làm tiếp khi anh muốn)
+## 4. Việc kỹ thuật còn nợ — ĐÃ XONG sprint R1 (07/10/2026)
 
-| Việc | Vì sao chưa làm |
+Sprint độ tin cậy **R1** đã merge (PR [#24](https://github.com/thanhbn123/studio/pull/24), merge `584ef6a`):
+
+| Việc | Kết quả |
 |---|---|
-| Hàng đợi bền (queue) + retry có kiểm soát | Hiện queue trong bộ nhớ: khởi động lại là mất việc đang chờ; MVP-05 đã ghi rõ giới hạn này |
-| Khoá tiền ở tầng DB cho nhiều tiến trình | Hiện khoá trong bộ nhớ ⇒ đúng khi chạy **1 instance** |
-| Cron thu hồi lượt treo (MVP-05) | Hiện chỉ chạy lúc khởi động / request kế tiếp / route admin |
-| Đo trên trình duyệt thật (DOM) | UI đã kiểm bằng hàm thật trong Node, chưa chạy Selenium/Playwright |
-| PostgreSQL cho mọi bảng mới | CI đã chạy schema + migration trên PG thật, nhưng test nghiệp vụ vẫn SQLite |
+| Hàng đợi bền (không mất việc khi restart) | ✅ `job_queue` trong DB + `resume()` + retry + trần lượt thử (đo: kill -9 ⇒ chạy lại, không mất việc) |
+| Khoá tiền ở tầng DB (nhiều tiến trình) | ✅ SQLite `BEGIN IMMEDIATE` · PostgreSQL `pg_advisory_xact_lock`; đo 2 tiến trình trên **cả SQLite và PG thật**: 0 dòng âm, 0 lỗi khoá |
+| Cron thu hồi lượt treo + việc chết | ✅ `src/scheduler.js` mỗi nhịp dọn **và nhặt việc đang chờ**; `/api/health` có khối `scheduler` |
 
----
+Còn lại (đã ghi `docs/VERIFICATION.md` §22.7 — **giới hạn vận hành, không phải lỗi mã**):
+
+- **SQLite vẫn là một khoá ghi toàn cục** ⇒ trần chờ liên tiến trình = `số lần thử × lockTimeoutMs`
+  (tệ nhất ~31,5s mặc định; giảm bằng `BILLING_LOCK_TIMEOUT_MS` / `QUEUE_LOCK_TIMEOUT_MS`). PostgreSQL giữ khoá **per-user**.
+- **Mô hình lease**: nếu tiến trình bị `SIGSTOP`/máy ngủ, **hai tiến trình có thể cùng THỰC THI** một mục
+  ⇒ tiền/trạng thái đã fenced (không mất/không tạo tiền) nhưng **chi phí provider có thể nhân đôi**.
+  4 cách giảm đã ghi trong tài liệu (heartbeat dày hơn, `QUEUE_STALE_MS` lớn hơn, idempotency key phía provider, chỉ gọi provider khi còn lease).
+- Tham số request (`force`, `only_region_ids`, `options`) **không được lưu** ⇒ lượt khôi phục sau restart dùng **mặc định an toàn**.
+- Chưa đo: nhiều tiến trình PostgreSQL cho lease/epoch · mất điện/fsync · tải lớn · UI trên trình duyệt thật.
 
 ## 5. Trạng thái tổng (nghiệm thu được ngay)
 

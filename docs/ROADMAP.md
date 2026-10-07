@@ -97,6 +97,15 @@ sản phẩm; không tạo ảnh giả người thật, thương hiệu thật, 
 
 ---
 
+## Sprint độ tin cậy R1 — ĐÃ MERGE (07/10/2026)
+
+PR [#24](https://github.com/thanhbn123/studio/pull/24), merge `584ef6a`. Bịt ba lỗ hổng vận hành:
+**hàng đợi bền trong DB** (restart không mất việc) · **khoá tiền ở tầng DB** (SQLite + PostgreSQL,
+đo 2 tiến trình thật) · **cron** dọn lượt ví treo/việc chết **và nhặt việc đang chờ**. Phản biện độc lập
+**3 vòng** (FAIL → PASS CÓ ĐIỀU KIỆN → PASS CÓ ĐIỀU KIỆN sau khi vá A1–A6 + B1–B3): báo cáo
+[`R1-REVIEW.md`](R1-REVIEW.md) · hợp đồng [`R1-RELIABILITY-CONTRACT.md`](R1-RELIABILITY-CONTRACT.md).
+Test: **986 · 985 pass · 0 fail · 1 skipped** · CI 5/5. Giới hạn còn lại: [`VERIFICATION.md`](VERIFICATION.md) §22.7.
+
 ## MVP-04 — Video Studio
 
 **Trạng thái: PHẦN OFFLINE ĐÃ MERGE VÀO `develop`** (PR [#23](https://github.com/thanhbn123/studio/pull/23), merge commit `af2b2da`, 07/10/2026) **— CHỜ OWNER NGHIỆM THU.**
