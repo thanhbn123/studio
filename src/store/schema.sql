@@ -215,6 +215,41 @@ CREATE INDEX IF NOT EXISTS idx_wallet_ledger_user ON wallet_ledger (user_id);
 -- `#applyAdditiveMigrations()` tạo SAU khi cột đã tồn tại (xem src/store/index.js).
 CREATE INDEX IF NOT EXISTS idx_wallet_ledger_job ON wallet_ledger (job_id);
 
+-- ============================================================================
+-- R1 — HÀNG ĐỢI BỀN (hợp đồng §2.1)
+--
+-- Vì sao có bảng này: hàng đợi MVP-01..05 nằm TRONG BỘ NHỚ, khởi động lại tiến trình là
+-- mất mọi việc đang chờ (đã ghi ở docs/OWNER-DECISIONS.md mục 4). Bảng này là SỔ CÁI của
+-- hàng đợi: mục việc được ghi DB TRƯỚC khi chạy, nên tiến trình chết vẫn chạy lại được.
+--
+-- Chỉ dùng TEXT/INTEGER + thời gian ISO-8601 trong TEXT ⇒ CÙNG file schema chạy được trên
+-- cả SQLite (node:sqlite) và PostgreSQL 16.
+--
+-- ⚠️ INDEX KHÔNG đặt ở đây — bài học `wallet_ledger.seq`: index tạo trong file này chạy
+-- TRƯỚC migration, nên trên DB cũ (bảng đã tồn tại nhưng thiếu cột) `CREATE INDEX` sẽ làm
+-- chết `init()`. Ba index của bảng này do `#applyAdditiveMigrations()` tạo SAU migration
+-- (xem src/store/index.js).
+--
+-- `payload` là JSON NHỎ (tham số lượt chạy) — TUYỆT ĐỐI không nhét base64 ảnh vào đây.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS job_queue (
+  id           TEXT PRIMARY KEY,             -- uuid của MỤC hàng đợi (khác `job_id`)
+  job_id       TEXT NOT NULL,
+  kind         TEXT NOT NULL,                -- 'content' | 'image_translation' | 'image_generation' | 'video_generation'
+  handler      TEXT NOT NULL,                -- tên việc: 'run' | 'generate' | 'render' | 'run_ocr' …
+  payload      TEXT,
+  status       TEXT NOT NULL DEFAULT 'queued',   -- 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
+  attempts     INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 3,
+  run_after    TEXT,                         -- ISO: chưa tới mốc thì không nhặt (backoff)
+  locked_at    TEXT,
+  locked_by    TEXT,
+  last_error   TEXT,
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL,
+  finished_at  TEXT
+);
+
 -- Bảng giá theo operation. `config.cost.*` (MVP-01) vẫn là nguồn giá MẶC ĐỊNH; bảng này
 -- để quản trị viên chỉnh giá mà không phải deploy lại (A2 seed từ config khi cần).
 CREATE TABLE IF NOT EXISTS pricing (

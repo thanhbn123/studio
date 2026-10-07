@@ -19,12 +19,24 @@
  *   listPricing()                               → pricingRow[]
  *   usageAggregate({ from, to, groupBy })       → row[]        (groupBy ∈ day|operation|user)
  *
+ * KHOÁ SỔ (R1-B — `docs/R1-RELIABILITY-CONTRACT.md` §3):
+ *   MỌI thao tác GHI sổ (`grant`, `holdForJob`, `settleForJob`, `refundForJob` — kể cả
+ *   `adjustment`) chạy trong `#withLedgerSection()`, và đoạn "đọc sổ → tính `balance_after`
+ *   → ghi dòng" nằm trong `store.withLedgerLock(userId, fn)` do R1-Q cung cấp (§2.2) ⇒ khoá
+ *   theo NGƯỜI DÙNG ở TẦNG DB, đúng cả khi nhiều tiến trình cùng ghi (SQLite: transaction ghi
+ *   + `busy_timeout`; PostgreSQL: `pg_advisory_xact_lock`).
+ *   `#locks` (promise chain trong bộ nhớ) được GIỮ như lớp chống trùng RẺ trong cùng tiến
+ *   trình — KHÔNG còn là lớp bảo vệ duy nhất.
+ *   R1-Q chưa land ⇒ `#withLedgerSection` rơi về khoá bộ nhớ **kèm log warn MỘT LẦN**
+ *   (`billing.ledger_lock_fallback`) + retry có giới hạn cho lỗi `database is locked`
+ *   (`LEDGER_BUSY` kèm `retryable: true` sau N lần). Fail-closed vẫn giữ: số dư âm bị tầng
+ *   store chặn, dòng trùng `(user_id, job_id, run_key, reason)` bị unique index chặn.
+ *
  * Giới hạn ĐÃ BIẾT (ghi rõ để không ai tưởng là an toàn tuyệt đối):
- *   - Khoá tuần tự hoá theo user nằm TRONG BỘ NHỚ (`#locks`) ⇒ chỉ đúng khi chạy
- *     MỘT tiến trình. Chạy nhiều instance (docker scale, cluster) thì hai request cùng
- *     user ở hai tiến trình khác nhau vẫn có thể đọc cùng số dư rồi cùng ghi ⇒ cần
- *     khoá/mutux ở tầng DB (SELECT ... FOR UPDATE trên hàng ví, hoặc unique index +
- *     transaction) trước khi mở rộng ngang.
+ *   - Khi `store.withLedgerLock` CHƯA có (R1-Q chưa land), hai TIẾN TRÌNH cùng user vẫn có
+ *     thể đọc cùng số dư rồi cùng ghi. Hệ quả được chặn bởi tầng DB (không âm, không trùng
+ *     dòng theo `run_key`), nhưng `balance_after` của dòng do tiến trình thua cuộc tính có
+ *     thể lệch — retry + đọc lại dòng thắng giữ cho API vẫn trả kết quả đúng.
  *   - `#jobRows` đọc sổ theo trang (tối đa `LEDGER_MAX_SCAN` dòng). Nếu A3 lọc được
  *     theo `jobId` ở tầng SQL thì mọi chuyện nhẹ; nếu không, user có sổ dài hơn ngưỡng
  *     đó sẽ được ghi log `billing.ledger_scan_truncated` (không im lặng).
@@ -61,6 +73,18 @@ const MAX_LIMIT = 500;
 const LEDGER_PAGE_SIZE = 100;
 /** Trần số dòng quét cho một job — chặn treo máy với sổ khổng lồ. */
 const LEDGER_MAX_SCAN = 5000;
+
+/* ── R1-B (§3): tham số cho khoá ghi sổ ở tầng DB ── */
+/** Số lần THỬ LẠI khi driver báo bận/khoá (`database is locked`, deadlock…). Hết lượt ⇒ `LEDGER_BUSY`. */
+const LEDGER_LOCK_RETRIES = 6;
+/** Thời gian chờ cơ sở giữa hai lần thử (ms) — tăng gấp đôi, có nhiễu để hai tiến trình không đập vào nhau cùng nhịp. */
+const LEDGER_LOCK_RETRY_BASE_MS = 20;
+/** Trần thời gian chờ một lần thử (ms) — tổng ngân sách thử lại phải NHỎ để không treo request. */
+const LEDGER_LOCK_RETRY_MAX_MS = 120;
+/** TỔNG ngân sách thử lại (ms) cho đường DỰ PHÒNG — hết ngân sách thì fail-closed, không chờ mãi. */
+const LEDGER_LOCK_RETRY_BUDGET_MS = 2000;
+/** Trần số lần thử lại cấu hình được (chặn cấu hình sai biến retry thành treo máy). */
+const LEDGER_LOCK_RETRIES_MAX = 20;
 
 /** Lỗi của tầng ví — LUÔN có `code` để A4 map sang HTTP mà không phải đoán chuỗi. */
 export class BillingError extends Error {
@@ -251,14 +275,63 @@ function pickReturnedRow(returned, payload) {
   return { ...payload, id: null, created_at: new Date().toISOString() };
 }
 
+/* ─────────────── R1-B (§3): nhận diện lỗi khoá/đua ở tầng DB ─────────────── */
+
+/**
+ * Lỗi HẠ TẦNG dạng "bận/khoá" — retry được, KHÔNG phải lỗi nghiệp vụ.
+ *
+ * Vì sao phải retry: SQLite ở chế độ WAL trả `SQLITE_BUSY_SNAPSHOT` khi một transaction
+ * ĐỌC muốn nâng lên GHI trong lúc tiến trình khác vừa ghi xong; PostgreSQL trả deadlock/
+ * serialization (`40001`/`40P01`). Đây là đua BÌNH THƯỜNG khi hai tiến trình cùng ghi sổ,
+ * không phải lỗi dữ liệu ⇒ thử lại (đọc lại số dư rồi quyết định lại) là đúng.
+ *
+ * KHÔNG khớp lỗi nghiệp vụ (`INSUFFICIENT_CREDIT`, `RERUN_LIMIT_EXCEEDED`, `INVALID_*`):
+ * retry một lỗi nghiệp vụ là vô nghĩa và có thể che lỗi thật.
+ */
+function isLedgerBusyError(err) {
+  if (err instanceof BillingError && err.code === 'LEDGER_BUSY') return true;
+  if (err?.details?.retryable === true) return true;
+  const text = `${err?.code ?? ''} ${err?.message ?? ''}`;
+  return /SQLITE_BUSY|SQLITE_ERROR|database is locked|database table is locked|deadlock|40001|40P01|55P03|ECONNRESET|ETIMEDOUT|LEDGER_BUSY/i.test(text);
+}
+
+/**
+ * Lỗi do UNIQUE INDEX của sổ (`uniq_wallet_ledger_run_reason`,
+ * `uniq_wallet_ledger_run_close`): một tiến trình KHÁC đã ghi dòng cho cùng
+ * `(user_id, job_id, run_key, reason)` trước mình. Đây là "thua cuộc đua" — đọc lại sổ và
+ * trả về dòng đã có (idempotent theo `(job_id, run_key)`), KHÔNG ghi thêm dòng nào.
+ */
+function isUniqueLedgerViolation(err) {
+  const text = `${err?.code ?? ''} ${err?.message ?? ''}`;
+  return /SQLITE_CONSTRAINT|UNIQUE constraint failed|duplicate key value|23505|uniq_wallet_ledger/i.test(text);
+}
+
+/** Chờ `ms` — dùng cho retry có giới hạn (không `unref`: chuỗi retry phải chạy xong). */
+function sleep(ms) {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
 /* ──────────────────────────────── BillingService ──────────────────────────────── */
 
 export class BillingService {
   /**
    * Khoá tuần tự hoá theo user: Map<userId, Promise> nối đuôi nhau (promise chain).
-   * ⚠️ CHỈ đúng trong MỘT tiến trình — xem phần "Giới hạn ĐÃ BIẾT" ở đầu file.
+   * Từ R1-B đây chỉ còn là lớp chống trùng RẺ TRONG TIẾN TRÌNH; lớp bảo vệ thật nằm ở
+   * `store.withLedgerLock` (xem `#withLedgerSection`).
    */
   #locks = new Map();
+
+  /**
+   * R1-B (§3) — số tầng khoá sổ đang giữ cho mỗi user. `#append` từ chối ghi nếu user
+   * KHÔNG ở trong khoá: chốt chặn để một đường code mới không thể lặng lẽ ghi sổ ngoài khoá.
+   */
+  #sections = new Map();
+
+  /** Đã cảnh báo "chưa có khoá DB ⇒ chỉ khoá trong bộ nhớ" chưa (cảnh báo MỘT lần). */
+  #lockFallbackWarned = false;
+
+  /** Đã log chế độ khoá đang dùng chưa (db | memory) — để vận hành biết mình đang ở đâu. */
+  #lockModeLogged = false;
 
   /** BR-10: đã cảnh báo "ngưỡng bị nâng lên đáy an toàn" cho đường không kiểm được job chưa. */
   #floorWarned = false;
@@ -280,6 +353,19 @@ export class BillingService {
     this.stuckRunMs = stuck !== null && stuck >= 0 ? stuck : 15 * 60 * 1000;
     /** Đáy an toàn chỉ áp cho đường KHÔNG kiểm được job đang chạy hay không (xem §7.3). */
     this.#floorWarned = false;
+    // R1-B (§3): tham số THỬ LẠI khi driver báo bận/khoá. Đọc từ `config.billing` (R3-S có
+    // thể nối env sau); mặc định đủ nhỏ để một sự cố khoá thật vẫn fail-closed NHANH
+    // (`LEDGER_BUSY`) chứ không treo request.
+    const lockRetries = toFiniteNumber(config?.billing?.ledgerLockRetries);
+    this.lockRetries = lockRetries !== null && lockRetries >= 0
+      ? Math.min(Math.trunc(lockRetries), LEDGER_LOCK_RETRIES_MAX)
+      : LEDGER_LOCK_RETRIES;
+    const lockBaseMs = toFiniteNumber(config?.billing?.ledgerLockRetryBaseMs);
+    this.lockRetryBaseMs = lockBaseMs !== null && lockBaseMs >= 0
+      ? Math.min(lockBaseMs, LEDGER_LOCK_RETRY_MAX_MS)
+      : LEDGER_LOCK_RETRY_BASE_MS;
+    this.#lockFallbackWarned = false;
+    this.#lockModeLogged = false;
     this.config = config;
   }
 
@@ -406,6 +492,125 @@ export class BillingService {
     }
   }
 
+  /**
+   * R1-B (§3) — CHẠY MỘT ĐOẠN GHI SỔ DƯỚI KHOÁ THEO NGƯỜI DÙNG.
+   *
+   * MỌI thao tác ghi (`grant`, `holdForJob`, `settleForJob`, `refundForJob`) PHẢI đi qua đây.
+   * Thứ tự khoá, từ ngoài vào trong:
+   *   1. `#locks` — hàng đợi promise TRONG TIẾN TRÌNH: rẻ, chặn trùng ngay tại chỗ và giữ
+   *      cho `balance_after` không lệch khi cùng một tiến trình có nhiều request;
+   *   2. `store.withLedgerLock(userId, fn)` — khoá Ở TẦNG DB (R1-Q, §2.2): đọc số dư + tính
+   *      `balance_after` + ghi dòng sổ nằm trong CÙNG một transaction ⇒ đúng cả khi chạy
+   *      NHIỀU tiến trình (SQLite transaction ghi + `busy_timeout`; PostgreSQL
+   *      `pg_advisory_xact_lock`).
+   *
+   * R1-Q CHƯA LAND (`store.withLedgerLock` không phải hàm) ⇒ rơi về khoá bộ nhớ **kèm log
+   * warn MỘT LẦN** và vẫn retry có giới hạn cho lỗi khoá của driver. Đây là đường TẠM THỜI:
+   * nó KHÔNG bảo vệ được hai tiến trình (tầng DB vẫn là chốt chặn cuối), nên phải thấy rõ
+   * trong log chứ không được im lặng.
+   */
+  async #withLedgerSection(userId, fn) {
+    const key = String(userId);
+    return this.#withUserLock(key, async () => {
+      const depth = this.#sections.get(key) ?? 0;
+      this.#sections.set(key, depth + 1);
+      try {
+        return await this.#runUnderDbLedgerLock(key, fn);
+      } finally {
+        // Trả lại đúng độ sâu cũ (khoá có thể lồng nhau: `reconcileStuckRuns` → `refundForJob`).
+        if (depth === 0) this.#sections.delete(key);
+        else this.#sections.set(key, depth);
+      }
+    });
+  }
+
+  /** Lớp khoá DB (nếu R1-Q đã cung cấp) + retry có giới hạn khi driver báo bận. */
+  async #runUnderDbLedgerLock(userId, fn) {
+    const store = this.#requireStore();
+    const dbLock = typeof store.withLedgerLock === 'function'
+      ? (callback) => store.withLedgerLock(userId, callback)
+      : null;
+    // Có khoá DB ⇒ việc THỬ LẠI thuộc về tầng store (R1-Q §3: `BEGIN IMMEDIATE` + retry riêng):
+    // billing KHÔNG nhân đôi ngân sách chờ (mỗi lần thử của store đã có `busy_timeout`), chỉ
+    // chuẩn hoá lỗi bận thành `LEDGER_BUSY`. Không có khoá DB ⇒ billing tự retry (đường dự phòng).
+    let retries = 0;
+    if (dbLock) this.#noteLockMode('db');
+    else {
+      this.#noteLockMode('memory');
+      this.#warnLockFallback();
+      retries = this.lockRetries;
+    }
+    return this.#retryLedgerBusy(userId, () => (dbLock ? dbLock(fn) : fn()), retries);
+  }
+
+  /**
+   * Retry CÓ GIỚI HẠN cho lỗi "bận/khoá" của driver (đường DỰ PHÒNG khi thiếu khoá DB).
+   *
+   * An toàn để thử lại vì cả hai driver đều bảo đảm: transaction LỖI thì KHÔNG commit
+   * (SQLite trả `SQLITE_BUSY` khi COMMIT ⇒ transaction còn mở rồi bị ROLLBACK; PostgreSQL
+   * huỷ transaction) — nên lần thử lại đọc sổ từ đầu và không thể ghi trùng. Hết lượt (hoặc
+   * quá tổng ngân sách) ⇒ `LEDGER_BUSY` kèm `retryable: true` (tầng trên map thành 503
+   * `BILLING_UNAVAILABLE`) — fail-closed, KHÔNG treo request.
+   */
+  async #retryLedgerBusy(userId, run, maxRetries = this.lockRetries) {
+    const startedAt = Date.now();
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await run();
+      } catch (err) {
+        if (!isLedgerBusyError(err)) throw err;
+        const outOfBudget = Date.now() - startedAt > LEDGER_LOCK_RETRY_BUDGET_MS;
+        if (attempt >= maxRetries || outOfBudget) throw this.#asLedgerBusy(err, attempt);
+        const wait = Math.min(this.lockRetryBaseMs * 2 ** attempt, LEDGER_LOCK_RETRY_MAX_MS);
+        // Nhiễu ±25% để hai tiến trình đập vào nhau không thức dậy cùng một nhịp.
+        const delay = Math.max(1, Math.round(wait * (0.75 + Math.random() * 0.5)));
+        this.logger?.warn?.('billing.ledger_lock_retry', {
+          user_id: userId,
+          attempt: attempt + 1,
+          retries: maxRetries,
+          delay_ms: delay,
+          error_code: err?.code ?? null,
+          hint: 'đua ghi sổ giữa các tiến trình — thử lại (đọc lại số dư rồi quyết định lại)',
+        });
+        await sleep(delay);
+      }
+    }
+  }
+
+  /** Chuẩn hoá lỗi hết lượt thử thành `LEDGER_BUSY` (fail-closed, có cờ `retryable`). */
+  #asLedgerBusy(err, attempts) {
+    if (err instanceof BillingError && err.code === 'LEDGER_BUSY') return err;
+    const wrapped = new BillingError(
+      'LEDGER_BUSY',
+      `Sổ credit đang bận sau ${attempts} lần thử lại — thao tác CHƯA được ghi (an toàn để thử lại).`,
+      { retryable: true, attempts, driver_code: err?.code ?? null },
+    );
+    wrapped.cause = err;
+    return wrapped;
+  }
+
+  /** Ghi log MỘT LẦN chế độ khoá đang dùng — vận hành phải biết mình đang được bảo vệ thế nào. */
+  #noteLockMode(mode) {
+    if (this.#lockModeLogged) return;
+    this.#lockModeLogged = true;
+    if (mode === 'db') {
+      this.logger?.info?.('billing.ledger_lock_mode', { mode: 'db', method: 'store.withLedgerLock', contract: 'R1 §3' });
+    }
+  }
+
+  /** Cảnh báo MỘT LẦN: chưa có khoá DB ⇒ chỉ đúng trong MỘT tiến trình. */
+  #warnLockFallback() {
+    if (this.#lockFallbackWarned) return;
+    this.#lockFallbackWarned = true;
+    this.logger?.warn?.('billing.ledger_lock_fallback', {
+      mode: 'memory',
+      missing: 'store.withLedgerLock',
+      reason: 'R1-Q chưa cung cấp khoá ví ở tầng DB — tạm dùng khoá TRONG TIẾN TRÌNH + retry có giới hạn.',
+      risk: 'hai TIẾN TRÌNH cùng user có thể đua: tầng DB vẫn chặn số dư âm và dòng trùng (unique index), nhưng thứ tự `balance_after` có thể lệch.',
+      contract: 'docs/R1-RELIABILITY-CONTRACT.md §3',
+    });
+  }
+
   /** Số dư ĐỌC TỪ SỔ, đã làm tròn. Chỉ gọi bên trong khoá của user. */
   async #balanceLocked(userId) {
     const store = this.#requireMethod('ledgerBalance');
@@ -459,12 +664,42 @@ export class BillingService {
   }
 
   /**
+   * R1-B (§3) — ĐỌC LẠI SỔ sau khi thua cuộc đua ở tầng DB (unique index): dòng CUỐI CÙNG
+   * của một lượt chạy theo `reason`. Trả `null` nếu không có ⇒ tầng gọi ném lỗi gốc
+   * (fail-closed, không đoán bừa là "chắc ai đó đã ghi rồi").
+   */
+  async #findRunRow(userId, jobId, runKey, reason) {
+    if (!runKey) return null;
+    const rows = await this.#jobRows(userId, jobId);
+    return findLast(rows.filter((row) => runKeyOf(row) === runKey), (row) => row.reason === reason) ?? null;
+  }
+
+  /** Dòng ĐÓNG của một lượt (`job_settle` ưu tiên, sau đó `job_refund`) — dùng khi thua cuộc đua ghi dòng đóng. */
+  async #closingRowOfRun(userId, jobId, runKey) {
+    if (!runKey) return null;
+    const rows = await this.#jobRows(userId, jobId);
+    const runRows = rows.filter((row) => runKeyOf(row) === runKey);
+    return findLast(runRows, (row) => row.reason === 'job_settle')
+      ?? findLast(runRows, (row) => row.reason === 'job_refund')
+      ?? null;
+  }
+
+  /**
    * GHI MỘT DÒNG SỔ (append-only). Chỉ gọi khi ĐANG giữ khoá của user và đã có
    * `balanceBefore` đọc từ sổ. Không bao giờ để số dư âm: nếu phép cộng ra âm thì
    * ném `INSUFFICIENT_CREDIT` và KHÔNG ghi gì.
    */
   async #append({ userId, amount, reason, jobId = null, operation = null, meta = null, balanceBefore, runKey = null }) {
     const store = this.#requireMethod('appendLedger');
+    // R1-B (§3) — CHỐT CHẶN: không được ghi sổ ngoài khoá theo người dùng. Nếu một đường code
+    // mới quên `#withLedgerSection`, dừng ngay (fail-closed) thay vì âm thầm ghi lệch số dư.
+    if ((this.#sections.get(String(userId)) ?? 0) <= 0) {
+      throw new BillingError(
+        'LEDGER_LOCK_REQUIRED',
+        'Ghi sổ credit phải chạy trong khoá theo người dùng (R1 §3) — đã chặn để không ghi lệch số dư.',
+        { user_id: userId, reason },
+      );
+    }
     const currency = this.#currency();
     // PB-06: khoản ghi sổ phải HỮU HẠN và trong trần — `roundMoney(1e308) === Infinity` và
     // tầng store biến nó thành 0 ⇒ sổ ghi "0 credit" trong khi API báo thành công.
@@ -650,7 +885,8 @@ export class BillingService {
       });
     }
     const meta = { actor_id: typeof actorId === 'string' && actorId.trim() ? actorId.trim() : null, note: note ? String(note) : '' };
-    return this.#withUserLock(uid, async () => {
+    // R1-B (§3): đọc số dư + ghi dòng `grant` nằm TRONG khoá DB theo user.
+    return this.#withLedgerSection(uid, async () => {
       const balanceBefore = await this.#balanceLocked(uid);
       return this.#append({ userId: uid, amount: value, reason: picked, meta, balanceBefore });
     });
@@ -690,7 +926,8 @@ export class BillingService {
 
     const runsCap = toFiniteNumber(maxRunsPerJob);
 
-    return this.#withUserLock(uid, async () => {
+    // R1-B (§3): chọn lượt chạy + đọc số dư + ghi `job_hold` nằm TRONG khoá DB theo user.
+    return this.#withLedgerSection(uid, async () => {
       const rows = await this.#jobRows(uid, jid);
 
       // (b0) PB-02: chọn LƯỢT CHẠY để giữ tiền — lượt đang mở nếu có (idempotent theo run),
@@ -746,16 +983,28 @@ export class BillingService {
       }
 
       const meta = { estimate: amount, operations: operationNames, run_key: targetRun };
-      const row = await this.#append({
-        userId: uid,
-        amount: -amount,
-        reason: 'job_hold',
-        jobId: jid,
-        runKey: targetRun,
-        operation: singleOperation(operationNames),
-        meta,
-        balanceBefore,
-      });
+      let row;
+      try {
+        row = await this.#append({
+          userId: uid,
+          amount: -amount,
+          reason: 'job_hold',
+          jobId: jid,
+          runKey: targetRun,
+          operation: singleOperation(operationNames),
+          meta,
+          balanceBefore,
+        });
+      } catch (err) {
+        // R1-B (§3) — THUA CUỘC ĐUA khi thiếu khoá DB: unique index
+        // `uniq_wallet_ledger_run_reason (user_id, job_id, run_key, reason)` chặn dòng thứ hai.
+        // Đọc lại sổ và trả về khoản ĐÃ GIỮ (idempotent theo `(job_id, run_key)`) — tuyệt đối
+        // KHÔNG giữ tiền hai lần; không tìm thấy dòng nào thì ném lỗi gốc (fail-closed).
+        const raced = isUniqueLedgerViolation(err) ? await this.#findRunRow(uid, jid, targetRun, 'job_hold') : null;
+        if (!raced) throw err;
+        this.logger?.warn?.('billing.hold_run_race_recovered', { user_id: uid, job_id: jid, run_key: targetRun });
+        return { ledgerId: raced.id ?? null, balance_after: await this.#balanceLocked(uid), run_key: targetRun, skipped: true };
+      }
       return { ledgerId: row?.id ?? null, balance_after: row?.balance_after ?? balanceBefore, run_key: targetRun };
     });
   }
@@ -777,7 +1026,8 @@ export class BillingService {
     const uid = this.#requireUserId(userId);
     const jid = requireJobId(jobId);
 
-    return this.#withUserLock(uid, async () => {
+    // R1-B (§3): quyết toán chạy trong khoá DB theo user (đọc sổ + ghi dòng `job_settle` cùng transaction).
+    return this.#withLedgerSection(uid, async () => {
       const rows = await this.#jobRows(uid, jid);
       // PB-02: quyết toán theo LƯỢT CHẠY. Lượt mặc định = lượt đang mở; nếu không còn lượt mở
       // (chế độ `holdBeforeJob=false`, hoặc lượt đã bị hoàn) thì dùng lượt mới nhất đã thấy,
@@ -865,7 +1115,16 @@ export class BillingService {
       if (usageUnavailable) meta.usage_unavailable = true; // BR-09/BR-11: thu 0 vì không quy được usage
       // BR-11: LUÔN ghi nguồn chi phí ⇒ đọc sổ là biết "job không tốn gì" hay "không quy được usage".
       meta.usage_source = usageSource ?? (actual <= MONEY_EPSILON ? 'none' : 'request');
-      return this.#append({ userId: uid, amount, reason: 'job_settle', jobId: jid, runKey: targetRun, meta, balanceBefore });
+      try {
+        return await this.#append({ userId: uid, amount, reason: 'job_settle', jobId: jid, runKey: targetRun, meta, balanceBefore });
+      } catch (err) {
+        // R1-B (§3) — thua cuộc đua với tiến trình khác (unique index `uniq_wallet_ledger_run_close`
+        // cho phép ĐÚNG MỘT dòng đóng mỗi lượt): đọc lại, trả dòng đóng đã có, KHÔNG ghi thêm.
+        const raced = isUniqueLedgerViolation(err) ? await this.#closingRowOfRun(uid, jid, targetRun) : null;
+        if (!raced) throw err;
+        this.logger?.warn?.('billing.settle_run_race_recovered', { user_id: uid, job_id: jid, run_key: targetRun, close_reason: raced.reason });
+        return raced;
+      }
     });
   }
 
@@ -885,7 +1144,8 @@ export class BillingService {
     const jid = requireJobId(jobId);
     const note = typeof reason === 'string' && reason.trim() ? reason.trim() : 'job_failed';
 
-    return this.#withUserLock(uid, async () => {
+    // R1-B (§3): hoàn tiền chạy trong khoá DB theo user (đọc sổ + ghi dòng `job_refund` cùng transaction).
+    return this.#withLedgerSection(uid, async () => {
       const rows = await this.#jobRows(uid, jid);
       const runs = runKeysOf(rows);
       const asked = typeof runKey === 'string' && runKey.trim() ? runKey.trim() : '';
@@ -915,21 +1175,30 @@ export class BillingService {
           if (Array.isArray(list)) refundLegacy = list.filter((e) => !String(e?.run_key || '')).length;
         } catch { /* không đọc được ⇒ bỏ qua, chỉ là tối ưu chống thu thừa */ }
       }
-      return this.#append({
-        userId: uid,
-        amount: remaining,
-        reason: 'job_refund',
-        jobId: jid,
-        runKey: targetRun,
-        meta: {
-          reason: note,
-          refunded: remaining,
-          run_key: targetRun,
-          ...(refundLegacy !== null ? { legacy_usage_counted: refundLegacy } : {}),
-          ...(extraMeta && typeof extraMeta === 'object' ? extraMeta : {}),
-        },
-        balanceBefore,
-      });
+      try {
+        return await this.#append({
+          userId: uid,
+          amount: remaining,
+          reason: 'job_refund',
+          jobId: jid,
+          runKey: targetRun,
+          meta: {
+            reason: note,
+            refunded: remaining,
+            run_key: targetRun,
+            ...(refundLegacy !== null ? { legacy_usage_counted: refundLegacy } : {}),
+            ...(extraMeta && typeof extraMeta === 'object' ? extraMeta : {}),
+          },
+          balanceBefore,
+        });
+      } catch (err) {
+        // R1-B (§3) — thua cuộc đua (unique index `uniq_wallet_ledger_run_close`): tiến trình
+        // khác đã ĐÓNG lượt này. Trả dòng đóng đã có ⇒ không hoàn hai lần, không tạo tiền.
+        const raced = isUniqueLedgerViolation(err) ? await this.#closingRowOfRun(uid, jid, targetRun) : null;
+        if (!raced) throw err;
+        this.logger?.warn?.('billing.refund_run_race_recovered', { user_id: uid, job_id: jid, run_key: targetRun, close_reason: raced.reason });
+        return raced;
+      }
     });
   }
 

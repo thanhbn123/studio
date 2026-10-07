@@ -262,6 +262,29 @@ export function loadConfig(env = process.env) {
       // Seed bảng `pricing` từ `config.cost.*` của MVP-01 (nguồn giá mặc định).
       pricingFromCost: toBool(env.BILLING_PRICING_FROM_COST, true),
     },
+
+    // ── R1 (sprint độ tin cậy) — hàng đợi BỀN + cron dọn dẹp ────────────────
+    // `docs/R1-RELIABILITY-CONTRACT.md` §2.3 (R1-Q) + §4 (R3-S). Tên khoá ĐÓNG BĂNG:
+    // R1-Q đọc `queue.*`, R3-S đọc `scheduler.*`; đổi tên là vỡ hợp đồng.
+    queue: {
+      // true (mặc định) = hàng đợi ghi DB trước khi chạy, khôi phục được sau khi khởi động lại.
+      // false = chạy như cũ (trong bộ nhớ) — chỉ để so sánh/rollback, KHÔNG bền.
+      durable: toBool(env.QUEUE_DURABLE, true),
+      // Mục `running` CŨ HƠN ngưỡng này (ms) ⇒ coi như tiến trình giữ nó đã chết ⇒ trả về `queued`.
+      // Mặc định 600000 (10 phút): dài hơn một job bình thường để không chạy đúp.
+      staleMs: Math.max(0, toInt(env.QUEUE_STALE_MS, 10 * 60 * 1000)),
+      // Số lần thử tối đa cho một mục hàng đợi (kẹp >= 1: 0 sẽ không bao giờ chạy).
+      maxAttempts: Math.max(1, toInt(env.QUEUE_MAX_ATTEMPTS, 3)),
+      // Backoff cơ sở: lần thử thứ n chờ `retryBaseMs * n` (mặc định 2000ms).
+      retryBaseMs: Math.max(0, toInt(env.QUEUE_RETRY_BASE_MS, 2000)),
+    },
+
+    scheduler: {
+      // true (mặc định) = cron dọn dẹp chạy cùng server; false = không tạo timer nào.
+      enabled: toBool(env.SCHEDULER_ENABLED, true),
+      // Nhịp cron (ms). Mặc định 60000 (1 phút). Kẹp >= 1 để `0` không thành vòng lặp nóng.
+      intervalMs: Math.max(1, toInt(env.SCHEDULER_INTERVAL_MS, 60_000)),
+    },
   };
 
   if (!AI_PROVIDERS.includes(cfg.vision.provider)) {

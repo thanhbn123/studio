@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { SqliteDriver } from './sqlite-driver.js';
 import { PostgresDriver } from './postgres-driver.js';
 
@@ -88,6 +89,17 @@ export const ANONYMOUS_GROUP_LABEL = '(ẩn danh)';
  * soát được bằng `===` và không lệch ~1e-15 giữa các lần đọc.
  */
 export const MONEY_DECIMALS = 6;
+
+/* ── R1 (§3): tham số khoá ghi sổ ở tầng DB — soi gương tham số của src/billing/index.js ── */
+
+/** Số lần THỬ LẠI khi SQLite báo bận (`database is locked`) — hết lượt ⇒ lỗi `LEDGER_BUSY`. */
+export const LEDGER_LOCK_RETRIES = 6;
+/** Thời gian chờ cơ sở giữa hai lần thử (ms) — tăng gấp đôi, có trần. Tổng ngân sách phải NHỎ. */
+export const LEDGER_LOCK_RETRY_BASE_MS = 20;
+/** Trần thời gian chờ một lần thử (ms). */
+export const LEDGER_LOCK_RETRY_MAX_MS = 120;
+/** Trần số mục một lượt `resume()` / `requeueStaleJobs()` — chặn boot treo vì sổ hàng đợi quá lớn. */
+export const QUEUE_RESUME_LIMIT = 200;
 
 /** Làm tròn tiền về 6 chữ số thập phân (null/không phải số ⇒ null). */
 export function roundMoney(value) {
@@ -184,6 +196,47 @@ function toIntOrNull(value) {
   return n === null ? null : Math.trunc(n);
 }
 
+/* ─────────────── R1 — tiện ích dùng chung cho khoá ghi + hàng đợi bền ─────────────── */
+
+/** Ngủ `ms` (không âm). Dùng cho backoff có giới hạn khi driver báo bận. */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+
+/**
+ * Lỗi "driver đang bận/khoá" — dùng để QUYẾT ĐỊNH thử lại, KHÔNG dùng để nuốt lỗi.
+ *
+ * ⚠️ Cố ý KHÔNG khớp mã `SQLITE_ERROR` trần: node:sqlite dùng chính mã đó cho lỗi cú pháp
+ * SQL, nên khớp trần là biến lỗi lập trình thành "thử lại 6 lần rồi báo LEDGER_BUSY" (che
+ * mất bug thật). Chỉ khớp khi THÔNG ĐIỆP nói rõ khoá/bận, hoặc mã khoá cụ thể.
+ */
+function isBusyError(err) {
+  const text = `${err?.code ?? ''} ${err?.message ?? ''}`;
+  return /SQLITE_BUSY|SQLITE_LOCKED|database is locked|database table is locked|deadlock|40001|40P01|55P03|LEDGER_BUSY|QUEUE_BUSY/i.test(text);
+}
+
+/**
+ * Thông điệp lỗi ngắn gọn để lưu vào `job_queue.last_error` (kèm `code` nếu có).
+ * Cắt trần 2000 ký tự — cột này chỉ để người vận hành đọc, không phải nơi chứa stack.
+ */
+function errorText(error) {
+  if (!error) return null;
+  const code = error.code ? `${error.code}: ` : '';
+  return `${code}${error.message || String(error)}`.slice(0, 2000);
+}
+
+/** Kẹp số nguyên trong khoảng [min, max]. */
+function clampInt(value, fallback, min, max) {
+  const n = toNum(value, null);
+  const v = n === null ? fallback : Math.trunc(n);
+  return Math.min(Math.max(v, min), max);
+}
+
+/**
+ * Dung sai dấu phẩy động khi chặn số dư ÂM (R1: tách ra hằng số module vì luật này dùng ở
+ * cả `appendLedger` lẫn transaction của `withLedgerLock`). `amount` là REAL nên một phép trừ
+ * "về 0" có thể ra -1e-17; chỉ coi là âm THẬT khi vượt dung sai.
+ */
+const EPS_LEDGER = 1e-9;
+
 export function createDriver(config, logger) {
   const driver = String(config?.db?.driver || 'sqlite').toLowerCase();
   if (driver === 'postgres' || driver === 'postgresql') {
@@ -207,8 +260,143 @@ export class Store {
     this.dialect = driver?.dialect || 'sqlite';
   }
 
+  /**
+   * R1 (§3): transaction ĐANG MỞ của ngữ cảnh async hiện tại.
+   *
+   * Vì sao phải là `AsyncLocalStorage` chứ không phải một field `this.#tx`: hai `withLedgerLock`
+   * của hai NGƯỜI DÙNG khác nhau chạy song song trong cùng tiến trình; một field chung sẽ để
+   * lời gọi của người này ghi nhầm vào transaction của người kia (hoặc ghi ra ngoài transaction
+   * ⇒ mất tính nguyên tử của "đọc số dư rồi ghi sổ"). ALS tách ngữ cảnh theo từng chuỗi async.
+   */
+  #txAls = new AsyncLocalStorage();
+
+  /**
+   * R1: mutex TRONG TIẾN TRÌNH cho transaction của SQLite.
+   *
+   * Vì sao cần: `node:sqlite` chỉ có MỘT kết nối `DatabaseSync` cho cả tiến trình, nên hai
+   * transaction chồng nhau (một cái đang `await` bên trong) sẽ lỗi
+   * "cannot start a transaction within a transaction". Mutex này xếp hàng các transaction
+   * do Store mở, nhờ vậy 20 thao tác ghi song song trong CÙNG tiến trình vẫn chạy tuần tự.
+   */
+  #txMutexTail = Promise.resolve();
+
   get isPostgres() {
     return this.dialect === 'postgres';
+  }
+
+  /* ──────── R1 — hạ tầng transaction/khoá dùng chung cho §2.2 và §3 ──────── */
+
+  /** Transaction đang mở của ngữ cảnh async này (null nếu đang ở ngoài transaction). */
+  #activeTx() {
+    return this.#txAls.getStore() || null;
+  }
+
+  /**
+   * Executor để ĐỌC/GHI: ưu tiên transaction đang mở (nếu có) rồi mới tới driver.
+   * Nhờ vậy `ledgerBalance()` gọi BÊN TRONG `withLedgerLock` đọc ĐÚNG transaction đó —
+   * "đọc số dư rồi ghi sổ" mới thật sự nguyên tử (đọc ở kết nối khác là đọc dữ liệu cũ).
+   */
+  #exec() {
+    const active = this.#activeTx();
+    return active?.tx || this.driver;
+  }
+
+  /**
+   * Giao diện transaction trao cho `fn` của `withLedgerLock` (§3).
+   *
+   * R2-B có HAI cách dùng, cả hai đều chạy trong CÙNG một transaction:
+   *   `await store.withLedgerLock(uid, async () => { await store.appendLedger({...}); })`
+   *   `await store.withLedgerLock(uid, async (tx) => { await tx.appendLedger({...}); })`
+   */
+  #txView(tx) {
+    return {
+      run: (sql, params = []) => tx.run(sql, params),
+      all: (sql, params = []) => tx.all(sql, params),
+      get: (sql, params = []) => tx.get(sql, params),
+      // Các method dưới đây dùng `#exec()` nên tự bám vào transaction đang mở.
+      appendLedger: (options = {}) => this.appendLedger(options),
+      ledgerBalance: (userId) => this.ledgerBalance(userId),
+      listLedger: (options = {}) => this.listLedger(options),
+    };
+  }
+
+  /** Xếp hàng một việc vào mutex trong tiến trình (xem `#txMutexTail`). */
+  async #withMutex(fn) {
+    const previous = this.#txMutexTail;
+    let release;
+    this.#txMutexTail = new Promise((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Transaction SQLite do Store tự mở.
+   *
+   * Vì sao không dùng thẳng `driver.transaction`: driver phát `BEGIN` (deferred) — với hai
+   * TIẾN TRÌNH cùng ghi, transaction bắt đầu bằng ĐỌC rồi mới ghi sẽ đụng `SQLITE_BUSY_SNAPSHOT`
+   * và `busy_timeout` KHÔNG cứu được (SQLite không thử lại loại xung đột này). `BEGIN IMMEDIATE`
+   * giữ khoá GHI ngay từ câu lệnh đầu nên chỉ còn chờ khoá thường (busy_timeout = 5000ms do
+   * `SqliteDriver.connect()` đặt).
+   *
+   * Nếu driver không phải SQLite thật (driver giả trong test), rơi về `driver.transaction`.
+   */
+  async #withSqliteTx(fn, { immediate = false } = {}) {
+    return this.#withMutex(async () => {
+      await this.driver.connect?.();
+      const db = this.driver?.db;
+      if (!db || typeof db.exec !== 'function') return this.driver.transaction(fn);
+      db.exec(immediate ? 'BEGIN IMMEDIATE' : 'BEGIN');
+      try {
+        const result = await fn(this.driver);
+        db.exec('COMMIT');
+        return result;
+      } catch (err) {
+        try {
+          db.exec('ROLLBACK');
+        } catch {
+          /* transaction có thể đã hỏng — bỏ qua, lỗi gốc mới là thứ cần ném */
+        }
+        throw err;
+      }
+    });
+  }
+
+  /** Transaction theo driver: PostgreSQL ⇒ `driver.transaction`; SQLite ⇒ `BEGIN IMMEDIATE`. */
+  async #inTransaction(fn) {
+    if (this.isPostgres) return this.driver.transaction(fn);
+    return this.#withSqliteTx(fn, { immediate: true });
+  }
+
+  /**
+   * Thử lại có GIỚI HẠN khi driver báo bận; hết lượt ⇒ lỗi `code` chỉ định (mặc định
+   * `LEDGER_BUSY`). Lỗi KHÁC (nghiệp vụ, cú pháp SQL…) được ném thẳng — không thử lại mù.
+   */
+  async #retryOnBusy(fn, { attempts = LEDGER_LOCK_RETRIES, baseMs = LEDGER_LOCK_RETRY_BASE_MS, maxMs = LEDGER_LOCK_RETRY_MAX_MS, code = 'LEDGER_BUSY', message = null, details = null } = {}) {
+    const tries = clampInt(attempts, LEDGER_LOCK_RETRIES, 1, 50);
+    let lastErr = null;
+    for (let attempt = 1; attempt <= tries; attempt += 1) {
+      try {
+        return await fn();
+      } catch (err) {
+        if (!isBusyError(err)) throw err;
+        lastErr = err;
+        if (attempt < tries) {
+          const wait = Math.min(clampInt(baseMs, LEDGER_LOCK_RETRY_BASE_MS, 0, 5000) * 2 ** (attempt - 1), clampInt(maxMs, LEDGER_LOCK_RETRY_MAX_MS, 0, 5000));
+          // Nhiễu nhỏ để hai tiến trình không đập vào nhau cùng nhịp.
+          await sleep(wait + Math.floor(Math.random() * 10));
+        }
+      }
+    }
+    throw Object.assign(
+      new Error(message || `DB đang bận (database is locked) sau ${tries} lần thử — thao tác chưa được ghi.`),
+      { code, details: { ...(details || {}), retryable: true, attempts: tries, driver_code: lastErr?.code ?? null }, cause: lastErr },
+    );
   }
 
   async init() {
@@ -279,6 +467,28 @@ export class Store {
     // lỗi ở đây không được làm chết boot (DB cũ/hỏng vẫn phải chạy được MVP-01/02/03).
     await this.#createIndexIfPossible('idx_jobs_user_id', 'jobs', 'user_id');
     await this.#createIndexIfPossible('idx_image_assets_user_id', 'image_assets', 'user_id');
+    // R1 (hợp đồng §2.1): index của `job_queue` được tạo Ở ĐÂY, không phải trong schema.sql —
+    // xem bài học `wallet_ledger.seq` ngay trên: index trong file schema chạy TRƯỚC migration
+    // nên DB cũ (bảng đã có nhưng thiếu cột) sẽ chết `init()`. Hàm `#createIndexIfPossible`
+    // bắt lỗi và chỉ ghi log, nên `init()` chạy hai lần liên tiếp vẫn không lỗi.
+    await this.#createIndexIfPossible('idx_job_queue_status_run_after', 'job_queue', 'status, run_after');
+    await this.#createIndexIfPossible('idx_job_queue_job_id', 'job_queue', 'job_id');
+    await this.#createIndexIfPossible('idx_job_queue_locked_at', 'job_queue', 'locked_at');
+    // ⚠️ KHÔNG unique index trên `(job_id, handler)`: hai REQUEST ĐỒNG THỜI trên cùng một job là
+    // hai LƯỢT CHẠY riêng (mỗi lượt có `run_key` và bị thu tiền riêng — MVP-05 §BR-02), nên hai
+    // mục sống cùng `(job_id, handler)` là HỢP LỆ. Khoá idempotency thật nằm ở `job_queue.id`
+    // (id tất định theo `(jobId, handler, runKey)` do JobQueue truyền vào) — xem `enqueueJob`.
+    // Dòng dưới chỉ để DỌN index mà bản R1-Q trung gian đã tạo (idempotent, DB mới không có gì).
+    await this.#dropIndexIfPossible('uniq_job_queue_live');
+  }
+
+  /** Xoá index nếu tồn tại — dùng để dọn index của bản trung gian; lỗi chỉ ghi log. */
+  async #dropIndexIfPossible(name) {
+    try {
+      await this.driver.run(`DROP INDEX IF EXISTS ${name}`);
+    } catch (err) {
+      this.logger?.warn('store.migration.index_drop_skipped', { name, error: err?.message || String(err) });
+    }
   }
 
   /** Thêm cột nếu thiếu — idempotent trên CẢ hai driver (xem #applyAdditiveMigrations). */
@@ -1161,7 +1371,6 @@ export class Store {
     if (value === null) {
       throw Object.assign(new Error(`appendLedger: amount không phải số hữu hạn (${JSON.stringify(amount)}).`), { code: 'INVALID_LEDGER_ROW' });
     }
-    const EPS = 1e-9;
     const ts = nowIso();
     // TIỀN TỆ LÀM TRÒN 6 CHỮ SỐ ngay tại biên ghi sổ: REAL cộng thô sinh 1.9000000000000001,
     // khiến `ledgerBalance` trả 9.995999999999999 và mọi test so `===` đều lệch ~1e-15.
@@ -1186,32 +1395,42 @@ export class Store {
       meta: meta && typeof meta === 'object' ? meta : null,
       created_at: ts,
     };
-    return this.driver.transaction(async (tx) => {
-      // Số dư VÀ số thứ tự `seq` được đọc trong CÙNG transaction với lần chèn: hai request
-      // cùng lúc không thể cùng đọc một số dư (hay cùng một `seq`) rồi ghi hai dòng lệch nhau.
-      const current = await tx.get(
-        'SELECT COALESCE(SUM(amount),0) AS total, COALESCE(MAX(seq),0) AS max_seq FROM wallet_ledger WHERE user_id = ?',
-        [uid],
+    // R1 (§3): nếu ĐANG ở trong `withLedgerLock` thì ghi vào CHÍNH transaction đó (bám theo
+    // ngữ cảnh async); còn không thì mở transaction riêng — vẫn giữ nguyên luật "đọc số dư +
+    // chèn dòng trong MỘT transaction". Nhờ nhánh đầu, R2-B gọi `store.appendLedger()` bên
+    // trong khoá mà không sinh transaction lồng nhau (SQLite: BEGIN chồng BEGIN là lỗi).
+    const active = this.#activeTx();
+    if (active) return this.#appendLedgerOn(active.tx, row, uid, ts);
+    if (this.isPostgres) return this.driver.transaction((tx) => this.#appendLedgerOn(tx, row, uid, ts));
+    return this.#withSqliteTx((tx) => this.#appendLedgerOn(tx, row, uid, ts), { immediate: true });
+  }
+
+  /** Thân của `appendLedger` chạy TRÊN một transaction đã có (driver hoặc transaction đang mở). */
+  async #appendLedgerOn(tx, row, uid, ts) {
+    // Số dư VÀ số thứ tự `seq` được đọc trong CÙNG transaction với lần chèn: hai request
+    // cùng lúc không thể cùng đọc một số dư (hay cùng một `seq`) rồi ghi hai dòng lệch nhau.
+    const current = await tx.get(
+      'SELECT COALESCE(SUM(amount),0) AS total, COALESCE(MAX(seq),0) AS max_seq FROM wallet_ledger WHERE user_id = ?',
+      [uid],
+    );
+    const balanceBefore = roundMoney(toNum(current?.total, 0));
+    const balanceAfter = roundMoney(balanceBefore + row.amount);
+    if (balanceAfter < -EPS_LEDGER) {
+      throw Object.assign(
+        new Error(`Không đủ credit: số dư ${balanceBefore} + ${row.amount} < 0.`),
+        { code: 'INSUFFICIENT_CREDIT', details: { user_id: uid, balance: balanceBefore, amount: row.amount, reason: row.reason, job_id: row.job_id } },
       );
-      const balanceBefore = roundMoney(toNum(current?.total, 0));
-      const balanceAfter = roundMoney(balanceBefore + row.amount);
-      if (balanceAfter < -EPS) {
-        throw Object.assign(
-          new Error(`Không đủ credit: số dư ${balanceBefore} + ${row.amount} < 0.`),
-          { code: 'INSUFFICIENT_CREDIT', details: { user_id: uid, balance: balanceBefore, amount: row.amount, reason: row.reason, job_id: row.job_id } },
-        );
-      }
-      const seq = Number(toNum(current?.max_seq, 0)) + 1;
-      await tx.run(
-        `INSERT INTO wallet_ledger (id, user_id, seq, amount, currency, reason, job_id, run_key, close_kind, operation, meta, balance_after, created_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        [
-          row.id, row.user_id, seq, row.amount, row.currency, row.reason, row.job_id, row.run_key,
-          row.close_kind, row.operation, toJson(row.meta), balanceAfter, ts,
-        ],
-      );
-      return { ...row, seq, balance_after: balanceAfter };
-    });
+    }
+    const seq = Number(toNum(current?.max_seq, 0)) + 1;
+    await tx.run(
+      `INSERT INTO wallet_ledger (id, user_id, seq, amount, currency, reason, job_id, run_key, close_kind, operation, meta, balance_after, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        row.id, row.user_id, seq, row.amount, row.currency, row.reason, row.job_id, row.run_key,
+        row.close_kind, row.operation, toJson(row.meta), balanceAfter, ts,
+      ],
+    );
+    return { ...row, seq, balance_after: balanceAfter };
   }
 
   /**
@@ -1228,11 +1447,11 @@ export class Store {
     // phân trang có thể trùng/sót dòng. `created_at`/`id` chỉ còn là khoá phụ cho dòng cũ
     // (tạo trước khi có cột `seq`, giữ `seq = 0`).
     const rows = jobId
-      ? await this.driver.all(
+      ? await this.#exec().all(
           `SELECT * FROM wallet_ledger WHERE user_id = ? AND job_id = ? ORDER BY seq DESC, created_at DESC, id DESC LIMIT ? OFFSET ?`,
           [uid, String(jobId), lim, off],
         )
-      : await this.driver.all(
+      : await this.#exec().all(
           `SELECT * FROM wallet_ledger WHERE user_id = ? ORDER BY seq DESC, created_at DESC, id DESC LIMIT ? OFFSET ?`,
           [uid, lim, off],
         );
@@ -1259,7 +1478,7 @@ export class Store {
     if (olderThanIso) { where.push('h.created_at < ?'); params.push(String(olderThanIso)); }
     if (userId) { where.push('h.user_id = ?'); params.push(String(userId)); }
     params.push(Math.min(Math.max(Number(limit) || 200, 1), 1000));
-    const rows = await this.driver.all(
+    const rows = await this.#exec().all(
       `SELECT h.* FROM wallet_ledger h WHERE ${where.join(' AND ')}
        ORDER BY h.created_at ASC, h.seq ASC LIMIT ?`,
       params,
@@ -1271,9 +1490,425 @@ export class Store {
   async ledgerBalance(userId) {
     const uid = String(userId ?? '');
     if (!uid) return 0;
-    const row = await this.driver.get('SELECT COALESCE(SUM(amount),0) AS total FROM wallet_ledger WHERE user_id = ?', [uid]);
+    const row = await this.#exec().get('SELECT COALESCE(SUM(amount),0) AS total FROM wallet_ledger WHERE user_id = ?', [uid]);
     // Trả số ĐÃ LÀM TRÒN 6 chữ số để khớp đúng `balance_after` của dòng cuối trong sổ.
     return roundMoney(toNum(row?.total, 0));
+  }
+
+  /* ═════════ R1 — HÀNG ĐỢI BỀN (§2.1/§2.2) + KHOÁ SỔ Ở TẦNG DB (§3) ═════════
+   *
+   * TÊN METHOD Ở ĐÂY LÀ HỢP ĐỒNG ĐÓNG BĂNG (§2.2): R2-B gọi `withLedgerLock`, R3-S gọi
+   * `requeueStaleJobs`. Đổi tên = phá vỡ lắp ghép giữa ba agent.
+   *
+   * Bốn luật được giữ ngay ở tầng thấp nhất:
+   *   #1 NGUYÊN TỬ — `claimNextJob`/`claimQueueItem` là MỘT câu UPDATE có điều kiện
+   *      `status='queued'` (PostgreSQL thêm `FOR UPDATE SKIP LOCKED`) ⇒ hai tiến trình cùng
+   *      nhặt KHÔNG BAO GIỜ nhận cùng một mục.
+   *   #2 CHỐNG TRÙNG THEO KHOÁ LƯỢT CHẠY (không phải `(job_id, handler)`): id mục hàng đợi là
+   *      khoá idempotency do JobQueue truyền vào (tất định khi có `runKey`) — hai request đồng
+   *      thời trên cùng một job là HAI LƯỢT riêng và phải chạy cả hai (MVP-05 §BR-02: mỗi lượt
+   *      thu tiền riêng). Xem `enqueueJob`.
+   *   #3 KHOÁ SỔ THEO NGƯỜI DÙNG — SQLite `BEGIN IMMEDIATE` + thử lại có giới hạn; PostgreSQL
+   *      `pg_advisory_xact_lock`. `fn` chạy TRONG transaction; lỗi ⇒ rollback rồi ném lại.
+   *   #4 FAIL-CLOSED — mọi lỗi đều có `code`; hết lượt thử vì bận ⇒ `LEDGER_BUSY`/`QUEUE_BUSY`,
+   *      KHÔNG im lặng coi như thành công.
+   */
+
+  /* ─────────────────────── §3 — khoá tiền theo người dùng ─────────────────────── */
+
+  /**
+   * Chạy `fn` trong một transaction GIỮ KHOÁ theo `userId`.
+   *
+   * R2-B dùng: mọi thao tác ghi sổ (đọc số dư + chèn dòng) phải nằm trong cùng transaction
+   * này, nếu không hai tiến trình vẫn đọc được cùng một số dư rồi ghi hai dòng lệch nhau.
+   *
+   *   `fn` nhận một `tx` ({ run, all, get, appendLedger, ledgerBalance, listLedger }) —
+   *   và các method của `store` gọi BÊN TRONG `fn` cũng tự bám vào transaction này
+   *   (AsyncLocalStorage), nên cả hai cách viết đều đúng.
+   *
+   * Lỗi: `fn` ném ⇒ ROLLBACK rồi ném LẠI NGUYÊN lỗi (giữ `code` nghiệp vụ như
+   * `INSUFFICIENT_CREDIT`). Bận quá N lần ⇒ lỗi `code = 'LEDGER_BUSY'` (kèm `retryable: true`).
+   */
+  async withLedgerLock(userId, fn) {
+    const uid = String(userId ?? '').trim();
+    if (!uid) {
+      throw Object.assign(new Error('withLedgerLock: thiếu userId — khoá sổ phải theo NGƯỜI DÙNG.'), { code: 'INVALID_LEDGER_LOCK' });
+    }
+    if (typeof fn !== 'function') {
+      throw Object.assign(new Error('withLedgerLock: tham số thứ hai phải là hàm (nhận tx).'), { code: 'INVALID_LEDGER_LOCK' });
+    }
+    // Đã ở TRONG một khoá (fn gọi lồng nhau, hoặc appendLedger gọi lại) ⇒ chạy tiếp trong CÙNG
+    // transaction. Mở transaction thứ hai ở đây là lỗi trên SQLite ("cannot start a transaction
+    // within a transaction") và làm mất tính nguyên tử trên PostgreSQL.
+    const active = this.#activeTx();
+    if (active) return fn(this.#txView(active.tx));
+    if (this.isPostgres) return this.#withPgLedgerLock(uid, fn);
+    return this.#withSqliteLedgerLock(uid, fn);
+  }
+
+  /** Tham số thử lại khi bận — đọc từ `config.queue.*` (R3-S) với mặc định của repo. */
+  #ledgerLockOptions() {
+    const cfg = this.config?.queue || {};
+    return {
+      attempts: clampInt(cfg.ledgerLockRetries, LEDGER_LOCK_RETRIES, 1, 50),
+      baseMs: clampInt(cfg.ledgerLockRetryBaseMs, LEDGER_LOCK_RETRY_BASE_MS, 0, 5000),
+      maxMs: clampInt(cfg.ledgerLockRetryMaxMs, LEDGER_LOCK_RETRY_MAX_MS, 0, 5000),
+    };
+  }
+
+  /**
+   * SQLite: `BEGIN IMMEDIATE` — giữ khoá GHI ngay câu lệnh đầu.
+   *
+   * Vì sao IMMEDIATE: transaction mở bằng ĐỌC rồi mới ghi sẽ đụng `SQLITE_BUSY_SNAPSHOT` khi
+   * tiến trình khác vừa ghi xong, và `busy_timeout` KHÔNG thử lại loại xung đột đó (SQLite trả
+   * lỗi ngay) ⇒ "database is locked" đúng như lỗi đã ghi trong hợp đồng. Giữ khoá ghi từ đầu
+   * thì chỉ còn chờ khoá thường — `busy_timeout = 5000ms` (đặt ở `SqliteDriver.connect()`)
+   * lo phần chờ, còn `#retryOnBusy` lo phần hi hữu còn lại.
+   */
+  async #withSqliteLedgerLock(uid, fn) {
+    const opts = this.#ledgerLockOptions();
+    return this.#retryOnBusy(
+      () => this.#withSqliteTx(async (tx) => {
+        const view = this.#txView(tx);
+        // Toàn bộ `fn` chạy bên trong transaction; ALS để mọi lời gọi store lồng bên trong
+        // (appendLedger, ledgerBalance…) dùng CHÍNH kết nối này.
+        return this.#txAls.run({ tx, userId: uid }, () => fn(view));
+      }, { immediate: true }),
+      {
+        ...opts,
+        code: 'LEDGER_BUSY',
+        message: `Sổ credit đang bận (database is locked) sau ${opts.attempts} lần thử — thao tác của user ${uid} chưa được ghi.`,
+        details: { user_id: uid },
+      },
+    );
+  }
+
+  /**
+   * PostgreSQL: `pg_advisory_xact_lock(hashtext(userId))` — khoá theo NGƯỜI DÙNG, giữ tới hết
+   * transaction (tự nhả khi COMMIT/ROLLBACK, không có đường rò khoá). `hashtext()` trả int4 nên
+   * ép `::bigint` tường minh để không phụ thuộc quy tắc chọn overload của PostgreSQL.
+   */
+  async #withPgLedgerLock(uid, fn) {
+    return this.driver.transaction(async (tx) => {
+      await tx.run('SELECT pg_advisory_xact_lock(hashtext(?)::bigint)', [uid]);
+      return this.#txAls.run({ tx, userId: uid }, () => fn(this.#txView(tx)));
+    });
+  }
+
+  /* ───────────────────────── §2.2 — bảng `job_queue` ───────────────────────── */
+
+  /** Dòng hàng đợi trả ra tầng trên — `payload` đã parse JSON (nhỏ, KHÔNG chứa base64 ảnh). */
+  #hydrateQueueRow(row) {
+    return {
+      id: row.id,
+      job_id: row.job_id,
+      kind: row.kind,
+      handler: row.handler,
+      payload: fromJson(row.payload),
+      status: row.status,
+      attempts: Number(toNum(row.attempts, 0)),
+      max_attempts: Number(toNum(row.max_attempts, 3)),
+      run_after: row.run_after ?? null,
+      locked_at: row.locked_at ?? null,
+      locked_by: row.locked_by ?? null,
+      last_error: row.last_error ?? null,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      finished_at: row.finished_at ?? null,
+    };
+  }
+
+  /**
+   * Mục SỐNG (`queued`/`running`) của một cặp `(job_id, handler)` — CHỈ dùng cho đường
+   * `enqueueJob` KHÔNG truyền `id` (tầng gọi trực tiếp). JobQueue luôn truyền `id` (khoá
+   * idempotency theo LƯỢT CHẠY) nên hai request đồng thời không bị gộp ở đây.
+   */
+  async #findLiveQueueItem(jobId, handler) {
+    const row = await this.driver.get(
+      `SELECT * FROM job_queue
+        WHERE job_id = ? AND handler = ? AND status IN ('queued','running')
+        ORDER BY created_at DESC, id DESC LIMIT 1`,
+      [jobId, handler],
+    );
+    return row ? this.#hydrateQueueRow(row) : null;
+  }
+
+  /**
+   * Xếp một mục việc vào hàng đợi BỀN (ghi DB TRƯỚC khi chạy — hợp đồng §2.3).
+   *
+   * HAI ĐƯỜNG, và đây là chỗ suýt gây hồi quy nghiệp vụ (xem báo cáo R1-Q):
+   *
+   *  1. **Có `id` do tầng gọi truyền** (JobQueue luôn truyền): id CHÍNH LÀ khoá idempotency.
+   *     - `id` TẤT ĐỊNH theo `(jobId, handler, runKey)` ⇒ hai tiến trình cùng xếp MỘT lượt chạy
+   *       thì PRIMARY KEY chặn kẻ đến sau (nguyên tử, không cần index phụ), kẻ đó đọc lại mục cũ
+   *       và trả `reused: true`.
+   *     - `id` ngẫu nhiên (lượt chạy KHÔNG có khoá) ⇒ là một lượt RIÊNG: hai request render
+   *       đồng thời trên cùng một job là HAI ý định, phải có hai mục và phải chạy cả hai
+   *       (MVP-05 §BR-02: mỗi lượt thu tiền riêng — đây là kết luận đã nghiệm thu, không được
+   *       gộp lại thành một).
+   *     Mục cùng id đã `done`/`failed` ⇒ MỞ LẠI (cùng một khoá = cùng một lượt chạy).
+   *
+   *  2. **Không truyền `id`** (tầng gọi trực tiếp, đường cũ): giữ luật §2.3 — đã có mục SỐNG
+   *     cùng `(jobId, handler)` thì trả mục cũ kèm `reused: true`.
+   */
+  async enqueueJob({ id = null, jobId = null, kind = 'content', handler = 'run', payload = null, maxAttempts = 3, runAfter = null } = {}) {
+    const jid = String(jobId ?? '').trim();
+    if (!jid) throw Object.assign(new Error('enqueueJob thiếu jobId.'), { code: 'INVALID_QUEUE_ITEM' });
+    const h = String(handler ?? '').trim() || 'run';
+    const explicitId = id === null || id === undefined || String(id).trim() === '' ? null : String(id).trim();
+    if (!explicitId) {
+      const existing = await this.#findLiveQueueItem(jid, h);
+      if (existing) return { ...existing, reused: true };
+    }
+    const ts = nowIso();
+    const row = {
+      id: explicitId || randomUUID(),
+      job_id: jid,
+      kind: String(kind || 'content'),
+      handler: h,
+      payload: toJson(payload),
+      status: 'queued',
+      attempts: 0,
+      max_attempts: clampInt(maxAttempts, 3, 1, 100),
+      run_after: runAfter ? String(runAfter) : null,
+      locked_at: null,
+      locked_by: null,
+      last_error: null,
+      created_at: ts,
+      updated_at: ts,
+      finished_at: null,
+    };
+    try {
+      await this.driver.run(
+        `INSERT INTO job_queue (id, job_id, kind, handler, payload, status, attempts, max_attempts,
+           run_after, locked_at, locked_by, last_error, created_at, updated_at, finished_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          row.id, row.job_id, row.kind, row.handler, row.payload, row.status, row.attempts, row.max_attempts,
+          row.run_after, row.locked_at, row.locked_by, row.last_error, row.created_at, row.updated_at, row.finished_at,
+        ],
+      );
+    } catch (err) {
+      // Đã có dòng cùng khoá (PRIMARY KEY) — hai tiến trình cùng xếp MỘT lượt chạy.
+      const same = explicitId ? await this.getQueueItemById(explicitId).catch(() => null) : null;
+      if (same && (same.status === 'queued' || same.status === 'running')) return { ...same, reused: true };
+      if (same) {
+        // Cùng khoá idempotency nhưng lượt trước đã kết thúc ⇒ MỞ LẠI chính mục đó (không đẻ
+        // thêm mục cho cùng một khoá), rồi trả về để chạy.
+        await this.driver.run(
+          `UPDATE job_queue
+              SET status = 'queued', run_after = ?, locked_at = NULL, locked_by = NULL,
+                  finished_at = NULL, last_error = NULL, updated_at = ?
+            WHERE id = ?`,
+          [row.run_after, ts, explicitId],
+        );
+        const revived = await this.getQueueItemById(explicitId);
+        this.logger?.info('store.queue_item_revived', { queue_item_id: explicitId, job_id: jid, handler: h });
+        return { ...revived, revived: true };
+      }
+      if (!explicitId) {
+        const again = await this.#findLiveQueueItem(jid, h).catch(() => null);
+        if (again) return { ...again, reused: true };
+      }
+      throw err;
+    }
+    return this.#hydrateQueueRow(row);
+  }
+
+  /** Thân chung của `claimNextJob` (nhặt mục KẾ TIẾP) và `claimQueueItem` (nhặt ĐÚNG một mục). */
+  async #claimQueueRow({ id = null, workerId = 'worker', now = null } = {}) {
+    const ts = String(now || nowIso());
+    const wid = String(workerId || 'worker');
+    // PostgreSQL: `FOR UPDATE SKIP LOCKED` để tiến trình thứ hai NHẢY QUA mục đang bị khoá thay
+    // vì chờ rồi nhặt lại chính mục đó. SQLite không có cú pháp này, nhưng câu UPDATE có điều
+    // kiện `status='queued'` + `RETURNING *` đã là NGUYÊN TỬ: một câu lệnh, một khoá ghi, chỉ
+    // một tiến trình thấy `changes`/`RETURNING` khác rỗng.
+    const skipLocked = this.isPostgres ? ' FOR UPDATE SKIP LOCKED' : '';
+    const target = id
+      ? `(SELECT id FROM job_queue WHERE id = ? AND status = 'queued'${skipLocked})`
+      : `(SELECT id FROM job_queue WHERE status = 'queued' AND (run_after IS NULL OR run_after <= ?)
+           ORDER BY created_at ASC, id ASC LIMIT 1${skipLocked})`;
+    const params = id ? [ts, wid, ts, id] : [ts, wid, ts, ts];
+    const sql = `UPDATE job_queue
+                    SET status = 'running', attempts = attempts + 1, locked_at = ?, locked_by = ?, updated_at = ?
+                  WHERE id = ${target} AND status = 'queued'
+                  RETURNING *`;
+    const row = await this.#retryOnBusy(
+      () => this.#inTransaction(async (tx) => {
+        const rows = await tx.all(sql, params);
+        return Array.isArray(rows) && rows[0] ? rows[0] : null;
+      }),
+      {
+        attempts: clampInt(this.config?.queue?.claimRetries, LEDGER_LOCK_RETRIES, 1, 50),
+        code: 'QUEUE_BUSY',
+        message: 'Hàng đợi đang bận (database is locked) — chưa nhặt được mục nào.',
+        details: { worker_id: wid },
+      },
+    );
+    return row ? this.#hydrateQueueRow(row) : null;
+  }
+
+  /**
+   * Nhặt mục KẾ TIẾP đã tới hạn (`queued`, `run_after` đã qua) — NGUYÊN TỬ.
+   * Trả `null` khi hàng đợi rỗng. Hết lượt thử vì bận ⇒ ném `code = 'QUEUE_BUSY'`
+   * (KHÔNG trả `null`: trả null là tầng gọi hiểu nhầm "hết việc" rồi ngồi không).
+   */
+  async claimNextJob({ workerId = 'worker', now = null } = {}) {
+    return this.#claimQueueRow({ id: null, workerId, now });
+  }
+
+  /**
+   * Nhặt ĐÚNG một mục đã biết (JobQueue đang giữ mục trong bộ nhớ) — cùng bảo đảm nguyên tử
+   * với `claimNextJob`. Trả `null` nếu mục đã bị tiến trình khác nhặt / đã xong / bị huỷ.
+   * Nhờ vậy tiến trình "kẻ đến sau" KHÔNG chạy lại việc mà tiến trình khác đã nhận.
+   */
+  async claimQueueItem(id, { workerId = 'worker', now = null } = {}) {
+    const qid = String(id ?? '').trim();
+    if (!qid) throw Object.assign(new Error('claimQueueItem thiếu id mục hàng đợi.'), { code: 'INVALID_QUEUE_ITEM' });
+    return this.#claimQueueRow({ id: qid, workerId, now });
+  }
+
+  /** Đánh dấu mục đã XONG. Trả `true` nếu thật sự có dòng đổi trạng thái. */
+  async completeQueueItem(id) {
+    const qid = String(id ?? '').trim();
+    if (!qid) return false;
+    const ts = nowIso();
+    const res = await this.driver.run(
+      `UPDATE job_queue
+          SET status = 'done', locked_at = NULL, locked_by = NULL, last_error = NULL,
+              updated_at = ?, finished_at = ?
+        WHERE id = ? AND status IN ('running','queued')`,
+      [ts, ts, qid],
+    );
+    return Number(res?.changes ?? 0) > 0;
+  }
+
+  /**
+   * Ghi nhận một lần THẤT BẠI của mục hàng đợi.
+   *
+   * `attempts` (đã tăng lúc nhặt) < `max_attempts` ⇒ trả mục về `queued` kèm `run_after` =
+   * hiện tại + `retryDelayMs` (backoff); hết lượt ⇒ `failed` + `finished_at` (tầng JobQueue
+   * phát tiếp sự kiện `failed` để job có `error_code` + `finished_at`).
+   *
+   * Mục biến mất khỏi DB (dữ liệu bị xoá tay?) ⇒ coi như HỎNG HẲN thay vì trả `queued`:
+   * trả `queued` cho một dòng không tồn tại là vòng lặp thử lại vô tận.
+   *
+   * `force: true` (mở rộng, KHÔNG đổi chữ ký hợp đồng) dùng cho lỗi CẤU HÌNH không thể tự
+   * khỏi — ví dụ mục khôi phục mà tiến trình này không có hàm xử lý: đánh dấu `failed` ngay
+   * thay vì thử lại 3 lượt vô ích.
+   */
+  async failQueueItem(id, { error = null, retryDelayMs = 0, force = false } = {}) {
+    const qid = String(id ?? '').trim();
+    if (!qid) throw Object.assign(new Error('failQueueItem thiếu id mục hàng đợi.'), { code: 'INVALID_QUEUE_ITEM' });
+    const row = await this.driver.get('SELECT * FROM job_queue WHERE id = ?', [qid]);
+    if (!row) return { status: 'failed', attempts: 0, missing: true, last_error: errorText(error) };
+    const attempts = Number(toNum(row.attempts, 0));
+    const maxAttempts = Math.max(1, Number(toNum(row.max_attempts, 3)));
+    const exhausted = force === true || attempts >= maxAttempts;
+    const ts = nowIso();
+    const delay = Math.max(0, Number(toNum(retryDelayMs, 0)) || 0);
+    const runAfter = exhausted ? null : new Date(Date.parse(ts) + delay).toISOString();
+    await this.driver.run(
+      `UPDATE job_queue
+          SET status = ?, run_after = ?, locked_at = NULL, locked_by = NULL,
+              last_error = ?, updated_at = ?, finished_at = ?
+        WHERE id = ? AND status IN (${force === true ? "'running','queued'" : "'running'"})`,
+      [exhausted ? 'failed' : 'queued', runAfter, errorText(error), ts, exhausted ? ts : null, qid],
+    );
+    // Đọc lại để trả ĐÚNG trạng thái thật (lượt requeue của scheduler có thể đã chen vào).
+    const after = await this.driver.get('SELECT status, attempts FROM job_queue WHERE id = ?', [qid]);
+    return {
+      status: after?.status ?? (exhausted ? 'failed' : 'queued'),
+      attempts: Number(toNum(after?.attempts, attempts)),
+      max_attempts: maxAttempts,
+      run_after: runAfter,
+      last_error: errorText(error),
+    };
+  }
+
+  /**
+   * Thu hồi các mục `running` QUÁ CŨ (tiến trình giữ chúng đã chết) về `queued` — R3-S gọi
+   * mỗi nhịp cron, `JobQueue.resume()` gọi lúc khởi động.
+   *
+   * `olderThanMs` tính từ `COALESCE(locked_at, updated_at, created_at)` (mục thiếu `locked_at`
+   * vẫn phải thu hồi được — nếu chỉ soi `locked_at` thì mục đó treo vĩnh viễn).
+   */
+  async requeueStaleJobs({ olderThanMs = 600000, now = null, limit = QUEUE_RESUME_LIMIT } = {}) {
+    const ts = String(now || nowIso());
+    const window = Math.max(0, Number(toNum(olderThanMs, 600000)) || 0);
+    const parsed = Date.parse(ts);
+    const cutoff = new Date((Number.isFinite(parsed) ? parsed : Date.now()) - window).toISOString();
+    const lim = clampInt(limit, QUEUE_RESUME_LIMIT, 1, 1000);
+    const rows = await this.driver.all(
+      `UPDATE job_queue
+          SET status = 'queued', locked_at = NULL, locked_by = NULL, run_after = ?, updated_at = ?
+        WHERE id IN (
+          SELECT id FROM job_queue
+           WHERE status = 'running' AND COALESCE(locked_at, updated_at, created_at) <= ?
+           ORDER BY COALESCE(locked_at, updated_at, created_at) ASC LIMIT ?
+        )
+        RETURNING id`,
+      [ts, ts, cutoff, lim],
+    );
+    const ids = (Array.isArray(rows) ? rows : []).map((r) => r.id);
+    return { requeued: ids.length, ids };
+  }
+
+  /**
+   * Đếm mục hàng đợi theo trạng thái. Hợp đồng §2.2 chốt ĐÚNG bốn khoá này — `cancelled`
+   * (chưa dùng ở sprint này) KHÔNG nằm trong kết quả để tầng gọi không phải đoán.
+   */
+  async queueStats() {
+    const rows = await this.driver.all('SELECT status, COUNT(*) AS n FROM job_queue GROUP BY status');
+    const out = { queued: 0, running: 0, done: 0, failed: 0 };
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const key = String(row?.status ?? '');
+      if (Object.prototype.hasOwnProperty.call(out, key)) out[key] = Number(toNum(row.n, 0));
+    }
+    return out;
+  }
+
+  /** Mục theo ID mục hàng đợi (bổ trợ cho JobQueue; hợp đồng §2.2 chỉ chốt `getQueueItem(jobId)`). */
+  async getQueueItemById(id) {
+    const qid = String(id ?? '').trim();
+    if (!qid) return null;
+    const row = await this.driver.get('SELECT * FROM job_queue WHERE id = ?', [qid]);
+    return row ? this.#hydrateQueueRow(row) : null;
+  }
+
+  /**
+   * Mục hàng đợi của một JOB. Ưu tiên mục còn SỐNG (`queued`/`running`) — đó là mục quyết định
+   * "job này còn việc hay không"; không có thì trả mục MỚI NHẤT (để tra cứu kết quả gần nhất).
+   */
+  async getQueueItem(jobId) {
+    const jid = String(jobId ?? '').trim();
+    if (!jid) return null;
+    const live = await this.driver.get(
+      `SELECT * FROM job_queue WHERE job_id = ? AND status IN ('queued','running')
+        ORDER BY created_at DESC, id DESC LIMIT 1`,
+      [jid],
+    );
+    if (live) return this.#hydrateQueueRow(live);
+    const latest = await this.driver.get(
+      'SELECT * FROM job_queue WHERE job_id = ? ORDER BY created_at DESC, id DESC LIMIT 1',
+      [jid],
+    );
+    return latest ? this.#hydrateQueueRow(latest) : null;
+  }
+
+  /**
+   * Liệt kê mục theo trạng thái (bổ trợ cho `JobQueue.resume()`). Sắp CŨ NHẤT TRƯỚC để việc
+   * khôi phục giữ đúng thứ tự đã xếp hàng.
+   */
+  async listQueueItems({ statuses = ['queued'], limit = QUEUE_RESUME_LIMIT } = {}) {
+    const list = (Array.isArray(statuses) ? statuses : [statuses]).map((s) => String(s)).filter(Boolean);
+    if (list.length === 0) return [];
+    const placeholders = list.map(() => '?').join(',');
+    const rows = await this.driver.all(
+      `SELECT * FROM job_queue WHERE status IN (${placeholders}) ORDER BY created_at ASC, id ASC LIMIT ?`,
+      [...list, clampInt(limit, QUEUE_RESUME_LIMIT, 1, 1000)],
+    );
+    return (Array.isArray(rows) ? rows : []).map((row) => this.#hydrateQueueRow(row));
   }
 
   /* ─────────────────────────────── pricing ─────────────────────────────── */

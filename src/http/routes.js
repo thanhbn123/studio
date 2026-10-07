@@ -1724,6 +1724,25 @@ export function buildRouter(app) {
         currency: creditCurrency(),
         reason: billingAvailable() ? null : BILLING_UNAVAILABLE_MESSAGE,
       },
+      // R1 (§4): cron dọn dẹp — chỉ cờ + số đếm, KHÔNG lộ bí mật/đường dẫn.
+      // Chưa gắn scheduler (test dựng router trực tiếp) ⇒ rơi về cấu hình + số 0.
+      scheduler: (() => {
+        const s = typeof app?.scheduler?.stats === 'function' ? app.scheduler.stats() : null;
+        const r = s?.last_result;
+        return {
+          enabled: s ? s.enabled !== false : config?.scheduler?.enabled !== false,
+          running: Boolean(s?.running),
+          ticks: Number.isFinite(Number(s?.ticks)) ? Number(s.ticks) : 0,
+          last_tick_at: s?.last_tick_at ?? null,
+          last_result: r
+            ? {
+              reconciled: Number(r.reconciled) || 0,
+              requeued: Number(r.requeued) || 0,
+              errors: Number(r.errors) || 0,
+            }
+            : null,
+        };
+      })(),
     });
   });
 
