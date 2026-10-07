@@ -99,6 +99,28 @@ sản phẩm; không tạo ảnh giả người thật, thương hiệu thật, 
 
 ## MVP-04 — Video Studio
 
+**Trạng thái: PHẦN OFFLINE ĐÃ MERGE VÀO `develop`** (PR [#23](https://github.com/thanhbn123/studio/pull/23), merge commit `af2b2da`, 07/10/2026) **— CHỜ OWNER NGHIỆM THU.**
+
+Bằng chứng: **929 test · 928 pass · 0 fail · 1 skipped** · `node tools/verify.mjs` EXIT=0 · **CI 5/5 xanh** · **5 vòng phản biện độc lập** (FAIL → FAIL → PASS CÓ ĐIỀU KIỆN → FAIL → PASS CÓ ĐIỀU KIỆN, điều kiện cuối đã vá). Video mẫu: [`assets/mvp04-video-mau.gif`](assets/mvp04-video-mau.gif). Hồ sơ: [`MVP-04-ACCEPTANCE.md`](MVP-04-ACCEPTANCE.md) · hợp đồng: [`MVP-04-CONTRACT.md`](MVP-04-CONTRACT.md) · phản biện: [`MVP-04-REVIEW.md`](MVP-04-REVIEW.md).
+
+Đã làm (offline, không dịch vụ trả tiền, không cần `ffmpeg`):
+- **GIF động** với bộ nén **LZW tự viết** — kiểm bằng `file`, `sips` (ImageIO), ImageMagick và **decoder Python độc lập** (khớp pixel).
+- **Chữ Việt** trên video (engine font MVP-02), **3 tỉ lệ 9:16 · 1:1 · 16:9** (pad/crop, **không bóp méo**),
+  chuyển cảnh cut/fade, zoom/pan, **nhiều ảnh ⇒ nhiều cảnh** đúng thứ tự gửi.
+- **Chống bịa**: chữ khẳng định/số liệu thiếu bằng chứng ⇒ **422, 0 pixel chữ** — đã bịt 5 vòng nguỵ trang
+  (không dấu, homoglyph Cyrillic/Hy Lạp, full-width, dấu câu chen trong cụm, dính chữ, lookalike Latin,
+  cụm bị tách sang nhiều mục/cảnh); đồng thời **hết chặn oan** chữ lành.
+- Tab thứ tư **“Video”** + 5 route `/api/videostudio/*` + usage `VIDEO_RENDER`/`VIDEO_ENCODE` thu **theo lượt**.
+
+Giới hạn THẬT: **video KHÔNG có tiếng** (GIF không chứa âm thanh — mọi kết quả đều nói rõ) ·
+**chưa có MP4/H.264** (cần `ffmpeg`/dịch vụ; provider fail-closed, chưa đo được) · GIF ≤ 256 màu/khung ·
+nhịp phát thật có thể lệch −4% (đã ghi `playback_ms`/`requested_ms`) · chỉ nhận PNG ·
+chưa đo PostgreSQL cho job video / trình duyệt thật / nhiều video 30s song song.
+
+Còn lại của MVP-04 (cần trả tiền): voice-over TTS tiếng Việt · nhạc nền · kết xuất MP4 · phụ đề tự động.
+
+## MVP-04 — Video Studio
+
 **Mục tiêu:** dựng video bán hàng ngắn từ ảnh + nội dung đã sinh ở MVP-01.
 
 Phạm vi dự kiến:
