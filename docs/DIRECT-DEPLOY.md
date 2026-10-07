@@ -9,7 +9,8 @@
 > |---|---|
 > | Bộ `deploy/` | **CÓ** — 76/76 ca thử tại máy đạt |
 > | Dự án đã triển khai ở đâu chưa | **CHƯA** — không script nào trong repo gọi `ssh`/`scp`/`rsync`, và `deploy.conf` để trống mọi host |
-> | Docker trên máy viết bộ này | **KHÔNG CÓ** (Mac mini) ⇒ chưa lần nào build ảnh hay chạy compose |
+> | Docker trên máy viết bộ này | **KHÔNG CÓ** (Mac mini) ⇒ tại máy chưa lần nào build ảnh hay chạy compose |
+| Ảnh Docker có dựng được không | **CÓ** — job CI `docker-build` dựng ảnh, `docker run` thật và gọi `/api/health` đạt (đo trên PR #25). Điều **vẫn chưa** đo: `docker compose up` với bố cục `releases/` + `shared/.env` của bộ này |
 >
 > Bộ này dựng **trước** lượt triển khai đầu tiên, đúng §20.6: có `deploy/` trước,
 > rồi mới triển khai — không triển khai tay rồi hợp thức hoá sau.
@@ -149,14 +150,27 @@ minh — nhưng phải báo `GITHUB_SYNC_PENDING = YES` và không để lịch 
 
 ## 8. GitHub Actions — xem rồi, KHÔNG sửa gì
 
-Rà ngày 07/10/2026. Một workflow `.github/workflows/ci.yml`, ba job:
-`test-sqlite`, `test-postgres`, `smoke`.
+Rà ngày 07/10/2026. Một workflow `.github/workflows/ci.yml`, **năm job**:
+`test-sqlite`, `test-postgres`, `smoke`, `secret-scan`, `docker-build`.
+
+> **Bản đầu của mục này viết "ba job" — SAI.** Em đếm bằng mắt từ đoạn đầu file
+> và bỏ sót hai job ở cuối. Số đúng lấy từ lệnh:
+> `grep -nE '^  [a-z0-9-]+:$' .github/workflows/ci.yml`. Lỗi nhỏ, nhưng nó là
+> đúng loại lỗi §12.1 luật 4 của `CLAUDE.md`: trường nào là dữ kiện đo được thì
+> phải lấy từ lệnh, không điền từ cảm giác.
 
 | Hạng mục | Kết luận |
 |---|---|
 | Trùng lặp push/PR | **không có** — cả hai trigger đã giới hạn `main`/`develop` |
-| Job nặng (trình duyệt, matrix lớn, build ảnh) | **không có** |
+| Job trình duyệt / matrix lớn | **không có** |
+| Job build ảnh Docker | **CÓ** (`docker-build`) — và **giữ**, xem dưới |
 | Job tốn phí đáng cắt | **không có** |
+
+**Vì sao giữ `docker-build` dù brief gốc xếp "Docker build matrix" vào loại nên
+cắt:** nó không phải matrix, nó chạy một lượt — và nó là **phép đo duy nhất
+chứng minh ảnh dựng được**, vì máy phát triển (Mac mini) không có Docker. Nó còn
+`docker run` thật rồi gọi `/api/health`. Cắt nó là cắt đúng thứ không ai khác
+đang đo.
 
 Nên lượt này **không sửa CI**. Sửa để có cái mà sửa là thêm rủi ro không đổi lại
 được gì. Cả ba job vẫn là lưới an toàn cho mã vào `develop`/`main`; chúng không
