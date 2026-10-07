@@ -95,6 +95,8 @@ const HOMOGLYPH_MAP = new Map(
     // Lưu ý: NFKC chạy TRƯỚC khi gộp nên ϲ (U+03F2) đã thành ς (U+03C2) và Ϲ (U+03F9) thành Σ
     // (U+03A3) — vì vậy phải map cả các dạng SAU chuẩn hoá, không chỉ dạng gõ vào.
     ϲ: 'c', Ϲ: 'C', ς: 'c', Σ: 'C', σ: 'c', ɡ: 'g', ѡ: 'w', ⅰ: 'i', ⅼ: 'l',
+    // MVP-04 vòng 3: bổ sung Hy Lạp hay bị dùng để nguỵ trang từ khoá tiếng Việt
+    ν: 'v', Ν: 'N', α: 'a', Α: 'A', ε: 'e', Ε: 'E', ι: 'i', Ι: 'I', κ: 'k', Κ: 'K', μ: 'm', Μ: 'M',
   }),
 );
 
@@ -732,7 +734,9 @@ export const CLAIM_GROUPS = Object.freeze([
   {
     id: 'number_one',
     label: 'số 1',
-    vi: /số\s*1\b|số một|top\s*1\b|đứng đầu|dẫn đầu|bán chạy nhất/gi,
+    // MVP-04 vòng 4: thêm ranh giới TRÁI cho 'số một'/'số 1' — trước đây 'Also mot chiec ao' bị chặn
+    // oan vì khớp chuỗi con 'so mot'. Không đổi luật, chỉ siết ranh giới từ.
+    vi: /(?:^|\s)số\s*1\b|(?:^|\s)số một|(?:^|\s)top\s*1\b|(?:^|\s)đứng đầu|(?:^|\s)dẫn đầu|(?:^|\s)bán chạy nhất/gi,
     zh: /第一|销量第一|排名第一|冠军|榜首/,
   },
   {

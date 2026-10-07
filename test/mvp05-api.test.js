@@ -11,6 +11,7 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { productImage } from './imagestudio-helpers.js';
+import { USAGE_OPERATIONS } from '../src/store/index.js';
 import {
   startMvp05App,
   register,
@@ -172,11 +173,22 @@ describe('MVP-05 · API — đăng ký / đăng nhập / phiên', () => {
     assert.equal(otherBody.balance.amount, 0);
   });
 
-  test('GET /api/billing/pricing là CÔNG KHAI và đủ 10 operation (CONTENT_REPAIR có giá)', async () => {
+  test('GET /api/billing/pricing là CÔNG KHAI và đủ MỌI operation của USAGE_OPERATIONS (CONTENT_REPAIR có giá)', async () => {
     const res = await request(ctx.base, '/api/billing/pricing');
     assert.equal(res.status, 200);
     const { pricing } = await j(res);
-    assert.equal(pricing.length, 10);
+    // KHÔNG hardcode số operation: mỗi lần hợp đồng thêm operation (MVP-04 thêm VIDEO_RENDER,
+    // VIDEO_ENCODE) test hardcode sẽ vỡ oan. So với chính nguồn sự thật `USAGE_OPERATIONS`.
+    assert.equal(
+      pricing.length,
+      USAGE_OPERATIONS.length,
+      `bảng giá phải đủ ${USAGE_OPERATIONS.length} operation của hợp đồng §2.1`,
+    );
+    assert.deepEqual(
+      pricing.map((row) => row.operation).sort(),
+      [...USAGE_OPERATIONS].sort(),
+      'tập operation trong bảng giá phải khớp USAGE_OPERATIONS',
+    );
     const repair = pricing.find((row) => row.operation === 'CONTENT_REPAIR');
     assert.ok(repair && repair.unit_price > 0, 'CONTENT_REPAIR PHẢI có giá');
     for (const row of pricing) {

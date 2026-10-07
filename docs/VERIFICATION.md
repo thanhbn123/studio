@@ -1345,3 +1345,71 @@ $ node /tmp/mvp05-atk2/t13,t12,t9,t7 → mỗi lượt thu đúng phần của l
   · `/tmp/mvp05-atk4/v1-br08.mjs` §V1.4 crash trong **script của phản biện** (`no such table:
     wallet_ledger`) khi họ thử dựng lại boot trên store in-memory — không phải lỗi repo; ca boot
     được chứng minh bằng `v2 §V2.3` (DB file thật, restart thật).
+
+---
+
+## 20. MVP-04 (Video Studio offline) — vòng gộp: cái gì ĐO ĐƯỢC, cái gì KHÔNG
+
+**Bối cảnh:** V1–V5 land chưa commit; `npm test` lúc bàn giao **1 fail** (`test/mvp05-api.test.js`
+hardcode `pricing.length === 10`, nay 12 vì thêm `VIDEO_RENDER`/`VIDEO_ENCODE`). Vòng gộp: sửa test
++ **nối multi-ảnh → nhiều cảnh** + các điểm lệch nhỏ.
+
+`npm test` → **856 test · 855 pass · 0 fail · 1 skipped**; `verify.mjs` EXIT=0; `imagelab-demo.mjs`
+→ `succeeded`.
+
+### 20.1 Nhiều ảnh ⇒ nhiều cảnh — ĐÃ CHẠY THẬT end-to-end
+
+```
+$ node --test test/mvp04-multi-scene.test.js
+  ✔ 3 ẢNH (scenes[i].image) ⇒ plan 3 cảnh, asset_id mỗi cảnh khác nhau, GIF đủ khung
+  ✔ ĐỐI CHỨNG NGƯỢC: 1 ảnh (chỉ `image`) ⇒ vẫn 1 cảnh như trước, không hồi quy
+  ✔ CHỈ `scenes[i].image` (không có `image` top-level) ⇒ vẫn nhận job
+  ✔ KHÔNG có ảnh nào ⇒ 400 MISSING_IMAGE; ảnh TRÙNG byte ⇒ khử còn 1 cảnh; quá trần ⇒ 413
+  ✔ presets: `limits.max_scenes` có mặt + đúng giá trị chặn 413 (=24)
+  ✔ cảnh báo "KHÔNG có tiếng" chỉ MỘT câu
+  ✔ mở lại job: `plan.scenes[].texts` giữ nội dung chữ + `last_run.run_key` có thật
+
+$ node /tmp/gop15/probe-multi.mjs      (HTTP thật, 6 ca)
+A) image + scenes KHÔNG kèm image → 202 asset_ids = 1 ảnh · plan.scene_count = 1   (đối chứng ngược)
+B) scenes[i].image (3 ảnh) → 202 asset_ids = 3 · plan.scene_count = 3 · durations=[250,250,250]
+   GIF: {"frames":9,"w":900,"h":900,"valid":true} · 19593 byte   (= 3 × 250 ms × 12 fps)
+C) CHỈ scenes[i].image (2 ảnh, không `image`) → 202 (2 asset_ids)   ← trước đây 400 MISSING_IMAGE
+D) 3 ảnh TRÙNG byte ⇒ asset_ids = 1 (khử trùng sha256)
+E) limits = {"max_image_bytes":8388608,"max_pixels":16000000,"max_seconds":30,"max_scenes":24}
+F) 30 cảnh ⇒ 413 TOO_MANY_SCENES
+```
+
+`GET /api/videostudio/jobs/:id` trả `rendered[]` + `plan.scene_count` khớp số ảnh; `plan.scenes[]`
+có `asset_id` **lấy từ DB** (khác nhau giữa các cảnh) + `texts` để UI hiện lại ô chữ;
+`last_run.run_key = 9da6fb16-…` (trước: `null`).
+
+### 20.2 Script tự kiểm của các agent (chạy lại sau khi gộp)
+
+```
+$ node /tmp/vs-v4-check/run.mjs      → ===== 48/48 PASS · 0 FAIL =====   (V4: API/IDOR/402/413/422/503)
+$ node /tmp/mvp04-v3/demo.mjs        → TẤT CẢ KHẲNG ĐỊNH ĐỀU ĐÚNG ✔      (V3: pipeline/wiring/store)
+$ node /tmp/vscheck/vs-real.test.mjs → 5/5 pass   (V5: payload V3/V4 chạy qua hàm render của UI)
+$ node /tmp/vscheck/vs-ui.test.mjs   → 32/34 pass · 2 FAIL — HAI khẳng định cũ nói "API chỉ nhận
+  1 ảnh/job" (đã lỗi thời sau vòng gộp):
+    · "body gửi máy chủ: cảnh 1 ở `image`, metadata cảnh trong options.scenes…" (đòi scenes KHÔNG có ảnh)
+    · "nhiều ảnh: nói THẲNG cảnh nào chưa gửi được (API 1 ảnh/job)" (đòi nhãn "chưa gửi được" ở cảnh 2+)
+  Hai khẳng định này KHÔNG sửa được từ phía repo (`/tmp` thuộc agent V5) và mâu thuẫn trực tiếp với
+  §2.5 nay đã chạy thật; hợp đồng + test repo đã khoá hành vi MỚI.
+```
+
+### 20.3 Giới hạn THẬT của MVP-04 (không tô hồng)
+
+- **KHÔNG có tiếng**: mọi kết quả `audio: null` + cảnh báo “Video KHÔNG có tiếng…” (đúng một câu).
+  Không có TTS/nhạc nền — muốn có tiếng phải cắm dịch vụ trả tiền.
+- **MP4/H.264 CHƯA ĐO**: máy này **không có `ffmpeg`**; provider `ffmpeg` fail-closed bằng
+  `FFMPEG_NOT_AVAILABLE` (không bịa). Đường đo được duy nhất là **GIF 89a** (bộ mã hoá LZW tự viết)
+  và chuỗi khung PNG.
+- **GIF là ảnh động 256 màu**: lượng tử hoá bảng màu (median-cut) ⇒ **có sai số màu**; `dither`
+  mặc định `false`; số khung = `round(duration_ms/1000 × fps)`; không có âm thanh, không tua được
+  như video thật.
+- **Ảnh gốc bất biến** và **không kéo giãn**: chỉ `pad`/`crop` (ghi vào `plan.scenes[].fit` + cảnh báo
+  đo được); ảnh ra đúng tỉ lệ preset (đo bằng pixel: 900×900 cho `vuong-1x1`).
+- **Chữ trên video** theo luật chống bịa của MVP-03: khẳng định/số liệu thiếu bằng chứng ⇒ 422
+  `VIDEO_TEXT_UNSUPPORTED_CLAIM`, **0 byte video** (đo ở V4 §(g): preflight chặn TRƯỚC khi tạo job).
+- Chưa đo: ffmpeg thật, video nhiều giây (>30 s bị cắt theo trần preset), UI trên trình duyệt thật
+  (chỉ đo hàm render thuần qua `/tmp/vscheck`).

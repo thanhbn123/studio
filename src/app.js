@@ -15,6 +15,10 @@
  * MVP-05: khối tài khoản (`src/accounts/**`) + ví credit (`src/billing/**`) nạp phòng thủ
  * y hệt. Hỏng/còn thiếu ⇒ `app.accountService`/`app.billingService` = null kèm lý do thật,
  * MVP-01/02/03 VẪN boot và chạy ở chế độ ẩn danh (luật #1: đăng nhập là tuỳ chọn).
+ *
+ * MVP-04: khối Video Studio (encode GIF của V2 + pipeline của V3) cũng nạp PHÒNG THỦ và độc
+ * lập — thiếu module anh em ⇒ `app.videostudioPipeline = null` + lý do thật, MVP-01/02/03/05
+ * VẪN boot và chạy bình thường.
  */
 
 import { loadConfig } from './config.js';
@@ -85,6 +89,23 @@ async function importMvp05Module(label, specifier) {
 }
 
 /**
+ * Nạp MỘT module MVP-04 (Video Studio) và gắn nhãn module vào lỗi — cùng khuôn với ba hàm
+ * trên: log `videostudio.wiring_failed` phải nói được CHÍNH XÁC module nào hỏng
+ * (`encode/index.js` của V2, `pipeline.js` của V3…).
+ */
+async function importVideostudioModule(label, specifier) {
+  try {
+    return await import(specifier);
+  } catch (err) {
+    const wrapped = new Error(`Không nạp được module MVP-04 "${specifier}" (${label}): ${scrubPaths(err?.message || err)}`);
+    wrapped.videostudioModule = specifier;
+    wrapped.videostudioLabel = label;
+    wrapped.cause = err;
+    throw wrapped;
+  }
+}
+
+/**
  * Operation DỰ KIẾN theo loại job — cơ sở để giữ tiền khi route chỉ truyền `kind`.
  *
  * Đây là ƯỚC TÍNH theo hướng GIỮ DƯ (upper bound): giữ thừa thì `settleForJob` hoàn lại
@@ -96,6 +117,9 @@ const OPERATIONS_BY_KIND = Object.freeze({
   content: Object.freeze(['SOURCE_EXTRACT', 'VISION_ANALYSIS', 'TRANSLATION', 'CONTENT_GENERATE']),
   image_translation: Object.freeze(['OCR_DETECT', 'TRANSLATION', 'IMAGE_RENDER']),
   image_generation: Object.freeze(['IMAGE_MATTING', 'IMAGE_COMPOSE', 'IMAGE_RETOUCH']),
+  // MVP-04: video offline chỉ chạy 2 bước thật (dựng khung + mã hoá GIF) — giữ tiền theo
+  // đúng hai operation này để ước tính không thừa/không thiếu (hợp đồng §2.3).
+  video_generation: Object.freeze(['VIDEO_RENDER', 'VIDEO_ENCODE']),
 });
 
 /**
@@ -452,6 +476,9 @@ function createBillingHook({ service, store, logger, config, BillingError = null
  * @param {object} [opts.mattingProvider]  [MVP-03] provider tách nền đã dựng sẵn (test)
  * @param {object} [opts.retouchProvider]  [MVP-03] provider retouch đã dựng sẵn (test)
  * @param {object} [opts.imagestudioPipeline] [MVP-03] pipeline tạo ảnh đã dựng sẵn (test)
+ * @param {object} [opts.videostudioPipeline] [MVP-04] pipeline video đã dựng sẵn (test)
+ * @param {object} [opts.videoEncoder] [MVP-04] bộ mã hoá video đã dựng sẵn; truyền `null`
+ *        CÓ CHỦ Ý = "không có encoder" ⇒ wiring phải báo hỏng phòng thủ (test ca fail-closed)
  * @param {object} [opts.accountService] [MVP-05] AccountService đã dựng sẵn (test)
  * @param {object} [opts.billingService] [MVP-05] BillingService đã dựng sẵn (test)
  */
@@ -799,6 +826,89 @@ export async function createApp(opts = {}) {
     }
   }
 
+  /* ── MVP-04 (Video Studio, phần OFFLINE) — nạp PHÒNG THỦ, KHÔNG làm chết boot ──
+   *
+   * `src/videostudio/encode/**` (V2 — mã hoá GIF) là module anh em có thể CHƯA tồn tại lúc
+   * boot; `src/videostudio/pipeline.js` (V3) nạp ĐỘNG V1/V2 bên trong nên tự nó vẫn import
+   * được. Nạp lỗi ⇒ `encoder`/`pipeline` = null, log `videostudio.wiring_failed` MỨC ERROR và
+   * ghi lý do THẬT (đã lọc đường dẫn) vào `app.videostudioUnavailableReason`.
+   *
+   * Storage dùng CHUNG với MVP-02/03 khi có (cùng `config.imagelab.dir`); không có thì tự nạp.
+   * `billingHook` (§3.4b) được bơm vào pipeline y như 3 pipeline kia: route giữ tiền trước,
+   * pipeline quyết toán/hoàn tiền ở cuối lượt (ẩn danh ⇒ bỏ qua hoàn toàn).
+   */
+  const videostudio = { encoder: null, pipeline: null, storage: null, reason: null };
+
+  if (config?.videostudio?.enabled === false) {
+    videostudio.reason = 'Tính năng tạo video đang bị tắt bằng cấu hình (config.videostudio.enabled = false / VIDEOSTUDIO_ENABLED=false).';
+    rootLogger.info('videostudio.disabled', { reason: videostudio.reason });
+  } else if (opts.videostudioPipeline) {
+    // Đã được bơm sẵn (test hoặc tầng gộp) → dùng luôn, khỏi nạp module anh em.
+    videostudio.encoder = opts.videoEncoder || null;
+    videostudio.pipeline = opts.videostudioPipeline;
+    videostudio.storage = opts.storage || imagelab.storage || imagestudio.storage || null;
+  } else {
+    try {
+      const [storageModule, pipelineModule, encodeModule] = await Promise.all([
+        importVideostudioModule('storage', './imagelab/storage.js'),
+        importVideostudioModule('pipeline', './videostudio/pipeline.js'),
+        importVideostudioModule('encode', './videostudio/encode/index.js'),
+      ]);
+      if (typeof pipelineModule.VideoStudioPipeline !== 'function') {
+        throw new Error('Module MVP-04 "./videostudio/pipeline.js" không xuất `VideoStudioPipeline`.');
+      }
+      const storage = opts.storage || imagelab.storage || imagestudio.storage || storageModule.createImageStorage(config, { logger: rootLogger });
+      // `videoEncoder: null` TRUYỀN CÓ CHỦ Ý (ca test "ép encoder null") ⇒ KHÔNG tự dựng lại,
+      // để nhánh kiểm ngay dưới báo hỏng wiring thay vì lặng lẽ tạo encoder thật.
+      const encoder = Object.prototype.hasOwnProperty.call(opts, 'videoEncoder')
+        ? opts.videoEncoder
+        : (typeof encodeModule.createVideoEncoder === 'function'
+          ? encodeModule.createVideoEncoder(config, { logger: rootLogger })
+          : null);
+      if (!encoder) throw new Error('Không tạo được bộ mã hoá video (V2 `createVideoEncoder` trả về rỗng).');
+      if (typeof encoder.encode !== 'function') throw new Error('Bộ mã hoá video (V2) thiếu hàm `encode`.');
+      if (encoder.configured === false) {
+        throw new Error(`Bộ mã hoá video "${encoder.name || 'unknown'}" CHƯA được cấu hình (configured = false) — không thể tạo video.`);
+      }
+      videostudio.encoder = encoder;
+      videostudio.storage = storage;
+      videostudio.pipeline = new pipelineModule.VideoStudioPipeline({
+        config,
+        logger: rootLogger,
+        store,
+        storage,
+        encoder,
+        // MVP-05: hook tính tiền (chỉ chạy khi job có `user_id`; null ⇒ bỏ qua hoàn toàn).
+        billingService: billing.service,
+        billingHook,
+      });
+      rootLogger.info('videostudio.wired', {
+        encoder: encoder.name || 'none',
+        encoder_mock: Boolean(encoder.isMock),
+        mime: encoder.mime || null,
+        storage: storage === imagelab.storage ? 'imagelab' : storage === imagestudio.storage ? 'imagestudio' : 'rieng',
+      });
+    } catch (err) {
+      videostudio.encoder = null;
+      videostudio.pipeline = null;
+      videostudio.storage = null;
+      const modulePath = err?.videostudioModule || null;
+      // Lỗi KHÔNG phải "nạp module" (vd `createVideoEncoder` trả null / encoder chưa cấu hình)
+      // cũng phải nói được lý do THẬT — không gán nhãn "(không xác định)" rồi im lặng.
+      videostudio.reason = modulePath
+        ? `Không nạp được module MVP-04 "${modulePath}" — tính năng tạo video bị tắt. Chi tiết ở log máy chủ (videostudio.wiring_failed).`
+        : `Không lắp được khối Video Studio (${scrubPaths(err?.message || err)}) — tính năng tạo video bị tắt. Chi tiết ở log máy chủ (videostudio.wiring_failed).`;
+      rootLogger.error('videostudio.wiring_failed', {
+        module: modulePath || '(khối mã hoá/pipeline MVP-04)',
+        module_label: err?.videostudioLabel || null,
+        // Không đưa cả object lỗi vào log: stack/message của Node chứa đường dẫn tuyệt đối.
+        error_name: err?.cause?.name || err?.name || 'Error',
+        error_code: err?.cause?.code || err?.code || null,
+        error_message: scrubPaths(err?.message || err),
+      });
+    }
+  }
+
   const queue = new JobQueue({
     concurrency: config.jobs.concurrency,
     maxAttempts: config.jobs.maxAttempts,
@@ -875,6 +985,12 @@ export async function createApp(opts = {}) {
     retouchProvider: imagestudio.retouchProvider,
     imagestudioPipeline: imagestudio.imagestudioPipeline,
     imagestudioUnavailableReason: imagestudio.reason,
+    // MVP-04: null nếu khối Video Studio nạp lỗi (V4 phải kiểm trước khi dùng → 503
+    // VIDEOSTUDIO_UNAVAILABLE), kèm lý do thật cho `/api/config`. `/api/health` KHÔNG đổi
+    // cấu trúc cũ — V4 thêm field `videostudio` khi hợp đồng §2.4 chốt.
+    videoEncoder: videostudio.encoder,
+    videostudioPipeline: videostudio.pipeline,
+    videostudioUnavailableReason: videostudio.reason,
     // MVP-05: null nếu khối tài khoản/ví nạp lỗi hoặc bị tắt bằng cấu hình. `/api/config`
     // trả `accounts: { available: Boolean(app.accountService), reason: app.accountsUnavailableReason }`
     // (A4 dựng), và `GET /api/auth/me` trả `anonymous: true` khi service = null.
