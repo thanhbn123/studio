@@ -578,6 +578,35 @@ export class JobQueue extends EventEmitter {
   async pumpQueued({ olderThanMs = null, limit = null } = {}) {
     if (!this.durable) return { durable: false, requeued: 0, claimed: 0, skipped: 0, exhausted: 0 };
     const reclaimed = await this.reclaimStale({ olderThanMs, limit });
+    // A2 (phản biện R1 vòng 2, VỪA): mục `queued` ĐÃ CHẠM TRẦN không bao giờ nhặt được nữa ⇒ phải
+    // được CHỐT `failed` (+ job `failed`) chứ không nằm im. Trước đây nó kẹt `queued` vĩnh viễn và
+    // vòng poll liên tục dựng handler rồi phát `done(skipped=true)` GIẢ.
+    let exhaustedMarked = 0;
+    const stuck = await this.store
+      .listQueueItems({ statuses: ['queued'], limit: limit ?? this.resumeLimit, onlyClaimable: false })
+      .catch(() => []);
+    for (const row of stuck) {
+      if (Number(row.attempts) < Number(row.max_attempts)) continue;
+      const err = Object.assign(
+        new Error(`Mục hàng đợi của job ${row.job_id} đã chạm trần số lần thử — không nhặt lại.`),
+        { code: 'QUEUE_ATTEMPTS_EXHAUSTED' },
+      );
+      await this.store.failQueueItem?.(row.id, { error: err, force: true }).catch((e2) => {
+        this.logger?.error('queue.exhausted_mark_failed_error', { queue_item_id: row.id, error: e2 });
+      });
+      if (typeof this.store.updateJob === 'function') {
+        await this.store.updateJob(row.job_id, {
+          status: 'failed',
+          stage: 'failed',
+          error_code: 'QUEUE_ATTEMPTS_EXHAUSTED',
+          error_message: err.message,
+          finished_at: new Date().toISOString(),
+        }).catch((e2) => this.logger?.error('queue.exhausted_job_update_failed', { job_id: row.job_id, error: e2 }));
+      }
+      this.logger?.error('queue.attempts_exhausted', { job_id: row.job_id, queue_item_id: row.id });
+      this.emit('failed', { id: row.job_id, error: err, attempts: Number(row.attempts) || 0, exhausted: true });
+      exhaustedMarked += 1;
+    }
     const rows = await this.store.listQueueItems({ statuses: ['queued'], limit: limit ?? this.resumeLimit });
     let claimed = 0;
     let skipped = 0;
@@ -640,7 +669,13 @@ export class JobQueue extends EventEmitter {
     }
     this.#pump();
     if (claimed > 0) this.logger?.info('queue.drained', { claimed, skipped, requeued: reclaimed.requeued });
-    return { durable: true, requeued: reclaimed.requeued, claimed, skipped, exhausted: reclaimed.exhausted };
+    return {
+      durable: true,
+      requeued: reclaimed.requeued,
+      claimed,
+      skipped,
+      exhausted: (Number(reclaimed.exhausted) || 0) + exhaustedMarked,
+    };
   }
 
   async resume() {
@@ -799,15 +834,37 @@ export class JobQueue extends EventEmitter {
       if (!claim) {
         // Không thắng được lượt nhặt: tiến trình KHÁC đã nhận mục này, hoặc mục đã xong/bị huỷ.
         // Đây là chốt chặn cuối cùng của "không chạy hai lần, không thu tiền hai lần".
-        this.logger?.warn('queue.item_skipped', { job_id: item.id, queue_item_id: item.queueItemId || null });
-        if (entry.state === JOB_STATE.PENDING) {
-          entry.state = JOB_STATE.DONE;
-          entry.skipped = true;
-          this.emit('done', { id: item.id, result: null, attempts: entry.attempts || 0, skipped: true });
+        //
+        // A2 (phản biện R1 vòng 2, VỪA): KHÔNG được phát `done` khi handler CHƯA CHẠY — trước đây
+        // phát `done(skipped: true)` nên tầng gọi tưởng job đã xong (đo được 10 `done` giả trong
+        // 2 giây). Nay phát `skipped` với lý do đọc được, và nếu mục đã chạm trần thì đánh dấu
+        // `failed` để không ai nhặt lại.
+        const row = item.queueItemId ? await this.store.getQueueItemById?.(item.queueItemId).catch(() => null) : null;
+        const exhausted = row ? Number(row.attempts) >= Number(row.max_attempts) : false;
+        if (exhausted && item.queueItemId) {
+          await this.store.failQueueItem?.(item.queueItemId, {
+            error: Object.assign(new Error('Mục đã chạm trần số lần thử — không chạy lại.'), { code: 'QUEUE_ATTEMPTS_EXHAUSTED' }),
+            force: true,
+          }).catch((err) => this.logger?.warn('queue.exhausted_mark_failed', { queue_item_id: item.queueItemId, error: err }));
+          this.logger?.error('queue.attempts_exhausted', { job_id: item.id, queue_item_id: item.queueItemId });
+          this.emit('failed', {
+            id: item.id,
+            error: Object.assign(new Error('Mục đã chạm trần số lần thử.'), { code: 'QUEUE_ATTEMPTS_EXHAUSTED' }),
+            attempts: Number(row?.attempts) || 0,
+            exhausted: true,
+          });
+        } else {
+          this.logger?.warn('queue.item_skipped', { job_id: item.id, queue_item_id: item.queueItemId || null });
+          this.emit('skipped', { id: item.id, queue_item_id: item.queueItemId || null, reason: 'claim_lost' });
         }
+        entry.state = exhausted ? JOB_STATE.FAILED : JOB_STATE.DONE;
+        entry.skipped = true;
+        this.active.set(item.id, entry);
         return;
       }
       entry.queueItemId = claim.id;
+      // A3 (fencing): epoch của LƯỢT CLAIM này — mọi thao tác kết thúc phải kèm epoch.
+      entry.epoch = Number(claim.epoch ?? 0);
     }
     entry.attempts = this.durable ? Number(claim?.attempts ?? entry.attempts + 1) : entry.attempts + 1;
     entry.state = JOB_STATE.RUNNING;
@@ -818,10 +875,33 @@ export class JobQueue extends EventEmitter {
     // Không có nhịp này, job dài hơn `stale_ms` bị cron "cướp" và HAI tiến trình chạy song song
     // cùng một mục (đo được: 2 khoảng thời gian chồng nhau, `attempts` 1→2, bản trùng `failed`
     // ⇒ hook hoàn tiền trong khi bản gốc vẫn xong ⇒ mất doanh thu).
-    const heartbeat = this.#startHeartbeat(entry.queueItemId);
+    const heartbeat = this.#startHeartbeat(entry.queueItemId, entry.epoch ?? null);
     try {
-      const result = await item.handler({ attempt: entry.attempts, queueItemId: entry.queueItemId ?? null });
-      if (this.durable && entry.queueItemId) await this.store.completeQueueItem(entry.queueItemId);
+      const result = await item.handler({
+        attempt: entry.attempts,
+        queueItemId: entry.queueItemId ?? null,
+        workerId: this.workerId,
+        epoch: entry.epoch ?? null,
+      });
+      if (this.durable && entry.queueItemId) {
+        // A3 (fencing): chỉ chốt `done` nếu epoch CÒN KHỚP. Runner đã bị cướp (SIGSTOP/mất lease)
+        // không được ghi đè kết quả của runner mới; kết quả của nó bị BỎ và ghi log.
+        const ok = await this.store.completeQueueItem(entry.queueItemId, { epoch: entry.epoch ?? null });
+        if (ok === false && entry.epoch !== undefined && entry.epoch !== null) {
+          this.logger?.warn('queue.stale_result_discarded', {
+            job_id: item.id,
+            queue_item_id: entry.queueItemId,
+            epoch: entry.epoch,
+            reason: 'epoch_lệch — lượt này đã bị claim lại bởi tiến trình khác',
+          });
+          entry.state = JOB_STATE.DONE;
+          entry.finishedAt = new Date().toISOString();
+          entry.staleResult = true;
+          this.active.set(item.id, entry);
+          this.emit('skipped', { id: item.id, queue_item_id: entry.queueItemId, reason: 'stale_epoch' });
+          return;
+        }
+      }
       entry.state = JOB_STATE.DONE;
       entry.finishedAt = new Date().toISOString();
       this.active.set(item.id, entry);
@@ -868,7 +948,7 @@ export class JobQueue extends EventEmitter {
     this.#pollTimer = null;
   }
 
-  #startHeartbeat(queueItemId) {
+  #startHeartbeat(queueItemId, epoch = null) {
     if (!this.durable || !queueItemId || typeof this.store?.touchQueueItem !== 'function') return null;
     // ⚠️ SÀN THẤP (50ms), không phải 1s: `stale_ms` có thể được chỉnh rất ngắn (test/đo), và nhịp
     // tim dài hơn cửa sổ treo thì KHÔNG bảo vệ được gì (đo thật: `stale_ms=500` + nhịp 1000ms ⇒
@@ -878,7 +958,7 @@ export class JobQueue extends EventEmitter {
     const timer = setInterval(() => {
       if (stopped) return;
       this.store
-        .touchQueueItem(queueItemId, { workerId: this.workerId, now: this.#iso() })
+        .touchQueueItem(queueItemId, { workerId: this.workerId, now: this.#iso(), epoch })
         .then((ok) => {
           if (ok === false) this.logger?.warn('queue.lease_lost', { queue_item_id: queueItemId, worker_id: this.workerId });
         })
@@ -923,12 +1003,26 @@ export class JobQueue extends EventEmitter {
       const delay = this.#retryDelayFor(entry.attempts);
       let out = null;
       try {
-        out = await this.store.failQueueItem(entry.queueItemId, { error: err, retryDelayMs: delay });
+        out = await this.store.failQueueItem(entry.queueItemId, { error: err, retryDelayMs: delay, epoch: entry.epoch ?? null });
       } catch (e2) {
         // KHÔNG ghi được trạng thái thất bại ⇒ fail-closed: coi như hỏng hẳn (không thử lại vô
         // hạn một mục mà DB không chịu cập nhật).
         this.logger?.error('queue.fail_mark_error', { job_id: item.id, queue_item_id: entry.queueItemId, error: e2 });
         out = { status: 'failed', attempts: entry.attempts };
+      }
+      if (out?.stale === true) {
+        // A3: lượt này đã bị claim lại ⇒ KHÔNG ghi trạng thái/tiền cho kết quả cũ.
+        this.logger?.warn('queue.stale_result_discarded', {
+          job_id: item.id,
+          queue_item_id: entry.queueItemId,
+          epoch: entry.epoch ?? null,
+          reason: 'kết quả của lượt cũ bị bỏ (epoch lệch)',
+        });
+        entry.state = JOB_STATE.DONE;
+        entry.staleResult = true;
+        this.active.set(item.id, entry);
+        this.emit('skipped', { id: item.id, queue_item_id: entry.queueItemId, reason: 'stale_epoch' });
+        return;
       }
       if (out?.status === 'queued') {
         this.logger?.warn('job.retry', { job_id: item.id, attempt: entry.attempts, retry_in_ms: delay, error: err });

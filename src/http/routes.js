@@ -2081,6 +2081,9 @@ export function buildRouter(app) {
           userId: req.user?.id ?? null,
           extraInstructions: sanitizeText(body.extra_instructions, { maxLength: 1000 }),
         }),
+        // F6 (phản biện vòng 2): chỗ này CÓ `hold` nhưng trước đây không truyền khoá lượt ⇒ hai
+        // tiến trình cùng xếp một lượt chạy lại vẫn tạo 2 mục. Nay đủ 8/8 chỗ.
+        { runKey: hold?.run_key ?? null },
       );
     } catch (err) {
       await withHoldRelease(req, job.id, hold, async () => { throw err; }).catch(() => {});

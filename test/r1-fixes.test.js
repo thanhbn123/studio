@@ -90,6 +90,9 @@ describe('R1-F2 — heartbeat giữ lease (không bị cướp)', () => {
     // `locked_at` cũ (như job chạy lâu) NHƯNG heartbeat vừa cập nhật ⇒ vẫn đang sống.
     await store.driver.run("UPDATE job_queue SET locked_at=? WHERE id='q-hb'", [new Date(Date.now() - 3600_000).toISOString()]);
     assert.equal(await store.touchQueueItem('q-hb', { workerId: 'A' }), true, 'chủ hiện tại phải gia hạn được');
+    // A6 (phản biện vòng 2): THIẾU `workerId` ⇒ từ chối (trước đây vẫn gia hạn được lease người khác).
+    assert.equal(await store.touchQueueItem('q-hb'), false, 'thiếu workerId ⇒ KHÔNG được gia hạn');
+    assert.equal(await store.touchQueueItem('q-hb', {}), false, 'workerId rỗng ⇒ KHÔNG được gia hạn');
     const out = await store.requeueStaleJobs({ olderThanMs: 1000 });
     assert.equal(out.requeued, 0, 'mục còn heartbeat KHÔNG được thu hồi (F2)');
     assert.equal((await store.getQueueItemById('q-hb')).locked_by, 'A', 'vẫn thuộc chủ cũ');
@@ -223,6 +226,154 @@ describe('R1-F4/F5 — phân loại lỗi sổ + timeout khoá', () => {
       assert.ok(elapsed < 5000, 'thao tác thứ hai phải xong trong hạn');
     }
     void release;
+    await store.close();
+  });
+});
+
+describe('R1-A1…A4 (vòng 2) — boot an toàn, trần ở mọi đường revive, fencing, mã lỗi khoá', () => {
+  test('A1: DDL chạy LẦN HAI (đua khởi động) không làm chết `init()`', async () => {
+    const store = await createStore(cfg(), silent);
+    await store.init();
+    // Mô phỏng tiến trình thứ hai cùng chạy migration trên DB đã nâng cấp: phải là NO-OP, không ném.
+    await store.init();
+    await store.close();
+
+    // Cột do migration thêm phải có mặt và KHÔNG nhân đôi sau nhiều lần init().
+    const store2 = await createStore(cfg(), silent);
+    await store2.init();
+    await store2.init();
+    const cols = await store2.driver.all('PRAGMA table_info(job_queue)');
+    assert.equal(cols.filter((c) => c.name === 'epoch').length, 1, 'cột `epoch` đúng MỘT lần');
+    assert.equal(cols.filter((c) => c.name === 'heartbeat_at').length, 1, 'cột `heartbeat_at` đúng MỘT lần');
+    await store2.close();
+  }, { timeout: 20000 });
+
+  test('A1: `busy_timeout` được đặt TRƯỚC mọi pragma (không mất timeout khi WAL lỗi)', async () => {
+    const store = await createStore(cfg({ QUEUE_LOCK_TIMEOUT_MS: '1234' }), silent);
+    await store.init();
+    const row = await store.driver.get('PRAGMA busy_timeout');
+    assert.equal(Number(row?.timeout), 1234, 'busy_timeout phải theo `config.queue.lockTimeoutMs`');
+    await store.close();
+  });
+
+  test('A2: mục chạm trần KHÔNG được revive thành `queued`; enqueue lại cùng khoá ⇒ lượt MỚI (attempts=0)', async () => {
+    const store = await createStore(cfg(), silent);
+    await store.init();
+    await store.enqueueJob({ id: 'q-a2', jobId: 'j-a2', handler: 'run', maxAttempts: 2 });
+    await store.claimNextJob({ workerId: 'w' });
+    await store.failQueueItem('q-a2', { error: new Error('lần 1') });
+    await store.claimQueueItem('q-a2', { workerId: 'w' });
+    await store.completeQueueItem('q-a2');
+    assert.equal((await store.getQueueItemById('q-a2')).status, 'done');
+
+    // Hàng đợi KHÔNG được trả mục đã chạm trần cho các đường hồi sinh.
+    await store.driver.run("UPDATE job_queue SET status='queued', attempts=max_attempts WHERE id='q-a2'");
+    const claimable = await store.listQueueItems({ statuses: ['queued'] });
+    assert.equal(claimable.filter((r) => r.id === 'q-a2').length, 0, 'mục chạm trần KHÔNG nằm trong danh sách nhặt');
+    assert.equal(await store.claimQueueItem('q-a2', { workerId: 'w' }), null, 'claim phải trả null');
+
+    // Còn `enqueue` lại cùng khoá = LƯỢT MỚI ⇒ reset attempts, chạy được.
+    await store.enqueueJob({ id: 'q-a2', jobId: 'j-a2', handler: 'run', maxAttempts: 2 });
+    const row = await store.getQueueItemById('q-a2');
+    assert.equal(row.attempts, 0, 'lượt mới phải bắt đầu lại từ attempts = 0');
+    assert.equal(row.status, 'queued');
+    assert.ok((await store.claimQueueItem('q-a2', { workerId: 'w' })) !== null, 'lượt mới phải nhặt được');
+    await store.close();
+  });
+
+  test('A2: handler KHÔNG chạy ⇒ KHÔNG phát `done` (chỉ `skipped`/`failed`)', async () => {
+    const store = await createStore(cfg(), silent);
+    await store.init();
+    await store.createJob({ id: 'j-a2b', sessionId: 's', kind: 'content' });
+    await store.enqueueJob({ id: 'q-a2b', jobId: 'j-a2b', handler: 'run', maxAttempts: 1 });
+    await store.driver.run("UPDATE job_queue SET status='queued', attempts=max_attempts WHERE id='q-a2b'");
+    const queue = new JobQueue({ store, concurrency: 1, workerId: 'w', logger: silent, queue: { durable: true, staleMs: 60000 } });
+    const done = [];
+    const failed = [];
+    queue.on('done', (e) => done.push(e));
+    queue.on('failed', (e) => failed.push(e));
+    await queue.pumpQueued();
+    await queue.drain();
+    assert.equal(done.length, 0, `KHÔNG được phát \`done\` khi handler chưa chạy, nhận ${JSON.stringify(done)}`);
+    assert.equal((await store.getQueueItemById('q-a2b')).status, 'failed', 'mục chạm trần phải nằm ở `failed`');
+    await queue.close({ waitMs: 0 });
+    await store.close();
+  });
+
+  test('A3: epoch lệch ⇒ complete/fail bị TỪ CHỐI (kết quả runner cũ bị bỏ)', async () => {
+    const store = await createStore(cfg(), silent);
+    await store.init();
+    await store.enqueueJob({ id: 'q-a3', jobId: 'j-a3', handler: 'run', maxAttempts: 5 });
+    const first = await store.claimNextJob({ workerId: 'A' });
+    assert.equal(first.epoch, 1, 'claim đầu cấp epoch = 1');
+    // Runner B cướp mục (A bị treo): epoch tăng.
+    await store.driver.run("UPDATE job_queue SET status='queued', locked_at=NULL WHERE id='q-a3'");
+    const second = await store.claimQueueItem('q-a3', { workerId: 'B' });
+    assert.equal(second.epoch, 2, 'claim sau tăng epoch');
+    // A (epoch cũ) không được chốt kết quả.
+    assert.equal(await store.completeQueueItem('q-a3', { epoch: 1 }), false, 'epoch lệch ⇒ KHÔNG được chốt done');
+    const stale = await store.failQueueItem('q-a3', { error: new Error('A xong muộn'), epoch: 1 });
+    assert.equal(stale.stale, true, 'failQueueItem phải báo `stale` cho runner cũ');
+    assert.equal((await store.getQueueItemById('q-a3')).status, 'running', 'trạng thái của B phải nguyên vẹn');
+    // B (epoch đúng) chốt được.
+    assert.equal(await store.completeQueueItem('q-a3', { epoch: 2 }), true, 'epoch khớp ⇒ chốt done');
+    await store.close();
+  });
+
+  test('A3: lượt đã HOÀN nhưng việc XONG ⇒ vẫn THU được (quyết toán muộn, không mất doanh thu)', async () => {
+    const store = await createStore(cfg(), silent);
+    await store.init();
+    const svc = createBillingService(cfg(), { store });
+    const userId = 'u-a3';
+    await svc.grant({ userId, amount: 100 });
+    // 1) giữ tiền cho lượt
+    await svc.holdForJob({ userId, jobId: 'J9', estimate: 10, runKey: 'rk-9' });
+    assert.equal(await store.ledgerBalance(userId), 90);
+    // 2) bản chạy TRÙNG thất bại ⇒ hoàn tiền
+    await svc.refundForJob({ userId, jobId: 'J9', runKey: 'rk-9', reason: 'JOB_FAILED' });
+    assert.equal(await store.ledgerBalance(userId), 100);
+    // 3) bản GỐC xong ⇒ quyết toán: PHẢI thu được chi phí thật (trước đây bị từ chối ⇒ sản phẩm miễn phí)
+    const settle = await svc.settleForJob({ userId, jobId: 'J9', actualCost: 10, runKey: 'rk-9' });
+    assert.equal(settle?.reason, 'job_settle', 'phải ghi được dòng thu');
+    assert.equal(settle?.amount, -10);
+    assert.equal(settle?.meta?.late_settle_after_refund, true, 'phải ghi vết quyết toán muộn');
+    assert.equal(await store.ledgerBalance(userId), 90, 'doanh thu được giữ: khách trả 10 cho việc đã xong');
+    await store.close();
+  });
+
+  test('A4/F5: hết hạn khoá ⇒ mã của repo (LEDGER_BUSY/QUEUE_BUSY có `retryable`), không mã thô', async () => {
+    const store = await createStore(cfg({ QUEUE_LOCK_TIMEOUT_MS: '250', BILLING_LOCK_TIMEOUT_MS: '250' }), silent);
+    await store.init();
+    const svc = createBillingService(cfg({ BILLING_LOCK_TIMEOUT_MS: '250' }), { store });
+    await svc.grant({ userId: 'u-hold', amount: 10 });
+    // Giữ khoá sổ vĩnh viễn (mô phỏng giao dịch treo).
+    const held = store.withLedgerLock('u-hold', () => new Promise(() => {})).catch(() => {});
+    await sleep(50);
+    const errs = [];
+    // Các đường KHÁC trong tiến trình phải fail SỚM với mã chuẩn (không treo, không mã thô).
+    for (const probe of [
+      () => store.withLedgerLock('u-other', async () => 'xong'),
+      () => store.claimNextJob({ workerId: 'p' }),
+      () => store.appendLedger({ userId: 'u-other', amount: 1, reason: 'grant' }),
+    ]) {
+      const t0 = Date.now();
+      try {
+        await probe();
+        errs.push({ ms: Date.now() - t0, code: 'OK' });
+      } catch (err) {
+        errs.push({ ms: Date.now() - t0, code: err?.code, retryable: err?.details?.retryable ?? null });
+      }
+    }
+    const codes = errs.map((e) => e.code);
+    assert.ok(
+      codes.every((c) => ['LEDGER_BUSY', 'QUEUE_BUSY', 'OK'].includes(c)),
+      `chỉ nhận mã của repo, nhận ${JSON.stringify(codes)}`,
+    );
+    for (const e of errs) {
+      if (e.code === 'LEDGER_BUSY' || e.code === 'QUEUE_BUSY') assert.equal(e.retryable, true, `${e.code} phải có retryable`);
+      assert.ok(e.ms <= 3000, `phải fail sớm (≤3s), nhận ${e.ms}ms cho ${e.code}`);
+    }
+    void held;
     await store.close();
   });
 });

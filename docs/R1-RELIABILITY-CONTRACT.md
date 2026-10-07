@@ -195,3 +195,73 @@ Phán quyết vòng 1: **FAIL** (`docs/R1-REVIEW.md`). Những điểm dưới �
   MỘT lần chạy (khoá chính là hàm băm tất định của `jobId::handler::rk:<runKey>`).
   **Hai lượt khác nhau** (kể cả hai request render song song của khách ẩn danh — không có ví ⇒
   không có `run_key`) vẫn là **hai mục, hai lần chạy** (MVP-05 §BR-02 giữ nguyên).
+
+---
+
+# VÒNG 3 — SỬA A1…A6 + hai mục còn sót của F5/F6
+
+Phán quyết vòng 2: **PASS CÓ ĐIỀU KIỆN** (`docs/R1-REVIEW.md` mục “VÒNG 2”, script `/tmp/r1-atk2/**`).
+
+## 7.1 A1 — BOOT ĐỒNG THỜI không được làm chết tiến trình (SQLite)
+
+- `SqliteDriver.connect()`: **`busy_timeout` đặt TRƯỚC TIÊN** (và truyền `timeout` cho
+  `new DatabaseSync`); `foreign_keys` và `journal_mode = WAL` là pragma RIÊNG, lỗi WAL **không**
+  còn làm mất timeout (trước đây cả ba nằm trong một `try` ⇒ WAL lỗi là timeout = 0).
+- `#pragmaWithRetry('journal_mode', …)`: 10 lần × 100–500ms cho `SQLITE_BUSY` khi nhiều tiến trình
+  cùng đổi sang WAL.
+- `Store.init()`: tách `#initOnce()` + **thử lại có ngân sách** (`queue.initRetries`,
+  tổng ≤ `queue.lockTimeoutMs`) khi gặp lỗi bận.
+- `#runIdempotentDdl()`: DDL nâng cấp cột/index chịu được ĐUA KHỞI ĐỘNG —
+  `duplicate column name` / `already exists` là **thành công** (migration idempotent), không ném.
+  (Đây là nguyên nhân thật của 13–38% ca boot chết: hai tiến trình cùng `ALTER TABLE`.)
+
+## 7.2 A2 — TRẦN `attempts` ở MỌI đường “hồi sinh”; không có `done` giả
+
+- `listQueueItems({ onlyClaimable = true })`: mặc định **loại** mục đã chạm trần ⇒ `resume()`,
+  vòng poll và `pumpQueued()` không bao giờ nhặt lại mục rác.
+- `enqueueJob()` khi mục đang `queued`/`running` **đã chạm trần** ⇒ coi là **LƯỢT MỚI**: reset
+  `attempts = 0`, `epoch = epoch + 1`, xoá `locked_*`/`finished_at` (log `store.queue_item_revived`).
+- `pumpQueued()` **chốt** mục `queued` đã chạm trần thành `failed` + job `failed`
+  (`QUEUE_ATTEMPTS_EXHAUSTED`) và phát sự kiện `failed`.
+- `#runItem`: khi `claim` trả `null` thì **KHÔNG phát `done`** nữa — phát `skipped`
+  (`reason: 'claim_lost'`) hoặc `failed` nếu mục đã chạm trần.
+
+## 7.3 A3 — FENCING bằng `epoch`
+
+- Cột `job_queue.epoch` (migration): **mỗi lần claim tăng 1**; `claimNextJob`/`claimQueueItem` trả
+  `epoch` cho runner.
+- `completeQueueItem(id, { epoch })` / `failQueueItem(id, { epoch, … })` /
+  `touchQueueItem(id, { workerId, epoch })`: **chỉ** chấp nhận khi epoch khớp. Lệch ⇒ `false`
+  (`complete`) hoặc `{ stale: true }` (`fail`), **không** đổi trạng thái.
+- `JobQueue`: giữ `entry.epoch`, truyền vào nhịp tim và hai đường kết thúc; kết quả của runner cũ
+  bị **BỎ** kèm log `queue.stale_result_discarded` (không ghi trạng thái job, không phát `done`).
+- ⚠️ `normalizeEpoch()`: `Number(null) === 0` ⇒ lời gọi KHÔNG truyền epoch từng bị hiểu là
+  `epoch = 0` và mọi UPDATE kèm `AND epoch = 0` không khớp dòng nào; nay `null`/`''` = “không kiểm”.
+- TIỀN (A3.2): lượt đã bị HOÀN nhưng việc **đã xong** ⇒ `settleForJob` ghi **quyết toán muộn**
+  (`run_key = <runKey>#late`, `meta.late_settle_after_refund = true`) ⇒ **không mất doanh thu**.
+  Chỉ giữ nguyên việc hoàn tiền khi BIẾT CHẮC job đã hỏng (`job.status` khác `succeeded`).
+
+## 7.4 A4 + F5 — khoá hết hạn: nhường ĐÚNG THỨ TỰ, mã lỗi của repo
+
+- `#withMutex` hết hạn: nhường lượt **sau khi chủ hiện tại xong** (`previous.then(release)`) —
+  trước đây `release()` ngay ⇒ người sau vào mutex khi transaction còn mở ⇒
+  `cannot start a transaction within a transaction` (`ERR_SQLITE_ERROR` thô).
+- `isBusyError` nhận thêm `cannot start a transaction within a transaction` + `DB_LOCK_TIMEOUT`.
+- `asRepoBusyError()`: mọi lỗi bận lộ ra tầng gọi đều được chuẩn hoá thành **`LEDGER_BUSY`/
+  `QUEUE_BUSY` kèm `retryable: true`** (áp cho cả `appendLedger` gọi trực tiếp, `withLedgerLock`,
+  `claimNextJob`, `init()`). Không bao giờ để `ERR_SQLITE_ERROR`/`SQLITE_BUSY` thô ra ngoài.
+
+## 7.5 A5 — trần chờ áp ở TẦNG DB
+
+- SQLite: `PRAGMA busy_timeout = config.queue.lockTimeoutMs` (mặc định 5000) — đặt trước mọi pragma.
+- PostgreSQL: trong transaction khoá sổ có `SET LOCAL lock_timeout = <ms>` và
+  `SET LOCAL statement_timeout = <3×ms>` ⇒ máy chủ tự cắt thay vì chờ vô hạn.
+- **Giới hạn còn lại (ghi rõ, không im lặng)**: SQLite vẫn là **một khoá ghi toàn cục**; đo thật
+  trên máy này: tiến trình thứ hai chờ tới khi chủ nhả (~8,5s trong phép đo với người giữ 9s),
+  KHÔNG cắt đúng 5s như mong đợi — xem `docs/VERIFICATION.md` §22.6.
+
+## 7.6 A6 + F6
+
+- A6: `touchQueueItem` **bắt buộc** `workerId` (thiếu/rỗng ⇒ `false` + log
+  `store.touch_missing_worker`); kèm `epoch` nếu caller biết.
+- F6: đủ **8/8** chỗ `queue.enqueue` truyền `meta.runKey` (bổ sung `POST /api/jobs/:id/regenerate`).

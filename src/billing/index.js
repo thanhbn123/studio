@@ -1160,9 +1160,55 @@ export class BillingService {
       const runRows = rows.filter((row) => runKeyOf(row) === targetRun);
       const existing = findLast(runRows, (row) => row.reason === 'job_settle');
       if (existing) return existing;
-      if (runRows.some((row) => row.reason === 'job_refund')) {
-        // Lượt đã được HOÀN (job failed) ⇒ không quyết toán lại (giữ luật "một chu kỳ một lần").
-        return findLast(runRows, (row) => row.reason === 'job_refund');
+      const refundRow = findLast(runRows, (row) => row.reason === 'job_refund');
+      if (refundRow) {
+        // A3 (phản biện R1 vòng 2, VỪA) — QUYẾT TOÁN MUỘN SAU KHI ĐÃ HOÀN.
+        //
+        // Ca thật đo được: lượt bị CƯỚP (SIGSTOP/mất lease) ⇒ bản chạy trùng thất bại ⇒ hoàn tiền;
+        // bản GỐC chạy xong THÀNH CÔNG ⇒ settle bị từ chối vì lượt đã đóng ⇒ **sản phẩm miễn phí**
+        // (mất 10 credit/lượt). Luật "một chu kỳ một lần" vẫn giữ, nhưng khi việc ĐÃ XONG thì phải
+        // THU được: ghi một dòng `job_settle` BÙ với khoá lượt `<runKey>#late` (không đụng unique
+        // index của lượt gốc) và ghi vết `meta.late_settle_after_refund`.
+        const job = typeof this.store?.getJob === 'function' ? await this.store.getJob(jid).catch(() => null) : null;
+        const lateRun = `${targetRun}#late`;
+        const lateRows = rows.filter((row) => runKeyOf(row) === lateRun);
+        const lateExisting = findLast(lateRows, (row) => row.reason === 'job_settle');
+        if (lateExisting) return lateExisting;
+        // `settleForJob` là API của đường THÀNH CÔNG (app.js gọi khi job xong; job hỏng thì đi
+        // `refundForJob`) ⇒ không có dòng job (hoặc job chưa có trạng thái) thì TIN tầng gọi.
+        // Chỉ giữ nguyên việc hoàn tiền khi BIẾT CHẮC job đã hỏng.
+        const jobStatus = job?.status === undefined || job?.status === null ? null : String(job.status);
+        if (jobStatus !== null && jobStatus !== 'succeeded') return refundRow
+        let lateCost = toFiniteNumber(actualCost);
+        if (lateCost === null || lateCost <= MONEY_EPSILON) {
+          const usage = await this.#usageCostOfRun(jid, targetRun, rows);
+          lateCost = usage ? usage.cost : 0;
+        }
+        if (!(lateCost > MONEY_EPSILON)) return refundRow; // không quy được chi phí ⇒ không thu
+        const lateBalance = await this.#balanceLocked(uid);
+        const late = await this.#appendInSavepoint({
+          userId: uid,
+          amount: -lateCost,
+          reason: 'job_settle',
+          jobId: jid,
+          runKey: lateRun,
+          meta: {
+            late_settle_after_refund: true,
+            refunded_run_key: targetRun,
+            refund_amount: Number(refundRow.amount) || 0,
+            cost: lateCost,
+            usage_source: toFiniteNumber(actualCost) !== null ? 'request' : 'run',
+          },
+          balanceBefore: lateBalance,
+        });
+        this.logger?.warn?.('billing.late_settle_after_refund', {
+          user_id: uid,
+          job_id: jid,
+          run_key: targetRun,
+          late_run_key: lateRun,
+          cost: lateCost,
+        });
+        return late;
       }
 
       let actual = toFiniteNumber(actualCost);

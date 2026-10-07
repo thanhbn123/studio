@@ -205,4 +205,73 @@ QUEUE_DURABLE=false:                              durable=false · 0 dòng job_q
 5. **F5**: timeout cho `#withMutex`/khoá sổ; hạ tổng ngân sách chờ xuống ≤ 3–5s.
 6. **F6 + F8**: truyền `runKey` vào `meta` ở các route, và bổ sung test 2 tiến trình thật (fork) cho cả SQLite lẫn PG, gồm 3 ca vừa phá được.
 
-*Bằng chứng thô: `/tmp/r1-atk/{q1,q2,q3,q4,q5,q6,l1_race,l2_lock,l3_hang,l4_pg,l5_race_err,l6_pg_rehold,c1_cron,r1_regression}.mjs` + `*.out`.*
+*Bằng chứng thô vòng 1: `/tmp/r1-atk/{q1,q2,q3,q4,q5,q6,l1_race,l2_lock,l3_hang,l4_pg,l5_race_err,l6_pg_rehold,c1_cron,r1_regression}.mjs` + `*.out`.*
+
+═══════════════════════════════════════════════════════════════════════════════
+
+# VÒNG 2 — CHẤM LẠI TẠI COMMIT `f1e75c5`
+
+**PHÁN QUYẾT VÒNG 2: PASS CÓ ĐIỀU KIỆN**
+
+> Chấm lại ĐỘC LẬP trên nhánh `feat/r1-reliability`, commit **`f1e75c5`** (PR #24).
+> Script vòng 2: `/tmp/r1-atk2/**`; script vòng 1 + đối chứng: `/tmp/r1-atk/**`.
+> `git diff HEAD` rỗng; **chỉ `docs/R1-REVIEW.md` được ghi** (không sửa mã nguồn/`test/**`).
+> Hash mã nguồn tại thời điểm đo: `queue.js 66b57d5e3d0e6cf8 · store/index.js 3ab0207e755aef59 ·
+> billing/index.js 2ddd96f06149e76f · scheduler.js fa67a49c2864770f · config.js fe9c4815ec9efd28 ·
+> app.js 43fdfc6042b5e651 · routes.js 7cb724ec337fb277`.
+
+## V2.1 — Sáu phát hiện vòng 1: đã vá thật hay chưa
+
+| # | Kết luận vòng 2 | Bằng chứng đo lại (đọc SỐ LIỆU, không đọc lời khai) |
+|---|---|---|
+| **F1** | **ĐÃ VÁ THẬT** | `node /tmp/r1-atk/q3_crashloop.mjs`: kill -9 lặp 8 vòng với `max_attempts=3` ⇒ `TỔNG số lần handler được gọi = 3`, DB cuối `{"status":"failed","attempts":3,"max_attempts":3}`, `queueStats={"failed":1}` (vòng 1: 8 lần, `running/attempts=8`). PG thật (`a5_pg_multi.mjs`): claim→requeue→claim→requeue ⇒ `failed` + `finished_at`, claim kế tiếp `null`. |
+| **F2** | **ĐÃ VÁ THẬT** (ca thường) | `q4_steal.mjs`: A đang chạy job 2,5s ⇒ `requeueStaleJobs` trả `{"requeued":0,"ids":[],"failed":0}`; log CHỈ có `A-START/A-END`, **không có `B-START`**; DB cuối `done/attempts=1` (vòng 1: B chạy lọt trong A, `attempts` 1→2). Còn khe **A3** (lease mất khi tiến trình bị treo). |
+| **F3** | **ĐÃ VÁ THẬT** | `q6_orphan.mjs`: B sống (đã `resume()` lúc hàng đợi rỗng) + cron ⇒ **chạy 3/3 việc, KHÔNG cần restart** (vòng 1: 0/3). PG thật (`a5.2`): A bị `kill -9` để lại 1 `running` + 2 `queued` ⇒ B sống nhặt đủ **3/3**, DB cuối cả 3 `done`. `scheduler.runOnce()` báo thêm `claimed`. |
+| **F4** | **ĐÃ VÁ THẬT** | `l6_pg_rehold.mjs` (DB sạch): SQLite **và PostgreSQL 16.15 thật** ⇒ `sqlite={"errCode":null,"holds":1,"balance":100} · postgres={"errCode":null,"holds":1,"balance":100}` (vòng 1: `LEDGER_BUSY` / `25P02`). `l5_race_err.mjs`: **0/100 lỗi** trên cả 2 driver (hold-race + settle-vs-refund), mỗi lượt đúng 1 dòng đóng. |
+| **F5** | **VÁ MỘT PHẦN — VÁ SAI CÁCH (mã lỗi)** | Trong tiến trình nay CÓ trần: `a45` với `*_LOCK_TIMEOUT_MS=300` ⇒ `withLedgerLock(u2)` fail sau **325ms**; mặc định ⇒ **5033ms** (vòng 1: treo vĩnh viễn) — hết chặn vô hạn. NHƯNG mã trả ra là **`ERR_SQLITE_ERROR` THÔ** (không phải mã `retryable`), và mọi transaction khác trong tiến trình fail **0–1ms** cho tới khi người giữ commit ⇒ xem **A4**. Liên tiến trình KHÔNG được trần này bảo vệ: **32474ms** mới fail `LEDGER_BUSY` ⇒ xem **A5**. |
+| **F6** | **ĐÃ VÁ THẬT 7/8 chỗ** | `grep -nE "queue\.enqueue\(|runKey: hold\?\.run_key|\{ runKey \}" src/http/routes.js` ⇒ 8 chỗ gọi `queue.enqueue`, **7 chỗ truyền `meta.runKey`**; còn **`POST /api/jobs/:id/regenerate` (dòng 2076–2078) CÓ `hold` nhưng KHÔNG truyền `runKey`** ⇒ đường chạy lại có thu tiền này vẫn không có chống trùng liên tiến trình. `q5_dupkey.mjs`: cùng `runKey` từ 2 tiến trình ⇒ **1 mục / 1 lần chạy**; KHÁC lượt (không runKey) ⇒ **2 mục / 2 lần** (không nuốt lượt đã trả tiền). Ghi chú hệ quả: 2 request ĐỒNG THỜI trên cùng job CÓ ví nay gộp thành MỘT lượt (khác kỳ vọng "2 lượt, 2 thu" của MVP-05 §BR-02) — tiền vẫn nhất quán (1 lượt = 1 thu); `test/imagelab-concurrency.test.js` vẫn 2/2 vì đường đó KHÔNG có ví (không truyền `runKey`). |
+
+## V2.2 — Lỗ hổng MỚI phát hiện ở vòng 2
+
+| # | Mức | Phát hiện | Bằng chứng (1 dòng) | Gợi ý sửa |
+|---|---|---|---|---|
+| **A1** | **VỪA–CAO** | **Boot đồng thời làm CHẾT tiến trình (SQLite).** `PRAGMA journal_mode = WAL` lỗi (`SQLITE_BUSY`) ⇒ `SqliteDriver.connect()` nuốt lỗi và **bỏ luôn `busy_timeout` + `foreign_keys`** ⇒ câu lệnh kế tiếp (`Store.init()` → `exec(schema)`) ném `database is locked` ⇒ tiến trình thoát. | `a1.1`: `busy_timeout={"timeout":0}`, DDL sau đó fail sau **0ms**. `a1.2`: 8 cặp boot đồng thời trên DB trắng ⇒ **6/16 tiến trình chết (38%)**; đối chứng DB đã init sẵn ⇒ **0/16** | Đặt `busy_timeout` TRƯỚC (hoặc `new DatabaseSync(file, { timeout: 5000 })`), bọc RIÊNG từng PRAGMA, retry chuyển WAL có giới hạn; cho `Store.init()` retry khi bận. (Gốc rễ có từ trước f1e75c5, nhưng đúng phạm vi "nhiều tiến trình" của R1.) |
+| **A2** | **VỪA** | **"Mở lại" mục đã chạm trần ⇒ kẹt `queued` VĨNH VIỄN + nuốt lượt chạy lại.** `enqueueJob` nhánh revive KHÔNG reset `attempts`, còn claim mới đòi `attempts < max_attempts` ⇒ mục không ai nhặt được, không bao giờ `failed`; JobQueue vẫn phát `done(skipped=true)`; vòng poll nhặt lại mục rác này MỖI nhịp. | `a2_revive.mjs`: revive ⇒ `queued/attempts=2/2`, `claimNextJob` = `null`, `requeueStaleJobs` không cứu; JobQueue: enqueue lại cùng lượt ⇒ handler chạy thêm **0 lần**, `events=["done(skipped=true)"]`. `a23`: poll 200ms ⇒ **10 lần dựng handler + 10 sự kiện 'done' giả trong 2s**, handler thật 0 lần | Revive phải `attempts = 0` (mở lượt mới) hoặc chốt `failed` nếu giữ trần; `listQueueItems`/`pumpQueued` bỏ qua mục `attempts >= max_attempts` thay vì nhặt rồi phát `done` giả. |
+| **A3** | **VỪA** | **Lease mất khi tiến trình bị TREO ⇒ vẫn chạy song song, và MẤT DOANH THU (đo ở SỔ CÁI).** Nhịp tim là timer ⇒ tiến trình bị treo (SIGSTOP ≡ máy ngủ/container pause/event loop bị chặn > nhịp tim) không gia hạn được ⇒ cron trả mục về `queued` ⇒ tiến trình khác nhặt và chạy; chủ cũ tỉnh dậy vẫn chạy tiếp. | `a3_lease_sigstop.mjs`: `requeued:1`, `A=[…315310..317811] B=[…316004..316004]` **chồng nhau**, DB cuối `done/attempts=2`. `a3.2` (BillingService thật): hold −10 → bản trùng thất bại ⇒ refund +10 → bản gốc thành công ⇒ `settleForJob` trả `job_refund` ⇒ **việc đã hoàn thành nhưng KHÔNG bị thu tiền: mất 10 credit/lượt trùng** | Fencing token/epoch trong `job_queue`: mỗi lần claim tăng epoch; `touchQueueItem`/`completeQueueItem` chỉ nhận epoch hiện tại; handler phải kiểm epoch trước khi ghi kết quả. (Mặc định `stale_ms=10 phút` làm ca này hiếm, nhưng `QUEUE_STALE_MS` hay được hạ.) |
+| **A4** | **VỪA** | **Trần chờ khoá mới: mã lỗi THÔ + "fail nhanh" cho mọi việc khác trong tiến trình.** Khi hết `*_LOCK_TIMEOUT_MS`, `#withMutex` nhường chỗ trong khi transaction của người giữ VẪN MỞ trên cùng connection ⇒ lần thử kế tiếp đâm vào `BEGIN IMMEDIATE` lồng nhau ⇒ SQLite ném lỗi KHÔNG khớp regex "busy" ⇒ thoát thô, không retryable; mọi thao tác DB khác trong tiến trình fail 0–1ms cho tới khi người giữ commit. | `a45_poison_recover.mjs` (người giữ CHẬM 3s, timeout 300ms): `withLedgerLock(u2): 325ms LỖI ERR_SQLITE_ERROR` → `claimNextJob: 0ms LỖI ERR_SQLITE_ERROR` → `appendLedger: 0ms LỖI` → sau khi người giữ commit: `OK · inTx=false · balance=101` (hồi phục sạch) | Khi timeout: KHÔNG nhường mutex nếu transaction còn mở (hoặc đánh dấu connection "bẩn" chỉ mở lại sau COMMIT/ROLLBACK); chuẩn hoá `cannot start a transaction within a transaction` thành mã retryable. |
+| **A5** | **VỪA** | **Trần timeout KHÔNG áp cho liên tiến trình.** `QUEUE/BILLING_LOCK_TIMEOUT_MS` chỉ chặn mutex/khoá-user TRONG tiến trình; chờ khoá ghi DB liên tiến trình vẫn do `busy_timeout=5000` cứng trong driver + 6 lần thử của `#retryOnBusy` quyết định. | `a4_lock_timeout.mjs` A4.3: tiến trình khác giữ khoá 60s ⇒ **32474ms** mới fail `LEDGER_BUSY` (vòng 1: 32384ms — gần như không đổi); với người giữ 7s thì chờ 7024ms rồi THÀNH CÔNG | Nếu quảng cáo "fail ≤2s" thì phải hạ cả `busy_timeout` (theo `lockTimeoutMs`) và số lần thử; nếu không, ghi rõ trong hợp đồng: trần chỉ có tác dụng trong tiến trình. |
+| **A6** | **THẤP** | **`touchQueueItem(id)` KHÔNG truyền `workerId` gia hạn được lease của NGƯỜI KHÁC** (nhánh SQL bỏ điều kiện `locked_by`). JobQueue luôn truyền `workerId` nên chưa khai thác được từ app, nhưng là đường hở cho caller mới. | `a6_touch_forge.mjs`: `touch hộ (không workerId) => true`, `heartbeat_at` đổi, `locked_by` vẫn `worker-A`; `workerId` SAI ⇒ `false`; ĐÚNG ⇒ `true` | Bắt buộc `workerId` (fail-closed khi thiếu) — test `r1-fixes` hiện chỉ kiểm ca workerId SAI. |
+
+## V2.3 — Đã cố phá mà KHÔNG phá được (vòng 2)
+
+1. **F1**: kill -9 lặp 8 vòng (SQLite) và claim/requeue lặp (PG thật) ⇒ không vượt trần, chốt `failed` đúng.
+2. **F2 ca thường**: job dài hơn `stale_ms` khi tiến trình còn sống (nhịp tim chạy) ⇒ `requeued:0`, không cướp được (chỉ phá được bằng SIGSTOP — A3).
+3. **F3**: việc mồ côi trên SQLite (`q6`) và **PG thật** (`a5.2`), kể cả khi `pumpQueued`/cron chạy song song với `resume()`/`enqueue`.
+4. **F4**: 2 tiến trình đua hold/settle/refund trên SQLite + PG: **0 lỗi**, không còn `25P02`/`LEDGER_BUSY` giả, mỗi lượt đúng 1 dòng đóng, số dư = tổng sổ, không tạo/mất tiền (`l1_race`, `l5_race_err`).
+5. **Nhặt trùng**: 2 tiến trình × 200 mục (`q1`: `dup=0`, `unique=200/200`); PG `SKIP LOCKED` 100/100 (`l4_pg`).
+6. **Cron**: 2 `runOnce()` chồng nhau + 2 tiến trình cùng cron ⇒ hoàn tiền đúng 1 lần/lượt; lỗi một bước không giết bước kia; `stop()` chờ nhịp dở; `intervalMs` 0/âm/NaN ⇒ 60000 (`c1_cron`).
+7. **Hồi quy**: `npm test` **970 · 969 pass · 0 fail · 1 skipped**; `imagelab-concurrency` **2/2**; nhóm tiền/ẩn danh MVP-05 (billing, hook, anonymous, store, refund-retry, api, round2/3) **86/86**; `tools/verify.mjs` **EXIT 0**; `tools/imagelab-demo.mjs` **EXIT 0**; `init()` 2 lần trên DB cũ nguyên dữ liệu (index mới `idx_job_queue_status_created` + cột `heartbeat_at` xuất hiện đúng 15+1 cột); `QUEUE_DURABLE=false` không ghi dòng `job_queue` nào và giữ hành vi bộ nhớ cũ (tiền lệ trước R1 cũng không gộp trùng).
+8. **`/api/health`** vẫn không lộ đường dẫn/bí mật; thêm `claimed`/`exhausted` đúng như hợp đồng.
+
+## V2.4 — Chưa kiểm được (vòng 2)
+
+1. **A3.2 chưa đo qua HTTP/app thật**: tôi đo chuỗi tiền bằng `BillingService` thật + `store` thật (không chỉ đọc mã), nhưng CHƯA dựng được ca "bản chạy trùng thất bại" bên trong pipeline thật để thấy hậu quả end-to-end (cần job ImageLab/Video chạy thật + hook).
+2. **Lease/heartbeat trên PG dưới 2 tiến trình** chưa đo (mới đo SQLite SIGSTOP; PG mới đo F1/F3).
+3. **A1 chưa đo trên PG** và chưa đo tần suất khi ≥3 tiến trình boot đồng thời / DB lớn (chỉ 8 cặp, DB trắng, macOS APFS).
+4. **Chưa đo mất điện/fsync** (`synchronous`, `wal_autocheckpoint`) và chưa đo tải lớn (hàng nghìn mục, hàng chục worker, `pollMs` mỗi nhịp list 200 mục).
+5. **Chưa xác minh ai ghi `test/r1-*.test.js` giữa phiên vòng 1** (không phải tôi) — cây làm việc bị ghi từ bên ngoài; `src/**` thì không đổi.
+
+## V2.5 — PASS (có điều kiện) NGHĨA LÀ gì — và KHÔNG nghĩa là gì
+
+**NGHĨA LÀ**: cả 6 phát hiện vòng 1 (F1…F6) đã được **vá thật và đo lại độc lập**, kể cả trên **PostgreSQL 16.15 thật**; câu hỏi trung tâm — "không mất việc, không chạy trùng, không sai tiền khi nhiều tiến trình / bị kill / driver bận" — nay đúng trong **các ca thường**: kill -9 (có nhịp tim), cron cướp việc, việc mồ côi, đua sổ cái 2 tiến trình, va chạm unique; bất biến tiền giữ nguyên; toàn bộ hồi quy xanh (970 test, verify EXIT 0).
+
+**KHÔNG NGHĨA LÀ**:
+1. **SQLite vẫn chỉ có MỘT khoá ghi toàn cục** — khoá ví chặn hàng đợi và ngược lại; trần timeout mới chỉ áp TRONG tiến trình (A5: liên tiến trình vẫn ~32s).
+2. **Tham số theo request KHÔNG được lưu** (`manual`, `onlyRegionIds`, `force`, `options`…) ⇒ lượt khôi phục chạy bằng **mặc định an toàn**, không phải "chạy lại y hệt".
+3. **Chống trùng liên tiến trình chỉ có khi caller truyền `runKey`** — routes nay đã truyền **7/8 chỗ** (còn `POST /api/jobs/:id/regenerate`), và code mới gọi `queue.enqueue` mà quên `runKey` là mất bảo vệ (và mở lại A2 nếu trùng khoá sau khi chạm trần).
+4. **Chưa đo nhiều tiến trình PG cho lease/F2** (mới SQLite) và chưa đo mất điện/fsync, tải lớn.
+5. **Còn 6 lỗ hổng vòng 2 chưa vá** (A1…A6) — trong đó A1 (38% tiến trình chết khi boot đồng thời trên DB trắng), A2 (mục kẹt vĩnh viễn + `done` giả mỗi nhịp), A3 (chạy song song + mất doanh thu khi lease mất) là ba việc nên vá trước khi coi R1 "XONG".
+
+**Điều kiện để chuyển sang PASS đầy đủ**: vá A1 (init/PRAGMA), A2 (revive + bỏ qua mục chạm trần khi list), A3 (fencing/epoch hoặc từ chối chạy lại khi chưa xác nhận chủ cũ chết), A4 (mã lỗi chuẩn hoá + không nhường mutex khi transaction còn mở), và ghi rõ A5/A6 vào tài liệu vận hành.
+
+*Bằng chứng thô vòng 2: `/tmp/r1-atk2/{a1_boot_race,a2_revive,a23_phantom_loop,a3_lease_sigstop,a4_lock_timeout,a44_poison,a45_poison_recover,a5_pg_multi,a6_touch_forge}.mjs` + `npmtest.out`, `l6_clean.out`, `r1reg.out`, `verify.out`, `demo.out`.*

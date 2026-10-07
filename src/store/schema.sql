@@ -244,6 +244,8 @@ CREATE TABLE IF NOT EXISTS job_queue (
   run_after    TEXT,                         -- ISO: chưa tới mốc thì không nhặt (backoff)
   locked_at    TEXT,
   locked_by    TEXT,
+  heartbeat_at TEXT,                         -- R1-F2: nhịp tim của worker đang giữ mục
+  epoch        INTEGER NOT NULL DEFAULT 0,   -- R1-A3: số thứ tự lần CLAIM (fencing)
   last_error   TEXT,
   created_at   TEXT NOT NULL,
   updated_at   TEXT NOT NULL,

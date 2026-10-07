@@ -211,10 +211,47 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, m
  * SQL, nên khớp trần là biến lỗi lập trình thành "thử lại 6 lần rồi báo LEDGER_BUSY" (che
  * mất bug thật). Chỉ khớp khi THÔNG ĐIỆP nói rõ khoá/bận, hoặc mã khoá cụ thể.
  */
+/**
+ * A3 (fencing) — chuẩn hoá `epoch` của tầng gọi: `null`/`undefined`/`''` nghĩa là "KHÔNG kiểm epoch".
+ *
+ * ⚠️ Bài học đo được: `Number(null) === 0` và `Number.isFinite(0) === true` ⇒ nếu viết
+ * `Number.isFinite(Number(epoch))` thì lời gọi KHÔNG truyền epoch sẽ bị hiểu là `epoch = 0` và
+ * mọi câu UPDATE kèm `AND epoch = 0` không khớp dòng nào (mục `running` có epoch ≥ 1) ⇒
+ * `completeQueueItem`/`touchQueueItem` im lặng thất bại.
+ */
+function normalizeEpoch(epoch) {
+  if (epoch === null || epoch === undefined || epoch === '') return null;
+  const n = Number(epoch);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * A4/F5 (phản biện R1 vòng 2) — CHUẨN HOÁ lỗi khoá thành mã của repo.
+ *
+ * Vì sao: khi hết hạn chờ khoá, driver SQLite trả `ERR_SQLITE_ERROR` (ví dụ
+ * `cannot start a transaction within a transaction` hoặc `database is locked`). Mã thô đó lọt ra
+ * tới HTTP/CLI là SAI HỢP ĐỒNG: tầng gọi chỉ biết `LEDGER_BUSY`/`QUEUE_BUSY` kèm `retryable`.
+ */
+function asRepoBusyError(err, { code = 'LEDGER_BUSY', message = null, details = null } = {}) {
+  if (!isBusyError(err)) return err;
+  if (err instanceof Error && (err.code === 'LEDGER_BUSY' || err.code === 'QUEUE_BUSY')) return err;
+  const wrapped = Object.assign(
+    new Error(message || 'Cơ sở dữ liệu đang bận (khoá ghi) — thao tác chưa được thực hiện, thử lại được.'),
+    {
+      code,
+      details: { ...(details ?? {}), retryable: true, driver_code: err?.code ?? null },
+      cause: err,
+    },
+  );
+  return wrapped;
+}
+
 function isBusyError(err) {
   const text = `${err?.code ?? ''} ${err?.message ?? ''}`;
   if (String(err?.code ?? '') === 'DB_LOCK_TIMEOUT') return true;
-  return /SQLITE_BUSY|SQLITE_LOCKED|database is locked|database table is locked|deadlock|40001|40P01|55P03|LEDGER_BUSY|QUEUE_BUSY/i.test(text);
+  // A4/F5 (vòng 2): lỗi "transaction lồng nhau" và `SQLITE_ERROR` do khoá cũng là BẬN — phải được
+  // map thành `LEDGER_BUSY`/`QUEUE_BUSY` kèm `retryable`, KHÔNG bao giờ để mã thô ra ngoài.
+  return /SQLITE_BUSY|SQLITE_LOCKED|database is locked|database table is locked|cannot start a transaction within a transaction|deadlock|40001|40P01|55P03|LEDGER_BUSY|QUEUE_BUSY|DB_LOCK_TIMEOUT/i.test(text);
 }
 
 /**
@@ -251,7 +288,8 @@ export function createDriver(config, logger) {
       logger,
     });
   }
-  return new SqliteDriver({ path: config?.db?.sqlitePath, logger });
+  // A1/A5: truyền `config` xuống driver để `busy_timeout` theo cấu hình (`queue.lockTimeoutMs`).
+  return new SqliteDriver({ path: config?.db?.sqlitePath, logger, config });
 }
 
 export class Store {
@@ -374,9 +412,13 @@ export class Store {
     try {
       await Promise.race([previous, timeout]);
     } catch (err) {
-      // Nhường lượt cho người sau rồi mới ném (không giữ chỗ trong hàng đợi).
-      release();
-      if (this.#txMutexTail === undefined) this.#txMutexTail = Promise.resolve();
+      // A4 (phản biện R1 vòng 2, VỪA): HẾT HẠN ⇒ nhường lượt **SAU KHI chủ hiện tại xong**.
+      //
+      // Trước đây chỗ này `release()` NGAY ⇒ người chờ kế tiếp vào mutex trong lúc transaction
+      // của chủ cũ CÒN MỞ ⇒ `BEGIN` thứ hai trên cùng kết nối SQLite nổ
+      // `cannot start a transaction within a transaction` (`ERR_SQLITE_ERROR` thô), và mọi việc
+      // khác trong tiến trình fail dây chuyền trong 0–1ms.
+      previous.then(() => release(), () => release());
       throw err;
     } finally {
       if (timer) clearTimeout(timer);
@@ -460,6 +502,40 @@ export class Store {
   }
 
   async init() {
+    // A1 (phản biện R1 vòng 2): BOOT ĐỒNG THỜI trên DB TRẮNG. Nhiều tiến trình cùng chạy DDL
+    // (schema + migration) có thể gặp `database is locked`; trước đây lỗi đó làm CHẾT tiến trình
+    // (đo được 6/16 lần boot). Nay `init()` tự thử lại với backoff — cùng lắm là boot chậm hơn.
+    const attempts = clampInt(this.config?.queue?.initRetries, 10, 1, 50);
+    // A5 (phản biện R1 vòng 2): trần chờ phải áp cho CẢ LIÊN TIẾN TRÌNH. Mỗi lần thử đã chờ
+    // `busy_timeout` (= `queue.lockTimeoutMs`) ở tầng driver; nhân với số lần thử sẽ thành 50s+.
+    // Vì vậy tổng ngân sách thử lại bị chặn bởi `queue.lockTimeoutMs` (mặc định 5000ms).
+    const budgetMs = this.#lockTimeoutMs();
+    const startedAt = Date.now();
+    let last = null;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        return await this.#initOnce();
+      } catch (err) {
+        last = err;
+        if (!isBusyError(err)) throw err;
+        const spent = Date.now() - startedAt;
+        if (spent >= budgetMs) {
+          this.logger?.warn('store.init_busy_budget_exhausted', { attempt, spent_ms: spent, budget_ms: budgetMs });
+          break;
+        }
+        this.logger?.warn('store.init_busy_retry', { attempt, attempts, spent_ms: spent, error_code: err?.code ?? null });
+        await sleep(Math.min(500, 100 * attempt, Math.max(0, budgetMs - spent)));
+      }
+    }
+    throw asRepoBusyError(last, {
+      code: 'QUEUE_BUSY',
+      message: `Khởi tạo store thất bại: DB đang bận quá ${budgetMs}ms (tiến trình khác đang giữ khoá ghi).`,
+      details: { budget_ms: budgetMs },
+    });
+  }
+
+  /** Thân `init()` một lượt (schema + migration + seed) — tách ra để `init()` thử lại được. */
+  async #initOnce() {
     await this.driver.connect();
     const schema = fs.readFileSync(SCHEMA_PATH, 'utf8');
     // PostgreSQL không hỗ trợ "PRAGMA"; schema không chứa PRAGMA nên chạy thẳng được.
@@ -520,6 +596,11 @@ export class Store {
     // R1-F2 (vòng sửa phản biện): `job_queue.heartbeat_at` — nhịp tim của worker đang giữ mục.
     // Thêm SAU migration (bài học `seq`/`run_key`): index/cột mới không được làm chết `init()`.
     await this.#addColumnIfMissing('job_queue', 'heartbeat_at', 'TEXT');
+    // R1-A3 (vòng 2): `job_queue.epoch` — số thứ tự lần CLAIM, dùng làm "fencing token".
+    // Mỗi lần claim tăng 1; mọi thao tác kết thúc (complete/fail/heartbeat) chỉ được chấp nhận
+    // nếu epoch còn khớp ⇒ kết quả của runner ĐÃ BỊ CƯỚP không thể ghi đè trạng thái/tiền của
+    // runner mới.
+    await this.#addColumnIfMissing('job_queue', 'epoch', 'INTEGER NOT NULL DEFAULT 0');
     await this.#createIndexIfPossible('idx_job_queue_status_created', 'job_queue', 'status, created_at, id');
     await this.#createIndexIfPossible('idx_usage_run_key', 'usage_events', 'job_id, run_key');
     await this.#createIndexIfPossible('idx_wallet_ledger_run_key', 'wallet_ledger', 'user_id, job_id, run_key');
@@ -558,21 +639,46 @@ export class Store {
   /** Thêm cột nếu thiếu — idempotent trên CẢ hai driver (xem #applyAdditiveMigrations). */
   async #addColumnIfMissing(table, column, ddl) {
     if (this.isPostgres) {
-      await this.driver.run(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${ddl}`);
+      // `IF NOT EXISTS` của PostgreSQL đã idempotent, nhưng hai tiến trình boot cùng lúc vẫn có
+      // thể đua ở tầng catalog ⇒ bọc thêm lớp chịu lỗi "đã tồn tại".
+      await this.#runIdempotentDdl(() => this.driver.run(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${ddl}`), { table, column });
       return;
     }
     const info = await this.driver.all(`PRAGMA table_info(${table})`);
     // Bảng chưa tồn tại (schema lỗi?) thì không ALTER — tránh lỗi khó hiểu.
     if (!Array.isArray(info) || info.length === 0) return;
     if (info.some((col) => col?.name === column)) return;
-    await this.driver.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
-    this.logger?.info('store.migration.column_added', { table, column, dialect: this.dialect });
+    const added = await this.#runIdempotentDdl(() => this.driver.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`), { table, column });
+    if (added) this.logger?.info('store.migration.column_added', { table, column, dialect: this.dialect });
+  }
+
+  /**
+   * A1 (phản biện R1 vòng 2, VỪA–CAO) — DDL PHẢI CHỊU ĐƯỢC ĐUA KHỞI ĐỘNG.
+   *
+   * Vì sao: hai tiến trình boot cùng lúc trên DB trắng đều thấy cột thiếu rồi cùng `ALTER TABLE`;
+   * kẻ thua nhận `duplicate column name: …` ⇒ `init()` ném ⇒ **tiến trình CHẾT** (đo được 2–6/16
+   * lần boot). "Đã tồn tại" là kết quả MONG MUỐN của migration idempotent, không phải lỗi.
+   *
+   * @returns {Promise<boolean>} `true` nếu câu lệnh thực sự tạo mới, `false` nếu đã có sẵn.
+   */
+  async #runIdempotentDdl(run, meta = {}) {
+    try {
+      await run();
+      return true;
+    } catch (err) {
+      const text = `${err?.code ?? ''} ${err?.message ?? ''}`;
+      if (/duplicate column name|already exists|duplicate key value|SQLITE_ERROR.*duplicate/i.test(text)) {
+        this.logger?.info('store.migration.already_applied', { ...meta, dialect: this.dialect });
+        return false;
+      }
+      throw err;
+    }
   }
 
   /** Tạo index nếu có thể — DB cũ thiếu cột thì chỉ ghi log, KHÔNG làm chết `init()`. */
   async #createIndexIfPossible(name, table, column) {
     try {
-      await this.driver.run(`CREATE INDEX IF NOT EXISTS ${name} ON ${table} (${column})`);
+      await this.#runIdempotentDdl(() => this.driver.run(`CREATE INDEX IF NOT EXISTS ${name} ON ${table} (${column})`), { name, table });
     } catch (err) {
       this.logger?.warn('store.migration.index_skipped', { name, table, column, error: err?.message || String(err) });
     }
@@ -588,7 +694,10 @@ export class Store {
       // ⚠️ `WHERE` phải nằm NGOÀI dấu ngoặc của danh sách cột (partial index); nhét vào trong
       // là lỗi cú pháp trên cả SQLite lẫn PostgreSQL.
       const clause = where ? ` WHERE ${where}` : '';
-      await this.driver.run(`CREATE UNIQUE INDEX IF NOT EXISTS ${name} ON ${table} (${columns})${clause}`);
+      await this.#runIdempotentDdl(
+        () => this.driver.run(`CREATE UNIQUE INDEX IF NOT EXISTS ${name} ON ${table} (${columns})${clause}`),
+        { name, table },
+      );
     } catch (err) {
       this.logger?.warn('store.migration.unique_index_skipped', {
         name,
@@ -1465,8 +1574,24 @@ export class Store {
     // trong khoá mà không sinh transaction lồng nhau (SQLite: BEGIN chồng BEGIN là lỗi).
     const active = this.#activeTx();
     if (active) return this.#appendLedgerOn(active.tx, row, uid, ts);
-    if (this.isPostgres) return this.driver.transaction((tx) => this.#appendLedgerOn(tx, row, uid, ts));
-    return this.#withSqliteTx((tx) => this.#appendLedgerOn(tx, row, uid, ts), { immediate: true });
+    // A4/F5: đường gọi TRỰC TIẾP vẫn phải trả mã của repo khi DB bận (không lộ `ERR_SQLITE_ERROR`).
+    const wrap = (err) => asRepoBusyError(err, {
+      code: 'LEDGER_BUSY',
+      message: `Sổ credit đang bận (khoá ghi) — chưa ghi được dòng cho user ${uid}.`,
+      details: { user_id: uid, reason: row.reason, job_id: row.job_id },
+    });
+    if (this.isPostgres) {
+      try {
+        return await this.driver.transaction((tx) => this.#appendLedgerOn(tx, row, uid, ts));
+      } catch (err) {
+        throw wrap(err);
+      }
+    }
+    try {
+      return await this.#withSqliteTx((tx) => this.#appendLedgerOn(tx, row, uid, ts), { immediate: true });
+    } catch (err) {
+      throw wrap(err);
+    }
   }
 
   /** Thân của `appendLedger` chạy TRÊN một transaction đã có (driver hoặc transaction đang mở). */
@@ -1646,6 +1771,8 @@ export class Store {
    */
   async #withSqliteLedgerLock(uid, fn) {
     const opts = this.#ledgerLockOptions();
+    // A5 (SQLite): trần LIÊN TIẾN TRÌNH do `PRAGMA busy_timeout` quyết định — driver lấy từ
+    // `config.queue.lockTimeoutMs` (xem `SqliteDriver.busyTimeoutMs`).
     return this.#retryOnBusy(
       () => this.#withSqliteTx(async (tx) => {
         const view = this.#txView(tx);
@@ -1668,7 +1795,14 @@ export class Store {
    * ép `::bigint` tường minh để không phụ thuộc quy tắc chọn overload của PostgreSQL.
    */
   async #withPgLedgerLock(uid, fn) {
+    const timeoutMs = this.#lockTimeoutMs();
     return this.driver.transaction(async (tx) => {
+      // A5 (phản biện R1 vòng 2, VỪA): TRẦN CHỜ KHOÁ PHẢI ÁP Ở TẦNG DB, không chỉ trong tiến trình.
+      // Trước đây tiến trình khác chờ tới **32,4s** mới fail (khoá ghi của SQLite) vì trần chỉ nằm
+      // trong bộ nhớ. `lock_timeout`/`statement_timeout` buộc MÁY CHỦ cắt sớm ⇒ lỗi trả về đúng
+      // hạn ở mọi tiến trình.
+      await tx.run(`SET LOCAL lock_timeout = '${timeoutMs}ms'`);
+      await tx.run(`SET LOCAL statement_timeout = '${timeoutMs * 3}ms'`);
       await tx.run('SELECT pg_advisory_xact_lock(hashtext(?)::bigint)', [uid]);
       return this.#txAls.run({ tx, userId: uid }, () => fn(this.#txView(tx)));
     });
@@ -1690,6 +1824,7 @@ export class Store {
       run_after: row.run_after ?? null,
       locked_at: row.locked_at ?? null,
       heartbeat_at: row.heartbeat_at ?? null,
+      epoch: Number(toNum(row.epoch, 0)),
       locked_by: row.locked_by ?? null,
       last_error: row.last_error ?? null,
       created_at: row.created_at,
@@ -1740,6 +1875,26 @@ export class Store {
       const existing = await this.#findLiveQueueItem(jid, h);
       if (existing) return { ...existing, reused: true };
     }
+    // A2 (phản biện R1 vòng 2, VỪA): mục đang `queued` NHƯNG ĐÃ CHẠM TRẦN là mục "rác" — giữ
+    // nguyên `attempts` thì `claim` trả `null` mãi mãi (kẹt `queued` vĩnh viễn + `done` giả từ
+    // vòng poll). `enqueue` lại chính khoá đó là MỘT LƯỢT MỚI ⇒ reset `attempts`, tăng `epoch`.
+    if (explicitId) {
+      const known = await this.getQueueItemById(explicitId).catch(() => null);
+      if (known && (known.status === 'queued' || known.status === 'running')
+        && Number(known.attempts) >= Number(known.max_attempts)) {
+        await this.driver.run(
+          `UPDATE job_queue
+              SET status = 'queued', attempts = 0, epoch = epoch + 1, run_after = ?,
+                  locked_at = NULL, locked_by = NULL, heartbeat_at = NULL,
+                  finished_at = NULL, last_error = NULL, updated_at = ?
+            WHERE id = ?`,
+          [runAfter ? String(runAfter) : null, nowIso(), explicitId],
+        );
+        const fresh = await this.getQueueItemById(explicitId);
+        this.logger?.info('store.queue_item_revived', { queue_item_id: explicitId, job_id: jid, attempts: fresh?.attempts ?? 0 });
+        return { ...fresh, revived: true, reused: false };
+      }
+    }
     const ts = nowIso();
     const row = {
       id: explicitId || randomUUID(),
@@ -1775,9 +1930,15 @@ export class Store {
       if (same) {
         // Cùng khoá idempotency nhưng lượt trước đã kết thúc ⇒ MỞ LẠI chính mục đó (không đẻ
         // thêm mục cho cùng một khoá), rồi trả về để chạy.
+        //
+        // A2 (phản biện R1 vòng 2, VỪA): mở lại là LƯỢT MỚI ⇒ phải **RESET `attempts`** và cấp
+        // `epoch` mới. Trước đây `attempts` giữ nguyên giá trị cũ ⇒ mục vừa mở lại đã chạm trần
+        // ngay: `claim` trả `null`, vòng poll nhặt lại liên tục và phát `done(skipped=true)` GIẢ
+        // (đo được 10 lần dựng handler + 10 `done` giả trong 2 giây dù handler chạy 0 lần).
         await this.driver.run(
           `UPDATE job_queue
-              SET status = 'queued', run_after = ?, locked_at = NULL, locked_by = NULL,
+              SET status = 'queued', attempts = 0, epoch = epoch + 1, run_after = ?,
+                  locked_at = NULL, locked_by = NULL, heartbeat_at = NULL,
                   finished_at = NULL, last_error = NULL, updated_at = ?
             WHERE id = ?`,
           [row.run_after, ts, explicitId],
@@ -1815,9 +1976,10 @@ export class Store {
       : `(SELECT id FROM job_queue WHERE status = 'queued' AND attempts < max_attempts
            AND (run_after IS NULL OR run_after <= ?)
            ORDER BY created_at ASC, id ASC LIMIT 1${skipLocked})`;
-    const params = id ? [ts, wid, ts, id] : [ts, wid, ts, ts];
+    const params = id ? [ts, wid, ts, ts, id] : [ts, wid, ts, ts, ts];
     const sql = `UPDATE job_queue
-                    SET status = 'running', attempts = attempts + 1, locked_at = ?, locked_by = ?, updated_at = ?
+                    SET status = 'running', attempts = attempts + 1, epoch = epoch + 1,
+                        locked_at = ?, locked_by = ?, heartbeat_at = ?, updated_at = ?
                   WHERE id = ${target} AND status = 'queued'
                   RETURNING *`;
     const row = await this.#retryOnBusy(
@@ -1856,16 +2018,19 @@ export class Store {
   }
 
   /** Đánh dấu mục đã XONG. Trả `true` nếu thật sự có dòng đổi trạng thái. */
-  async completeQueueItem(id) {
+  async completeQueueItem(id, { epoch = null } = {}) {
     const qid = String(id ?? '').trim();
     if (!qid) return false;
     const ts = nowIso();
+    const wantsEpoch = normalizeEpoch(epoch);
+    // A3 (fencing): runner ĐÃ BỊ CƯỚP (epoch lệch) không được chốt `done` — nếu không, kết quả của
+    // nó ghi đè trạng thái của runner mới.
     const res = await this.driver.run(
       `UPDATE job_queue
-          SET status = 'done', locked_at = NULL, locked_by = NULL, last_error = NULL,
+          SET status = 'done', locked_at = NULL, locked_by = NULL, heartbeat_at = NULL, last_error = NULL,
               updated_at = ?, finished_at = ?
-        WHERE id = ? AND status IN ('running','queued')`,
-      [ts, ts, qid],
+        WHERE id = ? AND status IN ('running','queued')${wantsEpoch === null ? '' : ' AND epoch = ?'}`,
+      wantsEpoch === null ? [ts, ts, qid] : [ts, ts, qid, wantsEpoch],
     );
     return Number(res?.changes ?? 0) > 0;
   }
@@ -1884,11 +2049,16 @@ export class Store {
    * khỏi — ví dụ mục khôi phục mà tiến trình này không có hàm xử lý: đánh dấu `failed` ngay
    * thay vì thử lại 3 lượt vô ích.
    */
-  async failQueueItem(id, { error = null, retryDelayMs = 0, force = false } = {}) {
+  async failQueueItem(id, { error = null, retryDelayMs = 0, force = false, epoch = null } = {}) {
     const qid = String(id ?? '').trim();
     if (!qid) throw Object.assign(new Error('failQueueItem thiếu id mục hàng đợi.'), { code: 'INVALID_QUEUE_ITEM' });
     const row = await this.driver.get('SELECT * FROM job_queue WHERE id = ?', [qid]);
     if (!row) return { status: 'failed', attempts: 0, missing: true, last_error: errorText(error) };
+    // A3 (fencing): mục đã được claim bởi LƯỢT KHÁC (epoch khác) ⇒ kết quả của runner cũ bị BỎ.
+    const wantsEpoch = normalizeEpoch(epoch);
+    if (wantsEpoch !== null && Number(toNum(row.epoch, 0)) !== wantsEpoch) {
+      return { status: row.status, attempts: Number(toNum(row.attempts, 0)), stale: true, last_error: errorText(error) };
+    }
     const attempts = Number(toNum(row.attempts, 0));
     const maxAttempts = Math.max(1, Number(toNum(row.max_attempts, 3)));
     const exhausted = force === true || attempts >= maxAttempts;
@@ -1977,15 +2147,24 @@ export class Store {
    *
    * @returns {Promise<boolean>} `true` nếu còn là chủ của mục (chưa bị thu hồi).
    */
-  async touchQueueItem(id, { workerId = null, now = null } = {}) {
+  async touchQueueItem(id, { workerId = null, now = null, epoch = null } = {}) {
     const qid = String(id ?? '').trim();
     if (!qid) return false;
+    // A6 (phản biện R1 vòng 2, THẤP): BẮT BUỘC khớp `workerId`. Trước đây thiếu `workerId` vẫn
+    // gia hạn được lease của NGƯỜI KHÁC (chỉ cần biết id mục) ⇒ một tiến trình lạ có thể giữ mục
+    // sống mãi. Nay thiếu/lệch `workerId` ⇒ từ chối (`false`).
+    const wid = workerId === null || workerId === undefined ? '' : String(workerId).trim();
+    if (!wid) {
+      this.logger?.warn('store.touch_missing_worker', { queue_item_id: qid });
+      return false;
+    }
     const ts = String(now || nowIso());
-    const wid = workerId === null || workerId === undefined ? null : String(workerId);
+    // A3: nếu caller biết `epoch` thì còn phải khớp epoch hiện tại (fencing).
+    const wantsEpoch = normalizeEpoch(epoch);
     const sql = `UPDATE job_queue
                     SET locked_at = ?, heartbeat_at = ?, updated_at = ?
-                  WHERE id = ? AND status = 'running'${wid === null ? '' : ' AND locked_by = ?'}`;
-    const params = wid === null ? [ts, ts, ts, qid] : [ts, ts, ts, qid, wid];
+                  WHERE id = ? AND status = 'running' AND locked_by = ?${wantsEpoch === null ? '' : ' AND epoch = ?'}`;
+    const params = wantsEpoch === null ? [ts, ts, ts, qid, wid] : [ts, ts, ts, qid, wid, wantsEpoch];
     const res = await this.#retryOnBusy(() => this.driver.run(sql, params), {
       attempts: clampInt(this.config?.queue?.claimRetries, LEDGER_LOCK_RETRIES, 1, 50),
       code: 'QUEUE_BUSY',
@@ -2041,12 +2220,16 @@ export class Store {
    * Liệt kê mục theo trạng thái (bổ trợ cho `JobQueue.resume()`). Sắp CŨ NHẤT TRƯỚC để việc
    * khôi phục giữ đúng thứ tự đã xếp hàng.
    */
-  async listQueueItems({ statuses = ['queued'], limit = QUEUE_RESUME_LIMIT } = {}) {
+  async listQueueItems({ statuses = ['queued'], limit = QUEUE_RESUME_LIMIT, onlyClaimable = true } = {}) {
     const list = (Array.isArray(statuses) ? statuses : [statuses]).map((s) => String(s)).filter(Boolean);
     if (list.length === 0) return [];
     const placeholders = list.map(() => '?').join(',');
+    // A2: mục đã CHẠM TRẦN không bao giờ được trả về cho các đường "hồi sinh" (`resume`/poll/
+    // `pumpQueued`) — nhặt nó lên chỉ tạo vòng lặp rác và `done` giả. `onlyClaimable: false` dành
+    // cho truy vấn quan sát.
+    const extra = onlyClaimable ? ' AND attempts < max_attempts' : '';
     const rows = await this.driver.all(
-      `SELECT * FROM job_queue WHERE status IN (${placeholders}) ORDER BY created_at ASC, id ASC LIMIT ?`,
+      `SELECT * FROM job_queue WHERE status IN (${placeholders})${extra} ORDER BY created_at ASC, id ASC LIMIT ?`,
       [...list, clampInt(limit, QUEUE_RESUME_LIMIT, 1, 1000)],
     );
     return (Array.isArray(rows) ? rows : []).map((row) => this.#hydrateQueueRow(row));

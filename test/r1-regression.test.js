@@ -29,9 +29,11 @@ const tableColumns = async (store, table) => (await store.driver.all(`PRAGMA tab
 /** Bảng `job_queue` đúng hợp đồng §2.1 — 15 cột, KHÔNG thiếu cột nào. */
 const QUEUE_COLUMNS = [
   'id', 'job_id', 'kind', 'handler', 'payload', 'status', 'attempts', 'max_attempts',
-  'run_after', 'locked_at', 'locked_by', 'last_error', 'created_at', 'updated_at', 'finished_at',
-  // R1-F2 (vòng sửa phản biện): nhịp tim của worker đang giữ mục (lease/heartbeat).
-  'heartbeat_at',];
+  'run_after', 'locked_at', 'locked_by',
+  // R1-F2/A3 (vòng sửa phản biện): hai cột THÊM SAU bằng migration ⇒ luôn nằm cuối bảng.
+  'heartbeat_at', 'epoch',
+  'last_error', 'created_at', 'updated_at', 'finished_at',
+];
 
 describe('R1 · §5 — DB "thời trước R1": init() hai lần, nâng cấp tại chỗ, dữ liệu cũ nguyên', () => {
   test('có `job_queue` + 3 index; `jobs`/`wallet_ledger` được thêm cột; dòng cũ KHÔNG bị đổi', async () => {

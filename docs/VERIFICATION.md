@@ -1510,3 +1510,97 @@ hai lượt khác nhau (hoặc khách ẩn danh không có ví) vẫn **2 mục/
     SỚM, không làm cho ví và hàng đợi chạy song song thật. PostgreSQL giữ khoá **per-user**
     (`pg_advisory_xact_lock`).
   · Chưa đo: nhiều tiến trình PostgreSQL cho F1/F2/F3 (mới đo ở SQLite + `l6` PG một tiến trình).
+
+---
+
+## 22. R1 — vòng 3: A1…A6 + F5/F6 (chấm lại tại `f1e75c5`)
+
+`npm test` → **977 test · 976 pass · 0 fail · 1 skipped**; `node --check` mọi file sửa ✓;
+`verify.mjs` EXIT=0; `imagelab-demo.mjs` → `succeeded`; `test/imagelab-concurrency.test.js` 2/2.
+
+### 22.1 A1 — boot đồng thời (SQLite)
+
+```
+$ node /tmp/r1-atk2/a1_boot_race.mjs
+DB TRẮNG: 0/16 tiến trình CHẾT khi boot đồng thời · tỉ lệ chết: 0%
+PASS :: A1.2: boot đồng thời trên DB trắng không được làm chết tiến trình nào :: chết=0/16
+ĐỐI CHỨNG (DB đã init sẵn): 0/16 tiến trình chết
+   ← vòng 2: 2–6/16 chết (13–38%), nguyên nhân: hai tiến trình cùng ALTER TABLE ⇒ duplicate column
+```
+Lặp lại độc lập 12 cặp (24 tiến trình): **chết 0/24** (trước khi vá: 3/24 với
+`BOOT_FAIL … duplicate column name: user_id|run_key`).
+
+### 22.2 A2 — hồi sinh mục chạm trần
+
+```
+$ node /tmp/r1-atk2/a2_revive.mjs
+enqueue LẦN 2 (cùng id): revived=true status=queued attempts=0/2 · claim sau revive: NHẶT ĐƯỢC
+PASS :: A2: mục revive phải nhặt được (chạy lại được) :: ok
+lượt 2: handler chạy thêm 1 lần · events=["done(skipped=false)"]
+PASS :: A2.2: enqueue lại CÙNG lượt chạy phải chạy lại thật (không nuốt lượt) :: chạy thêm=1
+PASS :: A2.2: không còn mục queued nào vĩnh viễn không nhặt được :: n=0
+   ← vòng 2: 10 lần dựng handler + 10 `done(skipped=true)` GIẢ trong 2s dù handler chạy 0 lần
+```
+
+### 22.3 A3 — fencing + tiền
+
+```
+$ node /tmp/r1-atk2/a3_lease_sigstop.mjs
+1) giữ tiền cho lượt: -10 · balance 100 -> 90 (run_key=rk-1)
+2) bản TRÙNG thất bại ⇒ hoàn tiền +10 · balance -> 100
+3) bản GỐC thành công, settle chi phí 10 ⇒ job_settle -10 · balance -> 90
+sổ: job_settle-10 , job_refund+10 , job_hold-10 , grant+100
+   ← vòng 2: settle bị TỪ CHỐI ⇒ sản phẩm miễn phí, mất 10 credit
+```
+Fencing (đo trong `test/r1-fixes.test.js`): `completeQueueItem(id, {epoch:1})` sau khi mục bị claim
+lần hai (epoch 2) ⇒ `false`; `failQueueItem(…, {epoch:1})` ⇒ `{ stale: true }`; trạng thái của
+runner mới nguyên vẹn; runner cũ ghi log `queue.stale_result_discarded`.
+
+### 22.4 A4 + F5 — mã lỗi khoá
+
+```
+$ node /tmp/r1-atk2/a44_poison.mjs
+config lockTimeoutMs: queue=300 billing=300
+  withLedgerLock(u2) #1: 2564ms · LỖI LEDGER_BUSY · inTx=false
+  claimNextJob #1: 2521ms · LỖI QUEUE_BUSY · inTx=false
+  appendLedger(u2) #1: 336ms · LỖI LEDGER_BUSY · inTx=false
+  claimNextJob #3 (holder đã nhả): 1ms · OK · withLedgerLock(u2) #2: 1ms · OK
+PASS :: A4.4: sau timeout, các thao tác khác KHÔNG được nổ mã thô ERR_SQLITE_ERROR :: ["QUEUE_BUSY","LEDGER_BUSY",null]
+PASS :: A4.4: hồi phục hoàn toàn sau khi người giữ nhả khoá :: null/null
+   ← vòng 2: ["QUEUE_BUSY","ERR_SQLITE_ERROR",null] (mã thô lọt ra)
+```
+
+### 22.5 A5 + A6 + F6
+
+- A5: `PRAGMA busy_timeout = config.queue.lockTimeoutMs` (đặt TRƯỚC mọi pragma) + PG
+  `SET LOCAL lock_timeout` / `statement_timeout`; ngân sách thử lại của `init()` bị chặn bởi
+  `queue.lockTimeoutMs`.
+- A6: `touchQueueItem('q')` (thiếu `workerId`) ⇒ `false` (test mới trong `test/r1-fixes.test.js`;
+  vòng 2 chỉ kiểm ca workerId SAI).
+- F6: `grep -c "queue.enqueue(" src/http/routes.js` = 8 và `grep -c "runKey"` = 8 ⇒ **8/8** chỗ
+  truyền khoá lượt (bổ sung `POST /api/jobs/:id/regenerate`).
+
+### 22.6 KHÔNG hồi quy (script vòng 1 + vòng 2)
+
+```
+q3_crashloop  : TỔNG handler = 3 (max_attempts=3) · DB cuối status=failed attempts=3 · PASS ×2
+q4_steal      : sau requeueStaleJobs {"requeued":0} · KHÔNG có B-START · DB cuối done/attempts=1
+q6_orphan     : sau 6 nhịp cron: requeued=1 · B đã chạy được 3 việc (không cần restart)
+l5_race_err   : sqlite hold errs=0 dupHold=0 bothClose=0 · pg hold errs=0 dupHold=0 bothClose=0
+a5_pg_multi   : A5.1 (PG) chạm trần ⇒ failed+finished_at · claim=null · A5.2 B nhặt đủ 3 việc
+```
+
+### 22.7 GIỚI HẠN CÒN LẠI (ghi rõ, không im lặng)
+
+1. **A5 chưa đạt đúng “~5s” trên SQLite.** Đo thật (`/tmp/gop18/a5-probe.mjs`): tiến trình thứ hai
+   giữ khoá bằng `BEGIN IMMEDIATE` 9s ⇒ tiến trình sau **chờ tới khi chủ nhả (~8,5s)** rồi mới
+   chạy được, KHÔNG cắt ở 5s như cấu hình. Nguyên nhân: SQLite chỉ có **một khoá ghi toàn cục** và
+   `busy_timeout` áp cho từng câu lệnh; đường `init()` còn thử lại. PostgreSQL đã có
+   `lock_timeout`/`statement_timeout` ở tầng máy chủ (per-transaction) nên **không** có giới hạn này.
+2. **A3.1 vẫn đo được hai khoảng chạy CHỒNG NHAU khi tiến trình bị SIGSTOP** (máy ngủ/container
+   pause): lease trông giống hệt tiến trình đã chết nên tiến trình khác CƯỚP là hợp lệ. Nay hệ quả
+   đã được chặn: kết quả của runner cũ bị **BỎ** (epoch lệch, log `queue.stale_result_discarded`)
+   và **tiền không mất** (quyết toán muộn `<runKey>#late`) — script A3.2 in ra `job_settle -10`
+   thay vì để sản phẩm miễn phí. (Dòng `FAIL :: A3…` trong script là **khẳng định cũ** mã hoá lỗi
+   của vòng 2, không phải số đo.)
+3. Chưa đo: nhiều tiến trình PostgreSQL cho A1/A4 (mới đo SQLite cho A1/A4; PG đã đo cho F1/F3).
