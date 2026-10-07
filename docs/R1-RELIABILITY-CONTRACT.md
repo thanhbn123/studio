@@ -124,3 +124,74 @@ export function createScheduler({ app, store, config, logger }) → {
 - Ví an toàn khi **2 tiến trình** ghi sổ cùng lúc: số dư = tổng sổ, không âm, không chết vì khoá.
 - Scheduler chạy được, `runOnce()` tất định, tắt sạch, số liệu hiện ở `/api/health`.
 - **Không hồi quy**: toàn bộ test cũ xanh; `node tools/verify.mjs` xanh; hành vi ẩn danh (không ví) không đổi.
+
+---
+
+# VÒNG SỬA PHẢN BIỆN (F1…F6) — chốt lại các điểm lệch
+
+Phán quyết vòng 1: **FAIL** (`docs/R1-REVIEW.md`). Những điểm dưới đây ĐỔI so với bản đóng băng đầu.
+
+## 6.1 F1 — TRẦN `max_attempts` ở MỌI đường (không chỉ `failQueueItem`)
+
+- `claimNextJob`/`claimQueueItem`: điều kiện nhặt có thêm **`attempts < max_attempts`**.
+- `requeueStaleJobs`: **hai nhánh** — `attempts < max_attempts` ⇒ `queued`; đã chạm trần ⇒
+  **`failed`** + `finished_at` + `last_error = 'quá số lần thử'`; trả thêm
+  `{ failed, failed_ids, failed_job_ids }`.
+- `JobQueue.reclaimStale()` chốt **JOB** tương ứng thành `failed` +
+  `error_code = 'QUEUE_ATTEMPTS_EXHAUSTED'` + `finished_at` và **phát sự kiện `failed`** để hook
+  tính tiền chạy đúng đường (hoàn tiền/đánh dấu).
+
+## 6.2 F2 — LEASE + HEARTBEAT (không cướp việc, không hoàn tiền oan)
+
+- Cột mới `job_queue.heartbeat_at` (migration cộng thêm).
+- `store.touchQueueItem(id, { workerId, now })` — chỉ **chủ hiện tại** (`locked_by`) gia hạn được;
+  trả `false` nếu mục đã đổi chủ/không còn `running`.
+- `JobQueue` chạy **nhịp tim** trong lúc handler chạy: chu kỳ `max(50ms, min(30s, stale_ms/3))`,
+  `unref()` (không giữ tiến trình sống), dừng ở `finally` và ở `close()`.
+- `requeueStaleJobs` chỉ thu hồi mục quá hạn theo `COALESCE(heartbeat_at, locked_at, updated_at,
+  created_at)` ⇒ job dài hơn `stale_ms` **không** còn bị cướp.
+- `completeQueueItem`/`failQueueItem` **idempotent theo trạng thái**: mục đã `done`/`failed` không
+  bị lật lại (không phát sự kiện hoàn tiền lần hai).
+
+## 6.3 F3 — TIẾN TRÌNH ĐANG SỐNG phải nhặt việc `queued` (không cần restart)
+
+- `JobQueue.pumpQueued({ olderThanMs?, limit? })`: `reclaimStale()` → liệt kê mục `queued` → dựng
+  handler từ bảng đã đăng ký → xếp vào bộ nhớ; tôn trọng `concurrency`, `run_after`, và **không**
+  nhặt lại mục đang PENDING/RUNNING trong bộ nhớ (so cả `queueItemId` **và** cặp
+  `(job_id, handler)` — vì khoá bộ nhớ `…::fn:<id>` khác khoá DB `…::row:<id>`).
+- Vòng **poll định kỳ** `config.queue.pollMs` (mặc định 1000ms, sàn 200ms) bật trong `resume()`,
+  `unref()`, tắt trong `close()`.
+- `scheduler.runOnce()` gọi `queue.pumpQueued()` mỗi nhịp (khi app có `queue.pumpQueued`), và
+  `/api/health → scheduler.last_result` có thêm `claimed` + `exhausted`.
+
+## 6.4 F4 — PHÂN LOẠI LỖI DRIVER + KHÔNG LÀM HỎNG TRANSACTION
+
+- `#callStore` phân loại **theo thứ tự**: vi phạm UNIQUE ⇒ `LEDGER_CONFLICT`
+  (`retryable: false`) → transaction bị abort (`25P02`) ⇒ `LEDGER_TX_ABORTED` → còn lại mới là
+  `LEDGER_BUSY` (`retryable: true`). Mã thô của driver không bao giờ ra tới HTTP.
+- `appendLedger` ghi kiểu **`ON CONFLICT DO NOTHING`** (PostgreSQL) / **`OR IGNORE`** (SQLite):
+  vi phạm UNIQUE **không** còn abort transaction; `changes === 0` ⇒ ném `LEDGER_CONFLICT` để tầng
+  gọi **đọc lại dòng đã có** (idempotent theo `(job_id, run_key)`).
+- `withLedgerLock`'s tx view có `savepoint(name, fn)`; tầng billing ghi sổ trong savepoint và tự
+  chạy lại section (tối đa 2 lần) nếu transaction bị abort.
+
+## 6.5 F5 — MỌI KHOÁ CÓ TIMEOUT HỮU HẠN
+
+- `config.billing.lockTimeoutMs` (`BILLING_LOCK_TIMEOUT_MS`, mặc định 5000) — khoá tuần tự hoá ví
+  trong bộ nhớ; hết hạn ⇒ `LEDGER_BUSY` + `retryable: true`.
+- `config.queue.lockTimeoutMs` (`QUEUE_LOCK_TIMEOUT_MS`, mặc định 5000) — mutex transaction SQLite
+  trong tiến trình; hết hạn ⇒ `DB_LOCK_TIMEOUT` (được `isBusyError` coi là bận) ⇒ `QUEUE_BUSY`
+  kèm `retryable: true`.
+- Ghi rõ: trên SQLite **mọi** transaction ghi dùng chung một hàng đợi (một file, một kết nối) —
+  yêu cầu ví có thể phải chờ hàng đợi; trần chờ ở trên bảo đảm nó fail sớm thay vì treo.
+
+## 6.6 F6 — KHOÁ IDEMPOTENCY TRÊN ĐƯỜNG THẬT
+
+- Mọi chỗ `queue.enqueue(...)` trong `src/http/routes.js` nay truyền `meta.runKey` khi lượt chạy
+  có khoá ví (`hold.run_key`): `POST /api/jobs`, `regenerate`, `POST /api/imagelab/jobs`,
+  `PUT …/regions`, `render`, `POST /api/imagestudio/jobs`, `generate`,
+  `POST/POST-generate /api/videostudio/jobs`.
+- Ngữ nghĩa: **cùng một khoá** (cùng lượt) + N tiến trình × M lần enqueue ⇒ **MỘT** mục hàng đợi,
+  MỘT lần chạy (khoá chính là hàm băm tất định của `jobId::handler::rk:<runKey>`).
+  **Hai lượt khác nhau** (kể cả hai request render song song của khách ẩn danh — không có ví ⇒
+  không có `run_key`) vẫn là **hai mục, hai lần chạy** (MVP-05 §BR-02 giữ nguyên).

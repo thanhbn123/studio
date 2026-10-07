@@ -235,10 +235,13 @@ describe('PB-04 — refundForJob không bao giờ hoàn phần đã tiêu', () =
       balanceAfter: 0.5,
     };
     await store.appendLedger(payload);
+    // F4 (R1 vòng sửa phản biện): DB KHÔNG còn để câu INSERT làm ABORT transaction — nó ghi kiểu
+    // `ON CONFLICT DO NOTHING`/`OR IGNORE` rồi tầng store ném `LEDGER_CONFLICT` (lỗi nghiệp vụ,
+    // transaction vẫn dùng được để ĐỌC LẠI dòng đã có). Vẫn đúng luật "không ghi trùng".
     await assert.rejects(
       () => store.appendLedger(payload),
-      (err) => /UNIQUE|constraint/i.test(String(err?.message || err)),
-      'ghi trùng (user, job, run_key, reason) phải bị DB chặn',
+      (err) => err?.code === 'LEDGER_CONFLICT' || /UNIQUE|constraint/i.test(String(err?.message || err)),
+      'ghi trùng (user, job, run_key, reason) phải bị chặn',
     );
     await store.close();
   });

@@ -58,6 +58,7 @@ export const QUEUE_DEFAULTS = Object.freeze({
    * Muốn đúng NGUYÊN lịch của hợp đồng: đặt `retryTotalMs` = 6000 (qua `config.queue.retryTotalMs`).
    */
   retryTotalMs: 2000,
+  pollMs: 1000,
 });
 
 /**
@@ -106,6 +107,10 @@ export function queueItemIdFor(idempotencyKey) {
 export class JobQueue extends EventEmitter {
   /** Định danh THAM CHIẾU hàm xử lý — khoá chống trùng cho lượt chạy không có `runKey`. */
   #fnIds;
+  /** F3 — timer vòng nhặt việc (null khi chưa bật/tắt). */
+  #pollTimer = null;
+  /** F3 — chu kỳ vòng nhặt việc (ms). */
+  #pollMs = QUEUE_DEFAULTS.pollMs;
   #fnSeq = 0;
 
   /**
@@ -163,6 +168,9 @@ export class JobQueue extends EventEmitter {
     // Trần TỔNG thời gian chờ thử lại của một mục — xem `QUEUE_DEFAULTS.retryTotalMs` để biết vì sao.
     this.retryTotalMs = Math.max(0, this.#num(cfg.retryTotalMs, QUEUE_DEFAULTS.retryTotalMs));
     this.staleMs = Math.max(0, this.#num(cfg.staleMs, QUEUE_DEFAULTS.staleMs));
+    // F3: nhịp NHẶT VIỆC (ms) — sàn 200ms để không tạo vòng lặp nóng, trần 60s.
+    this.#pollMs = Math.min(60000, Math.max(200, Math.trunc(this.#num(cfg.pollMs, QUEUE_DEFAULTS.pollMs))));
+    this.#pollTimer = null;
     this.resumeLimit = Math.max(1, Math.trunc(this.#num(cfg.resumeLimit, resumeLimit)));
     this.closeTimeoutMs = Math.max(0, this.#num(cfg.closeTimeoutMs, closeTimeoutMs));
     this.workerId = String(workerId || `w-${process.pid}-${randomUUID().slice(0, 8)}`);
@@ -498,15 +506,150 @@ export class JobQueue extends EventEmitter {
    * `claimQueueItem()` (một câu UPDATE nguyên tử), nên hai tiến trình cùng `resume()` thì chỉ
    * MỘT tiến trình chạy được mục đó.
    */
+  /**
+   * F1+F2 (phản biện R1) — THU HỒI MỤC QUÁ HẠN **và chốt hậu quả**.
+   *
+   * Khác `store.requeueStaleJobs` thuần: ở đây còn
+   *   · mục đã CHẠM TRẦN (`attempts >= max_attempts`) ⇒ job tương ứng được đánh dấu `failed` +
+   *     `error_code='QUEUE_ATTEMPTS_EXHAUSTED'` + `finished_at`, và phát sự kiện `failed` để hook
+   *     tính tiền chạy đúng đường (hoàn tiền/đánh dấu) — trước đây mục cứ quay lại `queued` mãi;
+   *   · mục còn lượt ⇒ về `queued` để `resume()`/`drain()` nhặt tiếp.
+   *
+   * @returns {Promise<{requeued:number, ids:string[], exhausted:number, exhausted_job_ids:string[]}>}
+   */
+  async reclaimStale({ olderThanMs = null, limit = null } = {}) {
+    const empty = { requeued: 0, ids: [], exhausted: 0, exhausted_job_ids: [] };
+    if (!this.durable || typeof this.store?.requeueStaleJobs !== 'function') return empty;
+    let out = null;
+    try {
+      out = await this.store.requeueStaleJobs({
+        olderThanMs: olderThanMs ?? this.staleMs,
+        now: this.#iso(),
+        limit: limit ?? this.resumeLimit,
+      });
+    } catch (err) {
+      // Thu hồi lỗi KHÔNG được chặn phần còn lại.
+      this.logger?.error('queue.resume_requeue_failed', { error: err });
+      return empty;
+    }
+    const requeued = Number(out?.requeued) || 0;
+    if (requeued > 0) this.logger?.warn('queue.stale_requeued', { requeued, stale_ms: this.staleMs });
+    const exhaustedJobs = Array.isArray(out?.failed_job_ids) ? out.failed_job_ids : [];
+    for (const jobId of exhaustedJobs) {
+      const err = Object.assign(
+        new Error(`Mục hàng đợi của job ${jobId} đã chạm trần số lần thử — không thử lại nữa.`),
+        { code: 'QUEUE_ATTEMPTS_EXHAUSTED' },
+      );
+      try {
+        await this.store.updateJob?.(jobId, {
+          status: 'failed',
+          stage: 'failed',
+          error_code: 'QUEUE_ATTEMPTS_EXHAUSTED',
+          error_message: err.message,
+          finished_at: new Date().toISOString(),
+        });
+      } catch (e2) {
+        this.logger?.error('queue.exhausted_job_update_failed', { job_id: jobId, error: e2 });
+      }
+      this.logger?.error('queue.attempts_exhausted', { job_id: jobId });
+      this.emit('failed', { id: jobId, error: err, attempts: this.queueMaxAttempts, exhausted: true });
+    }
+    return {
+      requeued,
+      ids: Array.isArray(out?.ids) ? out.ids : [],
+      exhausted: Number(out?.failed) || exhaustedJobs.length || 0,
+      exhausted_job_ids: exhaustedJobs,
+    };
+  }
+
+  /**
+   * F3 (phản biện R1, CAO) — NHẶT VÀ CHẠY việc `queued` không có chủ (việc "mồ côi").
+   *
+   * Trước đây chỉ `resume()` lúc BOOT mới chạy được việc `queued`; cron chỉ đổi trạng thái
+   * `running → queued` rồi **không ai nhặt** ⇒ tiến trình đang sống không cứu được việc của tiến
+   * trình đã chết (đo được: sau 6 nhịp cron, B chạy được 0 việc). Nay scheduler gọi `drain()` mỗi
+   * nhịp: nó (1) thu hồi mục quá hạn, (2) dựng handler cho các mục `queued` còn lượt và xếp vào
+   * bộ nhớ — tôn trọng `concurrency`, `run_after`, và KHÔNG đụng mục đang `running` ở tiến trình
+   * khác (lúc chạy vẫn phải thắng `claimQueueItem` nguyên tử).
+   *
+   * ⚠️ Tên `pumpQueued` (KHÔNG phải `drain`): `drain()` đã là API "chờ hàng đợi bộ nhớ rỗng" mà
+   * test/tầng gọi đang dùng — đổi nghĩa nó là phá vỡ hợp đồng có sẵn.
+   */
+  async pumpQueued({ olderThanMs = null, limit = null } = {}) {
+    if (!this.durable) return { durable: false, requeued: 0, claimed: 0, skipped: 0, exhausted: 0 };
+    const reclaimed = await this.reclaimStale({ olderThanMs, limit });
+    const rows = await this.store.listQueueItems({ statuses: ['queued'], limit: limit ?? this.resumeLimit });
+    let claimed = 0;
+    let skipped = 0;
+    for (const row of rows) {
+      if (this.closed) break;
+      if (this.running >= this.concurrency) break; // tôn trọng trần chạy song song
+      const rowRunKey = row.payload?.run_key ?? row.payload?.runKey ?? null;
+      const key = rowRunKey ? `${row.job_id}::${row.handler}::rk:${rowRunKey}` : `${row.job_id}::${row.handler}::row:${row.id}`;
+      const live = this.items.get(key);
+      if (live && (live.state === JOB_STATE.PENDING || live.state === JOB_STATE.RUNNING)) {
+        skipped += 1; // đã có trong bộ nhớ (kể cả đang chạy) ⇒ không nhặt lại
+        continue;
+      }
+      // ⚠️ KHOÁ BỘ NHỚ KHÁC KHOÁ DB: mục do `enqueue()` xếp hàng có khoá `…::fn:<id hàm>`, còn
+      // khoá suy từ dòng DB là `…::row:<id>`. Nếu chỉ so khoá, nhịp poll sẽ NHẶT LẠI chính mục mà
+      // hàng đợi trong bộ nhớ đang chờ ⇒ handler chạy HAI lần cho một việc. Vì vậy còn phải so
+      // theo `queueItemId` (id dòng DB) và theo (job, handler) đang PENDING/RUNNING.
+      const busyInMemory = [...this.items.values()].some((entry) => {
+        if (!entry || (entry.state !== JOB_STATE.PENDING && entry.state !== JOB_STATE.RUNNING)) return false;
+        if (entry.queueItemId && entry.queueItemId === row.id) return true;
+        return entry.id === row.job_id && entry.handlerName === row.handler;
+      });
+      if (busyInMemory) {
+        skipped += 1;
+        continue;
+      }
+      let handler = null;
+      try {
+        handler = await this.#buildHandler(row);
+      } catch (err) {
+        this.logger?.error('queue.handler_build_failed', { job_id: row.job_id, handler: row.handler, error: err });
+      }
+      if (!handler) {
+        skipped += 1;
+        continue; // không dựng được handler ⇒ để `resume()` xử lý fail-closed như cũ
+      }
+      const entry = {
+        id: row.job_id,
+        key,
+        handlerName: row.handler,
+        kind: row.kind,
+        stage: null,
+        payload: row.payload ?? null,
+        attempts: Number(row.attempts) || 0,
+        state: JOB_STATE.PENDING,
+        queueItemId: row.id,
+        restored: true,
+      };
+      this.items.set(key, entry);
+      const current = this.active.get(row.job_id);
+      if (!current || current.state === JOB_STATE.DONE || current.state === JOB_STATE.FAILED) {
+        this.active.set(row.job_id, entry);
+      }
+      const item = { id: row.job_id, handler, key, queueItemId: row.id };
+      const at = row.run_after ? Date.parse(row.run_after) : NaN;
+      const delay = Number.isFinite(at) ? at - Date.now() : 0;
+      if (delay > 0) this.#schedule(item, delay);
+      else this.queue.push(item);
+      claimed += 1;
+    }
+    this.#pump();
+    if (claimed > 0) this.logger?.info('queue.drained', { claimed, skipped, requeued: reclaimed.requeued });
+    return { durable: true, requeued: reclaimed.requeued, claimed, skipped, exhausted: reclaimed.exhausted };
+  }
+
   async resume() {
     if (!this.durable) return { durable: false, requeued: 0, restored: 0, skipped: 0 };
     let requeued = 0;
     try {
-      const out = await this.store.requeueStaleJobs({ olderThanMs: this.staleMs, now: this.#iso(), limit: this.resumeLimit });
+      const out = await this.reclaimStale();
       requeued = Number(out?.requeued) || 0;
-      if (requeued > 0) this.logger?.warn('queue.stale_requeued', { requeued, stale_ms: this.staleMs });
     } catch (err) {
-      // Thu hồi lỗi KHÔNG được chặn việc khôi phục phần còn lại.
       this.logger?.error('queue.resume_requeue_failed', { error: err });
     }
     const rows = await this.store.listQueueItems({ statuses: ['queued'], limit: this.resumeLimit });
@@ -570,8 +713,13 @@ export class JobQueue extends EventEmitter {
       restored += 1;
     }
     this.#pump();
+    // F3 (phản biện R1, CAO): bật VÒNG NHẶT VIỆC định kỳ. Không có nó, tiến trình đang sống chỉ
+    // chạy được việc tại đúng thời điểm `resume()`; việc `queued` sinh ra SAU đó (do tiến trình
+    // khác chết, do cron trả mục `running` về `queued`) sẽ nằm im mãi — đo được: sau 6 nhịp cron,
+    // tiến trình sống chạy được 0 việc, phải restart mới chạy.
+    this.#startPolling();
     if (restored > 0 || requeued > 0) {
-      this.logger?.info('queue.resumed', { requeued, restored, skipped, durable: true });
+      this.logger?.info('queue.resumed', { requeued, restored, skipped, durable: true, poll_ms: this.#pollMs });
     }
     return { durable: true, requeued, restored, skipped };
   }
@@ -666,6 +814,11 @@ export class JobQueue extends EventEmitter {
     this.active.set(item.id, entry);
     if (item.key) this.items.set(item.key, entry);
 
+    // F2 (phản biện R1, CAO) — HEARTBEAT: giữ lease sống trong lúc handler chạy.
+    // Không có nhịp này, job dài hơn `stale_ms` bị cron "cướp" và HAI tiến trình chạy song song
+    // cùng một mục (đo được: 2 khoảng thời gian chồng nhau, `attempts` 1→2, bản trùng `failed`
+    // ⇒ hook hoàn tiền trong khi bản gốc vẫn xong ⇒ mất doanh thu).
+    const heartbeat = this.#startHeartbeat(entry.queueItemId);
     try {
       const result = await item.handler({ attempt: entry.attempts, queueItemId: entry.queueItemId ?? null });
       if (this.durable && entry.queueItemId) await this.store.completeQueueItem(entry.queueItemId);
@@ -675,7 +828,72 @@ export class JobQueue extends EventEmitter {
       this.emit('done', { id: item.id, result, attempts: entry.attempts });
     } catch (err) {
       await this.#handleFailure(item, entry, err);
+    } finally {
+      heartbeat?.stop();
     }
+  }
+
+  /**
+   * F2 — nhịp tim cho mục đang chạy: `stale_ms/3` (tối thiểu 1s, tối đa 30s).
+   *
+   * Trả `null` khi không ở chế độ bền (không có mục DB để gia hạn). Mỗi nhịp gọi
+   * `store.touchQueueItem(id, { workerId })`; mục đã bị thu hồi/đổi chủ ⇒ hàm trả `false` và ta
+   * ghi log `queue.lease_lost` (KHÔNG tự ý chạy tiếp như thể vẫn sở hữu — nhưng cũng không giết
+   * handler đang chạy: để nó kết thúc rồi `completeQueueItem` sẽ là no-op vì mục không còn 'running').
+   */
+  /**
+   * F3 — vòng NHẶT VIỆC định kỳ (`config.queue.pollMs`, mặc định 1000ms, sàn 200ms).
+   *
+   * Nhịp này `unref()` (không giữ tiến trình sống) và chỉ chạy khi hàng đợi BỀN. Mỗi nhịp gọi
+   * `pumpQueued()`: thu hồi mục quá hạn rồi nhặt mục `queued` còn lượt để chạy — nhờ vậy việc "mồ
+   * côi" của tiến trình đã chết được cứu bởi BẤT KỲ tiến trình nào đang sống, không cần restart.
+   */
+  #startPolling() {
+    if (!this.durable || this.closed || this.#pollTimer) return null;
+    const timer = setInterval(() => {
+      if (this.closed) return;
+      this.pumpQueued().catch((err) => this.logger?.warn('queue.poll_failed', { error: err }));
+    }, this.#pollMs);
+    timer.unref?.();
+    this.#pollTimer = timer;
+    this.timers.add(timer);
+    return timer;
+  }
+
+  /** Dừng vòng nhặt việc (dùng trong `close()`). */
+  #stopPolling() {
+    if (!this.#pollTimer) return;
+    clearInterval(this.#pollTimer);
+    this.timers.delete(this.#pollTimer);
+    this.#pollTimer = null;
+  }
+
+  #startHeartbeat(queueItemId) {
+    if (!this.durable || !queueItemId || typeof this.store?.touchQueueItem !== 'function') return null;
+    // ⚠️ SÀN THẤP (50ms), không phải 1s: `stale_ms` có thể được chỉnh rất ngắn (test/đo), và nhịp
+    // tim dài hơn cửa sổ treo thì KHÔNG bảo vệ được gì (đo thật: `stale_ms=500` + nhịp 1000ms ⇒
+    // cron vẫn cướp mục đang chạy). Nhịp = `stale_ms/3` ⇒ luôn có 3 nhịp trong một cửa sổ.
+    const period = Math.max(50, Math.min(30000, Math.floor(this.staleMs / 3) || 50));
+    let stopped = false;
+    const timer = setInterval(() => {
+      if (stopped) return;
+      this.store
+        .touchQueueItem(queueItemId, { workerId: this.workerId, now: this.#iso() })
+        .then((ok) => {
+          if (ok === false) this.logger?.warn('queue.lease_lost', { queue_item_id: queueItemId, worker_id: this.workerId });
+        })
+        .catch((err) => this.logger?.warn('queue.heartbeat_failed', { queue_item_id: queueItemId, error: err }));
+    }, period);
+    // Nhịp tim KHÔNG được giữ tiến trình sống khi mọi việc đã xong.
+    timer.unref?.();
+    this.timers.add(timer);
+    const stop = () => {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+      this.timers.delete(timer);
+    };
+    return { stop, period };
   }
 
   /**
@@ -756,6 +974,7 @@ export class JobQueue extends EventEmitter {
    *    `resume()` sẽ chạy lại (đúng tinh thần "khởi động lại không mất việc").
    */
   async close({ waitMs = null } = {}) {
+    this.#stopPolling();
     this.closed = true;
     for (const timer of this.timers) clearTimeout(timer);
     this.timers.clear();

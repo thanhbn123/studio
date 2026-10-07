@@ -77,7 +77,7 @@ export function createScheduler({ app = null, store = null, config = {}, logger 
 
   /** Thân một nhịp: mỗi bước bọc `try/catch` riêng nên KHÔNG lỗi nào thoát ra ngoài. */
   async function runOnePass() {
-    const result = { reconciled: 0, requeued: 0, errors: 0 };
+    const result = { reconciled: 0, requeued: 0, claimed: 0, exhausted: 0, errors: 0 };
     let didWork = false;
 
     // Chỉ gọi khi hàm CÓ THẬT — R1-Q/R2-B có thể chưa land mà app vẫn phải boot.
@@ -110,8 +110,29 @@ export function createScheduler({ app = null, store = null, config = {}, logger 
       }
     }
 
-    // 2) Trả mục hàng đợi `running` quá cũ về `queued` (R1-Q).
-    if (requeue) {
+    // 2) F3 (phản biện R1, CAO): NHẶT VÀ CHẠY việc `queued` mồ côi — không chỉ đổi trạng thái.
+    // Trước đây cron chỉ `UPDATE running → queued` rồi không ai chạy ⇒ tiến trình đang sống không
+    // cứu được việc của tiến trình đã chết (đo được: 6 nhịp cron, 0 việc chạy). `queue.drain()`
+    // thu hồi mục quá hạn RỒI dựng handler và chạy, tôn trọng `concurrency`/`run_after`.
+    const queue = app?.queue && typeof app.queue.pumpQueued === 'function' ? app.queue : null;
+    if (queue) {
+      try {
+        const out = await queue.pumpQueued({ olderThanMs: config?.queue?.staleMs });
+        const n = toCount(typeof out === 'object' && out !== null ? out.claimed : out);
+        result.claimed = n;
+        result.requeued = toCount(typeof out === 'object' && out !== null ? out.requeued : 0);
+        result.exhausted = toCount(typeof out === 'object' && out !== null ? out.exhausted : 0);
+        if (n > 0 || result.requeued > 0 || result.exhausted > 0) didWork = true;
+      } catch (err) {
+        result.errors += 1;
+        logAt('warn', 'scheduler.step_failed', {
+          step: 'queue_pump_queued',
+          error_name: err?.name || 'Error',
+          error_code: err?.code || null,
+        });
+      }
+    } else if (requeue) {
+      // Không có `queue.pumpQueued` (dựng app kiểu cũ) ⇒ giữ đường cũ để không hồi quy.
       try {
         const out = await requeue.call(store, { olderThanMs: config?.queue?.staleMs });
         const n = toCount(typeof out === 'object' && out !== null ? out.requeued : out);

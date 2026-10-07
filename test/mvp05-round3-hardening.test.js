@@ -260,7 +260,7 @@ describe('BR-03 — sổ lỗi ⇒ fail-closed; DB chặn 2 dòng đóng cho cù
     await store.appendLedger({ userId, amount: 0.4, reason: 'job_settle', jobId, runKey: `${jobId}#1`, balanceAfter: 0.9 });
     await assert.rejects(
       () => store.appendLedger({ userId, amount: 0.1, reason: 'job_refund', jobId, runKey: `${jobId}#1`, balanceAfter: 1 }),
-      (err) => /UNIQUE|constraint/i.test(String(err?.message || err)),
+      (err) => err?.code === 'LEDGER_CONFLICT' || /UNIQUE|constraint/i.test(String(err?.message || err)),
       'BR-03b: một lượt chỉ được có MỘT dòng đóng (settle HOẶC refund)',
     );
     await store.close();

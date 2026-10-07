@@ -1413,3 +1413,100 @@ $ node /tmp/vscheck/vs-ui.test.mjs   → 32/34 pass · 2 FAIL — HAI khẳng đ
   `VIDEO_TEXT_UNSUPPORTED_CLAIM`, **0 byte video** (đo ở V4 §(g): preflight chặn TRƯỚC khi tạo job).
 - Chưa đo: ffmpeg thật, video nhiều giây (>30 s bị cắt theo trần preset), UI trên trình duyệt thật
   (chỉ đo hàm render thuần qua `/tmp/vscheck`).
+
+---
+
+## 21. R1 (độ tin cậy) — vòng sửa phản biện F1…F6
+
+Phán quyết vòng 1: **FAIL** (`docs/R1-REVIEW.md`: 1 CRITICAL + 2 CAO + 3 VỪA). Đã sửa cả 6 mục.
+`npm test` → **970 test · 969 pass · 0 fail · 1 skipped**; `verify.mjs` EXIT=0; `imagelab-demo.mjs`
+→ `succeeded`; `test/imagelab-concurrency.test.js` **2/2** (2 request render song song ⇒ 2 asset +
+2 usage).
+
+### 21.1 F1 (CRITICAL) — crash-loop vượt `max_attempts`
+
+`claimNextJob` có `attempts < max_attempts`; `requeueStaleJobs` chốt mục chạm trần thành `failed`;
+`JobQueue.reclaimStale` đánh dấu job `failed` + `QUEUE_ATTEMPTS_EXHAUSTED` + `finished_at`.
+
+```
+$ node /tmp/r1-atk/q3_crashloop.mjs
+vòng 1..3: status=running attempts=1..3 (max_attempts=3)
+vòng 4:    status=failed  attempts=3
+TỔNG số lần handler được gọi = 3 (max_attempts=3)      ← vòng 1: 8 lần, DB cuối `running`/attempts=8
+DB cuối: [{"job_id":"job-0","status":"failed","attempts":3,"max_attempts":3}]
+PASS :: k3': handler không chạy quá max_attempts=3 :: thực tế=3
+PASS :: k3': sau khi hết lượt, mục phải 'failed' (không quay lại queued/running)
+```
+
+### 21.2 F2 (CAO) — cướp việc ⇒ chạy song song
+
+`job_queue.heartbeat_at` + `touchQueueItem` + nhịp tim `stale_ms/3` (sàn 50ms) trong lúc chạy.
+
+```
+$ node /tmp/r1-atk/q4_steal.mjs
+DB lúc A đang chạy: [{"status":"running","attempts":1,"locked_by":"A"}]
+sau requeueStaleJobs: {"requeued":0,…} -> [{"status":"running","attempts":1,"locked_by":"A"}]
+log: A-START … A-END (KHÔNG có B-START)   B=[null..null]
+DB cuối: [{"status":"done","attempts":1,"locked_by":null}]
+     ← vòng 1: B chạy LỌT TRONG A, attempts 1→2, job bị chạy 2 lần
+```
+
+### 21.3 F3 (CAO) — việc mồ côi đình trệ vô hạn
+
+`JobQueue.pumpQueued()` + vòng poll `queue.pollMs` (mặc định 1s) + scheduler gọi mỗi nhịp.
+
+```
+$ node /tmp/r1-atk/q6_orphan.mjs
+B boot + resume(): {"durable":true,"requeued":0,"restored":0,"skipped":0}
+DB sau khi A chết: [job-0 running, job-1 queued, job-2 queued]
+sau 6 nhịp cron: requeued=2 · B đã chạy được 3 VIỆC      ← vòng 1: 0 việc, phải restart
+DB: [{"job_id":"job-0","status":"done","attempts":2},{"job_id":"job-1","status":"done"},{"job_id":"job-2","status":"done"}]
+```
+
+### 21.4 F4 (VỪA–CAO) — va chạm unique index báo sai mã (`25P02`/`LEDGER_BUSY`)
+
+`appendLedger` ghi `ON CONFLICT DO NOTHING`/`OR IGNORE` ⇒ UNIQUE không abort transaction;
+`#callStore` phân loại constraint TRƯỚC busy ⇒ `LEDGER_CONFLICT` (`retryable: false`); tx view có
+`savepoint()`; section tự chạy lại khi tx bị abort.
+
+```
+$ node /tmp/r1-atk/l6_pg_rehold.mjs
+SQLite:   hold lại CÙNG lượt sau khi đã đóng → ok skipped=true · holds=1 · errCode=null
+PostgreSQL THẬT: hold lại CÙNG lượt → ok skipped=true run_key=rk-1 · holds=1 · errCode=null
+     ← vòng 1: SQLite `LEDGER_BUSY` (retryable cho lỗi vĩnh viễn) · PG `25P02` thô
+```
+
+### 21.5 F5/F6 (VỪA)
+
+```
+$ node --test test/r1-fixes.test.js
+  ✔ F5: chờ khoá ví quá hạn ⇒ LEDGER_BUSY có `retryable` (không treo vô hạn)
+  ✔ F4: ghi trùng ⇒ LEDGER_CONFLICT (KHÔNG `retryable`), transaction vẫn ĐỌC được sau savepoint
+  ✔ F1/F2/F3: trần attempts · heartbeat giữ lease · pumpQueued nhặt việc mồ côi (và KHÔNG nhặt lại
+    mục đang chờ trong bộ nhớ ⇒ handler chạy đúng 1 lần)
+$ node --test --test-concurrency=1 test/imagelab-concurrency.test.js   → 2/2
+  (F6: hai request render KHÁC lượt ⇒ 2 mục, 2 asset, 2 usage — không bị gộp)
+```
+
+Khoá idempotency đường thật (F6): mọi `queue.enqueue` trong `src/http/routes.js` truyền
+`meta.runKey = hold.run_key` của LƯỢT CHẠY ⇒ hai tiến trình cùng xếp một lượt = **1 mục/1 lần chạy**;
+hai lượt khác nhau (hoặc khách ẩn danh không có ví) vẫn **2 mục/2 lần chạy** (MVP-05 §BR-02).
+
+### 21.6 Test thêm & phần chưa sửa được
+
+- **Thêm** `test/r1-fixes.test.js` (**8 test**: F1 hai chiều, F2 lease + idempotent trạng thái,
+  F3 nhặt mồ côi + không nhặt trùng, F4 phân loại + đọc lại sau savepoint, F5 timeout khoá).
+- **Sửa test cũ** theo hợp đồng mới: `test/r1-scheduler.test.js` (nhịp có thêm `claimed`/`exhausted`
+  và cron nay **nhặt-chạy** mục vừa thu hồi), `test/r1-regression.test.js` (`job_queue` có thêm cột
+  `heartbeat_at`), `test/mvp05-round{2,3}-hardening.test.js` (DB không còn ném UNIQUE thô ⇒
+  `LEDGER_CONFLICT`).
+- **Chưa sửa được / còn đo được:**
+  · `/tmp/r1-atk/l6_pg_rehold.mjs` vẫn in `FAIL :: tiền không đổi (100)` cho CẢ SQLite lẫn
+    PostgreSQL — đây là lỗi so sánh của chính script (nó so `balance` dạng object với số, in ra
+    `[object Object]`); số liệu thật trong cùng output cho thấy số dư **không đổi** ở cả hai.
+  · `q4_steal.mjs`/`q6_orphan.mjs` vẫn in `FAIL :: …` vì các dòng đó là **khẳng định cũ của script
+    chứng minh lỗi** (script viết để bắt lỗi, không phải để xác nhận bản vá); số liệu đã đúng.
+  · SQLite vẫn là **một khoá ghi toàn cục** (một file/một kết nối): trần chờ 5s chỉ bảo đảm fail
+    SỚM, không làm cho ví và hàng đợi chạy song song thật. PostgreSQL giữ khoá **per-user**
+    (`pg_advisory_xact_lock`).
+  · Chưa đo: nhiều tiến trình PostgreSQL cho F1/F2/F3 (mới đo ở SQLite + `l6` PG một tiến trình).

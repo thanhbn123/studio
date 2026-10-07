@@ -303,8 +303,12 @@ function isLedgerBusyError(err) {
  */
 function isUniqueLedgerViolation(err) {
   const text = `${err?.code ?? ''} ${err?.message ?? ''}`;
+  if (String(err?.code ?? '') === 'LEDGER_CONFLICT') return true; // mã đã chuẩn hoá ở `#callStore` (F4)
   return /SQLITE_CONSTRAINT|UNIQUE constraint failed|duplicate key value|23505|uniq_wallet_ledger/i.test(text);
 }
+
+/** Số lần chạy lại section khi transaction bị ABORT vì unique violation (F4). */
+const LEDGER_TX_ABORT_RETRIES = 2;
 
 /** Chờ `ms` — dùng cho retry có giới hạn (không `unref`: chuỗi retry phải chạy xong). */
 function sleep(ms) {
@@ -320,6 +324,9 @@ export class BillingService {
    * `store.withLedgerLock` (xem `#withLedgerSection`).
    */
   #locks = new Map();
+
+  /** F4: view transaction đang mở (để ghi sổ trong SAVEPOINT trên PostgreSQL). */
+  #txView = null;
 
   /**
    * R1-B (§3) — số tầng khoá sổ đang giữ cho mỗi user. `#append` từ chối ghi nếu user
@@ -458,16 +465,39 @@ export class BillingService {
       // `retryable` — không để lộ mã thô của driver (`ERR_SQLITE_ERROR`, `40P01`…) rồi bị tầng
       // trên nuốt mất, biến thành "job chạy mà không ai thu tiền".
       const rawCode = String(err?.code ?? '');
-      const isBusy = /SQLITE_ERROR|SQLITE_BUSY|locked|deadlock|40001|40P01|ECONNRESET|ETIMEDOUT/i.test(`${rawCode} ${String(err?.message ?? '')}`);
-      const wrapped = isBusy
-        ? new BillingError('LEDGER_BUSY', 'Sổ credit đang bận (khoá ghi/đua tiến trình) — thao tác chưa được ghi.', {
+      const text = `${rawCode} ${String(err?.message ?? '')}`;
+      // F4 (phản biện R1, VỪA–CAO) — THỨ TỰ PHÂN LOẠI QUAN TRỌNG:
+      //  (1) VI PHẠM UNIQUE của sổ là lỗi VĨNH VIỄN (đã có dòng rồi) ⇒ mã riêng, KHÔNG `retryable`
+      //      (trước đây `SQLITE_ERROR` khớp regex busy ⇒ báo `LEDGER_BUSY` + `retryable: true`,
+      //      client thử lại vô ích cho một xung đột không bao giờ tự khỏi);
+      //  (2) transaction bị ABORT (`25P02`) ⇒ mã riêng `LEDGER_TX_ABORTED` để tầng gọi biết phải
+      //      rollback về savepoint rồi đọc lại (không bao giờ để mã thô của driver ra ngoài);
+      //  (3) còn lại mới là BẬN (tạm thời, `retryable: true`).
+      const isConstraint = /SQLITE_CONSTRAINT|UNIQUE constraint failed|duplicate key value|23505|uniq_wallet_ledger/i.test(text);
+      const isTxAborted = /25P02|current transaction is aborted/i.test(text);
+      const isBusy = !isConstraint && !isTxAborted
+        && /SQLITE_BUSY|database is locked|database table is locked|deadlock|40001|40P01|55P03|ECONNRESET|ETIMEDOUT/i.test(text);
+      const wrapped = isConstraint
+        ? new BillingError('LEDGER_CONFLICT', 'Dòng sổ cho lượt này đã có (ghi bởi tiến trình khác) — đọc lại thay vì ghi thêm.', {
           ...(details ?? {}),
-          retryable: true,
+          retryable: false,
           driver_code: rawCode || null,
         })
-        : err && rawCode
-          ? new BillingError(rawCode, err.message || message, err.details ?? details)
-          : new BillingError(code, message, details);
+        : isTxAborted
+          ? new BillingError('LEDGER_TX_ABORTED', 'Transaction của sổ đã bị huỷ — cần chạy lại trong transaction mới.', {
+            ...(details ?? {}),
+            retryable: true,
+            driver_code: rawCode || null,
+          })
+          : isBusy
+            ? new BillingError('LEDGER_BUSY', 'Sổ credit đang bận (khoá ghi/đua tiến trình) — thao tác chưa được ghi.', {
+              ...(details ?? {}),
+              retryable: true,
+              driver_code: rawCode || null,
+            })
+            : err && rawCode
+              ? new BillingError(rawCode, err.message || message, err.details ?? details)
+              : new BillingError(code, message, details);
       wrapped.cause = err;
       throw wrapped;
     }
@@ -483,13 +513,45 @@ export class BillingService {
     });
     const tail = previous.then(() => current, () => current);
     this.#locks.set(key, tail);
-    await previous.catch(() => {}); // chờ lượt trước nhả khoá (kể cả khi lượt trước lỗi)
+    // F5 (phản biện R1, VỪA): khoá TUẦN TỰ HOÁ theo user trong bộ nhớ trước đây không timeout ⇒
+    // một thao tác ví treo làm mọi thao tác ví khác của CÙNG tiến trình đứng vĩnh viễn (đo được:
+    // 3 probe timeout 6s). Nay hết `config.billing.lockTimeoutMs` (mặc định 5000ms) ⇒
+    // `LEDGER_BUSY` kèm `retryable: true` — không bao giờ treo vô hạn.
+    const waitMs = this.#lockTimeoutMs();
+    let timer = null;
+    try {
+      await Promise.race([
+        previous.catch(() => {}), // chờ lượt trước nhả khoá (kể cả khi lượt trước lỗi)
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            reject(this.#asLedgerBusy(
+              Object.assign(new Error(`Chờ khoá ví của user quá ${waitMs}ms — thao tác khác đang giữ.`), { code: 'DB_LOCK_TIMEOUT' }),
+              0,
+            ));
+          }, waitMs);
+          timer.unref?.();
+        }),
+      ]);
+    } catch (err) {
+      release();
+      if (this.#locks.get(key) === tail) this.#locks.delete(key);
+      throw err;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
     try {
       return await fn();
     } finally {
       release();
       if (this.#locks.get(key) === tail) this.#locks.delete(key); // không để Map phình mãi
     }
+  }
+
+  /** F5 — trần chờ khoá ví/của user (ms): `config.billing.lockTimeoutMs`, mặc định 5000. */
+  #lockTimeoutMs() {
+    const raw = Number(this.config?.billing?.lockTimeoutMs);
+    if (Number.isFinite(raw) && raw > 0) return Math.min(60000, Math.trunc(raw));
+    return 5000;
   }
 
   /**
@@ -524,6 +586,29 @@ export class BillingService {
     });
   }
 
+  /**
+   * F4 (phản biện R1) — GHI SỔ TRONG SAVEPOINT khi đang ở trong transaction của khoá DB.
+   *
+   * Vì sao: trên PostgreSQL, INSERT vi phạm UNIQUE làm HỎNG cả transaction ⇒ câu SELECT phục hồi
+   * (`#findRunRow`/`#closingRowOfRun`) sau đó nổ `25P02` và mã thô lọt ra ngoài. Với SAVEPOINT,
+   * lỗi chỉ huỷ tới mốc, transaction vẫn dùng được ⇒ đường "đọc lại dòng đã có" chạy đúng và
+   * KHÔNG bao giờ trả `25P02` cho client.
+   *
+   * Không có `savepoint` (SQLite: `node:sqlite` không cần vì lỗi UNIQUE chỉ huỷ câu lệnh) ⇒ gọi thẳng.
+   */
+  async #appendInSavepoint(payload) {
+    const view = this.#currentTxView();
+    if (view && typeof view.savepoint === 'function') {
+      return view.savepoint('ledger_append', () => this.#append(payload));
+    }
+    return this.#append(payload);
+  }
+
+  /** View transaction ĐANG MỞ của ngữ cảnh async này (do `store.withLedgerLock` bơm vào callback). */
+  #currentTxView() {
+    return this.#txView ?? null;
+  }
+
   /** Lớp khoá DB (nếu R1-Q đã cung cấp) + retry có giới hạn khi driver báo bận. */
   async #runUnderDbLedgerLock(userId, fn) {
     const store = this.#requireStore();
@@ -540,7 +625,22 @@ export class BillingService {
       this.#warnLockFallback();
       retries = this.lockRetries;
     }
-    return this.#retryLedgerBusy(userId, () => (dbLock ? dbLock(fn) : fn()), retries);
+    return this.#retryLedgerBusy(
+      userId,
+      () => (dbLock
+        ? dbLock((tx) => {
+          // Ghi lại view transaction để `#appendInSavepoint` dùng được SAVEPOINT (F4).
+          const prev = this.#txView;
+          this.#txView = tx ?? null;
+          try {
+            return fn(tx);
+          } finally {
+            this.#txView = prev;
+          }
+        })
+        : fn()),
+      retries,
+    );
   }
 
   /**
@@ -554,10 +654,30 @@ export class BillingService {
    */
   async #retryLedgerBusy(userId, run, maxRetries = this.lockRetries) {
     const startedAt = Date.now();
+    // F4 (phản biện R1): transaction bị ABORT (`25P02`, hoặc `LEDGER_TX_ABORTED`) ⇒ mọi câu lệnh
+    // sau đó trong CÙNG transaction đều lỗi. Cách chữa ĐÚNG là chạy lại TOÀN BỘ section trong một
+    // transaction MỚI: lần chạy lại bắt đầu bằng bước ĐỌC sổ nên thấy ngay dòng mà tiến trình kia
+    // đã ghi (idempotent theo `(job_id, run_key)`), không ghi thêm — thay vì để mã thô `25P02`
+    // hoặc `LEDGER_BUSY` (cờ `retryable` cho một xung đột vĩnh viễn) lọt ra ngoài.
+    let abortRetries = 0;
+    const isAborted = (err) => {
+      const text = `${err?.code ?? ''} ${err?.details?.cause_code ?? ''} ${err?.details?.driver_code ?? ''} ${err?.message ?? ''}`;
+      return /25P02|current transaction is aborted|LEDGER_TX_ABORTED/i.test(text);
+    };
     for (let attempt = 0; ; attempt += 1) {
       try {
         return await run();
       } catch (err) {
+        if (isAborted(err) && abortRetries < LEDGER_TX_ABORT_RETRIES) {
+          abortRetries += 1;
+          this.logger?.warn?.('billing.ledger_tx_aborted_retry', {
+            user_id: userId,
+            attempt: abortRetries,
+            hint: 'transaction bị huỷ (unique violation) — chạy lại section trong transaction mới để ĐỌC LẠI dòng đã có',
+          });
+          await sleep(Math.max(1, this.lockRetryBaseMs));
+          continue;
+        }
         if (!isLedgerBusyError(err)) throw err;
         const outOfBudget = Date.now() - startedAt > LEDGER_LOCK_RETRY_BUDGET_MS;
         if (attempt >= maxRetries || outOfBudget) throw this.#asLedgerBusy(err, attempt);
@@ -985,7 +1105,7 @@ export class BillingService {
       const meta = { estimate: amount, operations: operationNames, run_key: targetRun };
       let row;
       try {
-        row = await this.#append({
+        row = await this.#appendInSavepoint({
           userId: uid,
           amount: -amount,
           reason: 'job_hold',
@@ -1116,7 +1236,7 @@ export class BillingService {
       // BR-11: LUÔN ghi nguồn chi phí ⇒ đọc sổ là biết "job không tốn gì" hay "không quy được usage".
       meta.usage_source = usageSource ?? (actual <= MONEY_EPSILON ? 'none' : 'request');
       try {
-        return await this.#append({ userId: uid, amount, reason: 'job_settle', jobId: jid, runKey: targetRun, meta, balanceBefore });
+        return await this.#appendInSavepoint({ userId: uid, amount, reason: 'job_settle', jobId: jid, runKey: targetRun, meta, balanceBefore });
       } catch (err) {
         // R1-B (§3) — thua cuộc đua với tiến trình khác (unique index `uniq_wallet_ledger_run_close`
         // cho phép ĐÚNG MỘT dòng đóng mỗi lượt): đọc lại, trả dòng đóng đã có, KHÔNG ghi thêm.
@@ -1176,7 +1296,7 @@ export class BillingService {
         } catch { /* không đọc được ⇒ bỏ qua, chỉ là tối ưu chống thu thừa */ }
       }
       try {
-        return await this.#append({
+        return await this.#appendInSavepoint({
           userId: uid,
           amount: remaining,
           reason: 'job_refund',

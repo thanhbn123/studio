@@ -41,13 +41,23 @@ function fakeDeps({ reconciled = 0, requeued = 0, reconcileError = null, requeue
 
 const CONFIG = { scheduler: { enabled: true, intervalMs: 60_000 }, billing: { stuckRunMs: 1234 }, queue: { staleMs: 5678 } };
 
+
+/** Phần ĐÓNG BĂNG của kết quả nhịp (§4). R1-F3 thêm `claimed`/`exhausted` — khẳng định riêng. */
+const hopLe = (out) => ({ reconciled: out.reconciled, requeued: out.requeued, errors: out.errors });
+
 describe('R1 · §4 — runOnce(): một nhịp tất định, gọi ĐÚNG hai hàm', () => {
   test('trả `{reconciled, requeued, errors}` và truyền đúng ngưỡng cấu hình cho từng bước', async () => {
     const { app, store, calls } = fakeDeps({ reconciled: 2, requeued: 3 });
     const scheduler = createScheduler({ app, store, config: CONFIG, logger: silent });
 
     const out = await scheduler.runOnce();
-    assert.deepEqual(out, { reconciled: 2, requeued: 3, errors: 0 });
+    // R1-F3 (vòng sửa phản biện): nhịp cron nay còn NHẶT VÀ CHẠY việc `queued` mồ côi ⇒ kết quả
+    // có thêm `claimed`/`exhausted`. Khẳng định phần ĐÓNG BĂNG cũ + phần mới.
+    assert.deepEqual(
+      { reconciled: out.reconciled, requeued: out.requeued, errors: out.errors },
+      { reconciled: 2, requeued: 3, errors: 0 },
+    );
+    assert.equal(out.claimed, 0, 'không có `app.queue.pumpQueued` ⇒ không nhặt thêm việc');
     assert.equal(calls.reconcile.length, 1, 'phải gọi `app.reconcileStuckRuns` đúng MỘT lần mỗi nhịp');
     assert.equal(calls.requeue.length, 1, 'phải gọi `store.requeueStaleJobs` đúng MỘT lần mỗi nhịp');
     assert.deepEqual(calls.reconcile[0], { olderThanMs: 1234 }, 'bước 1 dùng `config.billing.stuckRunMs`');
@@ -57,28 +67,31 @@ describe('R1 · §4 — runOnce(): một nhịp tất định, gọi ĐÚNG hai 
   test('thiếu CẢ HAI hàm ⇒ trả 0 và KHÔNG ném (app cũ vẫn boot được)', async () => {
     const scheduler = createScheduler({ app: {}, store: {}, config: CONFIG, logger: silent });
     const out = await scheduler.runOnce();
-    assert.deepEqual(out, { reconciled: 0, requeued: 0, errors: 0 });
+    assert.deepEqual(
+      { reconciled: out.reconciled, requeued: out.requeued, errors: out.errors },
+      { reconciled: 0, requeued: 0, errors: 0 },
+    );
     assert.deepEqual(scheduler.stats().last_result, out);
   });
 
   test('lỗi trong một bước ⇒ `errors` tăng + KHÔNG ném; bước còn lại vẫn chạy', async () => {
     const failing1 = fakeDeps({ requeued: 4, reconcileError: Object.assign(new Error('reconcile nổ'), { code: 'E1' }) });
     const s1 = createScheduler({ app: failing1.app, store: failing1.store, config: CONFIG, logger: silent });
-    assert.deepEqual(await s1.runOnce(), { reconciled: 0, requeued: 4, errors: 1 });
+    assert.deepEqual(hopLe(await s1.runOnce()), { reconciled: 0, requeued: 4, errors: 1 });
     assert.equal(failing1.calls.requeue.length, 1, 'bước 1 lỗi KHÔNG được chặn bước 2');
 
     const failing2 = fakeDeps({ reconciled: 5, requeueError: new Error('requeue nổ') });
     const s2 = createScheduler({ app: failing2.app, store: failing2.store, config: CONFIG, logger: silent });
-    assert.deepEqual(await s2.runOnce(), { reconciled: 5, requeued: 0, errors: 1 });
+    assert.deepEqual(hopLe(await s2.runOnce()), { reconciled: 5, requeued: 0, errors: 1 });
 
     // Lỗi ở CẢ HAI bước ⇒ errors = 2, vẫn không ném.
     const both = fakeDeps({ reconcileError: new Error('x'), requeueError: new Error('y') });
     const s3 = createScheduler({ app: both.app, store: both.store, config: CONFIG, logger: silent });
-    assert.deepEqual(await s3.runOnce(), { reconciled: 0, requeued: 0, errors: 2 });
+    assert.deepEqual(hopLe(await s3.runOnce()), { reconciled: 0, requeued: 0, errors: 2 });
     // Vòng lặp vẫn sống: nhịp sau (đã hết lỗi) chạy bình thường.
     both.app.reconcileStuckRuns = async () => ({ reconciled: 1 });
     both.store.requeueStaleJobs = async () => ({ requeued: 2 });
-    assert.deepEqual(await s3.runOnce(), { reconciled: 1, requeued: 2, errors: 0 });
+    assert.deepEqual(hopLe(await s3.runOnce()), { reconciled: 1, requeued: 2, errors: 0 });
   });
 
   test('stats() đếm `ticks`, `last_tick_at`, `last_result` sau mỗi nhịp', async () => {
@@ -95,7 +108,10 @@ describe('R1 · §4 — runOnce(): một nhịp tất định, gọi ĐÚNG hai 
     const one = scheduler.stats();
     assert.equal(one.ticks, 1);
     assert.ok(Number.isFinite(Date.parse(one.last_tick_at)), '`last_tick_at` phải là mốc ISO đọc được');
-    assert.deepEqual(one.last_result, { reconciled: 1, requeued: 1, errors: 0 });
+    assert.deepEqual(
+      { reconciled: one.last_result.reconciled, requeued: one.last_result.requeued, errors: one.last_result.errors },
+      { reconciled: 1, requeued: 1, errors: 0 },
+    );
 
     await scheduler.runOnce();
     const two = scheduler.stats();
@@ -175,7 +191,7 @@ describe('R1 · §4 — start()/stop(): không tick ngay, tắt sạch, không g
     assert.equal(scheduler.stats().running, false);
 
     // `enabled` chỉ chặn VÒNG LẶP; gọi tay `runOnce()` vẫn là một nhịp thật (test/vận hành).
-    assert.deepEqual(await scheduler.runOnce(), { reconciled: 1, requeued: 0, errors: 0 });
+    assert.deepEqual(hopLe(await scheduler.runOnce()), { reconciled: 1, requeued: 0, errors: 0 });
     assert.equal(scheduler.stats().ticks, 1);
   });
 });
@@ -189,7 +205,7 @@ describe('R1 · §4 — nhịp cron trên APP THẬT + /api/health', () => {
       assert.equal(typeof ctx.store.requeueStaleJobs, 'function', 'store thật phải có `requeueStaleJobs` (§4 bước 2)');
 
       const out = await scheduler.runOnce();
-      assert.deepEqual(out, { reconciled: 0, requeued: 0, errors: 0 }, 'DB sạch ⇒ nhịp không có việc, không lỗi');
+      assert.deepEqual({ reconciled: out.reconciled, requeued: out.requeued, errors: out.errors }, { reconciled: 0, requeued: 0, errors: 0 }, 'DB sạch ⇒ nhịp không có việc, không lỗi');
       // Mục hàng đợi `running` chết ⇒ nhịp cron THẬT phải thu hồi được.
       const old = new Date(Date.now() - 3600_000).toISOString();
       await ctx.store.enqueueJob({ id: 'q-chet', jobId: 'j-chet', handler: 'run' });
@@ -197,7 +213,12 @@ describe('R1 · §4 — nhịp cron trên APP THẬT + /api/health', () => {
       const again = await scheduler.runOnce();
       assert.equal(again.requeued, 1, 'cron phải trả mục `running` chết về hàng đợi');
       assert.equal(again.errors, 0);
-      assert.equal((await ctx.store.getQueueItemById('q-chet')).status, 'queued');
+      // R1-F3 (vòng sửa phản biện): nhịp cron KHÔNG chỉ đổi trạng thái — nó còn NHẶT VÀ CHẠY mục
+      // vừa thu hồi (`queue.pumpQueued`), nên trạng thái cuối là `running` (đang chạy) hoặc `done`,
+      // KHÔNG còn nằm im ở `queued` như trước.
+      assert.ok(again.claimed >= 1, `cron phải NHẶT mục vừa thu hồi để chạy, nhận claimed=${again.claimed}`);
+      const after = (await ctx.store.getQueueItemById('q-chet')).status;
+      assert.ok(['running', 'done'].includes(after), `mục phải được nhặt/chạy (không nằm im ở queued), nhận ${after}`);
       await ctx.store.driver.run("UPDATE job_queue SET status='done', locked_at=NULL WHERE id='q-chet'");
     } finally {
       await ctx.close();
@@ -210,6 +231,8 @@ describe('R1 · §4 — nhịp cron trên APP THẬT + /api/health', () => {
       // (a) Chưa gắn scheduler (test dựng router trực tiếp) ⇒ khối vẫn phải có, số 0, không ném.
       const bare = await j(await fetch(`${ctx.base}/api/health`));
       assert.deepEqual(Object.keys(bare.scheduler).sort(), ['enabled', 'last_result', 'last_tick_at', 'running', 'ticks']);
+      // (R1-F3 giữ nguyên 5 khoá của khối; nội dung `last_result` có thêm claimed/exhausted —
+      // khẳng định ở dưới.)
       assert.equal(bare.scheduler.enabled, ctx.config.scheduler.enabled !== false);
       assert.equal(bare.scheduler.running, false);
       assert.equal(bare.scheduler.ticks, 0);
@@ -230,7 +253,8 @@ describe('R1 · §4 — nhịp cron trên APP THẬT + /api/health', () => {
       assert.equal(body.scheduler.running, true, 'scheduler đã start() ⇒ health phải nói đang chạy');
       assert.equal(body.scheduler.ticks, 1);
       assert.ok(Number.isFinite(Date.parse(body.scheduler.last_tick_at)));
-      assert.deepEqual(Object.keys(body.scheduler.last_result).sort(), ['errors', 'reconciled', 'requeued']);
+      // R1-F3: kết quả nhịp có thêm `claimed`/`exhausted` (nhặt việc mồ côi) — vẫn là số.
+      assert.deepEqual(Object.keys(body.scheduler.last_result).sort(), ['claimed', 'errors', 'exhausted', 'reconciled', 'requeued']);
       for (const value of Object.values(body.scheduler.last_result)) assert.equal(typeof value, 'number');
 
       // Field CŨ phải còn nguyên (hợp đồng §4: CHỈ thêm khối `scheduler`).

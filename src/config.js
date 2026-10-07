@@ -239,6 +239,9 @@ export function loadConfig(env = process.env) {
       // Credit tặng khi đăng ký. Kẹp >= 0: số âm là "thu tiền lúc đăng ký" — vô nghĩa.
       defaultGrant: Math.max(0, toNum(env.BILLING_DEFAULT_GRANT, 0)),
       holdBeforeJob: toBool(env.BILLING_HOLD_BEFORE_JOB, true),
+      // F5 (R1 vòng sửa phản biện): trần CHỜ KHOÁ ví (ms) — khoá theo user ở tầng DB VÀ khoá tuần
+      // tự hoá trong bộ nhớ của tiến trình; hết hạn ⇒ `LEDGER_BUSY` kèm `retryable: true`.
+      lockTimeoutMs: Math.max(100, toInt(env.BILLING_LOCK_TIMEOUT_MS, 5000)),
       // PB-02 (vòng 2): trần số LƯỢT CHẠY có tính tiền cho mỗi job (chạy lần đầu + mọi lượt
       // chạy lại). Vượt ⇒ `RERUN_LIMIT_EXCEEDED` (HTTP 429). Kẹp >= 1: 0 sẽ khoá luôn lượt đầu.
       maxRunsPerJob: Math.max(1, toInt(env.BILLING_MAX_RUNS_PER_JOB, 10)),
@@ -273,18 +276,23 @@ export function loadConfig(env = process.env) {
       // Mục `running` CŨ HƠN ngưỡng này (ms) ⇒ coi như tiến trình giữ nó đã chết ⇒ trả về `queued`.
       // Mặc định 600000 (10 phút): dài hơn một job bình thường để không chạy đúp.
       staleMs: Math.max(0, toInt(env.QUEUE_STALE_MS, 10 * 60 * 1000)),
+      // F5: trần CHỜ KHOÁ của hàng đợi (ms) — dùng cho mutex transaction trong tiến trình; hết hạn
+      // ⇒ `QUEUE_BUSY` kèm `retryable: true`, không bao giờ treo vô hạn.
+      lockTimeoutMs: Math.max(100, toInt(env.QUEUE_LOCK_TIMEOUT_MS, 5000)),
+      // F3: nhịp NHẶT VIỆC định kỳ (ms) — tiến trình đang sống tự cứu việc của tiến trình đã chết.
+      pollMs: Math.max(200, toInt(env.QUEUE_POLL_MS, 1000)),
       // Số lần thử tối đa cho một mục hàng đợi (kẹp >= 1: 0 sẽ không bao giờ chạy).
       maxAttempts: Math.max(1, toInt(env.QUEUE_MAX_ATTEMPTS, 3)),
       // Backoff cơ sở: lần thử thứ n chờ `retryBaseMs * n` (mặc định 2000ms).
       retryBaseMs: Math.max(0, toInt(env.QUEUE_RETRY_BASE_MS, 2000)),
-    },
+},
 
     scheduler: {
       // true (mặc định) = cron dọn dẹp chạy cùng server; false = không tạo timer nào.
       enabled: toBool(env.SCHEDULER_ENABLED, true),
       // Nhịp cron (ms). Mặc định 60000 (1 phút). Kẹp >= 1 để `0` không thành vòng lặp nóng.
       intervalMs: Math.max(1, toInt(env.SCHEDULER_INTERVAL_MS, 60_000)),
-    },
+},
   };
 
   if (!AI_PROVIDERS.includes(cfg.vision.provider)) {
