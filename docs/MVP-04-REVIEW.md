@@ -479,3 +479,53 @@ Hai họ biến thể của vòng 3 **đã kín thật** (Hy Lạp/Cyrillic, s�
 ## D5. Muốn PASS thì cần gì (điều kiện đo được, không phải ý kiến)
 
 (1) `{text:{label:…}}` **không** vẽ `[object Object]` (422 hoặc bỏ + cảnh báo) và `texts=[[str]]` bị bỏ **có cảnh báo**; (2) `encode.playback_ms` là **số** khớp `Σ delay` GIF; (3) `"Also mot chiec ao"` và `"Suy tin hieu camera"` đều **202 + được vẽ**, còn `"Miễn phí vận chuyển"` vẫn **422**; (4) 17 ca ở D2 **không ca nào** được vẽ (422 hoặc `failed` + 0 px). Khi đó PASS sẽ nghĩa là: chữ khẳng định/số liệu thiếu bằng chứng không được vẽ với mọi cách viết thường gặp **và** chữ lành vẫn vẽ được; video 30s ở 3 preset mở được bằng 4 bộ giải mã độc lập; cảnh báo alpha/`fit_box`/thứ tự cảnh khớp pixel; tiền/IDOR/ảnh gốc bất biến đúng; 929 test xanh. PASS **KHÔNG** nghĩa là: có tiếng · MP4/ffmpeg đã đo · màu đã kiểm ngoài GIF 256 màu · UI đã kiểm trên trình duyệt thật · nhịp phát khớp tuyệt đối · bằng chứng khách quan (vẫn là dữ liệu người dùng tự lưu) · hàng rào từ khoá kín tuyệt đối trước mọi cách viết sáng tạo.
+
+---
+
+# VÒNG 5 — xác nhận chốt tại commit `82e2fb8`
+
+**PHÁN QUYẾT CUỐI: PASS CÓ ĐIỀU KIỆN** (1 điều kiện duy nhất: **N3 chưa kín** — lời khai "đã vá N3" đo ra **không đúng**).
+
+Toàn bộ 4 điều kiện của vòng 4 **đã đạt, trừ N3**: (1) 17 ca vòng 4 + 9 biến thể mới + 2 ca cụm bị tách ⇒ **27/27 bị chặn**, **0 ca lọt**; (2) **N2 đã vá thật** — `playback_ms/requested_ms/delay_drift_ms` là số và **khớp `Σ delay` của GIF**; (3) **hết chặn oan** — 18 câu lành (kể cả `"Also mot chiec ao"`, `"Suy tin hieu camera"`, cụm ghép nhiều mục) đều **202 + được vẽ**, còn `"Miễn phí vận chuyển"` / `"Sản phẩm số 1 Việt Nam"` vẫn **422**. Riêng **(4) N3**: `{text:{label:…}}` **vẫn vẽ `[object Object]` 17.400 px** và `texts=[[str]]` vẫn bị bỏ **im lặng** ⇒ còn 1 điều kiện.
+
+- Commit `82e2fb8` · người chấm **độc lập**, **không sửa mã nguồn/`test/**`**; `git status --short` cuối phiên: chỉ `docs/MVP-04-REVIEW.md`.
+- Script vòng 5: `/tmp/mvp04-atk6/**` (`attack5.mjs`, `fp5.mjs`, `long30.mjs` + decoder Python độc lập `gifmask.py`/`gifmask2.py`/`gifdec2.py` + vân tay mực `ink.mjs`).
+- Tự chạy lại rig vòng 2: `{"total":98,"http_422":74,"late_fail_202":[],"leaks":[]}`, đối chứng `benign` 202 + 12.288 px, `notext` 0 px — **khớp** lời khai của người điều phối.
+
+## E1. Bảng N1/N2/N3 + F1…F10 (chốt)
+
+| # | Trạng thái vòng 5 | Bằng chứng (1 dòng) |
+|---|---|---|
+| **N1** | **ĐÃ KÍN** | `node attack5.mjs` → `{"attacks":27,"attacks_blocked":27,"LEAKS":[],"benign":7,"benign_ok":7,"FALSE_POSITIVES":[],"must_block_all":true}`: 16 chuỗi vòng 4 (`miễn-phí`, `miễn.phí`, `miễn/phí`, `miễn_phí`, `miễn•phí`, `miễn(phí)`, `miễn…phí`, `miễn–phí`, `miễn - phí`, `khuyến-mãi`, `nguyên-seal`, `miễnphí`, `Mıễn phí`, `miễn phı`, `khuyến mãı`, `giɑ re nhat`) + 9 mới (`MIỄN–PHÍ…`, `khuyến••mãi`, `giá rẻ–nhất`, `nguyên…seal`, `ɡia re nhat`, `hàng.đầu…`, `freeship!`, `ｍｉễｎ－ｐｈí`, `miễn‥phí`) + cụm tách 3 mục + tách qua **2 CẢNH** ⇒ **422 hết, 0 pixel chữ** |
+| **N2** | **ĐÃ VÁ THẬT** | `node attack5.mjs` → `{"test":"N2","playback_ms":960,"requested_ms":996,"delay_drift_ms":3,"gif_delay_sum_ms":960,"gif_frames":12,"khop":true,"last_run_playback":960}`; `node long30.mjs` → video 30s: `encode_playback_ms 28800` = `Σ delay` GIF **28800** (360 khung), `requested_ms 29880`, `drift 3` |
+| **N3** | **CHƯA VÁ (lời khai sai)** | `{text:{label:"nguyen seal"}}` ⇒ 202 + `succeeded` + **vẽ `[object Object]` 17.400 px** (vân tay mực khớp `"[object Object]"@10`); nguyên nhân: `sanitizeText({label:…})` = `"[object Object]"` **ở route** (đo trực tiếp) nên tới `plan/texts.js` nó đã là chuỗi hợp lệ. `texts=[[str]]` / `[[[str]]]` ⇒ 202 + 0 px + **không cảnh báo chữ** (`text_warnings: []`) |
+| **Chặn oan** | **HẾT** | 18/18 câu lành ⇒ 202 **và được vẽ** (`Suy tin hieu camera` 9.702 px · `Also mot chiec ao` qua · `Chat lieu vai cao cap` · `Duy tri do ben…` · `Tui xach da bo, khoa keo` · cụm ghép `"Ao thun"|"nam cotton"`, `"Chat lieu"|"vai cao cap"`, `"Suy"|"tin hieu camera"` …); 3 câu khẳng định (`Miễn phí vận chuyển`, `Sản phẩm số 1 Việt Nam`, `Bảo hành 12 tháng`) ⇒ **422** |
+| **F1** | ĐÃ VÁ | 19/19 từ khoá gốc + không dấu/Cyrillic/full-width/HOA/ký tự vô hình ⇒ 422 |
+| **F2** | ĐÃ VÁ (kiểm lại) | `node long30.mjs`: 30s 16:9 ⇒ 202/`succeeded`/**360 khung**/`pixels_total 331.776.000`/592.599 B; `file`=GIF89a + `magick` 360 khung + decoder Python OK; `playback_ms 28800` |
+| **F3** | ĐÃ VÁ (giữ) | cảnh báo alpha `120000/120000` + khung 0 đúng màu nền (tầng `frames.js` không đổi ở vòng 4–5) |
+| **F4** | ĐÃ VÁ theo thoả thuận | `evidence_used.sources:["product_name"]` + `chars` |
+| **F5** | ĐÃ VÁ (giữ) | 8×8/64×64/256×256 ⇒ `inspectGif.valid=true` + decoder nghiêm ngặt chấp nhận |
+| **F6** | **ĐÃ VÁ** (= N2) | nhịp phát thật là **số máy đọc được** và khớp `Σ delay` GIF (cả ca 1s lẫn 30s) |
+| **F7** | ĐÃ VÁ | 15/17 dạng field ⇒ 422; đệ quy `{text:['…']}` ⇒ 422; 0 ca `202 → failed` |
+| **F8** | ĐÃ VÁ | chữ 800 ký tự ⇒ vẽ 500, `plan_summary` 500 |
+| **F9** | ĐÃ VÁ | job `failed` ⇒ `data.warnings` có câu không-tiếng |
+| **F10** | ĐÃ VÁ (giữ) | `fit_box={359,140,1,1000}` = bbox vẽ thật |
+| **Thứ tự cảnh** | ĐÃ VÁ (giữ) | cùng mili-giây + gửi ngược ⇒ plan + màu tâm khung đúng thứ tự gửi |
+
+**Hồi quy tự đo**: `npm test` → **929 · 928 pass · 0 fail · 1 skipped**, EXIT=0; `node tools/verify.mjs` → **929 · 928 · 0 · 1**, EXIT=0; ảnh gốc **bất biến** (`sha_before = sha_after = db_sha = 0fd335ccb14ef8b8…`); 402 `INSUFFICIENT_CREDIT` với `jobs_created=0`; **thu theo lượt** (`#1` → `#2`, ledger 4,999 → 4,998).
+
+## E2. Lỗ hổng mới (vòng 5)
+
+**Không tìm được lỗ hổng vẽ chữ bịa mới.** Hai rủi ro MỚI do bản vá (khớp "bỏ dấu câu" + nối mọi đoạn chữ) đã được thử riêng và **đều không xảy ra**: `fp5.mjs` → 11/11 câu lành (kể cả các cặp mục ghép có thể vô tình tạo cụm) **qua + được vẽ**, 0 chặn oan. Điều còn lại chỉ là **N3** (rác `[object Object]` + bỏ im lặng) — MINOR, không phải chữ bịa, nhưng **là điều kiện**.
+
+**Gợi ý vá N3 (1 chỗ)**: trong `sanitizeVideostudioTextItem` (`src/http/routes.js`), chỉ nhận `string`/`number` cho `item.text|content|label|value` (giống `readTextValue` mới) và **bỏ kèm cảnh báo** khi gặp object/mảng lồng — chặn `String(object)` ngay tại nguồn; đồng thời ghi cảnh báo khi `texts[i]` là mảng (thay vì bỏ im lặng).
+
+## E3. Chưa kiểm được (vòng 5)
+
+1. **Tiếng**: không có TTS/ffmpeg ⇒ chỉ đọc `audio: null` + cảnh báo. 2. **MP4/ffmpeg**: chưa chạy được. 3. **GIF 256 màu**: mọi phép đo pixel là trên GIF đã lượng tử hoá. 4. **UI trình duyệt thật**: chưa mở Chrome/Safari. 5. **Nhịp phát trên thiết bị**: chỉ đo `Σ delay` GIF (khớp `playback_ms`, vẫn −4% so với `duration_ms` do GIF làm tròn 10ms). 6. **Postgres** (toàn bộ chạy SQLite in-memory) và **nhiều job 30s song song** (chỉ chạy tuần tự). 7. **Bằng chứng "vòng"**: người dùng vẫn tự khai `product_name`/ghi chú rồi lấy đó làm bằng chứng (đã ghi trong hợp đồng, `evidence_used.sources` nói ra nguồn).
+
+## E4. PASS CÓ ĐIỀU KIỆN nghĩa là gì — và KHÔNG nghĩa là gì
+
+**Nghĩa là**: với 5 vòng tấn công (≈ 200 ca HTTP, mọi ca "lọt" đều đo pixel + khớp vân tay mực), **không còn cách viết nào đo được** khiến chữ khẳng định/số liệu thiếu bằng chứng được vẽ lên video — kể cả không dấu, homoglyph Hy Lạp/Cyrillic/Latin, full-width, ký tự vô hình, dấu câu chen giữa từ, dính chữ, số `\p{No}`/`\p{Nl}`/`№`, hay cụm bị tách sang nhiều mục/nhiều cảnh; **chữ lành vẫn 202 + được vẽ** (18/18), câu khẳng định vẫn bị chặn (3/3). Video 30s ở cả 3 preset tạo được và mở được bằng 4 bộ giải mã độc lập; cảnh báo alpha/`fit_box`/thứ tự cảnh khớp pixel thật; nhịp phát thật là số máy đọc được khớp `Σ delay`; tiền/IDOR/ảnh gốc bất biến đúng; 929 test xanh. **Điều kiện kèm theo**: sửa N3 (E2) để hết `[object Object]` và hết bỏ chữ im lặng.
+
+**KHÔNG nghĩa là**: (a) hàng rào chống bịa là **kín tuyệt đối** — đây vẫn là danh sách từ khoá + luật số; một cách viết hoàn toàn mới (hoặc ngôn ngữ khác, hoặc chia nhỏ hơn nữa) vẫn có thể lọt và tôi chưa nghĩ ra; (b) video có tiếng — bản offline là GIF **không tiếng**, mọi kết quả mang `audio: null`; (c) MP4/ffmpeg đã đo; (d) chất lượng màu đã kiểm ngoài GIF 256 màu; (e) UI đã kiểm trên trình duyệt thật; (f) nhịp phát khớp tuyệt đối — vẫn lệch ~4% vì GIF chỉ ghi delay bội số 10ms (nay đã hiện thành số, không còn giấu); (g) bằng chứng là "khách quan" — bằng chứng = **dữ liệu người dùng đã lưu**, nên người dùng vẫn có thể tự khai rồi tự vẽ (đã ghi trong hợp đồng, có `evidence_used.sources` để truy vết).

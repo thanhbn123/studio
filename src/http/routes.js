@@ -4303,14 +4303,23 @@ function sanitizeVideostudioOptions(raw) {
 }
 
 /** Một mục chữ (`string` | `{ text, … }`) → giá trị đã làm sạch, `null` nếu không có gì để vẽ. */
-function sanitizeVideostudioTextItem(item) {
+function sanitizeVideostudioTextItem(item, onDrop) {
   if (typeof item === 'string' || typeof item === 'number') {
     return sanitizeText(item, { maxLength: VIDEOSTUDIO_TEXT_MAX }) || null;
   }
-  if (!isPlainObject(item)) return null;
+  if (!isPlainObject(item)) {
+    // N3 (phản biện vòng 5): mục là MẢNG LỒNG (`[[str]]`) hoặc rác ⇒ trước đây bị bỏ IM LẶNG.
+    onDrop?.(Array.isArray(item) ? 'TEXT_ITEM_IS_ARRAY' : 'TEXT_ITEM_NOT_OBJECT');
+    return null;
+  }
   const entry = {};
-  const text = sanitizeText(item.text, { maxLength: VIDEOSTUDIO_TEXT_MAX });
+  // `text` chỉ nhận chuỗi/số. Object lồng (vd `{text:{label:'…'}}`) trước đây bị `sanitizeText`
+  // biến thành "[object Object]" và VẼ LÊN VIDEO (17.400 px) — nay bỏ + cảnh báo.
+  const text = typeof item.text === 'string' || typeof item.text === 'number'
+    ? sanitizeText(item.text, { maxLength: VIDEOSTUDIO_TEXT_MAX })
+    : '';
   if (text) entry.text = text;
+  else if (item.text !== undefined && item.text !== null) onDrop?.('TEXT_ITEM_NESTED_OBJECT');
   for (const [key, value] of Object.entries(item).slice(0, 24)) {
     if (key === 'text' || DANGEROUS_KEYS.has(key)) continue;
     const name = sanitizeText(key, { maxLength: 32 });
@@ -4331,7 +4340,7 @@ function sanitizeVideostudioTextItem(item) {
 function sanitizeVideostudioTextField(value) {
   if (value === undefined || value === null) return undefined;
   const list = (Array.isArray(value) ? value : [value]).slice(0, VIDEOSTUDIO_MAX_TEXTS);
-  const out = list.map(sanitizeVideostudioTextItem).filter((item) => item !== null);
+  const out = list.map((item) => sanitizeVideostudioTextItem(item)).filter((item) => item !== null);
   if (out.length === 0) return undefined;
   return Array.isArray(value) ? out : out[0];
 }
@@ -4388,7 +4397,21 @@ function sanitizeVideostudioTexts(raw) {
   if (raw.length > VIDEOSTUDIO_MAX_TEXTS) {
     throw new HttpError(413, 'TOO_MANY_TEXTS', `Quá nhiều đoạn chữ trong một yêu cầu (tối đa ${VIDEOSTUDIO_MAX_TEXTS}).`);
   }
-  return raw.map(sanitizeVideostudioTextItem).filter((item) => item !== null);
+  const dropped = [];
+  const out = raw
+    .map((item) => sanitizeVideostudioTextItem(item, (reason) => dropped.push(reason)))
+    .filter((item) => item !== null);
+  if (dropped.length > 0) {
+    // N3 (phản biện vòng 5): trước đây mục chữ hỏng bị bỏ IM LẶNG (`[[str]]` ⇒ video không có chữ,
+    // không một cảnh báo). Nay nói thẳng bằng mã lỗi để người dùng biết mình gửi sai dạng.
+    throw HttpError.safe(
+      400,
+      'BAD_TEXT_SHAPE',
+      'Dữ liệu chữ không hợp lệ: mỗi mục phải là chuỗi, số, hoặc object có `text`/`content`/`label`/`value` là chuỗi/số (không nhận mảng lồng hay object lồng).',
+      { dropped_count: dropped.length, reasons: [...new Set(dropped)] },
+    );
+  }
+  return out;
 }
 
 /**
