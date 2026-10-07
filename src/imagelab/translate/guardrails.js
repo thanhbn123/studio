@@ -95,6 +95,8 @@ const HOMOGLYPH_MAP = new Map(
     // Lưu ý: NFKC chạy TRƯỚC khi gộp nên ϲ (U+03F2) đã thành ς (U+03C2) và Ϲ (U+03F9) thành Σ
     // (U+03A3) — vì vậy phải map cả các dạng SAU chuẩn hoá, không chỉ dạng gõ vào.
     ϲ: 'c', Ϲ: 'C', ς: 'c', Σ: 'C', σ: 'c', ɡ: 'g', ѡ: 'w', ⅰ: 'i', ⅼ: 'l',
+    // MVP-04 vòng 3: bổ sung Hy Lạp hay bị dùng để nguỵ trang từ khoá tiếng Việt
+    ν: 'v', Ν: 'N', α: 'a', Α: 'A', ε: 'e', Ε: 'E', ι: 'i', Ι: 'I', κ: 'k', Κ: 'K', μ: 'm', Μ: 'M',
   }),
 );
 

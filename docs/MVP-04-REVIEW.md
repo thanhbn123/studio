@@ -330,3 +330,87 @@ Tổng: **22 ca LỌT có bằng chứng pixel** trong bộ 98 ca ở `/jobs` (1
 ## B5. Nếu N1 được vá thì "PASS" sẽ nghĩa là gì
 
 PASS sẽ **chỉ** có nghĩa: (a) mọi biến thể trong danh sách từ khoá — kể cả viết không dấu/homoglyph/full-width/xuống dòng — không được vẽ khi thiếu bằng chứng; (b) video 30s ở cả 3 preset tạo được và mở được bằng 4 bộ giải mã độc lập; (c) cảnh báo alpha/fit_box/thứ tự cảnh khớp pixel thật; (d) 929 test xanh. PASS **KHÔNG** có nghĩa: video có tiếng, MP4/ffmpeg đã đo, chất lượng màu đã kiểm ngoài GIF 256 màu, UI đã kiểm trên trình duyệt thật, nhịp phát thật khớp tuyệt đối (vẫn lệch ~4% do GIF làm tròn delay 10ms), hay hàng rào chống bịa là "kín tuyệt đối" trước mọi cách viết sáng tạo khác.
+
+---
+
+# VÒNG 3 — xác nhận tại commit `0809931`
+
+**PHÁN QUYẾT CUỐI: PASS CÓ ĐIỀU KIỆN.**
+
+N1 (lỗ hổng CRITICAL của vòng 2 — chữ khẳng định **viết không dấu / homoglyph / full-width / xuống dòng vẫn được VẼ**) **đã KÍN thật** với mọi cách viết thường gặp: rig vòng 2 chạy lại trên commit mới cho `leaks: []` (98 ca, 74 × 422, 0 ca `202 → failed`), 24 ca tấn công mới đều bị chặn hoặc không vẽ pixel nào, `/generate` 11/12 × 422 + 0 chữ bịa được vẽ, đối chứng dương vẫn 202 + vẽ đúng. **Nhưng** vẫn còn **2 họ biến thể ĐỐI KHÁNG** vẽ được chữ bịa (6 ca đo bằng pixel + vân tay mực) và **2 điểm chưa kín khác** (N3 im lặng, N2 trường máy đọc `null`) ⇒ **có điều kiện**, không phải PASS sạch.
+
+- Commit `0809931` (nhánh `feat/mvp04-videostudio`) · người chấm **độc lập**, **không sửa mã nguồn/`test/**`**; `git status --short` cuối phiên: chỉ `docs/MVP-04-REVIEW.md`.
+- Script vòng 3: `/tmp/mvp04-atk4/**` (dùng lại decoder độc lập `gifdec2.py` + rig `/tmp/mvp04-atk3/**`). Mọi ca "lọt" đều được **đo pixel khung 0 bằng decoder Python tự viết** và **khớp vân tay mực** (`ink.mjs`) để biết CHÍNH XÁC chuỗi nào đã được vẽ.
+- Bản vá tự kiểm: `fallbackViolations` nay `deaccent(normalizeForMatch(...))` cho **cả** câu chữ **và** bằng chứng (`pipeline.js:368-380`); bộ gom chữ của preflight **đệ quy** mọi mảng/object lồng (`routes.js` — `videostudioTextValueOf`).
+
+## C1. Bảng N1…N4 + F1…F10 (trạng thái cuối)
+
+| # | Trạng thái vòng 3 | Bằng chứng (1 dòng) |
+|---|---|---|
+| **N1** | **ĐÃ KÍN phần chính — CÒN 2 HỌ BIẾN THỂ ĐỐI KHÁNG (⇒ điều kiện 1 & 2)** | `node claims-rig.mjs` → `{"total":98,"http_422":74,"late_fail_202":[],"leaks":[]}`, đối chứng `benign` 202 + 12.288 px, `notext` 0 px; `node attack3.mjs` → 24 ca: 14 × 422 + 8 ca 0 px + 1 × 400 + **2 ca vẽ chữ bịa**; `node generate-endpoint.mjs` → 11/12 × 422, `drawn_claim: []`, đối chứng lành 202 + 12.288 px |
+| **N2** | **CHƯA VÁ** | `node f6-idor.mjs` → `encode.playback_ms = requested_ms = delay_drift_ms = null`; con số thật chỉ nằm trong chuỗi cảnh báo `"Nhịp phát THẬT của GIF là 0.96s (khai báo 1.00s; lệch -0.04s)"` |
+| **N3** | **VÁ MỘT NỬA** | Đã 422: `texts=[{text:["khuyen mai soc"]}]`, `scene.texts=[{text:["uy tin"]}]`; **vẫn im lặng**: `texts=[["mien phi van chuyen"]]` và `[[["gia re nhat"]]]` ⇒ 202 + `succeeded` + **0 px + 0 text + 0 cảnh báo** (sanitize bỏ mảng trước preflight). Thêm: `{text:{label:"nguyen seal"}}` ⇒ 202 + vẽ **"[object Object]" 17.400 px** (cảnh báo của repo ghi đúng chuỗi đó) |
+| **N4** | **ĐẠT** (kẹp + cảnh báo là hợp lý) | `node n3n4.mjs`: yêu cầu 40s ⇒ 202, `succeeded`, `plan.duration_ms = 30000`, cảnh báo nguyên văn *"Tổng thời lượng yêu cầu 40000ms vượt trần 30000ms … đã cắt 10000ms"*; GIF **360 khung 1280×720** hợp lệ, `playback 28.800ms`, không còn `VIDEO_GIF_INVALID` sai. §2.1 chỉ buộc "tổng ≤ trần preset" ⇒ kẹp + cảnh báo là **đúng hợp đồng**; muốn "chặn bằng mã" thì phải sửa hợp đồng trước |
+| **F1** | ĐÃ VÁ (như vòng 2) + N1 nay kín phần thường gặp | 19/19 từ khoá gốc ⇒ 422; không dấu (`mien phi`), Cyrillic, full-width, tab/CRLF/nhiều dòng/ZWJ/U+2060/BOM/NBSP, HOA, `１９９`, `①②③` ⇒ **đều 422** |
+| **F2** | ĐÃ VÁ (kiểm lại) | `node recheck.mjs`: 30s 16:9 ⇒ 202/`succeeded`/360 khung/`pixels_total 331.776.000`/592.599 B/`playback 28.800ms`; `file`+`sips`+`magick` 360 khung + hash luồng RGB `efbd382e65448b7a` (trùng vòng 2) |
+| **F3** | ĐÃ VÁ (kiểm lại) | `recheck.mjs`: PNG trong suốt toàn phần ⇒ cảnh báo `120000/120000 … LÀM PHẲNG lên màu nền #00FF00`, khung 0 = **810.000 px đúng `[0,255,0]`** |
+| **F4** | ĐÃ VÁ theo thoả thuận | `evidence_used.sources:["product_name"]` + `chars` (vòng bằng chứng vẫn mở đúng như hợp đồng, nay khai rõ nguồn) |
+| **F5** | ĐÃ VÁ (kiểm lại) | `recheck.mjs`: khung 8×8 (67 B) · 64×64 (129 B) · 256×256 (411 B) ⇒ `inspectGif.valid=true` + decoder Python nghiêm ngặt chấp nhận |
+| **F6** | VÁ MỘT NỬA (= N2) | Cảnh báo nhịp phát thật ĐÚNG và có mặt ở mọi đường; trường máy đọc vẫn `null` |
+| **F7** | ĐÃ VÁ (như vòng 2 + mạnh hơn) | 15/17 dạng field ⇒ 422; thêm đệ quy: `{text:['…']}`, mảng lồng trong object ⇒ 422; `0` ca `202 → failed` |
+| **F8** | ĐÃ VÁ | chữ 800 ký tự ⇒ vẽ 500, `plan_summary` cũng 500 |
+| **F9** | ĐÃ VÁ | job `failed` ⇒ `data.warnings` 4 câu (có câu không-tiếng) |
+| **F10** | ĐÃ VÁ (kiểm lại) | `recheck.mjs`: `fit_box={359,140,1,1000}` = **bbox vẽ thật `[359,140,1,1000]`** |
+| **Thứ tự cảnh** | ĐÃ VÁ (kiểm lại) | `node tt-order.mjs`: 3 ảnh lưu cùng/khác mili-giây (2 ảnh trùng `…02.618Z`), gửi NGƯỢC ⇒ `plan_order_matches_sent=true` và **màu tâm khung** `[[0,0,255],[0,255,0],[255,0,0]]` = đúng thứ tự gửi |
+
+**Hồi quy tự đo**: `npm test` → **929 · 928 pass · 0 fail · 1 skipped**, EXIT=0; `node tools/verify.mjs` → **929 · 928 · 0 · 1**, EXIT=0; ảnh gốc **bất biến** (`sha_before = sha_after = db_sha = 0fd335ccb14ef8b8…`); 402 `INSUFFICIENT_CREDIT` với `jobs_created=0`; usage theo bước (`VIDEO_RENDER:0.0006` + `VIDEO_ENCODE:0.0004`); **thu theo lượt** (`#1` → `#2`, ledger 4,999 → 4,998); IDOR: job/GIF/ảnh gốc ⇒ **404** cho phiên khác, chủ sở hữu 200 (`image/png 219B`, `image/gif 6.555B`).
+
+## C2. Lỗ hổng CÒN LẠI (2 họ, 6 ca đo được) — điều kiện để PASS sạch
+
+**Họ 1 — homoglyph GREEK chưa nằm trong bảng gộp** (Cyrillic đã kín; Greek thì chưa):
+
+```
+{"label":"Greek ο","text":"miễn phοí","http":202,"job":"succeeded","white":24064,"ink":"\"miễn phοí\"@16"}
+{"label":"Greek μ","text":"μιễn phí","http":202,"job":"succeeded","white":22680,"ink":"\"μιễn phí\"@18"}
+{"label":"Greek ν","text":"giảm ν giá","http":202,"job":"succeeded","white":22050,"ink":"\"giảm ν giá\"@15"}
+```
+(`ρ` và `ί` **đã** được xử lý → 422; lỗ nằm đúng ở vài codepoint Greek còn thiếu trong `foldHomoglyphs`.)
+
+**Họ 2 — "số" ngoài `\p{Nd}` mà luật số liệu không bắt** (½, ², ①②③, ¹⁹⁹, ١٩٩, १९९ **đều bị chặn**, nhưng `\p{Nl}`/`№` thì lọt):
+
+```
+{"label":"La Mã Ⅰ","text":"sản phẩm Ⅰ","http":202,"job":"succeeded","white":23175,"ink":"\"sản phẩm Ⅰ\"@15"}
+{"label":"La Mã Ⅻ","text":"top Ⅻ","http":202,"job":"succeeded","white":20736}
+{"label":"№","text":"№ một","http":202,"job":"succeeded","white":25344}
+```
+`guardrails.js` **đã có sẵn** luật cho `\p{No}`/`\p{Nl}`/`№` (dùng cho đường dịch) — bộ dự phòng của V3 chỉ cần dùng lại. **Gợi ý vá 1 dòng**: thêm Greek vào `foldHomoglyphs` + coi `\p{Nl}|\p{No}|№` là số liệu trong `fallbackViolations`.
+
+## C3. Chặn oan (false positive) — 1 ca do bản vá, 1 ca có sẵn
+
+- **MỚI (do bản vá)**: `"Suy tin hieu camera"` ⇒ **422** — tách bộ cho thấy `V3 = 1, V1 = 0`: chuẩn hoá mới khớp **chuỗi con** `"uy tin"` nằm trong `"suy tin"`. Đây là giá của việc khử dấu + so chuỗi con không biên từ (trước vá V3 không bắt câu này). Khuyến nghị: biên từ (`\b`) cho các needle một-từ.
+- **CÓ SẴN (không do bản vá)**: `"Also mot chiec ao"` ⇒ **422** với `V1 = 1, V3 = 0` (nhóm "số 1" của guardrails khớp `"so mot"`).
+- **Đối chứng dương vẫn đúng** (không chặn oan hàng loạt): 5/7 câu lành ⇒ 202 + **được vẽ**: `"Ao thun nam cotton"` 12.288 px · `"Giay sneaker trang"` 13.056 px · `"Tui xach da bo"` 13.800 px · `"Mien thue va phi van chuyen"` 6.825 px · `"Nguyen lieu vai cao cap"` 8.424 px (vân tay mực khớp từng câu).
+
+## C4. Đã cố phá mà KHÔNG phá được (vòng 3)
+
+1. **N1 toàn bộ biến thể thường gặp**: rig 98 ca + 24 ca mới — không dấu, Cyrillic (а/е/і/о/у/һ/ѕ), full-width (kể cả số `１９９`), HOA, tab/CRLF/3 dòng, ZWJ/U+2060/BOM/NBSP, `①②③`, `½`, `²`, `¹⁹⁹`, chữ số Ả Rập-Ấn/Devanagari, nhiều khoá trong 1 mục, object lồng, mảng trong object, `scene.texts[i].label` ⇒ **422 hết**.
+2. **Không có ca nào "202 rồi job failed"** (0/127+ ca) — preflight nay rộng hơn hoặc bằng thứ được vẽ.
+3. **Đối chứng dương**: chữ lành vẫn 202 **và được vẽ** cả ở `/jobs` lẫn `/generate` (12.288 px, vân tay khớp) ⇒ không "chặn bừa cho chắc".
+4. **N4**: 40s bị kẹp còn 30s kèm cảnh báo, GIF 360 khung hợp lệ — không còn lỗi sai kiểu `VIDEO_GIF_INVALID`.
+5. **Hồi quy**: `npm test` 929/928/0/1 · `verify.mjs` y hệt · ảnh gốc bất biến · tiền/usage/hoàn tiền theo lượt · IDOR 404/200 · F2/F3/F5/F10/thứ tự cảnh kiểm lại bằng pixel.
+
+## C5. Chưa kiểm được (vòng 3)
+
+1. **Tiếng**: không có TTS/ffmpeg ⇒ chỉ đọc được `audio: null` + cảnh báo; **chưa** đo tiếng thật.
+2. **MP4/ffmpeg**: máy không có `ffmpeg` ⇒ chưa đo chất lượng/độ dài MP4.
+3. **GIF 256 màu**: mọi phép đo pixel là trên GIF đã lượng tử hoá (palette 2–256 màu).
+4. **UI trình duyệt thật**: chưa mở Chrome/Safari; chỉ suy ra từ 4 bộ giải mã (`file`/`sips`/`magick`/Python).
+5. **Nhịp phát thật**: chỉ đo `Σ delay` trong GIF (28.800ms cho video khai 30.000ms ≈ −4%); chưa đo cảm nhận phát thật trên thiết bị.
+6. **Postgres** (toàn bộ chạy SQLite in-memory) và **nhiều job 30s song song** (một job ≈ 10 giây CPU; chỉ chạy tuần tự).
+7. **Bằng chứng "vòng"**: người dùng vẫn tự khai được `product_name`/ghi chú rồi lấy đó làm bằng chứng (đã ghi rõ trong hợp đồng, `evidence_used.sources` nói ra nguồn) — **chưa** kiểm được hành vi người dùng thật.
+
+## C6. PASS CÓ ĐIỀU KIỆN nghĩa là gì — và KHÔNG nghĩa là gì
+
+**Nghĩa là**: với mọi cách viết mà người dùng thật có thể gõ (kể cả không dấu, HOA, full-width, dán ký tự vô hình), chữ khẳng định/số liệu thiếu bằng chứng **không được vẽ**, đã đo bằng pixel trên 120+ ca; video 30s ở cả 3 preset tạo được và mở được bằng 4 bộ giải mã độc lập; cảnh báo alpha/`fit_box`/thứ tự cảnh khớp pixel thật; tiền/IDOR/quyền sở hữu/ảnh gốc bất biến đúng; 929 test xanh. **Điều kiện kèm theo**: (1) vá homoglyph Greek, (2) vá số `\p{Nl}`/`\p{No}`/`№`, (3) xử lý N3 (mảng lồng bị bỏ im lặng + `[object Object]`), (4) bổ sung trường `playback_ms` thật (N2) — cả bốn đều đã có bằng chứng đo được trong mục C2/C3.
+
+**KHÔNG nghĩa là**: (a) hàng rào chống bịa là **kín tuyệt đối** — đây là danh sách từ khoá + luật số, vẫn còn 6 ca đối kháng vẽ được chữ bịa (C2) và vẫn có thể chặn oan vài câu chứa chuỗi con (C3); (b) video có tiếng — bản offline là GIF **không tiếng**, mọi kết quả đều mang `audio: null`; (c) MP4/ffmpeg đã đo — chưa từng chạy; (d) chất lượng màu đã kiểm ngoài GIF 256 màu; (e) UI đã kiểm trên trình duyệt thật; (f) nhịp phát khớp tuyệt đối — vẫn lệch ~4% vì GIF chỉ ghi delay bội số 10ms; (g) bằng chứng là "khách quan" — bằng chứng = **dữ liệu người dùng đã lưu** (tên sản phẩm, ghi chú, vùng chữ nhập tay), nên người dùng vẫn có thể tự khai rồi tự vẽ (đã ghi trong hợp đồng, có `evidence_used.sources` để truy vết).

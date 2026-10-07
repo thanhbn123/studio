@@ -53,9 +53,13 @@ export function readTextValue(raw) {
   if (typeof raw === 'string') return raw;
   if (typeof raw === 'number' && Number.isFinite(raw)) return String(raw);
   if (raw && typeof raw === 'object') {
-    const value = raw.text ?? raw.content ?? raw.label ?? raw.value;
-    if (typeof value === 'string') return value;
-    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    // Vòng 3: CHỈ nhận string/số. Object lồng (vd {text:{label:'…'}}) trước đây bị String() thành
+    // "[object Object]" và VẼ LÊN VIDEO (17.400 px) — nay trả '' để bị bỏ + cảnh báo, không vẽ rác.
+    for (const key of ['text', 'content', 'label', 'value']) {
+      const value = raw[key];
+      if (typeof value === 'string') return value;
+      if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    }
   }
   return '';
 }

@@ -34,6 +34,10 @@ export const ENCODE_RESULT_FIELDS = Object.freeze([
   'warnings',
   'elapsed_ms',
   'error_code',
+  // N2 (phản biện MVP-04 vòng 3): nhịp phát THẬT phải là số máy đọc được, không chỉ một câu cảnh báo.
+  'playback_ms',
+  'requested_ms',
+  'delay_drift_ms',
 ]);
 
 /** Tên field ĐÓNG BĂNG của `output`. */

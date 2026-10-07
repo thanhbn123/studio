@@ -62,6 +62,10 @@ export class PureJsVideoEncoder extends VideoEncoder {
       height: gif.height,
       frames: gif.frames,
       palette_size: gif.palette_size,
+      // N2: nhịp phát thật (tổng delay GIF) vs yêu cầu — để tầng trên ghi vào encode_summary.
+      playback_ms: gif.playback_ms ?? null,
+      requested_ms: gif.requested_ms ?? null,
+      delay_drift_ms: gif.delay_drift_ms ?? null,
       warnings: [AUDIO_WARNING, ...collectFrameWarnings(frames), ...gif.warnings],
       error_code: null,
     };

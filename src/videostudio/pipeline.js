@@ -132,7 +132,12 @@ const MIME_EXT = Object.freeze({
 const NEVER_LIVE = Object.freeze(new Set(['LIVE_VERIFIED', 'AUTHENTICATED_LIVE_VERIFIED']));
 
 /** Chữ Hán/Nhật/Hàn trên video tiếng Việt = chưa dịch ⇒ chặn (luật chống bịa của MVP-03). */
-const CJK_RE = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]/;
+const CJK_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+// MVP-04 vòng 3: chữ Hy Lạp/Cyrillic trong overlay tiếng Việt hầu như luôn là NGUỴ TRANG từ khoá
+// (ο→o, ν→v…) hoặc chữ chưa dịch ⇒ chặn như chữ ngoại, không cố đoán.
+const FOREIGN_SCRIPT_RE = /[\p{Script=Greek}\p{Script=Cyrillic}]/u;
+// Số không phải chữ số thập phân (Ⅰ Ⅻ № ① ½ ² ١٩٩ १९९…) — luật này guardrails đã có cho đường dịch.
+const SPECIAL_NUMERAL_RE = /[\p{No}\p{Nl}]|№/u;
 
 /**
  * Từ ngữ "khẳng định" bị chặn khi KHÔNG có trong bằng chứng đã lưu. Danh sách này là bản dự
@@ -382,8 +387,11 @@ export function fallbackViolations(texts, evidenceText) {
   for (const text of texts) {
     const value = String(text ?? '').trim();
     if (!value) continue;
-    if (CJK_RE.test(value)) {
-      out.push({ rule: 'UNTRANSLATED_SCRIPT', text: value.slice(0, 200), detail: 'Chữ không phải tiếng Việt (Hán/Nhật/Hàn) — chưa dịch thì KHÔNG vẽ lên video.' });
+    if (CJK_RE.test(value) || FOREIGN_SCRIPT_RE.test(value)) {
+      out.push({ rule: 'UNTRANSLATED_SCRIPT', text: value.slice(0, 200), detail: 'Chữ không phải tiếng Việt (Hán/Nhật/Hàn/Hy Lạp/Cyrillic) — chưa dịch (hoặc bị nguỵ trang) thì KHÔNG vẽ lên video.' });
+    }
+    if (SPECIAL_NUMERAL_RE.test(value)) {
+      out.push({ rule: 'NUMERIC_CLAIM_UNSUPPORTED', text: value.slice(0, 200), detail: 'Chữ có số/ký hiệu đặc biệt (Ⅰ Ⅻ № ① ½ ²…) — không vẽ lên video.' });
     }
     const lower = norm(value);
     for (const match of lower.matchAll(/\d[\d.,]*/g)) {
@@ -394,7 +402,11 @@ export function fallbackViolations(texts, evidenceText) {
     }
     for (const phrase of CLAIM_PHRASES) {
       const needle = norm(phrase);
-      if (needle && lower.includes(needle) && !haystack.includes(needle)) {
+      // Khớp theo RANH GIỚI TỪ: tránh chặn oan câu lành chứa chuỗi con tình cờ
+      // (ví dụ "Suy tin hieu camera" chứa "uy tin", "Also mot chiec ao" chứa "so mot").
+      const re = needle ? new RegExp(`(^|[^\\p{L}\\p{N}])${needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^\\p{L}\\p{N}]|$)`, 'u') : null;
+      const hit = re ? re.test(lower) : false;
+      if (hit && !haystack.includes(needle)) {
         out.push({ rule: 'CLAIM_WORD_UNSUPPORTED', text: value.slice(0, 200), detail: `Khẳng định "${phrase}" không có trong dữ liệu đã lưu của job.` });
       }
     }
