@@ -813,17 +813,34 @@ export function buildRouter(app) {
    * dùng trả giá bằng một job + một lượt chạy chỉ để nhận lỗi muộn. Nay đọc ĐÚNG bộ khoá của V1.
    */
   const VIDEOSTUDIO_TEXT_VALUE_KEYS = Object.freeze(['text', 'content', 'label', 'value']);
-  const videostudioTextValueOf = (item) => {
-    if (typeof item === 'string') return item.trim();
-    if (typeof item === 'number' && Number.isFinite(item)) return String(item);
+  /**
+   * Gom MỌI đoạn chữ trong một mục — KHÔNG chỉ khoá đầu tiên.
+   *
+   * N1/N3 (phản biện MVP-04 vòng 2): bản cũ trả về **một** giá trị (khoá đầu tiên tìm thấy) nên
+   * `{ text: 'ok', label: 'miễn phí vận chuyển' }` hay `[[ 'miễn phí' ]]` (mảng lồng) **lọt** kiểm
+   * tra sớm rồi vẫn được VẼ. Nay duyệt **đệ quy**: mọi khoá chữ, mọi mảng, mọi object lồng — khớp
+   * đúng cách V1/V3 gom chữ để kiểm, nên "thứ bị kiểm" == "thứ được vẽ".
+   */
+  const videostudioTextValueOf = (item, out = []) => {
+    if (typeof item === 'string') {
+      if (item.trim()) out.push(item.trim());
+      return out;
+    }
+    if (typeof item === 'number' && Number.isFinite(item)) {
+      out.push(String(item));
+      return out;
+    }
+    if (Array.isArray(item)) {
+      for (const entry of item) videostudioTextValueOf(entry, out);
+      return out;
+    }
     if (item && typeof item === 'object') {
       for (const key of VIDEOSTUDIO_TEXT_VALUE_KEYS) {
-        const value = item[key];
-        if (typeof value === 'string' && value.trim()) return value.trim();
-        if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+        if (item[key] === undefined || item[key] === null) continue;
+        videostudioTextValueOf(item[key], out);
       }
     }
-    return '';
+    return out;
   };
 
   /** Trần độ dài chữ: ưu tiên hằng CỦA V1 (`VIDEOSTUDIO_TEXT_MAX`), fallback cùng giá trị. */
@@ -846,8 +863,7 @@ export function buildRouter(app) {
         const value = source[key];
         if (value === undefined || value === null) continue;
         for (const item of Array.isArray(value) ? value : [value]) {
-          const text = videostudioTextValueOf(item);
-          if (text) out.push(text);
+          for (const text of videostudioTextValueOf(item)) out.push(text);
         }
       }
     };

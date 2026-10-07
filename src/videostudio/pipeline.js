@@ -45,6 +45,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { DEFAULT_PRICING, JOB_STATUS, VERIFICATION_LEVELS } from '../store/index.js';
 import { sniffImageMime } from '../security/sanitize.js';
 import { decodePng, drawLayout, layoutText, loadFont, probeImage, toRgba } from '../imagelab/render/index.js';
+// N1 (phản biện MVP-04 vòng 2): bộ dự phòng phải chuẩn hoá GIỐNG bộ của MVP-02, nếu không thì chữ
+// không dấu / homoglyph / full-width / có ký tự vô hình sẽ LỌT và vẫn được vẽ lên video.
+import { deaccent, normalizeForMatch } from '../imagelab/translate/guardrails.js';
 
 /** Các bước của một job MVP-04 (hợp đồng §2.3 — ĐÓNG BĂNG, V4/V5 hiện tiến trình theo đây). */
 export const VIDEOSTUDIO_STAGES = Object.freeze([
@@ -363,7 +366,18 @@ function normalizeViolations(raw) {
  * Không có bằng chứng ⇒ MỌI khẳng định/số liệu bị chặn (fail-closed).
  */
 export function fallbackViolations(texts, evidenceText) {
-  const haystack = ` ${String(evidenceText || '').toLowerCase().normalize('NFC')} `;
+  /**
+   * N1 — chuẩn hoá ĐÚNG như bộ của MVP-02 (`normalizeForMatch` = NFKC + khử homoglyph + biến thể
+   * chính tả, rồi `deaccent` để bỏ dấu). Trước đây chỉ `toLowerCase().normalize('NFC').includes(...)`
+   * nên các biến thể sau LỌT và vẫn được VẼ: "mien phi" (không dấu), "miễn phі" (homoglyph Cyrillic),
+   * "ｍｉễｎ ｐｈí" (full-width), "miễn\nphí" (xuống dòng), "MIỄN PHÍ"…
+   */
+  const norm = (value) =>
+    deaccent(normalizeForMatch(String(value ?? '')))
+      .toLowerCase()
+      .replace(/[\s\u00a0\u200b-\u200d\u2060]+/g, ' ') // gộp khoảng trắng + bỏ ký tự vô hình
+      .trim();
+  const haystack = ` ${norm(evidenceText)} `;
   const out = [];
   for (const text of texts) {
     const value = String(text ?? '').trim();
@@ -371,7 +385,7 @@ export function fallbackViolations(texts, evidenceText) {
     if (CJK_RE.test(value)) {
       out.push({ rule: 'UNTRANSLATED_SCRIPT', text: value.slice(0, 200), detail: 'Chữ không phải tiếng Việt (Hán/Nhật/Hàn) — chưa dịch thì KHÔNG vẽ lên video.' });
     }
-    const lower = value.toLowerCase().normalize('NFC');
+    const lower = norm(value);
     for (const match of lower.matchAll(/\d[\d.,]*/g)) {
       const digits = match[0].replace(/[.,]+$/, '');
       if (digits && !haystack.includes(digits)) {
@@ -379,7 +393,8 @@ export function fallbackViolations(texts, evidenceText) {
       }
     }
     for (const phrase of CLAIM_PHRASES) {
-      if (lower.includes(phrase) && !haystack.includes(phrase)) {
+      const needle = norm(phrase);
+      if (needle && lower.includes(needle) && !haystack.includes(needle)) {
         out.push({ rule: 'CLAIM_WORD_UNSUPPORTED', text: value.slice(0, 200), detail: `Khẳng định "${phrase}" không có trong dữ liệu đã lưu của job.` });
       }
     }
