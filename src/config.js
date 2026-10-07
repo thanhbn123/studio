@@ -239,6 +239,9 @@ export function loadConfig(env = process.env) {
       // Credit tặng khi đăng ký. Kẹp >= 0: số âm là "thu tiền lúc đăng ký" — vô nghĩa.
       defaultGrant: Math.max(0, toNum(env.BILLING_DEFAULT_GRANT, 0)),
       holdBeforeJob: toBool(env.BILLING_HOLD_BEFORE_JOB, true),
+      // F5 (R1 vòng sửa phản biện): trần CHỜ KHOÁ ví (ms) — khoá theo user ở tầng DB VÀ khoá tuần
+      // tự hoá trong bộ nhớ của tiến trình; hết hạn ⇒ `LEDGER_BUSY` kèm `retryable: true`.
+      lockTimeoutMs: Math.max(100, toInt(env.BILLING_LOCK_TIMEOUT_MS, 5000)),
       // PB-02 (vòng 2): trần số LƯỢT CHẠY có tính tiền cho mỗi job (chạy lần đầu + mọi lượt
       // chạy lại). Vượt ⇒ `RERUN_LIMIT_EXCEEDED` (HTTP 429). Kẹp >= 1: 0 sẽ khoá luôn lượt đầu.
       maxRunsPerJob: Math.max(1, toInt(env.BILLING_MAX_RUNS_PER_JOB, 10)),
@@ -262,6 +265,39 @@ export function loadConfig(env = process.env) {
       // Seed bảng `pricing` từ `config.cost.*` của MVP-01 (nguồn giá mặc định).
       pricingFromCost: toBool(env.BILLING_PRICING_FROM_COST, true),
     },
+
+    // ── R1 (sprint độ tin cậy) — hàng đợi BỀN + cron dọn dẹp ────────────────
+    // `docs/R1-RELIABILITY-CONTRACT.md` §2.3 (R1-Q) + §4 (R3-S). Tên khoá ĐÓNG BĂNG:
+    // R1-Q đọc `queue.*`, R3-S đọc `scheduler.*`; đổi tên là vỡ hợp đồng.
+    queue: {
+      // true (mặc định) = hàng đợi ghi DB trước khi chạy, khôi phục được sau khi khởi động lại.
+      // false = chạy như cũ (trong bộ nhớ) — chỉ để so sánh/rollback, KHÔNG bền.
+      durable: toBool(env.QUEUE_DURABLE, true),
+      // Mục `running` CŨ HƠN ngưỡng này (ms) ⇒ coi như tiến trình giữ nó đã chết ⇒ trả về `queued`.
+      // Mặc định 600000 (10 phút): dài hơn một job bình thường để không chạy đúp.
+      staleMs: Math.max(0, toInt(env.QUEUE_STALE_MS, 10 * 60 * 1000)),
+      // F5: trần CHỜ KHOÁ của hàng đợi (ms) — dùng cho mutex transaction trong tiến trình; hết hạn
+      // ⇒ `QUEUE_BUSY` kèm `retryable: true`, không bao giờ treo vô hạn.
+      lockTimeoutMs: Math.max(100, toInt(env.QUEUE_LOCK_TIMEOUT_MS, 5000)),
+      // F3: nhịp NHẶT VIỆC định kỳ (ms) — tiến trình đang sống tự cứu việc của tiến trình đã chết.
+      pollMs: Math.max(200, toInt(env.QUEUE_POLL_MS, 1000)),
+      // B2 (R1 vòng 3): NGÂN SÁCH TỔNG cho các pragma lúc `connect()` (WAL dễ gặp khoá khi nhiều
+      // tiến trình boot). Hết ngân sách ⇒ bỏ qua WAL và đi tiếp, KHÔNG chặn boot hàng chục giây.
+      initBudgetMs: Math.max(200, toInt(env.QUEUE_INIT_BUDGET_MS, 5000)),
+      // Số lần thử lại của `Store.init()` khi DB bận (bị chặn thêm bởi `lockTimeoutMs`).
+      initRetries: Math.max(1, toInt(env.QUEUE_INIT_RETRIES, 10)),
+      // Số lần thử tối đa cho một mục hàng đợi (kẹp >= 1: 0 sẽ không bao giờ chạy).
+      maxAttempts: Math.max(1, toInt(env.QUEUE_MAX_ATTEMPTS, 3)),
+      // Backoff cơ sở: lần thử thứ n chờ `retryBaseMs * n` (mặc định 2000ms).
+      retryBaseMs: Math.max(0, toInt(env.QUEUE_RETRY_BASE_MS, 2000)),
+},
+
+    scheduler: {
+      // true (mặc định) = cron dọn dẹp chạy cùng server; false = không tạo timer nào.
+      enabled: toBool(env.SCHEDULER_ENABLED, true),
+      // Nhịp cron (ms). Mặc định 60000 (1 phút). Kẹp >= 1 để `0` không thành vòng lặp nóng.
+      intervalMs: Math.max(1, toInt(env.SCHEDULER_INTERVAL_MS, 60_000)),
+},
   };
 
   if (!AI_PROVIDERS.includes(cfg.vision.provider)) {

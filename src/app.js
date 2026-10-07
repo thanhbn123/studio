@@ -909,10 +909,15 @@ export async function createApp(opts = {}) {
     }
   }
 
+  // R1 (§2.3) — HÀNG ĐỢI BỀN: đọc `config.queue.*` với mặc định của hợp đồng, nhờ vậy app
+  // chạy được CẢ KHI R3-S chưa thêm khoá `config.queue` (lúc đó `config.queue` là undefined).
+  // `store` được truyền vào để `enqueue()` ghi mục việc xuống DB TRƯỚC khi chạy.
   const queue = new JobQueue({
     concurrency: config.jobs.concurrency,
     maxAttempts: config.jobs.maxAttempts,
     logger: rootLogger,
+    store,
+    queue: config.queue || null,
   });
 
   // Nếu KHÔNG có người nghe sự kiện 'failed', một job ném lỗi sẽ để `jobs.status` mãi ở
@@ -947,6 +952,93 @@ export async function createApp(opts = {}) {
     billingHook,
     // BR-10: thu hồi lượt treo CÓ ngữ cảnh (hàng đợi + trạng thái job) — route/admin dùng hàm này.
     reconcileStuckRuns: reconcileStuckRunsApp,
+  });
+
+  /* ═════════ R1 (§2.3) — BẢNG HÀM DỰNG HANDLER CHO `queue.resume()` ═════════
+   *
+   * Vì sao cần: tầng gọi đã nghiệm thu (`src/http/routes.js`) xếp hàng bằng CLOSURE
+   * (`queue.enqueue(id, () => pipeline.run(id, {...}))`) — closure đó chết theo tiến trình,
+   * nên mục khôi phục từ DB không thể chạy lại bằng nó. Bảng dưới đây dựng lại lời gọi
+   * tương đương từ DỮ LIỆU ĐÃ LƯU (jobs + payload nhỏ trong `job_queue`).
+   *
+   * Giới hạn thật (đã ghi ở báo cáo): tham số chỉ sống trong closure của request (ví dụ
+   * `manual`, `only_region_ids`, `force`, `options` của người dùng) KHÔNG được lưu, nên lượt
+   * chạy khôi phục dùng mặc định an toàn. Đây là "chạy lại được", không phải "chạy lại y hệt".
+   */
+  const resumeCtx = (job, payload = null) => ({
+    sessionId: payload?.sessionId ?? job?.session_id ?? '',
+    userId: payload?.userId ?? job?.user_id ?? null,
+  });
+  // Handler khôi phục LUÔN tồn tại (kể cả khi khối MVP tương ứng không lắp được): lúc đó nó
+  // ném lỗi CÓ MÃ để mục hỏng hẳn kèm lý do thật, thay vì bị coi là "không có hàm xử lý".
+  const unavailableHandler = (code, message) => () => {
+    throw Object.assign(new Error(message), { code });
+  };
+
+  queue.registerHandler('run', async ({ jobId, payload, store: st }) => {
+    const job = await st.getJob(jobId).catch(() => null);
+    const input = {
+      // `url`/`style`/`length` đọc lại từ job (route đã lưu chúng khi tạo job).
+      url: payload?.url ?? job?.source_url ?? '',
+      manual: payload?.manual ?? null,
+      style: payload?.style ?? job?.style,
+      length: payload?.length ?? job?.length,
+      ...resumeCtx(job, payload),
+    };
+    return () => pipeline.run(jobId, input);
+  });
+
+  queue.registerHandler('run_ocr', async ({ jobId, payload, store: st }) => {
+    const imagelabPipeline = imagelab.imagelabPipeline;
+    if (!imagelabPipeline || typeof imagelabPipeline.runOcr !== 'function') {
+      return unavailableHandler('IMAGELAB_UNAVAILABLE', 'Khối ImageLab chưa lắp được — không chạy lại được lượt OCR đã khôi phục.');
+    }
+    const job = await st.getJob(jobId).catch(() => null);
+    return () => imagelabPipeline.runOcr(jobId, { ...resumeCtx(job, payload), options: payload?.options ?? {} });
+  });
+
+  queue.registerHandler('render', async ({ jobId, payload, store: st }) => {
+    const imagelabPipeline = imagelab.imagelabPipeline;
+    if (!imagelabPipeline || typeof imagelabPipeline.renderApproved !== 'function') {
+      return unavailableHandler('IMAGELAB_UNAVAILABLE', 'Khối ImageLab chưa lắp được — không chạy lại được lượt render đã khôi phục.');
+    }
+    const job = await st.getJob(jobId).catch(() => null);
+    return () => imagelabPipeline.renderApproved(jobId, {
+      ...resumeCtx(job, payload),
+      onlyRegionIds: payload?.onlyRegionIds ?? null,
+      force: payload?.force === true,
+      unknownRegionIds: payload?.unknownRegionIds ?? [],
+    });
+  });
+
+  // `image_generation` (MVP-03) và `video_generation` (MVP-04) dùng CHUNG tên việc 'generate'
+  // nhưng KHÁC pipeline ⇒ phân nhánh theo `kind` của job.
+  queue.registerHandler('generate', async ({ jobId, kind, payload, store: st }) => {
+    const job = await st.getJob(jobId).catch(() => null);
+    const ctx = resumeCtx(job, payload);
+    if (String(kind || job?.kind) === 'video_generation') {
+      const videoPipeline = videostudio.pipeline;
+      if (!videoPipeline || typeof videoPipeline.generate !== 'function') {
+        return unavailableHandler('VIDEOSTUDIO_UNAVAILABLE', 'Khối Video Studio chưa lắp được — không chạy lại được lượt tạo video đã khôi phục.');
+      }
+      return () => videoPipeline.generate(jobId, {
+        sessionId: ctx.sessionId,
+        options: payload?.options ?? {},
+        // Khoá lượt chạy: dùng lại `run_key` đã lưu, không có thì để pipeline tự sinh.
+        runKey: payload?.runKey ?? undefined,
+      });
+    }
+    const imagestudioPipeline = imagestudio.imagestudioPipeline;
+    if (!imagestudioPipeline || typeof imagestudioPipeline.generate !== 'function') {
+      return unavailableHandler('IMAGESTUDIO_UNAVAILABLE', 'Khối ImageStudio chưa lắp được — không chạy lại được lượt tạo ảnh đã khôi phục.');
+    }
+    return () => imagestudioPipeline.generate(jobId, {
+      ...ctx,
+      options: payload?.options ?? {},
+      // Lượt khôi phục là lượt CHẠY LẠI: không `force` thì pipeline có thể trả về ngay vì ảnh
+      // đã có, còn `force: true` mới thật sự dựng lại ảnh.
+      force: payload?.force !== false,
+    });
   });
 
   const rateLimiters = {
@@ -1030,9 +1122,25 @@ export async function createApp(opts = {}) {
       const forceTimer = setTimeout(() => app.server.closeAllConnections?.(), 2000);
       forceTimer.unref?.();
     });
-    await queue.drain().catch(() => {});
+    // R1 (§2.3): đóng hàng đợi SẠCH — chờ việc đang chạy (có trần), KHÔNG nhặt việc mới. Mục
+    // chưa chạy vẫn nằm `queued` trong DB nên lần khởi động sau `resume()` sẽ chạy lại.
+    await queue.close().catch(() => {});
     await store.close().catch(() => {});
   };
+
+  // R1 (§2.3) — KHÔI PHỤC hàng đợi bền lúc boot: mục `queued` của tiến trình trước được chạy
+  // lại, mục `running` quá cũ (`config.queue.staleMs`) được trả về hàng đợi. BEST-EFFORT:
+  // mọi lỗi chỉ được LOG mức error — DB cũ/hỏng vẫn phải boot được MVP-01..05.
+  try {
+    const resumed = await queue.resume();
+    if (resumed.restored > 0 || resumed.requeued > 0) rootLogger.info('queue.resume_done', resumed);
+  } catch (err) {
+    rootLogger.error('queue.resume_failed', {
+      error_name: err?.name || 'Error',
+      error_code: err?.code || null,
+      error_message: scrubPaths(err?.message || err),
+    });
+  }
 
   return app;
 }

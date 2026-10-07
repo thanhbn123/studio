@@ -1724,6 +1724,29 @@ export function buildRouter(app) {
         currency: creditCurrency(),
         reason: billingAvailable() ? null : BILLING_UNAVAILABLE_MESSAGE,
       },
+      // R1 (§4): cron dọn dẹp — chỉ cờ + số đếm, KHÔNG lộ bí mật/đường dẫn.
+      // Chưa gắn scheduler (test dựng router trực tiếp) ⇒ rơi về cấu hình + số 0.
+      scheduler: (() => {
+        const s = typeof app?.scheduler?.stats === 'function' ? app.scheduler.stats() : null;
+        const r = s?.last_result;
+        return {
+          enabled: s ? s.enabled !== false : config?.scheduler?.enabled !== false,
+          running: Boolean(s?.running),
+          ticks: Number.isFinite(Number(s?.ticks)) ? Number(s.ticks) : 0,
+          last_tick_at: s?.last_tick_at ?? null,
+          last_result: r
+            ? {
+              reconciled: Number(r.reconciled) || 0,
+              requeued: Number(r.requeued) || 0,
+              // R1-F3 (vòng sửa phản biện): nhịp cron nay còn NHẶT VÀ CHẠY việc `queued` mồ côi
+              // (`claimed`) và CHỐT mục chạm trần thành `failed` (`exhausted`) — health phải nói thật.
+              claimed: Number(r.claimed) || 0,
+              exhausted: Number(r.exhausted) || 0,
+              errors: Number(r.errors) || 0,
+            }
+            : null,
+        };
+      })(),
     });
   });
 
@@ -1877,7 +1900,7 @@ export function buildRouter(app) {
     // KHÔNG tăng dòng nào (job_id sinh trước để hook giữ tiền theo đúng job đó).
     const userId = req.user?.id ?? null;
     const jobId = randomUUID();
-    await holdCreditBeforeJob(req, jobId, 'content');
+    const hold = await holdCreditBeforeJob(req, jobId, 'content'); // R1-F6: khoá hàng đợi theo lượt
 
     try {
       await store.createJob({
@@ -1898,6 +1921,8 @@ export function buildRouter(app) {
     }
 
     try {
+      // R1-F6: khoá idempotency theo LƯỢT CHẠY (khi có ví) ⇒ hai tiến trình cùng xếp MỘT lượt
+      // chỉ tạo MỘT mục; hai request khác lượt vẫn là hai mục (MVP-05 §BR-02).
       queue.enqueue(jobId, () =>
         pipeline.run(jobId, {
           url,
@@ -1907,6 +1932,7 @@ export function buildRouter(app) {
           sessionId: sid,
           userId,
         }),
+        { runKey: hold?.run_key ?? null },
       );
     } catch (err) {
       // PB-01: xếp hàng lỗi sau khi đã giữ tiền ⇒ hoàn khoản giữ.
@@ -2055,6 +2081,9 @@ export function buildRouter(app) {
           userId: req.user?.id ?? null,
           extraInstructions: sanitizeText(body.extra_instructions, { maxLength: 1000 }),
         }),
+        // F6 (phản biện vòng 2): chỗ này CÓ `hold` nhưng trước đây không truyền khoá lượt ⇒ hai
+        // tiến trình cùng xếp một lượt chạy lại vẫn tạo 2 mục. Nay đủ 8/8 chỗ.
+        { runKey: hold?.run_key ?? null },
       );
     } catch (err) {
       await withHoldRelease(req, job.id, hold, async () => { throw err; }).catch(() => {});
@@ -2223,7 +2252,7 @@ export function buildRouter(app) {
     }
 
     try {
-      queue.enqueue(jobId, () => app.imagelabPipeline.runOcr(jobId, { sessionId: sid, userId, options }));
+      queue.enqueue(jobId, () => app.imagelabPipeline.runOcr(jobId, { sessionId: sid, userId, options }), { runKey: hold?.run_key ?? null });
     } catch (err) {
       await releaseHoldOnFailure(req, jobId);
       throw err;
@@ -2497,6 +2526,9 @@ export function buildRouter(app) {
           force,
           unknownRegionIds,
         }),
+        // R1-F6: khoá idempotency theo LƯỢT CHẠY — hai tiến trình cùng xếp MỘT lượt render chỉ
+        // tạo MỘT mục; hai request render KHÁC lượt vẫn là hai mục (đã nghiệm thu ở MVP-05).
+        { runKey: hold?.run_key ?? null },
       );
     } catch (err) {
       await withHoldRelease(req, job.id, hold, async () => { throw err; }).catch(() => {});
@@ -2612,7 +2644,7 @@ export function buildRouter(app) {
     }
 
     try {
-      queue.enqueue(jobId, () => app.imagestudioPipeline.generate(jobId, { sessionId: sid, userId, options, force: false }));
+      queue.enqueue(jobId, () => app.imagestudioPipeline.generate(jobId, { sessionId: sid, userId, options, force: false }), { runKey: hold?.run_key ?? null });
     } catch (err) {
       await releaseHoldOnFailure(req, jobId);
       throw err;
@@ -2723,6 +2755,7 @@ export function buildRouter(app) {
       // Ảnh MỚI: pipeline ghi asset role `rendered` với `parent_id` = ảnh gốc; ảnh cũ còn nguyên.
       queue.enqueue(job.id, () =>
         app.imagestudioPipeline.generate(job.id, { sessionId: sid, userId: req.user?.id ?? null, options, force }),
+        { runKey: hold?.run_key ?? null },
       );
     } catch (err) {
       await withHoldRelease(req, job.id, hold, async () => { throw err; }).catch(() => {});
@@ -2883,7 +2916,7 @@ export function buildRouter(app) {
     const runKey = hold?.run_key || randomUUID();
     try {
       await withHoldRelease(req, jobId, hold, async () => {
-        queue.enqueue(jobId, () => app.videostudioPipeline.generate(jobId, { sessionId: sid, options, runKey }));
+        queue.enqueue(jobId, () => app.videostudioPipeline.generate(jobId, { sessionId: sid, options, runKey }), { runKey });
       });
     } catch (err) {
       throw mapVideostudioError(err, 'Không xếp được lượt tạo video.');
@@ -3005,7 +3038,7 @@ export function buildRouter(app) {
       });
 
       // Video MỚI: V3 ghi asset role `rendered` với `parent_id` = ảnh gốc; video cũ còn nguyên.
-      queue.enqueue(job.id, () => app.videostudioPipeline.generate(job.id, { sessionId: sid, options, runKey }));
+      queue.enqueue(job.id, () => app.videostudioPipeline.generate(job.id, { sessionId: sid, options, runKey }), { runKey });
     } catch (err) {
       await withHoldRelease(req, job.id, hold, async () => { throw err; }).catch(() => {});
       throw mapVideostudioError(err, 'Không chạy được lượt tạo video mới.');

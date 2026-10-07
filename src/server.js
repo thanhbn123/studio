@@ -9,6 +9,7 @@ import { loadDotEnv } from './env.js';
 import { loadConfig } from './config.js';
 import { createLogger } from './logger.js';
 import { createApp } from './app.js';
+import { createScheduler } from './scheduler.js';
 
 const loadedEnvFiles = await loadDotEnv();
 const config = loadConfig(process.env);
@@ -25,6 +26,31 @@ try {
 
 const { server } = app;
 
+/**
+ * R1 (§4) — CRON DỌN DẸP: thu hồi lượt chạy treo (MVP-05) + trả mục hàng đợi chết về hàng đợi
+ * (R1-Q). Tạo SAU khi app sẵn sàng (store/DB đã mở). `runOnce()` gọi được thủ công để test
+ * không cần thời gian thật; timer của `start()` đã `unref()` nên không giữ tiến trình sống.
+ *
+ * Vẫn TẠO scheduler khi bị tắt bằng cấu hình — để `/api/health` nói được `enabled: false`
+ * thay vì im lặng (im lặng là kiểu thất bại bị cấm).
+ */
+const scheduler = createScheduler({ app, store: app.store, config, logger });
+app.scheduler = scheduler;
+// `app.close()` phải tắt cron TRƯỚC khi đóng server/DB — bọc lại thay vì sửa `src/app.js`
+// (file của R1-Q). Nhờ vậy cả `shutdown()` lẫn nơi gọi `app.close()` khác đều tắt sạch.
+const closeApp = app.close.bind(app);
+app.close = async () => {
+  await scheduler.stop();
+  return closeApp();
+};
+if (config.scheduler?.enabled !== false) {
+  scheduler.start();
+} else {
+  logger.info('scheduler.disabled', {
+    message: 'SCHEDULER_ENABLED=false — không chạy nhịp dọn dẹp nào (không có timer).',
+  });
+}
+
 server.listen(config.port, config.host, () => {
   logger.info('server.listening', {
     url: `http://${config.host}:${config.port}`,
@@ -39,6 +65,10 @@ server.listen(config.port, config.host, () => {
     session_mode: config.session.mode,
     connectors: app.registry.list().map((c) => c.source),
     connector_init_failures: app.registry.initFailures,
+    // R1 (§4): cron có đang chạy không + nhịp bao nhiêu (không lộ bí mật/đường dẫn).
+    scheduler_enabled: config.scheduler?.enabled !== false,
+    scheduler_running: scheduler.stats().running,
+    scheduler_interval_ms: config.scheduler?.intervalMs ?? null,
   });
   // Cảnh báo rõ nếu thiếu AI — người dùng cần biết TRƯỚC khi dán link.
   if (!app.contentEngine.configured) {
@@ -53,7 +83,7 @@ server.on('error', (err) => {
   process.exit(1);
 });
 
-/** Tắt êm: đóng server, đợi job đang chạy, đóng DB. */
+/** Tắt êm: tắt cron (qua `app.close` đã bọc), đóng server, đợi job đang chạy, đóng DB. */
 async function shutdown(signal) {
   logger.info('server.shutdown', { signal });
   const timer = setTimeout(() => {
