@@ -55,6 +55,38 @@ const PRICING_OPERATIONS = Object.freeze([
 /** Câu DUY NHẤT cho mọi ca sai thông tin đăng nhập (khớp hằng số trong `buildRouter`). */
 const BAD_CREDENTIALS_TEXT = 'Email hoặc mật khẩu không đúng.';
 
+/* ══════════════ MVP-07 · hằng số ĐÓNG BĂNG (hợp đồng §2.6/§3.1) ══════════════
+ * Khai ở cấp MODULE để `/api/config` và hàm ánh xạ lỗi dùng CHUNG một nguồn. Cố ý KHÔNG
+ * static-import `src/publish/**`: routes.js phải nạp được kể cả khi khối MVP-07 chưa có mặt
+ * (app.js nạp phòng thủ bằng dynamic import) — một import hỏng ở đây sẽ làm chết cả MVP-01..06.
+ */
+
+/** Trạng thái bài đăng (bản sao ĐỌC-CHỈ của `PUBLISH_STATUSES` cho tầng HTTP). */
+const PUBLISH_STATUS_LIST = Object.freeze([
+  'draft', 'pending_review', 'approved', 'publishing', 'published', 'failed', 'rejected',
+]);
+
+/** `PublishError.code` ⇒ mã HTTP (hợp đồng §2.6). Mã lạ ⇒ 500 + log, KHÔNG đoán. */
+const PUBLISH_ERROR_STATUS = Object.freeze({
+  BAD_INPUT: 400,
+  BAD_SCHEDULE: 400,
+  TEXT_TOO_LONG: 400,
+  MEDIA_TOO_MANY: 400,
+  BAD_STATE: 409,
+  MEDIA_NOT_PUBLIC: 422,
+  ITEM_NOT_FOUND: 404,
+  // Mã QUAN TRỌNG NHẤT của sprint: bài chưa duyệt ⇒ 409, và provider chưa hề được gọi.
+  NOT_APPROVED: 409,
+  ITEM_REJECTED: 409,
+  PUBLISH_IN_PROGRESS: 409,
+  ALREADY_PUBLISHED: 409,
+  NOT_CONFIGURED: 409,
+  PROVIDER_DISABLED: 503,
+  PROVIDER_FAILED: 502,
+  ATTEMPTS_EXHAUSTED: 429,
+  STORE_WRITE_FAILED: 500,
+});
+
 const AUTH_CODE_SETS = Object.freeze({
   EMAIL_TAKEN: new Set(['EMAIL_TAKEN', 'EMAIL_EXISTS', 'DUPLICATE_EMAIL', 'USER_EXISTS', 'EMAIL_IN_USE']),
   WEAK_PASSWORD: new Set(['WEAK_PASSWORD', 'PASSWORD_TOO_SHORT', 'SHORT_PASSWORD', 'PASSWORD_TOO_WEAK', 'WEAK']),
@@ -1984,6 +2016,9 @@ export function buildRouter(app) {
         encoder: videostudioEncoderInfo(),
         audio: false,
       },
+      // MVP-07 (§4 hợp đồng đăng bài) — khối cho UI (P4): provider nào đang chạy, có phải CHẾ ĐỘ
+      // THỬ không, đã cấu hình Facebook chưa. CHỈ cờ + giới hạn: KHÔNG token, KHÔNG Page ID.
+      publish: publishConfigBlock(),
       // MVP-06 (§3 hợp đồng export) — khối cho UI (X3) biết có tải được gói .zip hay không.
       // CHỈ hai field: cờ khả dụng + định dạng; KHÔNG lộ đường dẫn, tên module hay bí mật.
       exports: {
@@ -3613,6 +3648,349 @@ export function buildRouter(app) {
       warnings: Array.isArray(built.warnings) ? built.warnings : [],
       missing: Array.isArray(built.missing) ? built.missing : [],
     });
+  });
+
+  /* ══════════════════════════════════════════════════════════════════════════
+   * MVP-07 — ĐĂNG BÀI FACEBOOK PAGE (DUYỆT TAY) · hợp đồng `docs/MVP-07-CONTRACT.md` §4
+   *
+   * Tám route dưới đây là route MỚI (chỉ THÊM, không sửa route cũ). Ba luật của khối:
+   *
+   *   1. **Bắt buộc đăng nhập** cho MỌI `/api/publish/*` — ẩn danh ⇒ 401. Đăng bài là hành động
+   *      ra ngoài, phải có người chịu trách nhiệm và phải có người duyệt.
+   *   2. **Khác chủ ⇒ 404** (không xác nhận sự tồn tại), y hệt chính sách `requireOwnJob`.
+   *      owner/admin thấy và duyệt được bài của MỌI người — đó chính là hàng đợi duyệt.
+   *   3. **Chỉ `approved` mới được đăng.** Route `…/publish` không tự kiểm bằng `if`: nó gọi
+   *      `PublishService.publishItem()`, và cổng thật nằm ở câu UPDATE có điều kiện trong
+   *      `Store#claimPublishItem` (xem src/store/index.js).
+   * ══════════════════════════════════════════════════════════════════════════ */
+
+  const PUBLISH_UNAVAILABLE_MESSAGE =
+    'Khối đăng bài chưa nạp được trên máy chủ này — tính năng đăng bài tạm thời không dùng được.';
+
+  /** Lý do THẬT do `src/app.js` ghi lại (hoặc cấu hình tắt) — cùng khuôn `imagelabUnavailableReason`. */
+  const publishUnavailableReason = () => {
+    const reason = app?.publishUnavailableReason;
+    return typeof reason === 'string' && reason.trim() ? reason : PUBLISH_UNAVAILABLE_MESSAGE;
+  };
+
+  const publishEnabled = () => config?.publish?.enabled !== false;
+
+  const publishService = () =>
+    app?.publishService && typeof app.publishService.publishItem === 'function' ? app.publishService : null;
+
+  const publishAvailable = () =>
+    publishEnabled()
+    && Boolean(publishService())
+    && typeof store?.createPublishItem === 'function'
+    && typeof store?.claimPublishItem === 'function';
+
+  /** Thiếu module/store cũ/tắt tường minh ⇒ 503 nói thẳng, KHÔNG mô phỏng danh sách rỗng. */
+  const requirePublish = () => {
+    if (!publishEnabled()) {
+      throw HttpError.safe(503, 'PUBLISH_UNAVAILABLE', 'Tính năng đăng bài đang bị tắt bằng cấu hình (PUBLISH_ENABLED=false).');
+    }
+    const svc = publishService();
+    if (!svc) throw HttpError.safe(503, 'PUBLISH_UNAVAILABLE', publishUnavailableReason());
+    if (typeof store?.claimPublishItem !== 'function' || typeof store?.createPublishItem !== 'function') {
+      throw HttpError.safe(503, 'PUBLISH_UNAVAILABLE', 'Store trên máy chủ này chưa có bảng/hàm đăng bài (DB chưa nâng cấp?).');
+    }
+    return svc;
+  };
+
+  /** Khối `publish` cho `/api/config` — CHỈ cờ + giới hạn; KHÔNG token, KHÔNG Page ID. */
+  const publishConfigBlock = () => {
+    const svc = publishService();
+    const info = svc ? svc.providerInfo() : { name: 'none', channel: 'facebook_page', configured: false, is_mock: false, notice: '' };
+    return {
+      available: publishAvailable(),
+      enabled: publishEnabled(),
+      reason: publishAvailable() ? null : publishUnavailableReason(),
+      channel: String(info.channel || 'facebook_page'),
+      // Luật bất biến của sprint: hệ thống KHÔNG BAO GIỜ tự đăng — UI phải nói rõ điều này.
+      manual_approval_required: true,
+      provider: { name: info.name, configured: Boolean(info.configured), is_mock: Boolean(info.is_mock), notice: String(info.notice || '') },
+      statuses: [...PUBLISH_STATUS_LIST],
+      limits: {
+        max_text_length: Number(config?.publish?.maxTextLength) || 63206,
+        max_media: Number(config?.publish?.maxMedia) || 1,
+        max_attempts: Number(config?.publish?.maxAttempts) || 3,
+      },
+    };
+  };
+
+  /** `PublishError.code` ⇒ HTTP theo hợp đồng §2.6. KHÔNG BAO GIỜ lộ stack/token của module. */
+  const mapPublishError = (err) => {
+    if (err instanceof HttpError) return err;
+    const code = String(err?.code || '').trim().toUpperCase();
+    const message = String(err?.message ?? '').trim();
+    const status = PUBLISH_ERROR_STATUS[code];
+    if (status) {
+      // Câu tiếng Việt do chính repo viết (module P1 không chứa token/đường dẫn) ⇒ hiện thẳng.
+      return HttpError.safe(status, code, message || 'Không thực hiện được yêu cầu đăng bài.', err?.details ?? {});
+    }
+    logger?.error?.('publish.route_failed', {
+      error_name: err?.name || 'Error',
+      error_code: err?.code || null,
+      error_message: scrubPaths(err?.message || err),
+    });
+    return HttpError.safe(500, 'PUBLISH_FAILED', 'Không xử lý được yêu cầu đăng bài. Vui lòng thử lại.');
+  };
+
+  /** Người gọi là owner/admin hay không (dùng để mở hàng đợi duyệt, KHÔNG để nới cổng duyệt). */
+  const isPublishAdmin = (req) => ADMIN_ROLES.has(String(req?.user?.role || 'member'));
+
+  /**
+   * Bài đăng của CHÍNH người gọi (hoặc bất kỳ bài, nếu người gọi là owner/admin).
+   * Khác chủ ⇒ **404** (không xác nhận sự tồn tại) — cùng chính sách `requireOwnJob`.
+   */
+  const requireOwnPublishItem = async (req, id) => {
+    if (!UUID_RE.test(String(id ?? ''))) throw new HttpError(400, 'BAD_ITEM_ID', 'Mã bài đăng không hợp lệ.');
+    const item = await store.getPublishItem(String(id));
+    if (!item) throw new HttpError(404, 'ITEM_NOT_FOUND', 'Không tìm thấy bài đăng.');
+    if (isPublishAdmin(req)) return item;
+    const uid = String(req?.user?.id ?? '');
+    if (!uid || String(item.user_id ?? '') !== uid) throw new HttpError(404, 'ITEM_NOT_FOUND', 'Không tìm thấy bài đăng.');
+    return item;
+  };
+
+  /**
+   * `MediaRef[]` cho provider: id media → asset THẬT trong store, kèm URL công khai nếu dựng
+   * được từ `PUBLIC_BASE_URL`.
+   *
+   * ⚠️ `PUBLIC_BASE_URL` rỗng ⇒ `url` rỗng ⇒ provider `facebook` trả `MEDIA_NOT_PUBLIC` (nói
+   * thẳng là Facebook không tải được ảnh về), KHÔNG dựng URL `127.0.0.1` rồi để Facebook lỗi
+   * mơ hồ. Asset không thuộc chủ bài ⇒ bỏ qua (không bao giờ đăng ảnh của người khác).
+   */
+  const publishMediaRefs = async (item) => {
+    const ids = Array.isArray(item?.media_ids) ? item.media_ids : [];
+    if (ids.length === 0 || typeof store?.getImageAsset !== 'function') return [];
+    const base = String(config?.publicBaseUrl ?? '').trim().replace(/\/+$/, '');
+    const out = [];
+    for (const id of ids) {
+      let asset = null;
+      try {
+        asset = await store.getImageAsset(String(id));
+      } catch {
+        asset = null;
+      }
+      if (!asset) continue;
+      const owner = asset.user_id ?? null;
+      if (owner && String(owner) !== String(item.user_id ?? '')) {
+        logger?.warn?.('publish.media_owner_mismatch', { item_id: item.id });
+        continue;
+      }
+      out.push({
+        id: String(asset.id),
+        mime: String(asset.mime ?? ''),
+        bytes: Number(asset.bytes ?? 0),
+        // Route tệp ảnh đã có từ MVP-02 — dùng lại, KHÔNG tự ghép đường dẫn đĩa.
+        url: base ? `${base}/api/imagelab/assets/${encodeURIComponent(String(asset.id))}/file` : '',
+      });
+    }
+    return out;
+  };
+
+  /** Bài đăng trả ra API — ĐÚNG các field hợp đồng; KHÔNG lộ `session_id`, KHÔNG lộ token. */
+  const publicPublishItem = (item) => ({
+    id: item.id,
+    job_id: item.job_id,
+    channel: item.channel,
+    provider: item.provider,
+    text: item.text,
+    media_ids: item.media_ids,
+    status: item.status,
+    scheduled_at: item.scheduled_at,
+    approved_by: item.approved_by,
+    approved_at: item.approved_at,
+    rejected_by: item.rejected_by,
+    rejected_at: item.rejected_at,
+    reject_reason: item.reject_reason,
+    published_at: item.published_at,
+    external_post_id: item.external_post_id,
+    external_url: item.external_url,
+    is_mock: item.is_mock,
+    error_code: item.error_code,
+    last_error: item.last_error,
+    attempts: item.attempts,
+    created_at: item.created_at,
+    updated_at: item.updated_at,
+  });
+
+  /* ── Tạo bài NHÁP từ một job ── */
+
+  router.post('/api/publish/items', async (req, res) => {
+    const svc = requirePublish();
+    const user = requireUser(req);
+    enforce(rateLimiters.jobs, `publish:${sessionId(req, res)}`);
+    const body = await readJson(req, { maxBytes: 256 * 1024 });
+    const jobId = String(body?.job_id ?? body?.jobId ?? '').trim();
+    if (!jobId) throw new HttpError(400, 'BAD_INPUT', 'Thiếu `job_id` — bài đăng phải xuất phát từ một job đã chạy.');
+    // Job phải là job CỦA CHÍNH NGƯỜI GỌI (khác chủ ⇒ 404) — kể cả owner/admin: tạo bài là
+    // hành động của chủ nội dung, duyệt mới là việc của quản trị.
+    const job = await requireOwnJob(req, res, jobId);
+    try {
+      const created = await svc.createItem({
+        job,
+        userId: user.id,
+        text: body?.text,
+        mediaIds: body?.media_ids ?? body?.mediaIds ?? [],
+        channel: body?.channel,
+        scheduledAt: body?.scheduled_at ?? body?.scheduledAt ?? null,
+        submit: body?.submit === true,
+      });
+      sendJson(res, 201, {
+        item: publicPublishItem(created.item),
+        warnings: created.warnings ?? [],
+        dropped_media: created.dropped_media ?? 0,
+        provider: svc.providerInfo(),
+      });
+    } catch (err) {
+      throw mapPublishError(err);
+    }
+  });
+
+  /* ── Hàng đợi duyệt: owner/admin thấy MỌI bài, member chỉ thấy bài của mình ── */
+
+  router.get('/api/publish/items', async (req, res) => {
+    const svc = requirePublish();
+    const user = requireUser(req);
+    enforce(rateLimiters.requests, `publish-read:${sessionId(req, res)}`);
+    const url = new URL(req.url, 'http://local');
+    const statusRaw = String(url.searchParams.get('status') ?? '').trim();
+    if (statusRaw && !PUBLISH_STATUS_LIST.includes(statusRaw)) {
+      throw new HttpError(400, 'BAD_STATUS', `Trạng thái không hợp lệ (chỉ nhận: ${PUBLISH_STATUS_LIST.join(', ')}).`);
+    }
+    const jobId = String(url.searchParams.get('job_id') ?? '').trim();
+    const all = isPublishAdmin(req);
+    const [items, total] = await Promise.all([
+      store.listPublishItems({
+        userId: user.id,
+        all,
+        status: statusRaw || null,
+        jobId: jobId || null,
+        limit: clampInt(url.searchParams.get('limit'), 50, 1, 200),
+        offset: clampInt(url.searchParams.get('offset'), 0, 0, 100000),
+      }),
+      store.countPublishItems({ userId: user.id, all, status: statusRaw || null }),
+    ]);
+    sendJson(res, 200, {
+      items: asArray(items).map((it) => publicPublishItem(it)),
+      total,
+      scope: all ? 'all' : 'mine',
+      can_approve: all,
+      provider: svc.providerInfo(),
+      statuses: [...PUBLISH_STATUS_LIST],
+    });
+  });
+
+  /* ── Chi tiết + VẾT mọi lần gọi provider (kể cả lỗi nguyên văn của Facebook) ── */
+
+  router.get('/api/publish/items/:id', async (req, res, params) => {
+    const svc = requirePublish();
+    requireUser(req);
+    enforce(rateLimiters.requests, `publish-read:${sessionId(req, res)}`);
+    const item = await requireOwnPublishItem(req, params.id);
+    const logs = typeof store.listPublishLogs === 'function' ? asArray(await store.listPublishLogs(item.id, { limit: 50 })) : [];
+    sendJson(res, 200, {
+      item: publicPublishItem(item),
+      logs: logs.map((l) => ({
+        id: l.id,
+        attempt: l.attempt,
+        provider: l.provider,
+        status: l.status,
+        external_post_id: l.external_post_id,
+        error_code: l.error_code,
+        // NGUYÊN VĂN lỗi nền tảng (token đã bị `maskToken` che ở tầng provider).
+        error_message: l.error_message,
+        is_mock: l.is_mock,
+        request_summary: l.request_summary,
+        created_at: l.created_at,
+      })),
+      provider: svc.providerInfo(),
+    });
+  });
+
+  /* ── Chủ bài gửi duyệt: draft → pending_review ── */
+
+  router.post('/api/publish/items/:id/submit', async (req, res, params) => {
+    const svc = requirePublish();
+    requireUser(req);
+    enforce(rateLimiters.jobs, `publish:${sessionId(req, res)}`);
+    const item = await requireOwnPublishItem(req, params.id);
+    try {
+      sendJson(res, 200, { item: publicPublishItem(await svc.submit(item.id)) });
+    } catch (err) {
+      throw mapPublishError(err);
+    }
+  });
+
+  /* ── DUYỆT / TỪ CHỐI — CHỈ owner/admin (member ⇒ 403) ── */
+
+  router.post('/api/publish/items/:id/approve', async (req, res, params) => {
+    const svc = requirePublish();
+    const admin = requireAdmin(req);
+    enforce(rateLimiters.jobs, `publish:${sessionId(req, res)}`);
+    const item = await requireOwnPublishItem(req, params.id);
+    try {
+      sendJson(res, 200, { item: publicPublishItem(await svc.approve(item.id, { by: admin.id })) });
+    } catch (err) {
+      throw mapPublishError(err);
+    }
+  });
+
+  router.post('/api/publish/items/:id/reject', async (req, res, params) => {
+    const svc = requirePublish();
+    const admin = requireAdmin(req);
+    enforce(rateLimiters.jobs, `publish:${sessionId(req, res)}`);
+    const item = await requireOwnPublishItem(req, params.id);
+    const body = await readJson(req, { maxBytes: 16 * 1024 }).catch(() => null);
+    try {
+      const next = await svc.reject(item.id, { by: admin.id, reason: sanitizeText(String(body?.reason ?? ''), { maxLength: 1000 }) });
+      sendJson(res, 200, { item: publicPublishItem(next) });
+    } catch (err) {
+      throw mapPublishError(err);
+    }
+  });
+
+  /* ── ĐĂNG — CHỈ chạy khi bài đã `approved` (cổng thật ở `Store#claimPublishItem`) ── */
+
+  router.post('/api/publish/items/:id/publish', async (req, res, params) => {
+    const svc = requirePublish();
+    const user = requireUser(req);
+    enforce(rateLimiters.jobs, `publish:${sessionId(req, res)}`);
+    const item = await requireOwnPublishItem(req, params.id);
+    const media = await publishMediaRefs(item);
+    try {
+      const out = await svc.publishItem(item.id, { actorId: user.id, media });
+      sendJson(res, 200, {
+        item: publicPublishItem(out.item),
+        result: {
+          status: out.result?.status ?? null,
+          post_id: out.result?.post_id ?? null,
+          url: out.result?.url ?? null,
+          error_code: out.result?.error_code ?? null,
+          error_message: String(out.result?.error_message ?? ''),
+          is_mock: Boolean(out.result?.is_mock),
+          provider: out.result?.provider ?? null,
+          scheduled_at: out.result?.scheduled_at ?? null,
+        },
+        // `called = false` ⇒ provider KHÔNG được gọi (bài đã đăng trước đó) — luật "một bài
+        // chỉ đăng một lần" quan sát được từ ngoài, không phải chỉ nằm trong mã.
+        called: out.called === true,
+        idempotent: out.idempotent === true,
+      });
+    } catch (err) {
+      throw mapPublishError(err);
+    }
+  });
+
+  /* ── Trạng thái provider (có thể gọi mạng) — CHỈ owner/admin ── */
+
+  router.get('/api/publish/provider', async (req, res) => {
+    const svc = requirePublish();
+    requireAdmin(req);
+    enforce(rateLimiters.requests, `publish-read:${sessionId(req, res)}`);
+    sendJson(res, 200, { provider: svc.providerInfo(), probe: await svc.probe() });
   });
 
   /**

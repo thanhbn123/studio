@@ -192,6 +192,22 @@ const state = {
       dirtyPaint: false,
     },
   },
+  // MVP-07 — Đăng bài Facebook Page (DUYỆT TAY), hợp đồng §5. Tách riêng khỏi state của các
+  // sprint khác để không giẫm chân nhau. `canApprove` là câu trả lời THẬT của máy chủ
+  // (`can_approve` trong `GET /api/publish/items`) — UI KHÔNG tự suy quyền duyệt từ role.
+  pub: {
+    items: [],
+    total: 0,
+    scope: 'mine',
+    canApprove: false,
+    filter: '',
+    loading: false,
+    creating: false,
+    busyId: null,
+    error: null,
+    jobs: [],
+    draft: { jobId: '', text: '' },
+  },
   // MVP-05 — Tài khoản + ví credit (§3.5). `me` là câu trả lời THẬT của `GET /api/auth/me`.
   auth: {
     me: null, // { user, anonymous, balance } | null = chưa kiểm tra
@@ -367,6 +383,16 @@ function route() {
     stopIsPolling();
     stopVsPolling();
     openAdmin();
+    return;
+  }
+  // MVP-07 (§5) — tab thứ năm “Đăng bài”, route hash riêng `#/dangbai`.
+  if (hash.startsWith('#/dangbai')) {
+    stopPolling();
+    stopIlPolling();
+    stopIsPolling();
+    stopVsPolling();
+    renderPublish();
+    loadPublishItems({ quiet: true });
     return;
   }
   // MVP-04 (§2.5) — tab thứ tư “Video”, route hash riêng: `#/video` và `#/video/:id`.
@@ -590,6 +616,21 @@ function onGlobalClick(ev) {
     // ── Gói xuất bản (.zip) — hợp đồng §4 ──
     exportbundle: () => downloadExportBundle(btn.dataset.exportId),
     exportmanifest: () => openExportManifest(btn.dataset.exportId),
+    // ── MVP-07 — Đăng bài Facebook Page (duyệt tay) ──
+    publish: () => {
+      location.hash = '#/dangbai';
+    },
+    pubreload: () => loadPublishItems(),
+    pubfilter: () => {
+      state.pub.filter = String(btn.dataset.filter ?? '');
+      loadPublishItems();
+    },
+    pubcreate: () => createPublishItem(false),
+    pubcreatesubmit: () => createPublishItem(true),
+    pubsubmit: () => publishItemAction(btn.dataset.id, 'submit'),
+    pubapprove: () => publishItemAction(btn.dataset.id, 'approve'),
+    pubreject: () => publishItemAction(btn.dataset.id, 'reject'),
+    pubpublish: () => publishItemAction(btn.dataset.id, 'publish'),
     // ── MVP-05 — Tài khoản + ví credit ──
     login: () => {
       location.hash = '#/dangnhap';
@@ -6711,6 +6752,8 @@ function wireAuthGlobal() {
     // Giữ bản nháp để render lại không mất chữ. Mật khẩu KHÔNG bao giờ vào state.
     if (t.id === 'auth-email') state.auth.form.email = String(t.value ?? '');
     else if (t.id === 'auth-name') state.auth.form.display_name = String(t.value ?? '');
+    // MVP-07: giữ bản nháp bài đăng để render lại không mất chữ người dùng đang viết.
+    else if (t.id === 'pub-text') state.pub.draft.text = String(t.value ?? '');
     else if (t.id === 'credit-amount') state.auth.creditDraft.amount = String(t.value ?? '');
     else if (t.id === 'credit-note') state.auth.creditDraft.note = String(t.value ?? '');
     // MVP-06 — giữ bản nháp form nạp credit để render lại không mất chữ.
@@ -6726,6 +6769,10 @@ function wireAuthGlobal() {
       state.auth.roleDraft[t.dataset.roleUser] = String(t.value || '');
       return;
     }
+    if (t.id === 'pub-job') {
+      state.pub.draft.jobId = String(t.value || '');
+      return;
+    }
     if (t.id === 'admin-usage-group') {
       state.auth.usageGroup = String(t.value || 'day');
       loadAdminUsage(true);
@@ -6735,6 +6782,424 @@ function wireAuthGlobal() {
       state.auth.usageTo = String(t.value || '');
     }
   });
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * MVP-07 — MÀN “ĐĂNG BÀI” (Facebook Page, DUYỆT TAY)
+ * Hợp đồng: `docs/MVP-07-CONTRACT.md` §5.
+ *
+ * Ba điều màn này BẮT BUỘC nói thật, vì chúng là lý do cả sprint tồn tại:
+ *   1. Provider `dry-run` ⇒ băng vàng “CHẾ ĐỘ THỬ — không đăng thật”.
+ *   2. Provider `facebook` chưa có token ⇒ băng đỏ “chưa cấu hình Facebook (cần Page ID + token)”.
+ *   3. Bài chưa duyệt ⇒ nút ĐĂNG NGAY **disabled** + câu giải thích; không bao giờ có đường
+ *      nào trong UI gọi `…/publish` cho bài chưa `approved`.
+ *
+ * Mọi text động đi qua `esc()`.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const PUB_STATUS_LABEL = {
+  draft: 'Nháp',
+  pending_review: 'Chờ duyệt',
+  approved: 'Đã duyệt',
+  publishing: 'Đang đăng',
+  published: 'Đã đăng',
+  failed: 'Lỗi',
+  rejected: 'Bị từ chối',
+};
+
+const PUB_STATUS_CLASS = {
+  draft: '',
+  pending_review: 'warn',
+  approved: 'ok',
+  publishing: 'warn',
+  published: 'ok',
+  failed: 'bad',
+  rejected: 'bad',
+};
+
+/** Bộ lọc trên màn (thứ tự hiển thị). `''` = tất cả. */
+const PUB_FILTERS = [
+  ['', 'Tất cả'],
+  ['draft', 'Nháp'],
+  ['pending_review', 'Chờ duyệt'],
+  ['approved', 'Đã duyệt'],
+  ['published', 'Đã đăng'],
+  ['failed', 'Lỗi'],
+  ['rejected', 'Bị từ chối'],
+];
+
+const PUB_DRY_RUN_LINE = 'CHẾ ĐỘ THỬ — không đăng thật';
+const PUB_NOT_CONFIGURED_LINE = 'chưa cấu hình Facebook (cần Page ID + token)';
+const PUB_MANUAL_LINE = 'Hệ thống KHÔNG BAO GIỜ tự đăng: mỗi bài phải có owner/admin bấm DUYỆT trước.';
+const PUB_NEED_LOGIN_LINE = 'Đăng bài cần đăng nhập — bài đăng phải có người chịu trách nhiệm và có người duyệt.';
+const PUB_NOT_APPROVED_HINT = 'Bài phải được DUYỆT trước khi đăng.';
+
+// ⚠️ Bảng này cố ý KHÔNG tham chiếu các hằng ở trên: bộ test UI trích TỪNG hằng ra khỏi
+// `public/app.js` rồi biên dịch riêng, nên một object tham chiếu hằng khác sẽ không nạp được.
+// Đây là bản sao CÂU CHỮ (copy hiển thị), không phải bản sao LUẬT — luật nằm ở `src/publish/**`.
+const PUB_ERROR_HINT = {
+  PUBLISH_UNAVAILABLE: 'Máy chủ chưa nạp được khối đăng bài — các tính năng khác vẫn dùng bình thường.',
+  UNAUTHENTICATED: 'Đăng bài cần đăng nhập — bài đăng phải có người chịu trách nhiệm và có người duyệt.',
+  FORBIDDEN: 'Chỉ owner/admin được duyệt hoặc từ chối bài.',
+  NOT_APPROVED: 'Bài phải được DUYỆT trước khi đăng.',
+  ITEM_NOT_FOUND: 'Không tìm thấy bài: có thể bài thuộc tài khoản khác, hoặc đã bị xoá.',
+  NOT_CONFIGURED: 'Chưa cấu hình Facebook (cần Page ID + token) nên máy chủ không đăng gì cả.',
+  PROVIDER_DISABLED: 'Đường đăng bài đang tắt bằng cấu hình.',
+  MEDIA_NOT_PUBLIC: 'Ảnh chỉ có trên đĩa máy chủ, Facebook không tải về được. Hãy đăng bài chỉ có chữ, hoặc cấu hình PUBLIC_BASE_URL công khai.',
+  ATTEMPTS_EXHAUSTED: 'Bài đã thử đăng hết số lượt cho phép — xem lỗi gần nhất rồi tạo bài mới.',
+  ALREADY_PUBLISHED: 'Bài này đã đăng rồi — hệ thống không đăng lần hai.',
+  PUBLISH_IN_PROGRESS: 'Một lượt đăng khác đang xử lý bài này.',
+};
+
+/** Câu nói THẬT khi một thao tác đăng bài thất bại — theo mã + HTTP status, không đoán bừa. */
+function pubErrorText(err) {
+  const code = String(err?.code || '').trim();
+  const status = Number(err?.status || 0);
+  const rawMsg = String(err?.payload?.message || err?.message || '').trim();
+  const real = rawMsg && rawMsg !== `HTTP ${status}` ? rawMsg : '';
+  const hint = PUB_ERROR_HINT[code] || '';
+  const head = status ? `HTTP ${status}${code ? ` ${code}` : ''}` : code || 'lỗi không rõ';
+  const server = real ? ` Máy chủ báo: “${real}”` : '';
+  return `${hint ? `${hint} ` : ''}(${head}).${server}`.trim();
+}
+
+function pubStatusBadge(status) {
+  const s = String(status ?? '');
+  const cls = PUB_STATUS_CLASS[s] ?? '';
+  return `<span class="badge ${cls}">${esc(PUB_STATUS_LABEL[s] || s || 'không rõ')}</span>`;
+}
+
+/** Khối `publish` của `/api/config` — thiếu thì coi như chưa khả dụng, KHÔNG đoán là sẵn sàng. */
+function pubConfig() {
+  return state.config?.publish || null;
+}
+
+function pubProvider() {
+  return pubConfig()?.provider || null;
+}
+
+/**
+ * Băng trạng thái provider — luật §5 của hợp đồng. Đây là chỗ UI PHẢI nói thật:
+ * chế độ thử thì nói chế độ thử; chưa có token thì nói chưa có token.
+ */
+function pubProviderNotice() {
+  const cfg = pubConfig();
+  if (!cfg) {
+    return `<div class="notice error"><strong>Chưa biết trạng thái đăng bài</strong>
+      <p class="small" style="margin:6px 0 0">Máy chủ không trả khối <span class="mono">publish</span> trong /api/config — bản máy chủ cũ hơn tính năng này.</p></div>`;
+  }
+  if (!cfg.available) {
+    return `<div class="notice error"><strong>Tính năng đăng bài chưa sẵn sàng (PUBLISH_UNAVAILABLE)</strong>
+      <p class="small" style="margin:6px 0 0">Lý do máy chủ báo: ${esc(cfg.reason || 'không nêu lý do — xem log máy chủ (publish.wiring_failed).')}</p></div>`;
+  }
+  const p = cfg.provider || {};
+  const name = String(p.name || 'none');
+  if (p.is_mock) {
+    return `<div class="notice warn"><strong>${esc(PUB_DRY_RUN_LINE)}</strong>
+      <p class="small" style="margin:6px 0 0">Provider <span class="mono">${esc(name)}</span>: bài KHÔNG được gửi lên Facebook.
+      Mã bài trả về có tiền tố <span class="mono">dry-</span> và được đánh dấu <strong>là giả</strong>.
+      ${esc(PUB_MANUAL_LINE)}</p></div>`;
+  }
+  if (!p.configured) {
+    return `<div class="notice error"><strong>${esc(PUB_NOT_CONFIGURED_LINE)}</strong>
+      <p class="small" style="margin:6px 0 0">Provider <span class="mono">${esc(name)}</span> chưa đủ cấu hình nên máy chủ
+      <strong>không đăng gì cả</strong>. Cần khai <span class="mono">FACEBOOK_PAGE_ID</span> +
+      <span class="mono">FACEBOOK_PAGE_ACCESS_TOKEN</span> (token do chủ dự án cấp sau khi Facebook app review).</p></div>`;
+  }
+  return `<div class="notice ok"><strong>Đã cấu hình Facebook Page — bài được DUYỆT sẽ đăng THẬT.</strong>
+    <p class="small" style="margin:6px 0 0">Provider <span class="mono">${esc(name)}</span>. ${esc(PUB_MANUAL_LINE)}</p></div>`;
+}
+
+/** Xem trước nội dung: giữ nguyên văn, chỉ cắt gọn để danh sách đọc được. */
+function pubPreviewText(text, { max = 400 } = {}) {
+  const s = String(text ?? '');
+  const chars = [...s];
+  return chars.length > max ? `${chars.slice(0, max).join('')}…` : s;
+}
+
+/** Ảnh/video kèm bài — dùng route tệp có sẵn của MVP-02, KHÔNG tự ghép đường dẫn đĩa. */
+function pubMediaHtml(item) {
+  const ids = Array.isArray(item?.media_ids) ? item.media_ids : [];
+  if (ids.length === 0) return '<p class="muted small" style="margin:6px 0 0">Bài chỉ có chữ (không kèm ảnh/video).</p>';
+  return `<div class="row" style="margin-top:8px">${ids
+    .map((id) => {
+      const url = `/api/imagelab/assets/${encodeURIComponent(String(id))}/file`;
+      return `<a href="${esc(url)}" target="_blank" rel="noopener" title="${esc(String(id))}"
+        ><img src="${esc(url)}" alt="Ảnh kèm bài" style="width:96px;height:96px;object-fit:cover;border-radius:8px;border:1px solid var(--line)" /></a>`;
+    })
+    .join('')}</div>`;
+}
+
+/** Kết quả đã đăng — `dry-` phải được nói rõ là id THỬ, không phải bài thật. */
+function pubResultHtml(item) {
+  const id = String(item?.external_post_id ?? '');
+  if (!id) return '';
+  const isDry = item?.is_mock === true || id.startsWith('dry-');
+  const link = !isDry && item?.external_url
+    ? ` · <a href="${esc(String(item.external_url))}" target="_blank" rel="noopener">mở bài trên Facebook</a>`
+    : '';
+  return `<p class="small ${isDry ? 'muted' : ''}" style="margin:6px 0 0">
+    Mã bài: <span class="mono">${esc(id)}</span>${
+    isDry ? ' — <strong>id thử — không có bài thật</strong>' : ''}${link}</p>`;
+}
+
+/** Lỗi gần nhất của bài — NGUYÊN VĂN từ nền tảng, không nuốt, không dịch lại. */
+function pubLastErrorHtml(item) {
+  const msg = String(item?.last_error ?? '').trim();
+  if (!msg) return '';
+  return `<div class="notice error small" style="margin:8px 0 0">
+    <strong>Lỗi lần đăng gần nhất${item?.error_code ? ` (${esc(String(item.error_code))})` : ''}:</strong>
+    <p class="mono" style="margin:6px 0 0;white-space:pre-wrap">${esc(msg)}</p></div>`;
+}
+
+/**
+ * Các nút của MỘT bài. Luật §5: nút ĐĂNG NGAY chỉ BẬT khi bài `approved`/`failed`;
+ * bài chưa duyệt thì nút bị `disabled` kèm câu giải thích — không có đường nào bấm đăng được.
+ */
+function pubItemActions(item) {
+  // Quyền duyệt lấy từ CÂU TRẢ LỜI THẬT của máy chủ (`can_approve` trong GET /api/publish/items),
+  // KHÔNG tự suy từ role trong state: role có thể cũ hơn phiên, còn `can_approve` là thứ chính
+  // máy chủ vừa khẳng định. Không có câu trả lời ⇒ coi như KHÔNG có quyền (fail-closed).
+  const canApprove = state.pub.canApprove === true;
+  const status = String(item?.status ?? '');
+  const id = String(item?.id ?? '');
+  const busy = state.pub.busyId === id;
+  const dis = busy ? ' disabled aria-disabled="true"' : '';
+  const buttons = [];
+  if (status === 'draft') {
+    buttons.push(`<button class="btn tiny" type="button" data-action="pubsubmit" data-id="${esc(id)}"${dis}>GỬI DUYỆT</button>`);
+  }
+  if (canApprove && (status === 'draft' || status === 'pending_review')) {
+    buttons.push(`<button class="btn primary tiny" type="button" data-action="pubapprove" data-id="${esc(id)}"${dis}>DUYỆT</button>`);
+  }
+  if (canApprove && status !== 'published' && status !== 'rejected' && status !== 'publishing') {
+    buttons.push(`<button class="btn tiny danger" type="button" data-action="pubreject" data-id="${esc(id)}"${dis}>TỪ CHỐI</button>`);
+  }
+  const publishable = status === 'approved' || status === 'failed';
+  if (status !== 'published' && status !== 'rejected') {
+    buttons.push(`<button class="btn primary tiny" type="button" data-action="pubpublish" data-id="${esc(id)}"${
+      publishable && !busy ? '' : ' disabled aria-disabled="true"'
+    }>ĐĂNG NGAY</button>`);
+  }
+  const hint = publishable || status === 'published' || status === 'rejected'
+    ? ''
+    : `<p class="muted small" style="margin:6px 0 0">${esc(PUB_NOT_APPROVED_HINT)}</p>`;
+  return `<div class="row" style="margin-top:10px">${buttons.join('')}</div>${hint}`;
+}
+
+/** Một thẻ bài đăng trong danh sách. */
+function pubItemCard(item) {
+  const id = String(item?.id ?? '');
+  const text = pubPreviewText(item?.text);
+  return `<article class="panel" style="margin-top:12px" data-pub-item="${esc(id)}">
+    <div class="spread">
+      <div class="row">
+        ${pubStatusBadge(item?.status)}
+        <span class="badge">${esc(String(item?.channel || 'facebook_page'))}</span>
+        ${item?.is_mock ? '<span class="badge warn">THỬ</span>' : ''}
+        ${item?.attempts ? `<span class="badge">đã thử ${esc(String(item.attempts))} lượt</span>` : ''}
+      </div>
+      <span class="muted small mono">${esc(String(item?.created_at ?? ''))}</span>
+    </div>
+    <div class="field-body" style="margin-top:10px;white-space:pre-wrap">${esc(text) || '<span class="muted">(không có chữ)</span>'}</div>
+    ${pubMediaHtml(item)}
+    <dl class="kv" style="margin-top:10px">
+      <dt>Job nguồn</dt><dd class="mono">${esc(String(item?.job_id ?? '—'))}</dd>
+      ${item?.approved_by ? `<dt>Người duyệt</dt><dd class="mono">${esc(String(item.approved_by))} · ${esc(String(item.approved_at ?? ''))}</dd>` : ''}
+      ${item?.rejected_by ? `<dt>Người từ chối</dt><dd class="mono">${esc(String(item.rejected_by))} · ${esc(String(item.reject_reason ?? ''))}</dd>` : ''}
+      ${item?.published_at ? `<dt>Đăng lúc</dt><dd class="mono">${esc(String(item.published_at))}</dd>` : ''}
+    </dl>
+    ${pubResultHtml(item)}
+    ${pubLastErrorHtml(item)}
+    ${pubItemActions(item)}
+  </article>`;
+}
+
+/** Form tạo bài nháp: chọn job trong lịch sử + ô nội dung (bỏ trống ⇒ lấy gợi ý từ job). */
+function pubCreateFormHtml() {
+  const jobs = Array.isArray(state.pub.jobs) ? state.pub.jobs : [];
+  const selected = String(state.pub.draft.jobId ?? '');
+  const options = jobs.length
+    ? jobs
+      .map((jb) => {
+        const label = `${jb.product_name || jb.source_url || jb.id} · ${jb.status || ''}`;
+        return `<option value="${esc(String(jb.id))}"${String(jb.id) === selected ? ' selected' : ''}>${esc(label)}</option>`;
+      })
+      .join('')
+    : '';
+  return `<section class="panel">
+    <h2>Tạo bài đăng mới</h2>
+    <p class="muted small" style="margin:0 0 10px">Bài mới luôn là <strong>nháp</strong> hoặc <strong>chờ duyệt</strong> — không có đường nào tạo ra bài “đã duyệt”.</p>
+    <div class="field">
+      <div class="field-head"><label for="pub-job">Job nguồn</label></div>
+      ${jobs.length
+    ? `<select id="pub-job" class="text-input">${options}</select>`
+    : `<p class="muted small" style="margin:0">Chưa có job nào trong lịch sử của bạn. Hãy chạy một sản phẩm ở tab “Sản phẩm mới” trước.</p>`}
+    </div>
+    <div class="field">
+      <div class="field-head"><label for="pub-text">Nội dung bài</label><span class="muted small">bỏ trống ⇒ lấy gợi ý từ nội dung job</span></div>
+      <textarea id="pub-text" class="text-input" rows="6" placeholder="Nội dung sẽ đăng lên Facebook Page…">${esc(String(state.pub.draft.text ?? ''))}</textarea>
+    </div>
+    <div class="row">
+      <button class="btn primary" type="button" data-action="pubcreate"${jobs.length && !state.pub.creating ? '' : ' disabled aria-disabled="true"'}>${
+    state.pub.creating ? 'Đang tạo…' : 'TẠO NHÁP'
+  }</button>
+      <button class="btn" type="button" data-action="pubcreatesubmit"${jobs.length && !state.pub.creating ? '' : ' disabled aria-disabled="true"'}>TẠO &amp; GỬI DUYỆT</button>
+    </div>
+  </section>`;
+}
+
+/** Màn “Đăng bài”. */
+function renderPublish() {
+  stopPolling();
+  stopIlPolling();
+  stopIsPolling();
+  stopVsPolling();
+  const cfg = pubConfig();
+  const loggedIn = Boolean(state.auth.me?.user);
+  const items = Array.isArray(state.pub.items) ? state.pub.items : [];
+  const filter = String(state.pub.filter ?? '');
+
+  const body = !loggedIn
+    ? `<section class="panel"><div class="notice warn"><strong>${esc(PUB_NEED_LOGIN_LINE)}</strong>
+         <p class="small" style="margin:8px 0 0"><button class="btn tiny" type="button" data-action="login">ĐĂNG NHẬP</button></p></div></section>`
+    : cfg && cfg.available === false
+      ? ''
+      : `${pubCreateFormHtml()}
+      <section class="panel">
+        <div class="spread">
+          <h2 style="margin:0">Danh sách bài đăng${state.pub.scope === 'all' ? ' (toàn hệ thống)' : ''}</h2>
+          <button class="btn ghost tiny" type="button" data-action="pubreload">Nạp lại</button>
+        </div>
+        <div class="tabs" style="margin-top:10px">
+          ${PUB_FILTERS.map(([id, label]) => `<button class="tab ${filter === id ? 'active' : ''}" type="button" data-action="pubfilter" data-filter="${esc(id)}">${esc(label)}</button>`).join('')}
+        </div>
+        ${state.pub.loading
+        ? '<p class="muted small" style="margin:12px 0 0">Đang nạp…</p>'
+        : items.length === 0
+          ? '<p class="muted small" style="margin:12px 0 0">Chưa có bài nào ở mục này.</p>'
+          : items.map((it) => pubItemCard(it)).join('')}
+      </section>`;
+
+  app.innerHTML = `
+    <section class="panel">
+      <div class="spread">
+        <div style="min-width:0">
+          <h2 style="margin:0 0 4px">Đăng bài — Facebook Page</h2>
+          <p class="muted small" style="margin:0">Tạo bài từ job đã chạy → <strong>owner/admin duyệt tay</strong> → mới đăng. ${esc(PUB_MANUAL_LINE)}</p>
+        </div>
+        <span class="badge ${cfg?.available ? 'ok' : 'bad'}">${cfg?.available ? 'Sẵn sàng' : 'Chưa khả dụng'}</span>
+      </div>
+      ${pubProviderNotice()}
+    </section>
+    ${body}
+    ${authHintHtml()}
+    <div id="pub-error"></div>
+  `;
+  pubPaintError();
+}
+
+/** Vẽ lỗi vào ô riêng để không mất cả màn hình khi một thao tác lỗi. */
+function pubPaintError() {
+  const box = document.querySelector('#pub-error');
+  if (!box) return;
+  box.innerHTML = state.pub.error
+    ? `<div class="notice error"><strong>Không thực hiện được:</strong> ${esc(state.pub.error)}</div>`
+    : '';
+}
+
+/** Nạp danh sách bài + lịch sử job (để chọn job nguồn). */
+async function loadPublishItems({ quiet = false } = {}) {
+  if (!state.auth.me?.user) return;
+  if (!quiet) {
+    state.pub.loading = true;
+    renderPublish();
+  }
+  try {
+    const query = state.pub.filter ? `?status=${encodeURIComponent(state.pub.filter)}` : '';
+    const data = await api(`/api/publish/items${query}`);
+    state.pub.items = Array.isArray(data?.items) ? data.items : [];
+    state.pub.total = Number(data?.total ?? 0);
+    state.pub.scope = String(data?.scope ?? 'mine');
+    state.pub.canApprove = data?.can_approve === true;
+    state.pub.error = null;
+  } catch (err) {
+    state.pub.items = [];
+    state.pub.error = pubErrorText(err);
+  } finally {
+    state.pub.loading = false;
+  }
+  try {
+    const hist = await api('/api/jobs?limit=20');
+    state.pub.jobs = Array.isArray(hist?.items) ? hist.items : Array.isArray(hist?.jobs) ? hist.jobs : [];
+    if (!state.pub.draft.jobId && state.pub.jobs.length) state.pub.draft.jobId = String(state.pub.jobs[0].id);
+  } catch {
+    /* lịch sử không nạp được thì chỉ mất ô chọn job — không chặn cả màn */
+  }
+  renderPublish();
+}
+
+/** Tạo bài nháp (hoặc tạo + gửi duyệt). KHÔNG BAO GIỜ tạo ra bài `approved`. */
+async function createPublishItem(submit) {
+  const jobId = String($('#pub-job')?.value || state.pub.draft.jobId || '').trim();
+  const text = String($('#pub-text')?.value ?? state.pub.draft.text ?? '');
+  state.pub.draft.jobId = jobId;
+  state.pub.draft.text = text;
+  if (!jobId) {
+    state.pub.error = 'Hãy chọn job nguồn cho bài đăng.';
+    pubPaintError();
+    return;
+  }
+  state.pub.creating = true;
+  state.pub.error = null;
+  renderPublish();
+  try {
+    await api('/api/publish/items', { method: 'POST', body: { job_id: jobId, text, submit: submit === true } });
+    state.pub.draft.text = '';
+    toast(submit ? 'Đã tạo bài và gửi duyệt' : 'Đã tạo bài nháp');
+  } catch (err) {
+    state.pub.error = pubErrorText(err);
+  } finally {
+    state.pub.creating = false;
+  }
+  await loadPublishItems({ quiet: true });
+}
+
+/** Một thao tác trên bài: submit / approve / reject / publish. */
+async function publishItemAction(id, action) {
+  const itemId = String(id ?? '').trim();
+  if (!itemId) return;
+  let body;
+  if (action === 'reject') {
+    // `prompt` có thể bị trình duyệt chặn ⇒ coi như không có lý do, vẫn từ chối được.
+    let reason = '';
+    try {
+      reason = window.prompt('Lý do từ chối (có thể để trống):') ?? '';
+    } catch {
+      reason = '';
+    }
+    body = { reason: String(reason) };
+  }
+  state.pub.busyId = itemId;
+  state.pub.error = null;
+  renderPublish();
+  try {
+    const res = await api(`/api/publish/items/${encodeURIComponent(itemId)}/${action}`, { method: 'POST', ...(body ? { body } : {}) });
+    if (action === 'publish') {
+      const r = res?.result || {};
+      if (res?.idempotent === true) toast('Bài này đã đăng trước đó — không đăng lần hai');
+      else if (r.is_mock) toast(`${PUB_DRY_RUN_LINE} · mã thử ${String(r.post_id ?? '')}`);
+      else if (r.status === 'PUBLISHED' || r.status === 'SCHEDULED') toast(`Đã đăng · mã bài ${String(r.post_id ?? '')}`);
+      else state.pub.error = `Đăng KHÔNG thành công (${String(r.error_code ?? r.status ?? 'không rõ')}). Máy chủ/nền tảng báo: “${String(r.error_message ?? '')}”`;
+    } else {
+      toast(action === 'approve' ? 'Đã DUYỆT bài' : action === 'reject' ? 'Đã từ chối bài' : 'Đã gửi duyệt');
+    }
+  } catch (err) {
+    state.pub.error = pubErrorText(err);
+  } finally {
+    state.pub.busyId = null;
+  }
+  await loadPublishItems({ quiet: true });
 }
 
 boot();

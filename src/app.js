@@ -475,6 +475,8 @@ function createBillingHook({ service, store, logger, config, BillingError = null
  * @param {object} [opts.imagelabPipeline] [MVP-02] pipeline đã dựng sẵn (test)
  * @param {object} [opts.mattingProvider]  [MVP-03] provider tách nền đã dựng sẵn (test)
  * @param {object} [opts.retouchProvider]  [MVP-03] provider retouch đã dựng sẵn (test)
+ * @param {object} [opts.publishProvider] [MVP-07] provider đăng bài đã dựng sẵn (test)
+ * @param {object} [opts.publishService]  [MVP-07] PublishService đã dựng sẵn (test)
  * @param {object} [opts.imagestudioPipeline] [MVP-03] pipeline tạo ảnh đã dựng sẵn (test)
  * @param {object} [opts.videostudioPipeline] [MVP-04] pipeline video đã dựng sẵn (test)
  * @param {object} [opts.videoEncoder] [MVP-04] bộ mã hoá video đã dựng sẵn; truyền `null`
@@ -1041,6 +1043,53 @@ export async function createApp(opts = {}) {
     });
   });
 
+  /* ── MVP-07 (ĐĂNG BÀI, duyệt tay) — nạp PHÒNG THỦ, KHÔNG được làm chết boot ──
+   *
+   * Cùng khuôn MVP-02/03/04: module `src/publish/**` có thể chưa tồn tại / lỗi cú pháp lúc boot
+   * ⇒ cả hai về `null`, ghi log `publish.wiring_failed` mức error và ghi lý do THẬT vào
+   * `app.publishUnavailableReason`; mọi tính năng cũ vẫn chạy. Route `/api/publish/*` tự kiểm
+   * trước và trả 503 `PUBLISH_UNAVAILABLE` — KHÔNG mô phỏng danh sách rỗng.
+   *
+   * ⚠️ Provider MẶC ĐỊNH là `dry-run`: chế độ thử, KHÔNG gọi mạng (dự án chưa có Page ID +
+   * token Facebook). Không có đường nào đăng thật khi chưa khai `PUBLISH_PROVIDER=facebook`.
+   */
+  const publish = { provider: null, service: null, reason: null };
+
+  if (config?.publish?.enabled === false) {
+    publish.reason = 'Tính năng đăng bài đang bị tắt bằng cấu hình (config.publish.enabled = false / PUBLISH_ENABLED=false).';
+    rootLogger.info('publish.disabled', { reason: publish.reason });
+  } else if (opts.publishService) {
+    // Đã được bơm sẵn (test hoặc tầng gộp) → dùng luôn.
+    publish.service = opts.publishService;
+    publish.provider = opts.publishProvider || opts.publishService.provider || null;
+  } else {
+    try {
+      const mod = await import('./publish/index.js');
+      if (typeof mod?.createPublishProvider !== 'function' || typeof mod?.PublishService !== 'function') {
+        throw Object.assign(new Error('src/publish/index.js thiếu createPublishProvider/PublishService'), { code: 'PUBLISH_EXPORT_MISSING' });
+      }
+      const provider = opts.publishProvider || mod.createPublishProvider(config, { logger: rootLogger });
+      publish.provider = provider;
+      publish.service = new mod.PublishService({ store, provider, config, logger: rootLogger });
+      rootLogger.info('publish.wired', {
+        provider: provider?.name || 'none',
+        provider_mock: Boolean(provider?.isMock),
+        configured: Boolean(provider?.configured),
+        // Luật của sprint: KHÔNG BAO GIỜ tự đăng — mọi bài phải có người bấm duyệt.
+        manual_approval_required: true,
+      });
+    } catch (err) {
+      publish.provider = null;
+      publish.service = null;
+      publish.reason = 'Không nạp được module MVP-07 "src/publish/index.js" — tính năng đăng bài bị tắt. Chi tiết ở log máy chủ (publish.wiring_failed).';
+      rootLogger.error('publish.wiring_failed', {
+        error_name: err?.name || 'Error',
+        error_code: err?.code || null,
+        error_message: scrubPaths(err?.message || err),
+      });
+    }
+  }
+
   const rateLimiters = {
     requests: new MemoryRateLimiter({ windowMs: config.rateLimit.windowMs, max: config.rateLimit.maxRequests }),
     jobs: new MemoryRateLimiter({ windowMs: config.rateLimit.windowMs, max: config.rateLimit.maxJobs }),
@@ -1098,6 +1147,11 @@ export async function createApp(opts = {}) {
     // năng tắt — im lặng là kiểu thất bại bị cấm. `null` = khả dụng.
     accountsUnavailableReason: accounts.reason,
     billingUnavailableReason: billing.reason,
+    // MVP-07: `null` nếu module đăng bài nạp lỗi hoặc bị tắt ⇒ route trả 503 PUBLISH_UNAVAILABLE
+    // kèm `publishUnavailableReason` (lý do THẬT, đã lọc đường dẫn). `/api/config` đọc cùng chỗ.
+    publishProvider: publish.provider,
+    publishService: publish.service,
+    publishUnavailableReason: publish.reason,
   };
 
   app.router = buildRouter(app);

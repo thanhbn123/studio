@@ -173,7 +173,7 @@ Phạm vi dự kiến:
 
 **Trạng thái: ĐÃ XONG PHẦN CODE theo PHẠM VI ĐÃ CHỐT** (nhánh `thanhbn123/mvp06-topup`,
 09/10/2026). Hợp đồng: [`MVP-06-CONTRACT.md`](MVP-06-CONTRACT.md); bằng chứng số đo:
-[`VERIFICATION.md` §26](VERIFICATION.md).
+[`VERIFICATION.md` §28](VERIFICATION.md).
 
 **Quyết định của Owner (09/10/2026):** pháp nhân là **cá nhân** ⇒ dùng **chuyển khoản ngân hàng
 tay + quản trị viên cấp credit**. Vì vậy MVP-06 bản gốc (cổng thanh toán, webhook có kiểm chữ ký,

@@ -282,6 +282,74 @@ CREATE TABLE IF NOT EXISTS pricing (
 );
 
 -- ============================================================================
+-- MVP-07 — ĐĂNG BÀI FACEBOOK PAGE (DUYỆT TAY) — hợp đồng `docs/MVP-07-CONTRACT.md` §3
+--
+-- Vì sao có hai bảng này: chủ dự án đã chốt **duyệt tay từng bài**. `publish_items` là HÀNG ĐỢI
+-- DUYỆT (sổ cái của từng bài: ai duyệt, lúc nào, đã đăng chưa, id bài bên ngoài), còn
+-- `publish_logs` là VẾT của **mọi** lời gọi provider — kể cả lần thất bại, kèm lỗi NGUYÊN VĂN
+-- của nền tảng. Không có `publish_logs` thì `last_error` chỉ giữ lỗi cuối và cả lịch sử đăng
+-- biến mất, đúng kiểu "không chứng minh được" mà repo này cấm.
+--
+-- CỔNG DUYỆT nằm ở tầng DB: `Store#claimPublishItem` là MỘT câu UPDATE có điều kiện
+-- (`status IN ('approved','failed') AND external_post_id IS NULL`). Không claim được ⇒ không có
+-- đường nào gọi tới provider ⇒ hệ thống KHÔNG BAO GIỜ tự đăng khi chưa có người bấm duyệt.
+--
+-- Chỉ dùng TEXT/INTEGER + thời gian ISO-8601 trong TEXT ⇒ CÙNG file schema chạy được trên cả
+-- SQLite (node:sqlite) và PostgreSQL 16.
+--
+-- ⚠️ INDEX KHÔNG ĐẶT Ở ĐÂY — bài học `wallet_ledger.seq` / `job_queue.epoch`: index trong file
+-- này chạy TRƯỚC migration, nên trên DB cũ (bảng đã tồn tại nhưng thiếu cột) `CREATE INDEX` làm
+-- CHẾT `init()`. Bốn index của hai bảng này do `#applyAdditiveMigrations()` tạo SAU migration
+-- (xem src/store/index.js).
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS publish_items (
+  id               TEXT PRIMARY KEY,
+  job_id           TEXT,
+  user_id          TEXT,                              -- chủ bài; route /api/publish/* bắt buộc đăng nhập
+  channel          TEXT NOT NULL DEFAULT 'facebook_page',
+  provider         TEXT,                              -- provider ĐÃ dùng ở lượt đăng gần nhất
+  text             TEXT,
+  media_ids        TEXT,                              -- JSON mảng id của image_assets
+  -- 'draft' | 'pending_review' | 'approved' | 'publishing' | 'published' | 'failed' | 'rejected'
+  status           TEXT NOT NULL DEFAULT 'draft',
+  scheduled_at     TEXT,
+  approved_by      TEXT,                              -- user_id của owner/admin đã bấm DUYỆT
+  approved_at      TEXT,
+  rejected_by      TEXT,
+  rejected_at      TEXT,
+  reject_reason    TEXT,
+  published_at     TEXT,
+  external_post_id TEXT,                              -- id bài trên nền tảng; 'dry-…' = CHẾ ĐỘ THỬ
+  external_url     TEXT,
+  is_mock          INTEGER NOT NULL DEFAULT 0,        -- 1 = kết quả của provider GIẢ (dry-run)
+  error_code       TEXT,
+  last_error       TEXT,
+  attempts         INTEGER NOT NULL DEFAULT 0,
+  run_key          TEXT,                              -- '<itemId>#<n>' — danh tính MỘT lượt đăng
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL
+);
+
+-- Vết MỌI lời gọi provider (luật §0.3 của hợp đồng). APPEND-ONLY: không UPDATE/DELETE nào lên
+-- bảng này trong toàn bộ mã nguồn.
+-- `error_message` giữ NGUYÊN VĂN lỗi nền tảng, nhưng access token đã bị `maskToken()` che TRƯỚC
+-- khi tới đây. `request_summary` chỉ là SỐ LIỆU (endpoint, độ dài chữ, số media) — KHÔNG chứa
+-- nội dung bài, KHÔNG chứa token.
+CREATE TABLE IF NOT EXISTS publish_logs (
+  id               TEXT PRIMARY KEY,
+  item_id          TEXT NOT NULL,
+  attempt          INTEGER NOT NULL DEFAULT 0,
+  run_key          TEXT,
+  provider         TEXT,
+  channel          TEXT,
+  status           TEXT,                              -- PublishResult.status
+  external_post_id TEXT,
+  error_code       TEXT,
+  error_message    TEXT,
+  is_mock          INTEGER NOT NULL DEFAULT 0,
+  request_summary  TEXT,
+  created_at       TEXT NOT NULL
+
 -- MVP-06 — NẠP CREDIT THỦ CÔNG (chuyển khoản tay + quản trị cấp credit)
 -- `docs/MVP-06-CONTRACT.md` §2. Ba luật riêng được phản ánh ngay ở đây:
 --
