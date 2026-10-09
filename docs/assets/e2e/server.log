@@ -1,0 +1,1 @@
+{"ts":"2026-10-09T08:10:11.727Z","level":"warn","msg":"accounts.no_owner_configured","ctx":{"note":"Hệ thống chưa có owner/admin nào. Đặt OWNER_EMAIL=<email> trong .env hoặc chạy `npm run make-owner -- <email>` để tạo owner đầu tiên — nếu không, KHÔNG ai cấp được credit và mọi job sẽ trả 402."}}

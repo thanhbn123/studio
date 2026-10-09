@@ -26,6 +26,10 @@ coverage/
 test-results/
 *.tap
 
+# E2E trình duyệt thật: dữ liệu chạy tạm (SQLite riêng, ảnh, tệp tải về).
+# Bằng chứng ĐƯỢC commit nằm ở `docs/assets/e2e/`, không nằm ở đây.
+.e2e-data/
+
 # ── OS / editor ────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db

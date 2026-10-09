@@ -4945,6 +4945,10 @@ const EXPORT_ERROR_HINT = {
   EXPORT_UNAVAILABLE: 'Máy chủ chưa nạp được module gói xuất bản — phần nội dung/ảnh/video của job vẫn xem bình thường.',
   JOB_NOT_FOUND: 'Không tìm thấy job này: có thể job thuộc phiên hoặc tài khoản khác, hoặc đã bị xoá.',
   BAD_JOB_ID: 'Mã job không hợp lệ nên máy chủ từ chối.',
+  // R6: trần kích thước gói và cổng giới hạn số lượt dựng gói đồng thời — nói đúng loại lỗi,
+  // không gộp vào câu "thử lại" chung (thử lại y hệt vẫn vượt trần / vẫn bận).
+  BUNDLE_TOO_LARGE: 'Gói vượt trần kích thước máy chủ cho phép nên bị từ chối dựng. Bớt ảnh/video của job rồi thử lại, hoặc nhờ quản trị nâng `EXPORT_MAX_BUNDLE_BYTES`.',
+  EXPORT_BUSY: 'Máy chủ đang dựng một gói xuất bản khác (mỗi lúc chỉ dựng vài gói để không hết bộ nhớ) — chờ vài giây rồi bấm lại.',
 };
 
 function exportBundleUrl(jobId) {
@@ -4965,6 +4969,22 @@ function exportErrorText(err) {
   const server = real ? ` Máy chủ báo: “${real}”` : '';
   const hint = EXPORT_ERROR_HINT[code] || '';
   if (code === 'EXPORT_BAD_MANIFEST') return EXPORT_NOT_MANIFEST_LINE;
+  // R6: 413 kèm SỐ ĐO thật trong `details` (bytes/limit) — in số ra, không nói chung chung.
+  if (code === 'BUNDLE_TOO_LARGE' || status === 413) {
+    const details = err?.payload?.details || {};
+    const bytes = Number(details.bytes);
+    const limit = Number(details.limit);
+    const measured = Number.isFinite(bytes) && Number.isFinite(limit)
+      ? ` Gói đo được ${Math.round(bytes / (1024 * 1024) * 10) / 10} MB, trần ${Math.round(limit / (1024 * 1024) * 10) / 10} MB (${limit} byte).`
+      : '';
+    return `Gói xuất bản vượt trần kích thước (413${code ? ` ${code}` : ''}).${measured} ${hint || 'Bớt dữ liệu của job rồi thử lại.'}${server}`;
+  }
+  // R6: 429 do QUÁ TẢI DỰNG GÓI (khác 429 rate-limit theo phiên) — nói đúng loại, có gợi ý chờ.
+  if (code === 'EXPORT_BUSY') {
+    const retry = Number(err?.payload?.retry_after_ms);
+    const wait = Number.isFinite(retry) && retry > 0 ? ` Máy chủ đề nghị chờ ~${Math.ceil(retry / 1000)} giây.` : '';
+    return `Máy chủ đang bận dựng gói xuất bản (429 ${code}).${wait} ${hint || 'Chờ một lát rồi thử lại.'}${server}`;
+  }
   if (code === 'EXPORT_UNAVAILABLE' || status === 503) {
     return `Chưa tải được gói xuất bản (503${code ? ` ${code}` : ''}). ${hint || 'Máy chủ báo tính năng gói xuất bản chưa khả dụng.'}${server}`;
   }
@@ -5014,12 +5034,16 @@ function exportUnion(...lists) {
   return out;
 }
 
-/** Nhãn kiểm chứng: chỉ ĐỌC đúng thứ máy chủ khai, không tự nâng lên LIVE_VERIFIED. */
+/**
+ * Nhãn kiểm chứng để HIỂN THỊ — CHỈ nhận CHUỖI, giữ nguyên văn (đã trim) thứ máy chủ khai.
+ *
+ * R2 (phản biện vòng 2, LOW): trước đây hàm này còn đọc `v.level`/`v.label` của OBJECT ⇒
+ * `verification: {level:'LIVE_VERIFIED'}` được dịch thành nhãn "LIVE_VERIFIED" và UI tô badge
+ * XANH dù `live_service_called: false`. Object/kiểu lạ ⇒ coi như KHÔNG có nhãn (lý do in kèm).
+ */
 function exportVerificationLabel(manifest) {
   const v = manifest?.verification;
-  if (typeof v === 'string') return v.trim();
-  if (v && typeof v === 'object') return String(v.label || v.status || v.level || '').trim();
-  return '';
+  return typeof v === 'string' ? v.trim() : '';
 }
 
 function exportVerificationText(manifest) {
@@ -5048,7 +5072,27 @@ function exportManifestHtml(data) {
   const manifest = data?.manifest && typeof data.manifest === 'object' ? data.manifest : {};
   const job = manifest.job && typeof manifest.job === 'object' ? manifest.job : {};
   const label = exportVerificationLabel(manifest);
-  const cls = label === 'LIVE_VERIFIED' ? 'ok' : label ? 'warn' : '';
+  const rawVerification = manifest.verification;
+  // R2: CỔNG NHÃN ở phía UI. Badge XANH ("đã kiểm chứng bằng dịch vụ thật") chỉ được hiện khi:
+  //   (a) nhãn là CHUỖI và sau khi chuẩn hoá (trim + HOA) ra ĐÚNG một mức LIVE, VÀ
+  //   (b) bằng chứng máy chủ khai `verification_detail.live_service_called === true`
+  //       (máy chủ chỉ đặt true khi `transport === 'http'`).
+  // Nhãn KHÔNG chuẩn (`live_verified`, `LIVE_VERIFIED `, object `{level:…}`) không còn lọt badge.
+  const liveLevels = ['LIVE_VERIFIED', 'AUTHENTICATED_LIVE_VERIFIED'];
+  const level = label.toUpperCase();
+  const liveProven = manifest?.verification_detail?.live_service_called === true;
+  const isLive = liveLevels.includes(level) && liveProven;
+  const labelNotes = [];
+  if (!label && rawVerification !== null && rawVerification !== undefined && rawVerification !== '') {
+    labelNotes.push('Máy chủ trả nhãn kiểm chứng KHÔNG phải chuỗi (object/kiểu lạ) ⇒ UI coi như KHÔNG có nhãn và không tự dịch nó thành nhãn.');
+  }
+  if (label && level !== label) {
+    labelNotes.push(`Nhãn đã được CHUẨN HOÁ (trim + chữ hoa) để xét cổng bằng chứng: ${JSON.stringify(label)} → ${level}.`);
+  }
+  if (liveLevels.includes(level) && !liveProven) {
+    labelNotes.push('Nhãn LIVE nhưng bằng chứng máy chủ khai KHÔNG chứng minh đã gọi dịch vụ thật (`live_service_called` không phải true) ⇒ UI KHÔNG hiện badge LIVE.');
+  }
+  const cls = isLive ? 'ok' : label ? 'warn' : '';
   const audio = manifest.audio === null
     ? 'audio: KHÔNG có tiếng (video không tiếng)'
     : manifest.audio === undefined
@@ -5058,11 +5102,20 @@ function exportManifestHtml(data) {
     ? Object.entries(manifest.counts).map(([k, v]) => `${k}=${exportScalarText(v)}`)
     : [];
   const warnings = exportUnion(data?.warnings, manifest.warnings);
-  // D1: nếu bản kê khai KHÔNG có khoá `mock_steps` (bản cũ/thiếu dữ liệu) thì UI phải nói "không
-  // kiểm được", KHÔNG được khẳng định là "không có bước giả".
-  const mockStepsKnown = Array.isArray(manifest.mock_steps) || Array.isArray(data?.manifest?.mock_steps);
+  // D1 + R5: nếu bản kê khai KHÔNG có khoá `mock_steps` (bản cũ/thiếu dữ liệu) thì UI phải nói "không
+  // kiểm được", KHÔNG được khẳng định là "không có bước giả". Và mảng CÓ phần tử nhưng không đọc
+  // được tên bước nào (`[null]`, `[""]`) cũng KHÔNG phải bằng chứng "không có bước giả".
+  const rawMockSteps = Array.isArray(manifest.mock_steps)
+    ? manifest.mock_steps
+    : typeof manifest.mock_steps === 'string' && manifest.mock_steps.trim()
+      ? [manifest.mock_steps]
+      : Array.isArray(data?.manifest?.mock_steps)
+        ? data.manifest.mock_steps
+        : null;
+  const mockSteps = exportList(rawMockSteps);
+  const mockStepsKnown = rawMockSteps !== null;
+  const mockStepsEmpty = rawMockSteps !== null && rawMockSteps.length === 0;
   const missing = exportUnion(data?.missing, manifest.missing);
-  const mockSteps = exportList(manifest.mock_steps);
   const providers = exportList(manifest.providers);
   const jobLine = `Job <span class="mono">${esc(String(job.id || '—'))}</span> · loại ${esc(String(job.kind || '—'))} · trạng thái ${esc(String(job.status || '—'))} · sinh lúc ${esc(String(manifest.generated_at || '—'))}`;
   return `<div class="notice">
@@ -5071,14 +5124,18 @@ function exportManifestHtml(data) {
       <span class="badge ${esc(cls)}">Nhãn kiểm chứng: ${esc(label || 'máy chủ không khai')}</span>
       <span class="badge">${esc(audio)}</span>
     </div>
+    ${labelNotes.length ? `<p class="muted small" style="margin:6px 0 0">${esc(labelNotes.join(' '))}</p>` : ''}
     ${exportBlockHtml('Kiểm chứng (verification)', [exportVerificationText(manifest)])}
     ${exportBlockHtml('Bước dùng dữ liệu giả (mock_steps)', mockSteps, {
       cls: mockSteps.length ? 'warn' : '',
       // D1 (phản biện Gói xuất bản, HIGH): câu này chỉ được nói khi danh sách THẬT SỰ rỗng — trước
       // đây nó in cả khi máy chủ khai thiếu (mock_steps rỗng do lỗi gom dấu vết), tức UI nói dối.
-      empty: mockStepsKnown
+      // R5: `[null]`/`[""]` là CÓ dấu vết mock ⇒ tuyệt đối không được khẳng định "không có bước giả".
+      empty: mockStepsEmpty
         ? 'Máy chủ khai KHÔNG có bước nào dùng dữ liệu giả.'
-        : 'Bản kê khai KHÔNG có mục mock_steps ⇒ KHÔNG kiểm được job có bước giả hay không.',
+        : mockStepsKnown
+          ? `Bản kê khai CÓ mục mock_steps (${rawMockSteps.length} phần tử) nhưng KHÔNG đọc được tên bước nào ⇒ KHÔNG kiểm được job có bước giả hay không.`
+          : 'Bản kê khai KHÔNG có mục mock_steps ⇒ KHÔNG kiểm được job có bước giả hay không.',
     })}
     ${exportBlockHtml('Thiếu trong gói (missing)', missing, { cls: 'warn', empty: 'Máy chủ khai KHÔNG thiếu mục nào.' })}
     ${exportBlockHtml('Cảnh báo của job (warnings)', warnings, { cls: 'warn', empty: 'Máy chủ không trả cảnh báo nào.' })}
@@ -5141,7 +5198,8 @@ function exportPaintError(err, jobId) {
   const status = Number(err?.status || 0);
   const code = String(err?.code || '');
   // 503/EXPORT_UNAVAILABLE thì tải thẳng cũng hỏng ⇒ KHÔNG mời người dùng bấm thêm một lần vô ích.
-  const canFallback = Boolean(jobId) && status !== 503 && status !== 429 && code !== 'EXPORT_UNAVAILABLE' && code !== 'EXPORT_BAD_MANIFEST';
+  // R6: 413 (vượt trần) và 429 EXPORT_BUSY cũng vậy — tải thẳng y hệt vẫn bị từ chối.
+  const canFallback = Boolean(jobId) && status !== 503 && status !== 429 && status !== 413 && code !== 'EXPORT_UNAVAILABLE' && code !== 'EXPORT_BAD_MANIFEST' && code !== 'BUNDLE_TOO_LARGE' && code !== 'EXPORT_BUSY';
   const fallback = canFallback
     ? `<p style="margin:8px 0 0"><a class="btn tiny ghost" href="${esc(exportBundleUrl(jobId))}" download rel="noopener">${esc(EXPORT_FALLBACK_LINE)}</a></p>`
     : '';

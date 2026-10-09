@@ -67,11 +67,26 @@ export {
   stampFor,
   providersFor,
   verificationFor,
+  normalizeVerificationLevel,
+  isLiveClaim,
   collectJobWarnings,
+  mockStepsFor,
+  mockStepsFromProviders,
+  usableMockSteps,
+  UNKNOWN_MOCK_STEP,
   MANIFEST_VERSION,
   TOOL,
 } from './manifest.js';
 export { buildExportBundle, buildExportManifest, DEFAULT_MAX_TOTAL_BYTES } from './bundle.js';
+// R6: trần kích thước gói + cổng giới hạn số lượt dựng gói đồng thời (X2 đọc env rồi áp ở route).
+export {
+  DEFAULT_MAX_BUNDLE_BYTES,
+  DEFAULT_MAX_CONCURRENT_BUNDLES,
+  DEFAULT_MAX_QUEUED_BUNDLES,
+  DEFAULT_MAX_WAIT_MS,
+  resolveExportLimits,
+  createExportGate,
+} from './limits.js';
 export { renderHumanText } from './text.js';
 export {
   ASSET_GROUPS,

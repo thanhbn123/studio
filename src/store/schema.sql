@@ -1,9 +1,27 @@
 -- ============================================================================
 -- VIP PRODUCT STUDIO — schema MVP-01 + phần cộng thêm của MVP-02 (ImageLab)
 --
--- Viết theo SQL DI ĐỘNG (portable): dùng TEXT/INTEGER/REAL, thời gian lưu dạng
--- ISO-8601 trong TEXT. Nhờ vậy CÙNG một file schema chạy được trên cả SQLite
--- (node:sqlite) và PostgreSQL 16 — không phải bảo trì hai bản schema.
+-- ⚠️ KIỂU SỐ CỦA TIỀN — `REAL` KHÔNG DÙNG ĐƯỢC CHO TIỀN.
+--
+-- `REAL` của SQLite là float **8 byte**, nhưng `REAL` của PostgreSQL là float **4 byte**
+-- (`float4`, chỉ ~7 chữ số có nghĩa). Đơn vị tiền của repo là 6 chữ số thập phân
+-- (`MONEY_DECIMALS = 6`, `MONEY_EPSILON = 1e-6`), nên trên PostgreSQL tiền BỊ LÀM TRÒN MẤT:
+--
+--   ví 10.000 credit, trừ 0.0004 credit (giá thật 1 lượt OCR_DETECT)
+--     → `wallet_ledger.amount REAL` trên PostgreSQL: số dư VẪN LÀ 10000 (không thu được tiền)
+--     → cùng dữ liệu trên SQLite: 9999.9996 (đúng)
+--   `SELECT 99.999999::real` → `100`
+--
+-- Vì vậy mọi cột TIỀN khai `DOUBLE PRECISION`: PostgreSQL hiểu là `float8`, còn SQLite coi
+-- tên kiểu chứa "DOUB" là **REAL affinity** ⇒ CÙNG file schema vẫn chạy trên cả hai driver.
+-- DB PostgreSQL ĐANG CHẠY không tự sửa được bằng `CREATE TABLE IF NOT EXISTS` (no-op), nên
+-- `Store#applyAdditiveMigrations()` có bước `ALTER COLUMN … TYPE DOUBLE PRECISION`.
+-- Bộ test giữ luật này: `test/pg-wallet.test.js` so CÙNG dữ liệu trên hai dialect.
+--
+-- Viết theo SQL DI ĐỘNG (portable): dùng TEXT/INTEGER/REAL (cột TIỀN dùng DOUBLE
+-- PRECISION — xem ghi chú ngay trên), thời gian lưu dạng ISO-8601 trong TEXT. Nhờ vậy
+-- CÙNG một file schema chạy được trên cả SQLite (node:sqlite) và PostgreSQL 16 — không
+-- phải bảo trì hai bản schema.
 --
 -- Quy ước: mọi câu lệnh dùng placeholder `?`; driver PostgreSQL tự dịch sang $n.
 -- ============================================================================
@@ -56,7 +74,7 @@ CREATE TABLE IF NOT EXISTS usage_events (
   model           TEXT,
   input_units     INTEGER DEFAULT 0,
   output_units    INTEGER DEFAULT 0,
-  estimated_cost  REAL DEFAULT 0,
+  estimated_cost  DOUBLE PRECISION DEFAULT 0,   -- TIỀN: xem ghi chú "KIỂU SỐ CỦA TIỀN" ở đầu file
   currency        TEXT DEFAULT 'USD',
   meta            TEXT,
   created_at      TEXT NOT NULL
@@ -140,8 +158,9 @@ CREATE INDEX IF NOT EXISTS idx_translation_lines_job ON translation_lines (job_i
 -- ============================================================================
 -- MVP-05 — TÀI KHOẢN + VÍ CREDIT (hợp đồng §2.1)
 --
--- Bốn bảng dưới đây cũng chỉ dùng TEXT/INTEGER/REAL + ISO-8601 trong TEXT nên CÙNG
--- file schema chạy được trên cả SQLite (node:sqlite) và PostgreSQL 16.
+-- Bốn bảng dưới đây cũng chỉ dùng TEXT/INTEGER/REAL (cột TIỀN dùng DOUBLE PRECISION) +
+-- ISO-8601 trong TEXT nên CÙNG file schema chạy được trên cả SQLite (node:sqlite) và
+-- PostgreSQL 16.
 --
 -- Hai luật riêng của MVP-05 được phản ánh ngay ở đây:
 --   #1 Ẩn danh KHÔNG bị phá: `jobs.user_id` / `image_assets.user_id` là cột CỘNG THÊM,
@@ -198,13 +217,13 @@ CREATE TABLE IF NOT EXISTS wallet_ledger (
   id            TEXT PRIMARY KEY,
   user_id       TEXT NOT NULL,
   seq           INTEGER NOT NULL DEFAULT 0,
-  amount        REAL NOT NULL,
+  amount        DOUBLE PRECISION NOT NULL,   -- TIỀN: KHÔNG được là REAL (xem đầu file)
   currency      TEXT NOT NULL DEFAULT 'USD',
   reason        TEXT NOT NULL,   -- 'grant'|'admin_grant'|'job_hold'|'job_settle'|'job_refund'|'adjustment'
   job_id        TEXT,
   operation     TEXT,
   meta          TEXT,
-  balance_after REAL NOT NULL,
+  balance_after DOUBLE PRECISION NOT NULL,   -- TIỀN: KHÔNG được là REAL (xem đầu file)
   created_at    TEXT NOT NULL
 );
 
@@ -256,7 +275,7 @@ CREATE TABLE IF NOT EXISTS job_queue (
 -- để quản trị viên chỉnh giá mà không phải deploy lại (A2 seed từ config khi cần).
 CREATE TABLE IF NOT EXISTS pricing (
   operation  TEXT PRIMARY KEY,
-  unit_price REAL NOT NULL,
+  unit_price DOUBLE PRECISION NOT NULL,   -- TIỀN: KHÔNG được là REAL (xem đầu file)
   currency   TEXT NOT NULL DEFAULT 'USD',
   note       TEXT,
   updated_at TEXT NOT NULL

@@ -3,7 +3,7 @@
  *
  * ⚠️ TRẠNG THÁI THẬT KHI VIẾT FILE NÀY: dự án **CHƯA có Page ID + Page Access Token** (cần
  * Facebook app review). Vì vậy đường mã này **CHƯA từng gọi API thật một lần nào** — nó được
- * kiểm bằng server HTTP giả trong test. Xem `docs/VERIFICATION.md` §25.
+ * kiểm bằng server HTTP giả trong test. Xem `docs/VERIFICATION.md` §27.
  *
  * Bốn luật của file này:
  *   1. **Thiếu token ⇒ KHÔNG gọi mạng.** `configured = false` được kiểm TRƯỚC khi dựng URL;

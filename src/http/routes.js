@@ -1739,10 +1739,24 @@ export function buildRouter(app) {
       dbOk = false;
       dbError = err.message;
     }
+    const moneySchema = typeof store?.moneySchemaStatus === 'function'
+      ? store.moneySchemaStatus()
+      : { ok: true, checked: false, reason: null, not_widened: [] };
     sendJson(res, dbOk ? 200 : 503, {
       status: dbOk ? 'ok' : 'degraded',
       time: new Date().toISOString(),
       db: { dialect: store.dialect, ok: dbOk, error: dbError },
+      // F1 (phản biện PR #28): KIỂU CỘT TIỀN phải HIỆN RA ở health, không im lặng.
+      // `money_schema_ok: false` = DB còn cột tiền `real` (float4) — migration nới kiểu đã bị
+      // chặn (app không boot tới được đây) HOẶC cột nằm NGOÀI `search_path` nên app không đọc tới.
+      // `checked: false` = chưa kiểm được (SQLite, store dựng tay) — KHÔNG phải "đã kiểm và đạt".
+      money_schema_ok: moneySchema.ok !== false,
+      money_schema_reason: moneySchema.reason ?? null,
+      money_schema: {
+        checked: moneySchema.checked === true,
+        ok: moneySchema.ok !== false,
+        not_widened: Array.isArray(moneySchema.not_widened) ? moneySchema.not_widened : [],
+      },
       jobs: queue.stats(),
       connectors: registry.list(),
       connector_init_failures: registry.initFailures,
@@ -1875,6 +1889,9 @@ export function buildRouter(app) {
         // PB-02: trần số lượt chạy có tính tiền cho mỗi job (vượt ⇒ 429 RERUN_LIMIT_EXCEEDED).
         max_runs_per_job: Number.isFinite(Number(billingConfig().maxRunsPerJob)) ? Number(billingConfig().maxRunsPerJob) : 10,
         max_amount: Number.isFinite(Number(billingConfig().maxAmount)) ? Number(billingConfig().maxAmount) : null,
+        // F3 (vòng vá PR #28): trần SỐ DƯ ví (vượt ⇒ 400 `AMOUNT_TOO_LARGE`) — UI/admin phải
+        // biết con số này, nếu không họ chỉ thấy lỗi 400 mà không hiểu vì sao.
+        max_balance: Number.isFinite(Number(billingConfig().maxBalance)) ? Number(billingConfig().maxBalance) : null,
         // BR-08: ngưỡng coi một lượt chạy là TREO (ms) — quá ngưỡng thì được thu hồi tự động.
         stuck_run_ms: Number.isFinite(Number(billingConfig().stuckRunMs)) ? Number(billingConfig().stuckRunMs) : null,
         min_stuck_run_ms: Number.isFinite(Number(billingConfig().minStuckRunMs)) ? Number(billingConfig().minStuckRunMs) : null,
@@ -3254,6 +3271,42 @@ export function buildRouter(app) {
     if (code === 'BAD_INPUT' && /storage/i.test(String(err?.message ?? ''))) {
       return HttpError.safe(503, 'EXPORT_UNAVAILABLE', exportUnavailableMessage());
     }
+    // R6 (phản biện vòng 2, MEDIUM): gói vượt TRẦN KÍCH THƯỚC ⇒ 413 kèm SỐ ĐO thật (bytes/limit),
+    // KHÔNG phải 500 "thử lại" (thử lại y hệt vẫn vượt trần) và KHÔNG được dựng tiếp cho hết RAM.
+    if (code === 'BUNDLE_TOO_LARGE') {
+      const details = err?.details && typeof err.details === 'object' ? err.details : {};
+      const bytes = Number(details.bytes);
+      const limit = Number(details.limit);
+      const measured = Number.isFinite(bytes) && Number.isFinite(limit)
+        ? ` Đo được ${bytes} byte, trần cho phép ${limit} byte.`
+        : '';
+      logger?.warn?.('exports.bundle_too_large', {
+        job_id: details.jobId ?? null,
+        bytes: Number.isFinite(bytes) ? bytes : null,
+        limit: Number.isFinite(limit) ? limit : null,
+      });
+      return HttpError.safe(
+        413,
+        'BUNDLE_TOO_LARGE',
+        `Gói xuất bản vượt trần kích thước máy chủ cho phép nên bị từ chối dựng (để không ăn hết bộ nhớ).${measured}`,
+        { bytes: Number.isFinite(bytes) ? bytes : null, limit: Number.isFinite(limit) ? limit : null, max_bundle_bytes: Number.isFinite(limit) ? limit : null },
+      );
+    }
+    // R6: quá nhiều lượt dựng gói đồng thời ⇒ 429 `EXPORT_BUSY` (KHÁC 429 RATE_LIMITED theo phiên).
+    if (code === 'EXPORT_BUSY') {
+      const details = err?.details && typeof err.details === 'object' ? err.details : {};
+      logger?.warn?.('exports.busy', { running: details.running ?? null, queued: details.queued ?? null, concurrency: details.concurrency ?? null });
+      const retryAfterMs = Number.isFinite(Number(details.retry_after_ms)) ? Number(details.retry_after_ms) : 2000;
+      return Object.assign(
+        HttpError.safe(
+          429,
+          'EXPORT_BUSY',
+          'Máy chủ đang dựng một gói xuất bản khác và hàng đợi đã đầy — chờ một lát rồi thử lại (mỗi lúc chỉ dựng vài gói để không hết bộ nhớ).',
+          { ...details, retry_after_ms: retryAfterMs },
+        ),
+        { retryAfterMs },
+      );
+    }
     logExportError('exports.bundle_build_failed', err);
     return HttpError.safe(500, 'EXPORT_FAILED', 'Không dựng được gói xuất bản. Vui lòng thử lại.');
   };
@@ -3274,11 +3327,83 @@ export function buildRouter(app) {
   };
 
   /**
+   * R6 — TRẦN KÍCH THƯỚC GÓI + CỔNG GIỚI HẠN SỐ LƯỢT DỰNG GÓI ĐỒNG THỜI.
+   *
+   * Vì sao không static-import `src/exports/limits.js`: cùng lý do như module X1 ở trên — một
+   * import hỏng (bản sao repo đã xoá `src/exports/**`, xem test 503) sẽ giết cả server. Nên giới
+   * hạn được đọc qua module đã nạp phòng thủ, kèm bản dự phòng tối thiểu (fail-closed).
+   *
+   * `app.exportLimits` (nếu có) được QUYỀN GHI ĐÈ — điểm bơm cho test/vận hành, cùng khuôn với
+   * `app.exports` và `app.exportsUnavailableReason`.
+   */
+  const EXPORT_FALLBACK_LIMITS = Object.freeze({ maxBundleBytes: 64 * 1024 * 1024, maxConcurrentBundles: 1, maxQueuedBundles: 4, maxWaitMs: 30_000 });
+
+  const exportLimits = (mod) => {
+    const base = typeof mod?.resolveExportLimits === 'function' ? mod.resolveExportLimits(process.env) : { ...EXPORT_FALLBACK_LIMITS };
+    const injected = app?.exportLimits;
+    return injected && typeof injected === 'object' ? { ...base, ...injected } : base;
+  };
+
+  /** Cổng dự phòng khi module X1 chưa có `createExportGate` (bản cũ hơn bản vá R6) — KHÔNG fail-open. */
+  const fallbackExportGate = (concurrency, queueLimit) => {
+    let running = 0;
+    const waiting = [];
+    const stats = () => ({ running, queued: waiting.length, concurrency, queue_limit: queueLimit });
+    const release = () => {
+      const next = waiting.shift();
+      if (next) next();
+      else running = Math.max(0, running - 1);
+    };
+    return {
+      stats,
+      async run(fn) {
+        if (running >= concurrency) {
+          if (waiting.length >= queueLimit) {
+            throw Object.assign(
+              new Error(`Máy chủ đang dựng ${running} gói xuất bản và hàng đợi đã đầy (${waiting.length}/${queueLimit}) — từ chối thêm để không ăn hết bộ nhớ.`),
+              { code: 'EXPORT_BUSY', details: { ...stats(), retry_after_ms: 2000 } },
+            );
+          }
+          await new Promise((resolve) => waiting.push(resolve));
+        } else {
+          running += 1;
+        }
+        try {
+          return await fn();
+        } finally {
+          release();
+        }
+      },
+    };
+  };
+
+  let exportGate = null;
+  let exportGateKey = '';
+  /** Một cổng cho mỗi router; đổi giới hạn ⇒ dựng lại (test bơm `app.exportLimits` trước request). */
+  const exportGateFor = (mod, limits) => {
+    const key = `${limits.maxConcurrentBundles}/${limits.maxQueuedBundles}/${limits.maxWaitMs}`;
+    if (!exportGate || exportGateKey !== key) {
+      if (typeof mod?.createExportGate === 'function') {
+        exportGate = mod.createExportGate({ concurrency: limits.maxConcurrentBundles, queueLimit: limits.maxQueuedBundles, maxWaitMs: limits.maxWaitMs });
+      } else {
+        logger?.warn?.('exports.gate_without_limiter', { message: 'Module X1 chưa có `createExportGate` ⇒ dùng cổng dự phòng của route.' });
+        exportGate = fallbackExportGate(limits.maxConcurrentBundles, limits.maxQueuedBundles);
+      }
+      exportGateKey = key;
+    }
+    return exportGate;
+  };
+
+  /**
    * Dựng gói qua module X1. Cả hai route dùng CHUNG hàm này để `manifest` trả qua API và
    * `MANIFEST.json` trong gói luôn là MỘT nguồn sự thật (không có hai bản kê khai lệch nhau).
    */
   const buildBundleFor = async (jobId, { zip = true } = {}) => {
     const mod = await requireExportModule();
+    const limits = exportLimits(mod);
+    // R6: chỉ đường TẢI GÓI (.zip) đi qua cổng — `/manifest` không nén, chỉ đọc + băm, nhưng vẫn
+    // chịu CÙNG trần byte để một job khổng lồ không kéo cả kho ảnh vào RAM.
+    const gate = zip ? exportGateFor(mod, limits) : null;
     try {
       // D5 (phản biện Gói xuất bản, MEDIUM): route `/manifest` KHÔNG được dựng cả ZIP rồi bỏ
       // buffer — job 60 MB asset tốn ~2,3s CPU + ~245 MB RSS cho một phản hồi 10 KB. Module X1 có
@@ -3289,24 +3414,30 @@ export function buildRouter(app) {
           message: 'Module X1 chưa có `buildExportManifest` ⇒ route /manifest phải dựng cả ZIP (chậm hơn).',
         });
       }
-      const built = await (onlyManifest ? mod.buildExportManifest : mod.buildExportBundle)({
-        store,
-        // Gói chỉ ĐỌC asset đã có trên đĩa; X1 tự quyết cách đọc, routes.js không ghép đường dẫn.
-        storage: app?.storage ?? null,
-        jobId,
-        logger,
-      });
-      if (zip === false) {
-        // Đường chỉ-manifest: bắt buộc có `manifest`, KHÔNG cần buffer.
-        if (!built || !built.manifest) {
-          throw Object.assign(new Error('buildExportManifest không trả về manifest hợp lệ'), { code: 'BAD_BUNDLE' });
+      const build = async () => {
+        const built = await (onlyManifest ? mod.buildExportManifest : mod.buildExportBundle)({
+          store,
+          // Gói chỉ ĐỌC asset đã có trên đĩa; X1 tự quyết cách đọc, routes.js không ghép đường dẫn.
+          storage: app?.storage ?? null,
+          jobId,
+          logger,
+          // R6: trần byte có cấu hình (`EXPORT_MAX_BUNDLE_BYTES`) — X1 ném `BUNDLE_TOO_LARGE`
+          // NGAY khi tổng byte vượt trần, không dựng tiếp.
+          maxTotalBytes: limits.maxBundleBytes,
+        });
+        if (zip === false) {
+          // Đường chỉ-manifest: bắt buộc có `manifest`, KHÔNG cần buffer.
+          if (!built || !built.manifest) {
+            throw Object.assign(new Error('buildExportManifest không trả về manifest hợp lệ'), { code: 'BAD_BUNDLE' });
+          }
+          return built;
+        }
+        if (!built || !Buffer.isBuffer(built.buffer) || built.buffer.length === 0) {
+          throw Object.assign(new Error('buildExportBundle không trả về buffer hợp lệ'), { code: 'BAD_BUNDLE' });
         }
         return built;
-      }
-      if (!built || !Buffer.isBuffer(built.buffer) || built.buffer.length === 0) {
-        throw Object.assign(new Error('buildExportBundle không trả về buffer hợp lệ'), { code: 'BAD_BUNDLE' });
-      }
-      return built;
+      };
+      return gate ? await gate.run(build) : await build();
     } catch (err) {
       throw mapExportError(err);
     }
@@ -3862,11 +3993,15 @@ function mapBillingError(err) {
     );
   }
   // PB-06: khoản tiền không hợp lệ / vượt trần ⇒ 400 (trước đây `grant(1e308)` ghi sổ 0 mà vẫn 201).
+  // F3 (vòng vá PR #28): `AMOUNT_TOO_LARGE` nay còn dùng cho TRẦN SỐ DƯ ví (`max_balance`) —
+  // chi tiết trả thêm `balance`/`max_balance` để UI/admin biết vì sao bị từ chối.
   if (code === 'INVALID_AMOUNT' || code === 'AMOUNT_TOO_LARGE' || code === 'INVALID_REASON') {
     const d = err.details && typeof err.details === 'object' ? err.details : {};
     return HttpError.safe(400, code, String(err.message || 'Số credit không hợp lệ.'), {
       amount: d.amount ?? null,
       max: d.max ?? null,
+      balance: Number.isFinite(Number(d.balance)) ? Number(d.balance) : null,
+      max_balance: Number.isFinite(Number(d.max_balance)) ? Number(d.max_balance) : null,
     });
   }
   if (code !== 'INSUFFICIENT_CREDIT' && Number(err.status) !== 402) return null;

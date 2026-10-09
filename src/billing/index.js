@@ -42,7 +42,10 @@
  *     đó sẽ được ghi log `billing.ledger_scan_truncated` (không im lặng).
  */
 
-import { DEFAULT_MAX_AMOUNT, MONEY_EPSILON, normalizeAmount, roundMoney, sumMoney, toFiniteNumber } from './money.js';
+import {
+  DEFAULT_MAX_AMOUNT, DEFAULT_MAX_BALANCE, MONEY_EPSILON, MONEY_FLOAT8_CEILING,
+  normalizeAmount, roundMoney, sumMoney, toFiniteNumber,
+} from './money.js';
 import { normalizeLedgerRow, normalizeLedgerRows, normalizePricingRow } from './ledger-rows.js';
 
 /**
@@ -351,6 +354,10 @@ export class BillingService {
     // PB-06: trần credit cho một thao tác cấp/điều chỉnh (mặc định 1e9 — xem `money.js`).
     const cap = toFiniteNumber(config?.billing?.maxAmount);
     this.maxAmount = cap !== null && cap > 0 ? cap : DEFAULT_MAX_AMOUNT;
+    // F3 (vòng vá PR #28): trần SỐ DƯ ví — giữ tiền trong dải mà `float8` còn đủ 6 chữ số thập
+    // phân (xem `MONEY_FLOAT8_CEILING`); cấp credit vượt trần ⇒ `AMOUNT_TOO_LARGE` (HTTP 400).
+    const balanceCap = toFiniteNumber(config?.billing?.maxBalance);
+    this.maxBalance = balanceCap !== null && balanceCap > 0 ? balanceCap : DEFAULT_MAX_BALANCE;
     // BR-08 (vòng 4): ngưỡng TREO của một lượt chạy (mặc định 15 phút) — xem `reconcileStuckRuns`.
     const stuck = toFiniteNumber(config?.billing?.stuckRunMs);
     const floor = toFiniteNumber(config?.billing?.minStuckRunMs);
@@ -1008,6 +1015,23 @@ export class BillingService {
     // R1-B (§3): đọc số dư + ghi dòng `grant` nằm TRONG khoá DB theo user.
     return this.#withLedgerSection(uid, async () => {
       const balanceBefore = await this.#balanceLocked(uid);
+      // F3 (vòng vá PR #28): TRẦN SỐ DƯ. Chỉ chặn chiều LÀM TĂNG số dư (cấp/điều chỉnh tăng);
+      // điều chỉnh GIẢM vẫn đi qua bình thường. Vì sao phải chặn: trên `float8`, số dư vượt
+      // `2^53/1e6 ≈ 9,007e9` credit thì phép trừ tiền nhỏ bị nuốt chữ số (đo được: 1e11 trừ
+      // 1.000 lượt 0,0004 ⇒ lệch 2,83e-3) — tức là ví "tự sinh tiền" ở đúng dải mà trần này
+      // đóng lại. So sánh SAU `roundMoney` nên `1000 + 1e-9` không bị từ chối oan.
+      if (value > 0) {
+        const balanceAfter = roundMoney(balanceBefore + value);
+        if (balanceAfter > this.maxBalance) {
+          throw new BillingError(
+            'AMOUNT_TOO_LARGE',
+            `Cấp ${value} credit làm số dư vượt trần ${this.maxBalance} `
+            + `(số dư hiện tại ${balanceBefore}). Trần số dư giữ tiền trong dải mà float8 còn đủ `
+            + `6 chữ số thập phân (giới hạn cứng ${Math.floor(MONEY_FLOAT8_CEILING)} credit).`,
+            { amount: value, balance: balanceBefore, balance_after: balanceAfter, max_balance: this.maxBalance, max: this.maxAmount },
+          );
+        }
+      }
       return this.#append({ userId: uid, amount: value, reason: picked, meta, balanceBefore });
     });
   }
