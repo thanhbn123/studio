@@ -1677,15 +1677,515 @@ q6_orphan    : sau 6 nhịp cron: requeued=1 · B đã chạy được 3 việc
 
 ---
 
-## 24. UI TRÊN TRÌNH DUYỆT THẬT (E2E) — lỗ hổng lớn nhất của dự án, nay đã bịt phần chính
+## 24. Gói xuất bản (.zip) — vòng sửa phản biện D1…D6
+
+Phán quyết vòng 1: **FAIL** (`docs/EXPORT-REVIEW.md`, 380 dòng, script `/tmp/x-atk/**`); hai agent
+độc lập bắt trùng 3 lỗi. `env -u DATABASE_URL npm test` → **1069 test · 1063 pass · 0 fail · 6 skip ·
+0 todo** (3 test `{todo}` đã chuyển thành test THẬT và xanh); `node --check` ✓; `verify.mjs` EXIT=0;
+`imagelab-demo.mjs` → `succeeded`; 3 suite UI xanh (`imagelab-ui` 23/23, `imagestudio-ui` 15/15,
+`mvp04-ui` 9/9).
+
+### 24.1 D1/D2/D3 — script phản biện
+
+```
+$ node /tmp/x-atk/a1-bundle.mjs        → findings: 0
+  S1 (MVP-01 mock):   manifest.mock_steps = ["content"]      ← vòng 1: []
+  S2 (asset mock):    manifest.mock_steps = ["ocr"] + note “đường asset hoạt động”
+  S6 (transport lạ):  verification = null · suggested_level = "MOCK_VERIFIED"
+                      notes: 'Dấu vết ghi nhãn "LIVE_VERIFIED" nhưng KHÔNG có transport … ⇒ KHÔNG giữ nhãn'
+  entries == manifest.entries (kể cả "MANIFEST.json")        ← vòng 1: thiếu chính MANIFEST.json
+$ node /tmp/x-atk/a6-e2e.mjs
+  MANIFEST.json providers.content = {"name":"mock","model":"mock-1","is_mock":true,…}
+  providers.usage = [{"operation":"VISION_ANALYSIS","provider":"mock","is_mock":true}, …]
+                                                     ← vòng 1: provider "mock" khai is_mock:false
+```
+
+### 24.2 D4/D5 — script phản biện + test mới
+
+```
+$ node /tmp/x-atk/a3-api.mjs           → findings: 0
+$ node --test test/export-api.test.js
+  ✔ D4: job KHÔNG có chủ (không user_id, không session_id) ⇒ 404 cho cả /bundle và /manifest
+  ✔ D5: `/manifest` KHÔNG dựng ZIP (nhanh hơn hẳn) và vẫn là một nguồn với gói
+$ node --test test/export-bundle.test.js
+  ✔ D5: `buildExportManifest` KHÔNG tạo ZIP và cho ra CÙNG bản kê khai  (zipped=false, buffer=null)
+  ✔ D1: job MVP-01 chạy provider GIẢ ⇒ `noi-dung.txt` PHẢI có dòng cảnh báo mock
+```
+
+### 24.3 D6 — script phản biện
+
+```
+$ node /tmp/x-atk/a4-edge.mjs          → findings: 0
+$ node /tmp/x-atk/a4b-nostorage.mjs
+  config.exports = {"available":false,"formats":["zip"]}      ← vòng 1: available:true
+  GET /bundle   khi app.storage=null: 503 EXPORT_UNAVAILABLE  ← vòng 1: 500
+  GET /manifest khi app.storage=null: 503 EXPORT_UNAVAILABLE  ← vòng 1: 500
+  server sống: 200
+$ node --test test/export-bundle.test.js
+  ✔ D6: `manifest.entries` kể cả MANIFEST.json và `files` cùng độ dài
+  ✔ D6: `createZip` TỪ CHỐI tên entry chứa CR/LF (BAD_ENTRY_NAME)
+  ✔ D6: thiếu `storage` ⇒ lỗi BAD_INPUT nói rõ storage (route map thành 503)
+```
+
+### 24.4 CÁI GÌ CHƯA ĐO ĐƯỢC (nói thẳng)
+
+1. **ZIP64 (> 4 GiB / > 65535 entry) CHƯA kiểm** — bản này chỉ ghi ZIP cổ điển và **từ chối** khi
+   vượt trần (`ZIP_TOO_LARGE`), nên không có ca >4 GiB nào chạy thật; biên đã đo: 1000 entry,
+   ~5 MB, 0 byte (`a1-bundle.mjs` S10).
+2. **Finder/Windows Explorer/Chrome thật CHƯA kiểm** — mới kiểm bằng bộ đọc độc lập trong repo
+   (`inspectZip`) + script Python ngoài (`a2-external.py`); chưa mở gói bằng công cụ hệ điều hành.
+3. **PostgreSQL CHƯA kiểm cho luồng xuất gói** — mọi phép đo chạy SQLite (`DATABASE_URL` đang trỏ
+   PG đã tắt ⇒ phải chạy `env -u DATABASE_URL npm test`); phần đọc store của X1 không có nhánh
+   riêng theo driver nhưng **chưa có bằng chứng đo** trên PG.
+4. **UI thật (trình duyệt) CHƯA kiểm** — chỉ kiểm bằng test DOM (`export-ui.test.js`) + script
+   `a5-ui.mjs` đọc mã nguồn `public/app.js`.
+5. **Gói > trần bộ nhớ** chỉ được chặn (`BUNDLE_TOO_LARGE`), chưa đo gói lớn nhất chạy được trên
+   máy yếu.
+
+---
+
+## 25. PostgreSQL — phủ NGHIỆP VỤ cho các bảng mới (MVP-03/04/05 + R1)
+
+**Lỗ hổng trước sprint này.** CI có job PostgreSQL 16 thật, nhưng nó chỉ chứng minh
+**`schema.sql` + migration cộng thêm** chạy được. Toàn bộ **nghiệp vụ** của các bảng mới —
+`image_assets.meta` (MVP-03), job `video_generation` (MVP-04), `users`/`user_sessions`/
+`wallet_ledger`/`pricing`/`jobs.user_id` (MVP-05), `job_queue`/`epoch`/`heartbeat_at` (R1) —
+chỉ được đo trên **SQLite in-memory** (`testConfig` ép `DB_DRIVER=sqlite`). Các dòng
+“Chưa đo: PostgreSQL thật…” ở §16.x, §17.x, §18.x, §21.x, §22.7 nói về đúng lỗ này.
+
+### 25.1 Môi trường đo (thật, không mock)
+
+```
+$ postgres --version
+postgres (PostgreSQL) 16.15 (Homebrew)          ← máy này KHÔNG có Docker; dựng bằng initdb/pg_ctl
+$ initdb -D <scratch>/pgdata -U viporder --auth=trust -E UTF8
+$ pg_ctl -D <scratch>/pgdata -o "-p 55440 -c listen_addresses=127.0.0.1 -c unix_socket_directories=''" start
+$ createdb -p 55440 -U studio -O studio studio
+DATABASE_URL=postgres://studio:studio@127.0.0.1:55440/studio
+```
+⚠️ Phải tắt Unix-domain socket (`unix_socket_directories=''`, chỉ chạy TCP): đường
+scratchpad dài hơn **giới hạn 103 byte** của socket PostgreSQL ⇒ `pg_ctl` chết với
+`FATAL: could not create any Unix-domain sockets` nếu không đặt.
+
+### 25.2 Kết quả hai lần chạy TOÀN BỘ bộ test
+
+```
+$ env -u DATABASE_URL npm test
+ℹ tests 1098 · pass 1063 · fail 0 · skipped 35 · todo 0          EXIT 0
+   ← 35 skip = 6 skip PostgreSQL có từ trước + 29 test mới của §25.3 (bỏ qua CÓ KIỂM SOÁT)
+
+$ DATABASE_URL=postgres://studio:studio@127.0.0.1:55440/pr_test npm test
+ℹ tests 1098 · pass 1097 · fail 0 · skipped 1 · todo 0           EXIT 0
+   ← 29 test mới CHẠY THẬT + 6 test PG cũ CHẠY THẬT; 1 skip còn lại là ca ÂM
+     “thiếu DATABASE_URL nhưng chọn driver postgres” (chỉ chạy khi KHÔNG có PG).
+     Chạy trên DB TRẮNG (`createdb pr_test`) ⇒ đi đường `schema.sql`, không nhờ migration.
+
+$ env -u DATABASE_URL node tools/verify.mjs
+EXIT 0
+```
+**CI đã chạy lại y hệt trên PostgreSQL 16 / Linux** (PR #28, run `37906501618`, job
+`Test (PostgreSQL 16)` — `ci.yml` đã set `DATABASE_URL` sẵn nên 29 test này tự chạy thật,
+KHÔNG phải sửa `ci.yml`):
+```
+ℹ tests 1098 · pass 1097 · fail 0 · skipped 1 · todo 0          job pass 1m16s
+✔ claimNextJob NGUYÊN TỬ: hai pool song song KHÔNG nhặt trùng một mục (8.957119ms)
+✔ TIỀN ĐI QUA POSTGRESQL KHÔNG ĐƯỢC MẤT CHỮ SỐ (đối chiếu trực tiếp với SQLite) (16.002897ms)
+✔ init() chạy LẦN HAI trên DB ĐÃ CÓ DỮ LIỆU vẫn không lỗi (migration idempotent) (87.344931ms)
+```
+Cả 5 job CI xanh (SQLite 56s · PostgreSQL 16 1m16s · smoke · Docker · quét secret).
+
+Baseline của `develop` trước nhánh này (`f8d96a3`, xem §24): `1069 · 1063 pass · 0 fail ·
+6 skipped`. Số **pass của SQLite không đổi (1063)** ⇒ 29 test mới không làm hỏng đường cũ;
+tổng test tăng đúng 29 (1069 → 1098) và skip tăng đúng 29 (6 → 35).
+
+### 25.3 Cái gì GIỜ ĐÃ ĐO ĐƯỢC trên PostgreSQL (29 test mới)
+
+| File | Phủ gì |
+|---|---|
+| `test/pg-wallet.test.js` (9) | số dư = TỔNG SỔ qua cả chu kỳ `grant→hold→settle`; `seq` = 1..n liên tục; số dư **không bao giờ âm** (kể cả gọi thẳng `appendLedger` ⇒ `INSUFFICIENT_CREDIT`, không để lại dòng); `holdForJob` thiếu credit ⇒ sổ không đổi; **idempotent `(job_id, run_key)`** (hold 2 lần ⇒ 1 dòng); **partial unique index** chặn dòng `job_hold` thứ hai và lộ ra `LEDGER_CONFLICT` chứ **không** `25P02 transaction is aborted`; **đua `settle` + `refund`** cùng lượt ⇒ đúng **1** dòng đóng; **đua 2 `holdForJob`** ⇒ giữ tiền 1 lần; `listLedger` phân trang **không trùng/không sót** + thứ tự `seq` giảm dần; **tiền không mất chữ số** (so CÙNG dữ liệu trên 2 dialect) |
+| `test/pg-queue.test.js` (9) | `claimNextJob` **nguyên tử với 2 POOL kết nối riêng** (đua thật, không giả lập): 1 mục/2 worker ⇒ đúng 1 thắng, `attempts` tăng 1 lần; 8 mục/2 worker ⇒ **không mục nào bị nhặt 2 lần, không sót**, mỗi mục `epoch=1`; **epoch/fencing**: runner bị cướp **không** chốt được `done`, thiếu epoch cũng bị từ chối, runner mới chốt được; `failQueueItem` của runner cũ bị đánh `stale`; **`heartbeat_at`**: mục còn nhịp **không** bị cron cướp (cửa sổ 600s), worker lạ/thiếu `workerId` không gia hạn được lease, mất nhịp thì bị thu hồi; `requeueStaleJobs` chốt `failed` khi **chạm trần** (+`failed_job_ids`) và không nhặt lại được; `enqueueJob` cùng khoá idempotency ⇒ **mở lại** mục cũ, `attempts` reset 0, epoch mới, **không đẻ mục thứ hai**; `run_after` (backoff) chặn nhặt sớm; `queueStats` trả **số** (không phải chuỗi BIGINT) |
+| `test/pg-schema.test.js` (11) | `init()` chạy **lần 2 và lần 3** trên DB **đã có dữ liệu** ⇒ không lỗi, dữ liệu cũ còn nguyên; mọi cột do migration thêm **có thật**; 2 partial unique index **tồn tại thật**; `users`/`user_sessions` vòng đời thật + tiếng Việt có dấu round-trip + `COUNT(*)` BIGINT được ép về **number**; `jobs.user_id` lọc đúng chủ sở hữu (`listJobs`/`countJobs`); `pricing` upsert **idempotent** (`ON CONFLICT DO UPDATE`) + có giá cho **mọi** `USAGE_OPERATIONS`; **`usage_events.run_key`** tách chi phí theo TỪNG lượt (và dòng `run_key IS NULL` của DB cũ quy về lượt `#1`); **MVP-03 `image_assets.meta`** JSON lồng nhau round-trip + `updateImageAssetMeta` không mất phần khác; **MVP-04** job `video_generation` vòng đời + `content_meta` round-trip + usage `VIDEO_RENDER`/`VIDEO_ENCODE` mang `run_key` + cột ngoài allowlist bị bỏ qua im lặng; `usageAggregate` trả **number** |
+
+Hai file dùng chung `test/pg-helpers.js`: tự **BỎ QUA** khi thiếu `DATABASE_URL`, mọi dòng mang
+tiền tố `RUN_TAG` riêng cho mỗi lần chạy và được **dọn sạch** ở `after` (DB PostgreSQL là DB
+**dùng chung** — không để rác, và **không** `DELETE FROM job_queue` trần vì đó là thao tác phá
+hoại nếu `DATABASE_URL` trỏ vào DB thật).
+
+### 25.4 LỖI THẬT phát hiện được — tiền MẤT CHỮ SỐ trên PostgreSQL (đã sửa)
+
+Đây là lỗi mà **SQLite không bao giờ lộ ra**, và nó nằm đúng ở môi trường production
+(`deploy/` chạy PostgreSQL; SQLite chỉ là DB dev/test).
+
+**Nguyên nhân.** `schema.sql` khai các cột tiền là `REAL`. `REAL` của SQLite là float **8 byte**,
+nhưng `REAL` của PostgreSQL là **`float4` — 4 byte, chỉ ~7 chữ số có nghĩa**. Đơn vị tiền của repo
+là **6 chữ số thập phân** (`MONEY_DECIMALS = 6`, `MONEY_EPSILON = 1e-6`) ⇒ tiền bị làm tròn mất.
+
+**Bằng chứng (đo qua store THẬT, cùng dữ liệu, hai dialect).**
+```
+grant=100     charge=-0.000001  → PG: 100          (đúng: 99.999999)   SQLite: 99.999999
+grant=10000   charge=-0.0004    → PG: 10000        (đúng: 9999.9996)   SQLite: 9999.9996
+grant=100000  charge=-0.004     → PG: 99999.99     (đúng: 99999.996)   SQLite: 99999.996
+$ psql -c "SELECT 99.999999::real, 1234.567891::real"   →   100 | 1234.5679
+```
+0.0004 và 0.004 là **giá THẬT** của repo (`DEFAULT_PRICING`: `OCR_DETECT = 0.0004`,
+`CONTENT_GENERATE = 0.004` credit/lượt), và ví 10.000 credit là mức bình thường.
+
+**Hệ quả nếu không sửa.** Ví 10.000 credit + giá 0.0004/lượt ⇒ trên PostgreSQL mỗi lượt trừ tiền
+nhưng **số dư không đổi** ⇒ người dùng chạy **miễn phí không giới hạn**. Ở mức 100.000 credit thì
+sổ còn **tự sinh sai số** (lệch −0.006 cho một lần trừ 0.004), phá đúng luật #2 của hợp đồng
+MVP-05 (“số dư = tổng sổ”).
+
+**Cách sửa (2 chỗ, không thêm dependency, không đổi tên hàm/field nào).**
+1. `src/store/schema.sql`: 4 cột tiền `REAL` → **`DOUBLE PRECISION`** —
+   `wallet_ledger.amount`, `wallet_ledger.balance_after`, `usage_events.estimated_cost`,
+   `pricing.unit_price`. Chạy được trên **cả hai** driver: PostgreSQL hiểu là `float8`, còn
+   SQLite coi tên kiểu chứa `DOUB` là **REAL affinity**.
+2. `src/store/index.js` — thêm `#widenMoneyColumns()` vào `#applyAdditiveMigrations()`:
+   `ALTER TABLE … ALTER COLUMN … TYPE DOUBLE PRECISION`, **chỉ PostgreSQL**, và **chỉ** khi
+   `information_schema` còn báo `data_type = 'real'` (nên `init()` lần hai không viết lại bảng).
+   Bắt buộc phải có bước này: `CREATE TABLE IF NOT EXISTS` là **no-op**, nên DB PostgreSQL
+   **đang chạy** sẽ không tự được sửa.
+
+**Đo sau khi sửa.**
+```
+DB ĐANG CHẠY (đi đường migration):
+  trước init(): wallet_ledger.amount = real          … (4 cột)
+  sau   init(): wallet_ledger.amount = double precision … (4 cột)
+  test/pg-wallet.test.js → 9/9 pass
+DB TRẮNG (đi đường schema.sql, KHÔNG qua migration):
+  $ createdb fresh_test && DATABASE_URL=…/fresh_test node --test test/pg-*.test.js
+  ℹ tests 29 · pass 29 · fail 0        4 cột đều = double precision
+```
+
+### 25.5 Cái gì VẪN CHƯA ĐO (đừng ghi là đã đo)
+
+1. **Nhiều TIẾN TRÌNH OS** (không chỉ nhiều pool kết nối): 29 test này chạy trong **một**
+   tiến trình Node với 2 pool riêng. `FOR UPDATE SKIP LOCKED` và `pg_advisory_xact_lock` là
+   khoá ở **phía máy chủ** nên 2 pool là phép thử đúng bản chất, nhưng cảnh “tiến trình bị
+   `kill -9` giữa transaction” thì vẫn chưa đo trên PostgreSQL.
+2. **Lease mất trên PostgreSQL (R3)**: giới hạn ở §22.7/§23.3 (hai tiến trình có thể cùng
+   THỰC THI một mục ⇒ chi phí provider nhân đôi; tiền/trạng thái đã được fence) **chưa**
+   được đo lại trên PostgreSQL.
+3. **Dữ liệu tiền CŨ đã bị `float4` làm tròn**: `ALTER COLUMN … TYPE DOUBLE PRECISION` chỉ nới
+   kiểu cột, **không** phục hồi được chữ số đã mất của dòng ghi trước đó. Hệ quả cụ thể (bất biến
+   “dòng cuối = số dư” vỡ trên DB đã nâng cấp) + cách xử lý: xem **§25.9**. Hiện **chưa** có DB
+   production nào — `deploy/` chưa từng triển khai thật, xem §DIRECT-DEPLOY.
+4. **`listOpenJobHolds` / `reconcileStuckRuns`** trên PostgreSQL: chưa phủ (vẫn chỉ SQLite).
+   Các method còn lại của `src/billing/**` (`estimate`, `priceOf`, `usageSummary` theo nhóm,
+   `billableRunsOfJob`) cũng chưa chạy trên PG.
+5. **PostgreSQL ≠ 16**: đã đo trên **16.15 macOS/arm64** (máy Owner) **và PostgreSQL 16
+   trên Linux** (CI, run `37906501618`) ⇒ không còn phụ thuộc một máy. Nhưng bản
+   **14 / 15 / 17 vẫn CHƯA đo** — `DOUBLE PRECISION` và `FOR UPDATE SKIP LOCKED` đều có từ
+   lâu nên rủi ro thấp, song đó là suy luận, không phải số đo.
+6. Không liên quan sprint này nhưng vẫn mở: provider thật (OCR/dịch/matting/TTS), trình duyệt
+   thật, `deploy/` trên máy chủ thật.
+
+### 25.6 VÒNG VÁ F1 — migration cột tiền nay **FAIL-CLOSED** (không còn im lặng bỏ qua schema khác)
+
+**Bộ test sau vòng vá (2 chế độ, `--test-concurrency=1`):**
+
+```
+$ env -u DATABASE_URL npm test                             → tests 1104 · pass 1065 · fail 0 · skipped 39  EXIT 0
+$ DATABASE_URL=postgres://…@127.0.0.1:55921/studio npm test → tests 1104 · pass 1103 · fail 0 · skipped 1 EXIT 0
+$ env -u DATABASE_URL node tools/verify.mjs                → tests 1104 · pass 1065 · fail 0 · skipped 39  EXIT 0
+$ env -u DATABASE_URL node tools/imagelab-demo.mjs         → Trạng thái job: succeeded                  EXIT 0
+```
+So với §25.2 (1098 test): **+4 test** của §25.7 (PostgreSQL, skip khi thiếu `DATABASE_URL`) và
+**+2 test** của §25.8 (chạy ở CẢ hai chế độ) ⇒ 1104. Bỏ qua ở chế độ SQLite: 35 + 4 = 39.
+PG cục bộ dựng bằng `initdb`/`pg_ctl` (máy KHÔNG Docker): cổng **55921**, socket dir ngắn
+`/tmp/f123pg/sock`, role+db `studio` (xem §25.1).
+
+**Lỗi (phản biện độc lập, `docs/PG-MONEY-REVIEW.md` F1 — TRUNG BÌNH).** `#widenMoneyColumns()`
+lọc cứng `table_schema = 'public'`. DB có `search_path` trỏ schema khác (triển khai tách schema /
+DBA đặt `search_path`) ⇒ **0/4 cột được nới mà KHÔNG một dòng log**, app vẫn boot, ví vẫn là
+`float4` ⇒ **chạy miễn phí**.
+
+**Đo lại trên schema KHÔNG phải `public`** (`search_path=app_*`, cùng dữ liệu, hai cây mã nguồn —
+cây CŨ `7a93e9a` và cây đã vá):
+
+```
+
+{ "init": "OK",
+  "columns": [ "pricing.unit_price=real", "usage_events.estimated_cost=real",
+               "wallet_ledger.amount=real", "wallet_ledger.balance_after=real" ],
+  "widened_logs": 0, "logs": [], "balance_after_1_run": 10000 }      ← ví 10.000 trừ 0,0004 ⇒ KHÔNG thu được gì
+
+=================== CÂY ĐÃ VÁ · cùng schema, cùng luồng tiền ===================
+{ "init": "OK",
+  "columns": [ "pricing.unit_price=double precision", "usage_events.estimated_cost=double precision",
+               "wallet_ledger.amount=double precision", "wallet_ledger.balance_after=double precision" ],
+  "widened_logs": 4, "balance_after_1_run": 9999.9996 }
+```
+
+**Cách vá (`src/store/index.js`).** Ba bước, không có nhánh "warn rồi chạy tiếp":
+
+1. **Quét MỌI schema** (`pg_catalog`, bỏ lọc `public`): `MONEY_COLUMNS` (hằng số export — dùng
+   CHUNG cho migration, kiểm tra và test) × `pg_attribute`/`pg_class`/`pg_namespace`, kèm
+   `pg_table_is_visible` = app có "nhìn thấy" bảng đó theo `search_path` không.
+2. **Nới TỪNG cột** tìm được, `ALTER TABLE "<schema>"."<table>" ALTER COLUMN "<col>" TYPE DOUBLE
+   PRECISION` (định danh được trích dẫn), log từng cột; lỗi ⇒ log **ERROR** (`money_widen_failed`).
+3. **QUÉT LẠI** (không tin kết quả bước 2):
+   · còn cột `real` **nhìn thấy được** ⇒ **NÉM `MONEY_COLUMNS_NOT_WIDENED`**, chặn boot, thông điệp
+     + `details.columns` nêu ĐÚNG tên cột (ca `pricing.unit_price` rớt lại `real` cũng bị coi là
+     chưa đạt — trước đây chỉ warn);
+   · còn cột `real` ở schema **NGOÀI `search_path`** ⇒ không chặn boot (app không đọc tới) nhưng
+     log **ERROR** + phơi ra `/api/health`.
+· Không ĐỌC được `pg_catalog` cũng là fail-closed (không được coi là "đã nới").
+
+**Bằng chứng 1 — `migrate.js` trên DB cột tiền `real` mà `ALTER` bị từ chối (lỗi THẬT của PG:
+cột được dùng bởi cột sinh), `search_path` = schema riêng:**
+
+```
+$ DATABASE_URL='postgres://…/studio?options=-c+search_path%3Dapp_f4427b' node src/store/migrate.js --driver postgres
+{"level":"error","msg":"store.migration.money_widen_failed","ctx":{"schema":"app_f4427b","table":"wallet_ledger",
+  "column":"amount","error":"cannot alter type of a column used by a generated column"}}
+{"level":"warn","msg":"store.migration.money_column_widened","ctx":{"schema":"app_f4427b","table":"wallet_ledger","column":"balance_after",…}}
+{"level":"warn","msg":"store.migration.money_column_widened","ctx":{…"usage_events","estimated_cost"…}}
+{"level":"warn","msg":"store.migration.money_column_widened","ctx":{…"pricing","unit_price"…}}
+{"level":"error","msg":"store.migration.money_columns_not_widened","ctx":{"code":"MONEY_COLUMNS_NOT_WIDENED",
+  "columns":"app_f4427b.wallet_ledger.amount"}}
+Migration thất bại: Cột TIỀN chưa được nới sang double precision: app_f4427b.wallet_ledger.amount — app sẽ đọc/ghi
+tiền bằng float4 (4 byte) và LÀM MẤT chữ số thập phân (ví 10.000 trừ 0,0004 ⇒ số dư KHÔNG đổi). Đã dừng khởi động
+thay vì chạy tiếp. Kiểm quyền sở hữu bảng cho role của app rồi chạy lại migration.
+EXIT=1                      ← 3/4 cột VẪN được nới (amount=real, balance_after/estimated_cost/unit_price=double precision)
+```
+
+**Bằng chứng 2 — `/api/health` nói thật khi cột `real` nằm NGOÀI `search_path` (app vẫn phục vụ):**
+
+```
+LOG error store.migration.money_widen_failed {"schema":"stray_dec4be","table":"wallet_ledger","column":"amount", …}
+LOG error store.migration.money_columns_not_widened_unreachable {"columns":"stray_dec4be.wallet_ledger.amount",
+  "reason":"cột tiền còn kiểu real nhưng không nằm trong search_path — app không đọc tới, KHÔNG chặn boot"}
+GET /api/health → HTTP 200 · status=ok
+{ "money_schema_ok": false,
+  "money_schema_reason": "còn cột TIỀN kiểu real NGOÀI search_path (app hiện không đọc tới): stray_dec4be.wallet_ledger.amount",
+  "money_schema": { "checked": true, "ok": false,
+    "not_widened": [ { "schema":"stray_dec4be","table":"wallet_ledger","column":"amount","data_type":"real","visible":false } ] } }
+```
+(`checked: false` = CHƯA KIỂM — SQLite hoặc store dựng tay; KHÔNG phải "đã kiểm và đạt".)
+
+### 25.7 VÒNG VÁ F2 — test BẢO VỆ đường migration (`test/pg-money-migration.test.js`, 4 test mới)
+
+**Lỗi (F2 — THẤP).** Không test nào phủ đường migration: tắt hẳn `#widenMoneyColumns()` thì
+**29/29 test PostgreSQL cũ vẫn xanh**; không test nào khẳng định `data_type`.
+
+**Test mới (PostgreSQL thật, tự skip khi thiếu `DATABASE_URL`; mỗi ca một SCHEMA riêng theo
+`RUN_TAG`, xoá sạch trong `finally`):**
+
+| Test | Đo gì |
+|---|---|
+| `DB dựng bằng schema CŨ (4 cột real) ở schema KHÁC public ⇒ init() nới CẢ 4 CỘT` | DDL "cũ" **suy ra từ chính `schema.sql`** (đổi 4 cột tiền sang `REAL`, có chốt chặn nếu không đổi được) → `init()` → `information_schema.columns.data_type` của **đủ 4 cột** = `double precision`; dữ liệu cũ (`balance_after=10000`) không bị đụng; `SUM(amount)` sau khi thêm dòng `-0,0004` = **9999.9996**; `init()` lần hai vẫn đúng (idempotent) |
+| `cột TIỀN bị hạ cấp NGƯỢC về real trên DB đã nâng cấp ⇒ init() nới LẠI` | DB đã `double precision` → `ALTER TABLE pricing ALTER COLUMN unit_price TYPE REAL` → `init()` phải nới LẠI; không được coi "DB đã nâng cấp rồi" là xong |
+| `còn cột TIỀN real trong schema ĐANG DÙNG ⇒ init() NÉM MONEY_COLUMNS_NOT_WIDENED` | Chặn `ALTER` bằng **lỗi thật của PostgreSQL** (cột dùng bởi cột sinh) ⇒ `init()` **phải ném**, `code=MONEY_COLUMNS_NOT_WIDENED`, thông điệp nêu `wallet_ledger.amount`, `visible=true`; 3 cột còn lại VẪN được nới |
+| `cột TIỀN real NGOÀI search_path ⇒ app vẫn boot nhưng /api/health nói money_schema_ok:false` | Schema "mồ côi" ngoài `search_path` ⇒ init OK, `/api/health` trả `money_schema_ok:false` + lý do + `not_widened[]`; dọn schema mồ côi ⇒ trạng thái chuyển `true` (chứng minh quét MỌI schema) |
+
+```
+$ DATABASE_URL=postgres://studio:***@127.0.0.1:55921/studio node --test --test-concurrency=1 test/pg-money-migration.test.js
+▶ Migration cột TIỀN trên PostgreSQL thật (F2)
+  ✔ DB dựng bằng schema CŨ (4 cột real) ở schema KHÁC `public` ⇒ init() nới CẢ 4 CỘT (73.85575ms)
+  ✔ cột TIỀN bị hạ cấp NGƯỢC về real trên DB đã nâng cấp ⇒ init() nới LẠI (không cần dựng lại DB) (37.598708ms)
+  ✔ còn cột TIỀN real trong schema ĐANG DÙNG ⇒ init() NÉM MONEY_COLUMNS_NOT_WIDENED (34.409542ms)
+  ✔ cột TIỀN real NGOÀI search_path ⇒ app vẫn boot nhưng /api/health nói money_schema_ok:false (104.552208ms)
+ℹ tests 4 · pass 4 · fail 0 · skipped 0
+$ psql -tAc "SELECT nspname FROM pg_namespace WHERE nspname LIKE 'pgtmoney%'"     → (trống: đã dọn sạch)
+```
+
+**Kiểm chứng NGƯỢC (mutation trên bản sao — test phải ĐỎ khi bản vá bị vô hiệu hoá):**
+
+| Mutation | Kết quả |
+|---|---|
+| **A** — bó hẹp quét về đúng `public` (tái hiện F1) | **fail 4/4** |
+| **B** — quét mọi schema nhưng TẮT nhánh ném (quay lại "warn rồi chạy tiếp") | **fail 1/4** — đúng ca fail-closed; ca `/api/health` vẫn xanh vì trạng thái được tính từ vẫn-quét-lại |
+
+### 25.8 VÒNG VÁ F3 — TRẦN SỐ DƯ ví ⇒ 400 `AMOUNT_TOO_LARGE`
+
+**Lỗi (F3 — THẤP).** `float8` chỉ giữ đủ 6 chữ số thập phân tới `2^53/1e6 = 9.007.199.254,74`
+credit; trần MỘT LỆNH cấp (`maxAmount = 1e9`) không chặn được điều đó (~9 lệnh cấp trần là vượt).
+Đo của phản biện: số dư `1e11`, 1.000 lượt trừ `0,0004` ⇒ lệch **2,83e-3**.
+
+**Cách vá.** `config.billing.maxBalance` (`BILLING_MAX_BALANCE`, mặc định `1e9`, hằng số
+`DEFAULT_MAX_BALANCE`/`MONEY_FLOAT8_CEILING` ở `src/billing/money.js`). `grant()` đọc số dư TRONG
+khoá sổ rồi chặn chiều LÀM TĂNG: `roundMoney(balanceBefore + value) > maxBalance` ⇒
+`AMOUNT_TOO_LARGE` (400) kèm `balance`/`max_balance`; điều chỉnh GIẢM không bị chặn.
+`GET /api/config.billing` công bố `max_balance`.
+
+```
+$ env -u DATABASE_URL REPO=$PWD node /tmp/f123pg/f3-http.mjs        (app THẬT + HTTP THẬT, BILLING_MAX_BALANCE=1000)
+GET /api/config → billing.max_balance = 1000 | max_amount = 1000000000
+POST /api/admin/users/<id>/credit {amount:999} → HTTP 201   {"balance":999,"ledger":"admin_grant"}
+POST /api/admin/users/<id>/credit {amount:2}   → HTTP 400
+    {"code":"AMOUNT_TOO_LARGE","message":"Cấp 2 credit làm số dư vượt trần 1000 (số dư hiện tại 999).
+      Trần số dư giữ tiền trong dải mà float8 còn đủ 6 chữ số thập phân (giới hạn cứng 9007199254 credit).",
+     "details":{"amount":2,"max":1000000000,"balance":999,"max_balance":1000}}
+sổ ví sau 2 lệnh: [{"amount":999,"reason":"admin_grant","balance_after":999}]      ← KHÔNG thêm dòng
+số dư đọc lại: 999
+```
+
+Hai test mới trong `test/mvp05-round2-hardening.test.js` (chạy ở CẢ hai chế độ, không cần PG):
+tầng dịch vụ (vượt trần ⇒ không ghi sổ; **đúng** trần vẫn cho; điều chỉnh giảm không bị chặn) và
+HTTP (201 → 400 + `/api/config.billing.max_balance`).
+
+### 25.9 (PHỤ) Bất biến “dòng cuối = số dư” VỠ trên DB ĐÃ NÂNG CẤP — và cách xử lý
+
+`ALTER COLUMN … TYPE DOUBLE PRECISION` chỉ nới **kiểu cột**, không phục hồi chữ số đã bị `float4`
+nuốt của các dòng ghi TRƯỚC đó. Đo được (mục 25.7, test 1 — dòng sổ CŨ giữ nguyên giá trị):
+
+```
+dòng seq=1  amount=+10000     balance_after=10000     ← ghi bằng float4 trước migration (giữ nguyên)
+dòng seq=2  amount=-0.0004    balance_after=10000     ← khoản trừ bị float4 nuốt khi ghi
+SUM(amount) sau migration = 9999.9996   ≠   balance_after dòng cuối = 10000      ← LỆCH 0,0004
+```
+
+Hệ quả: bất biến “`balance_after` dòng mới nhất === số dư” **vỡ trên DB đã nâng cấp** (lệch đúng
+phần đã bị float4 nuốt trước đây). Hướng lệch là **còn nợ tiền** (khách đã tiêu mà sổ chưa trừ),
+**không thất thoát thêm**; màn đối soát sẽ thấy lệch cho tới khi có dòng mới ghi bằng float8.
+
+Cách xử lý (Owner chọn, ghi rõ để không ai tưởng là đã tự sửa):
+1. **Chấp nhận + ghi rõ** (mặc định khuyến nghị khi chưa có DB production nào — `deploy/` chưa từng
+   triển khai thật): số dư THẬT là `SUM(amount)` (float8) và mọi dòng MỚI đã đúng; chỉ các dòng cũ
+   lệch. `/api/health` + `money_schema_ok` đã nói ra trạng thái kiểu cột.
+2. **Đồng bộ lại `balance_after` theo thứ tự `seq`** (chỉ chạy khi Owner muốn sổ khớp từng dòng —
+   thao tác GHI vào sổ append-only, phải sao lưu trước):
+   ```sql
+   -- SAO LƯU TRƯỚC: CREATE TABLE wallet_ledger_bak_20261009 AS SELECT * FROM wallet_ledger;
+   BEGIN;
+   WITH running AS (
+     SELECT id, SUM(amount) OVER (PARTITION BY user_id ORDER BY seq, created_at, id
+                                  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS total
+       FROM wallet_ledger
+   )
+   UPDATE wallet_ledger w SET balance_after = round(r.total::numeric, 6)
+     FROM running r WHERE r.id = w.id AND w.balance_after IS DISTINCT FROM round(r.total::numeric, 6);
+   COMMIT;
+   ```
+   ⚠️ Chỉ chạy khi KHÔNG có job đang chạy (khoá ghi sổ theo user vẫn giữ nguyên tiền); script này
+   **không** tạo/xoá dòng nào, chỉ sửa `balance_after` của dòng cũ. Hiện **chưa** chạy trên DB nào
+   (không có DB production) — đây là hướng dẫn, KHÔNG phải số đo.
+=======
+## 24.5 Vòng vá R1…R6 (phản biện vòng 2) — SỐ ĐO THẬT và phần CHƯA làm
+
+Nguồn phát hiện: `docs/EXPORT-REVIEW.md` §6.2. Luật sau khi vá: `docs/EXPORT-CONTRACT.md` §10.
+Hồi quy: `env -u DATABASE_URL npm test` → **1090 test · 1084 pass · 0 fail · 6 skipped · 0 todo**
+(baseline trước vá: **1069 · 1063 pass · 0 fail · 6 skipped · 0 todo**; +21 test mới ở
+`test/export-r1r6-hardening.test.js`).
+
+### 24.5.1 R6 — đo TRƯỚC/SAU trên CÙNG một script (`/tmp/x-atk/a3c-resource.mjs`)
+
+Job 40 × 1.5 MB = **60 MB dữ liệu ngẫu nhiên (không nén được)**, SQLite in-memory, server + client
+trong cùng tiến trình (cách đo y hệt vòng 1/2 nên so được):
+
+```
+TRƯỚC (vòng 1, a3c — ghi trong docs/EXPORT-REVIEW.md §2 P5/P6):
+  GET /bundle : 200 content-length=62924015 nhận=60.0MB thời gian=1992ms RSS 98→342MB (+245MB)
+  GET /manifest: 200 thân=10KB thời gian=2347ms   (còn dựng cả ZIP)
+TRƯỚC (vòng 2 @3bc139f, EXPORT-REVIEW §6.2 R6): RSS 98→368MB (+270MB), 1788ms
+SAU (vòng vá R1…R6, a3c nguyên bản):
+  GET /bundle : 200 content-length=62924095 nhận=60.0MB thời gian=1963ms RSS 99→346MB (+247MB)
+  GET /manifest: 200 thân=10KB thời gian=63ms   (D5 giữ nguyên: KHÔNG nén)
+  maxTotalBytes=1MB: ném BUNDLE_TOO_LARGE — "Gói vượt trần 1048576 byte …"
+```
+
+**Nói thẳng:** cổng + trần KHÔNG làm một request bớt tốn RAM (vẫn ~3,3–4,5× kích thước asset —
+muốn giảm phải STREAM ZIP, xem 24.5.3). Cái đã vá là **trần** và **sự chồng lấn**:
+
+```
+$ node /tmp/x-atk2/c1-r6-limits.mjs
+resolveExportLimits({}) = {"maxBundleBytes":67108864,"maxConcurrentBundles":1,"maxQueuedBundles":4,"maxWaitMs":30000}
+1) 60MB asset  : 200 nhận=60.0MB 1775ms · RSS 98→294MB (+196MB, 3.26×)
+2) 80MB asset  : HTTP 413 code=BUNDLE_TOO_LARGE 58ms · RSS +0MB
+   message: "…Đo được 73400356 byte, trần cho phép 67108864 byte."
+   details: {"bytes":73400356,"limit":67108864,"max_bundle_bytes":67108864}
+3) 6 request ĐỒNG THỜI (job 60MB): #1…#5 = 200 (1 chạy + 4 xếp hàng) · #6 = 429
+   code=EXPORT_BUSY details={"running":1,"queued":4,"concurrency":1,"queue_limit":4,"retry_after_ms":2000}
+   BỘ ĐẾM THẬT: đỉnh số lượt dựng gói đọc asset ĐỒNG THỜI = 1 (giới hạn 1); cả 6 request: 9258ms
+
+$ EXPORT_MAX_CONCURRENT_BUNDLES=1 node /tmp/x-atk2/c2-r6-concurrency-rss.mjs   # tiến trình riêng
+  2 request song song: [200,200] 120.0MB 3565ms · đỉnh đồng thời = 1 · RSS nền 98MB → đỉnh 421MB (+323MB)
+$ EXPORT_MAX_CONCURRENT_BUNDLES=2 node /tmp/x-atk2/c2-r6-concurrency-rss.mjs
+  2 request song song: [200,200] 120.0MB 4049ms · đỉnh đồng thời = 2 · RSS nền 99MB → đỉnh 485MB (+386MB)
+```
+
+- Ca 2 chứng minh trần hoạt động: vượt 64 MiB ⇒ **413 kèm số đo**, dừng sau **58 ms** thay vì đọc
+  nốt 80 MB.
+- Ca 3/4 chứng minh cổng hoạt động bằng **BỘ ĐẾM** (không chỉ thời gian): mặc định 1 ⇒ không bao
+  giờ có 2 lượt dựng gói chồng nhau; ép 2 ⇒ bộ đếm lên 2 và đỉnh RSS cao hơn (+63 MB) mà **không
+  nhanh hơn** (4049 ms so với 3565 ms) — lý do hợp lệ để mặc định là 1.
+- Số RSS ở (3)(4) gồm cả 2 buffer ZIP 60 MB phía client trong cùng tiến trình (cách đo này ghi ở
+  đầu `c2-r6-concurrency-rss.mjs`); hai cấu hình chịu phần đó như nhau.
+- Trần mặc định của module cũng hạ: `DEFAULT_MAX_TOTAL_BYTES` **512 MiB → 64 MiB** (một nguồn với
+  `EXPORT_MAX_BUNDLE_BYTES`).
+
+### 24.5.2 R1…R5 — script phản biện chạy lại trên bản vá
+
+```
+$ node /tmp/x-atk2/b1-matrix.mjs       → findings: 0
+  ca G (R1): mock_steps=["ocr","translate","render"] | is_mock=true tại 3 đường dẫn providers.imagelab.* — KHỚP
+  R2: 'live_verified' / 'LIVE_VERIFIED ' / object {level} ⇒ label=null + suggested=MOCK_VERIFIED + notes (trước: lọt, notes=0)
+  ma trận 14 ca bất biến "providers.is_mock=true ⇒ mock_steps khác rỗng": OK hết
+$ node /tmp/x-atk2/b3-zipnames.mjs     → findings: 1 (chỉ còn check R4 hardcode, xem 24.5.3 mục 8)
+  12/12 tên chứa ký tự điều khiển (LF/CR/CRLF/NEL/LS/PS/VT/FF/ESC/DEL/RLO) ⇒ BAD_ENTRY_NAME (trước: 8 tên LỌT)
+  mock_steps=[null] ⇒ "Bản kê khai CÓ mục mock_steps (1 phần tử) nhưng KHÔNG đọc được tên bước nào ⇒ KHÔNG kiểm được…"
+$ node /tmp/x-atk2/b2-d5-d4-d6.mjs     → findings: 0   (D5: /manifest deflate=0 inflate=0, /bundle 8/8; D4 404; D6 entries=8≡ZIP, 503)
+$ node /tmp/x-atk/a1-bundle.mjs        → findings: 0
+$ node /tmp/x-atk/a3-api.mjs           → findings: 0
+$ node /tmp/x-atk/a4-edge.mjs          → findings: 0
+$ node /tmp/x-atk/a4b-nostorage.mjs    → 503 EXPORT_UNAVAILABLE như cũ, server sống
+$ node /tmp/x-atk/a5-ui.mjs            → findings: 0
+$ node --test test/export-*.test.js    → 104/104 pass (83 test cũ + 21 test mới), 0 fail, 0 todo
+```
+
+Một thay đổi số liệu của script cũ cần giải thích (KHÔNG phải hồi quy nội dung): `a3-api.mjs` mục 9
+in **“3 gói giống nhau? false”** (vòng 1/2 là `true`). Nguyên nhân: cổng R6 xếp 3 request song song
+thành TUẦN TỰ nên 3 gói được dựng ở 3 mốc mili-giây khác nhau ⇒ `MANIFEST.json.generated_at` khác
+nhau. Kiểm lại từng entry (`/tmp/x-atk2/c3-parallel-payload.mjs`):
+
+```
+sha256 CẢ FILE giống nhau? false
+  payload noi-dung/noi-dung.json  : crc32=43f53d29/43f53d29/43f53d29 giống=true
+  payload noi-dung/noi-dung.txt   : e21a3f11/e21a3f11/e21a3f11 giống=true
+  payload anh/anh-goc-1..3.png    : 80a5b28f/fbd745d3/76405c37 — giống=true cả 3
+  payload bang-chung/usage.json   : ac5bcb5b ×3 giống=true
+  payload bang-chung/evidence.json: 99e21454 ×3 giống=true
+  MANIFEST.json (bỏ generated_at/filename) giống nhau? true
+  generated_at: 08:15:34.518Z · .529Z · .538Z
+```
+
+### 24.5.3 CÒN GÌ CHƯA LÀM / CHƯA ĐO (nói thẳng)
+
+1. **CHƯA STREAM ZIP** — `/bundle` vẫn dựng trọn gói trong RAM rồi mới trả. Trần 64 MiB + cổng 1
+   lượt chỉ **giới hạn thiệt hại**, không giảm khuếch đại ~3,3–4,5× của MỘT request. Muốn giảm thật
+   phải viết `createZip` theo luồng (stream ra `res` + bỏ `content-length`/dùng chunked) — việc lớn,
+   **chưa làm trong vòng này**.
+2. **Giới hạn đồng thời là TRONG MỘT TIẾN TRÌNH** — chạy nhiều process/node cluster thì mỗi tiến
+   trình có cổng riêng (N process × 1 lượt). **Chưa đo** 2 process cùng lúc.
+3. **`/manifest` KHÔNG đi qua cổng** — nó chỉ chịu trần byte (`EXPORT_MAX_BUNDLE_BYTES`); đường này
+   không nén nên khuếch đại ~1×, nhưng nhiều request `/manifest` song song vẫn có thể cộng lại.
+4. **Chưa đo đúng ngưỡng trần** — mới đo 60 MB (qua) và 80 MB (bị chặn ở 73 400 356 byte); chưa đo
+   gói sát trần 64 MiB, chưa đo trên máy yếu.
+5. **Chưa có HTTP header `Retry-After`** — 429 `EXPORT_BUSY` chỉ kèm `retry_after_ms` trong JSON
+   (hạ tầng `sendError` của repo chỉ hỗ trợ field này).
+6. **`EXPORT_MAX_BUNDLE_BYTES`/`EXPORT_MAX_CONCURRENT_BUNDLES`… chưa khai trong `.env.example`** —
+   phạm vi vòng vá chỉ cho sửa `src/exports/**`, `public/app.js` và khối export của
+   `src/http/routes.js`; muốn thêm mẫu env phải mở phạm vi sang `.env.example`/`src/config.js`.
+7. **`/api/config` giữ nguyên `exports = {available, formats}`** — cố ý không thêm field để không
+   phá client/test đã nghiệm thu; trần và giới hạn chỉ hiện ra khi có lỗi (413/429).
+8. **`b3-zipnames.mjs` còn 1 “finding” ở mục R4** — script hardcode `NUL phải là BAD_ENTRY_NAME`,
+   nhưng hợp đồng §10.3 chọn nhánh “HAI mã + lý do khác nhau”: NUL ⇒ `ZIP_NAME_INVALID` (lỗi định
+   dạng, mã đã có từ trước D6), ký tự điều khiển khác ⇒ `BAD_ENTRY_NAME`. Đổi NUL sang
+   `BAD_ENTRY_NAME` sẽ phá test đã nghiệm thu `test/export-zip.test.js:232` — mà `test/**` ngoài
+   phạm vi được sửa. Đây là **quyết định có ghi trong hợp đồng**, không phải chỗ vá sót.
+9. **ZIP64 / Finder / Chrome / PostgreSQL**: giữ nguyên như §24.4 mục 1–4 (mọi phép đo trên đây vẫn
+   chạy SQLite in-memory với `env -u DATABASE_URL`).
+
+## 26. UI TRÊN TRÌNH DUYỆT THẬT (E2E) — lỗ hổng lớn nhất của dự án, nay đã bịt phần chính
 
 > Trước mục này, **mọi** kết luận về UI trong tài liệu đều đến từ việc *trích hàm render của
 > `public/app.js` rồi chạy trong Node* (`test/*-ui-helpers.js`, `test/*-ui.test.js`). Cách đó đo được
 > chuỗi HTML sinh ra, nhưng **không** đo được: DOM thật, CSS thật, kéo-thả thật, `FileList` thật,
 > XHR thật, poll thật, `<img>` có giải mã được không, tệp tải về có mở được không, và **có lỗi
-> console hay không**. §24 đo đúng những thứ đó.
+> console hay không**. §26 đo đúng những thứ đó.
 
-### 24.1 Cách chạy
+### 26.1 Cách chạy
 
 ```bash
 npm run test:e2e              # mở CỬA SỔ Google Chrome thật
@@ -1701,7 +2201,7 @@ Google Chrome **đã cài sẵn trên máy**. Không Playwright, không Puppetee
 Script tự dựng máy chủ riêng (cổng rảnh ngẫu nhiên, SQLite + thư mục ảnh riêng trong `.e2e-data/`,
 `AI_PROVIDER=mock`, `OCR_PROVIDER=mock`, `env -u DATABASE_URL`) nên không đụng dữ liệu phát triển.
 
-### 24.2 Môi trường đã đo (lấy từ `docs/assets/e2e/report.json`)
+### 26.2 Môi trường đã đo (lấy từ `docs/assets/e2e/report.json`)
 
 ```json
 { "chrome": "Chrome/154.0.8037.98",
@@ -1710,7 +2210,7 @@ Script tự dựng máy chủ riêng (cổng rảnh ngẫu nhiên, SQLite + thư
   "headless": false, "node": "v26.7.0" }
 ```
 
-### 24.3 Kết quả — 4/4 luồng PASS, **0 lỗi console**, **0 phản hồi HTTP ≥ 400**
+### 26.3 Kết quả — 4/4 luồng PASS, **0 lỗi console**, **0 phản hồi HTTP ≥ 400**
 
 ```
 $ npm run test:e2e
@@ -1728,7 +2228,7 @@ HTTP >= 400 toàn phiên: 0 []
 **Chạy lại được, không rung (flaky):** 3 lượt `E2E_HEADLESS=1 npm run test:e2e` liên tiếp đều
 `4 PASS · 0 FAIL · exit=0`, cộng 2 lượt chạy **cửa sổ Chrome thật** cũng `4 PASS · 0 FAIL`.
 
-**Không đụng gì tới bộ test nền.** Thay đổi của §24 chỉ gồm `tools/e2e/**`, một dòng
+**Không đụng gì tới bộ test nền.** Thay đổi của §26 chỉ gồm `tools/e2e/**`, một dòng
 `"test:e2e"` trong `scripts`, một dòng `.e2e-data/` trong `.gitignore` và bằng chứng trong
 `docs/assets/e2e/` — **không thêm test nào vào `test/`**, không sửa `src/**`, không sửa `public/**`:
 
@@ -1765,7 +2265,7 @@ f4  gõ được toạ độ + chữ Trung bằng BÀN PHÍM THẬT
 f4  bảng duyệt (#il-lines) hiện và chứa đúng chữ Trung đã nhập tay   (4 dòng)
 ```
 
-### 24.4 Tệp TẢI VỀ phải **mở được**, không chỉ “có tải”
+### 26.4 Tệp TẢI VỀ phải **mở được**, không chỉ “có tải”
 
 Tệp được tải bằng cách **bấm chuột thật vào nút tải** trong trang; Chrome ghi xuống đĩa qua
 `Browser.setDownloadBehavior`, test chờ `Page.downloadProgress` = `completed`, rồi **giải mã lại
@@ -1778,7 +2278,7 @@ f3 video GIF → GIF OK bytes=636921 720x1280 frames=48 trailer=True   (2 cảnh
 f4 ảnh dịch  → PNG OK bytes=2344   320x320  idat_raw=409920 chunks=IHDR,IDAT,IEND
 ```
 
-### 24.5 Luồng 5 “gói xuất bản `.zip`” — **CHƯA CÓ trong baseline này**
+### 26.5 Luồng 5 “gói xuất bản `.zip`” — **CHƯA CÓ trong baseline này**
 
 ```
 $ grep -rni 'zip' --exclude-dir=node_modules --exclude-dir=.git . | grep -v package-lock
@@ -1787,12 +2287,12 @@ $ grep -rni 'zip' --exclude-dir=node_modules --exclude-dir=.git . | grep -v pack
 
 Không có endpoint, không có nút, không có tài liệu nào mô tả gói `.zip`. Màn job chỉ có link tải
 **một** tệp (`<a download>`): ảnh dịch (`public/app.js:1623`), ảnh tạo (`:2906`), video GIF (`:4249`)
-— cả ba đã được tải thật và kiểm mở được ở §24.4. Theo coordinator, tính năng đang nằm ở nhánh
+— cả ba đã được tải thật và kiểm mở được ở §26.4. Theo coordinator, tính năng đang nằm ở nhánh
 `feat/export-bundle` **chưa merge**, nên **sẽ test sau khi PR gói xuất bản merge**. Hàm
 `verifyFileOpens()` trong `tools/e2e/run.mjs` **đã hỗ trợ sẵn nhánh ZIP**, khi đó chỉ cần thêm một
 luồng bấm nút.
 
-### 24.6 Một hành vi THẬT mà chỉ chạy trên trình duyệt mới lộ ra (và nó ĐÚNG)
+### 26.6 Một hành vi THẬT mà chỉ chạy trên trình duyệt mới lộ ra (và nó ĐÚNG)
 
 Lần đầu làm f3, ảnh thứ hai được tạo bằng cách **copy y hệt** ảnh thứ nhất. UI hiện đúng một
 cảnh báo đỏ — ảnh chụp `f3-03-nhan-khong-co-tieng.png` của lượt đó:
@@ -1809,7 +2309,7 @@ UI **nói thẳng ra** thay vì im lặng — đúng luật “không bịa” c
 **khác thật** (bàn cờ vàng/xanh, dựng bằng `encodePng` của `tools/make-test-image.mjs`) và có thêm
 khẳng định `máy chủ DÙNG ĐỦ cả 2 cảnh`; kết quả `frames=48` = 2 cảnh × 24 khung xác nhận điều đó.
 
-### 24.7 Ba lỗi do chính E2E này tìm ra — **đều là lỗi của test, KHÔNG phải lỗi sản phẩm**
+### 26.7 Ba lỗi do chính E2E này tìm ra — **đều là lỗi của test, KHÔNG phải lỗi sản phẩm**
 
 Ghi lại để người sau khỏi vấp lại (đúng tinh thần §5 của `HANDOVER.md`):
 
@@ -1825,7 +2325,7 @@ Ghi lại để người sau khỏi vấp lại (đúng tinh thần §5 của `H
    nào”. Dùng chung một phép thử (có ô `x` không?) thì cú bấm “Mở ra” lại **ĐÓNG** mất khối đang mở.
    ⇒ Phân biệt bằng sự có mặt của nút “Thêm vùng”.
 
-### 24.8 Vẫn CHƯA đo (nói thẳng, đừng suy ra thừa)
+### 26.8 Vẫn CHƯA đo (nói thẳng, đừng suy ra thừa)
 
 - **Chỉ đo trên Chrome 154/macOS.** Chưa đo Safari/WebKit, chưa đo Firefox, chưa đo trình duyệt di
   động hay màn hình hẹp (layout responsive **chưa** có test).

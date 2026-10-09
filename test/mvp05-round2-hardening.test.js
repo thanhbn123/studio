@@ -321,6 +321,83 @@ describe('PB-06 — grant số cực lớn ⇒ 400 và KHÔNG ghi sổ', () => {
   });
 });
 
+/**
+ * F3 (vòng vá PR #28) — TRẦN SỐ DƯ ví.
+ *
+ * Vì sao: `float8` chỉ giữ đủ 6 chữ số thập phân tới `2^53/1e6 = 9.007.199.254,74` credit
+ * (đo được ở vòng phản biện: số dư `1e11`, 1.000 lượt trừ `0,0004` ⇒ lệch `2,83e-3`). Trần
+ * MỘT LỆNH cấp (`maxAmount`) không chặn được điều đó — chỉ cần ~9 lệnh cấp trần là vượt. Vì
+ * vậy có trần SỐ DƯ `billing.maxBalance` (mặc định `1e9`): cấp credit làm số dư vượt trần ⇒
+ * **400 `AMOUNT_TOO_LARGE`**, sổ KHÔNG thêm dòng.
+ */
+describe('F3 — trần SỐ DƯ ví: cấp credit vượt trần ⇒ 400 AMOUNT_TOO_LARGE', () => {
+  test('tầng dịch vụ: vượt `billing.maxBalance` ⇒ AMOUNT_TOO_LARGE, sổ không đổi (biên vẫn cho)', async () => {
+    const config = unitConfig({ BILLING_MAX_BALANCE: '1000' });
+    const store = await createStore(config, silent);
+    await store.init?.();
+    const svc = createBillingService(config, { store });
+    try {
+      assert.equal(svc.maxBalance, 1000, 'config.billing.maxBalance phải được nối thật vào service');
+
+      await svc.grant({ userId: 'u-f3', amount: 999 });
+      const before = await ledgerRows(store, 'u-f3');
+      await assert.rejects(
+        () => svc.grant({ userId: 'u-f3', amount: 2 }),
+        (err) => err.code === 'AMOUNT_TOO_LARGE'
+          && err.details?.max_balance === 1000
+          && err.details?.balance === 999
+          && err.details?.balance_after === 1001,
+      );
+      const after = await ledgerRows(store, 'u-f3');
+      assert.equal(after.length, before.length, 'bị từ chối thì sổ KHÔNG được thêm dòng nào');
+      assert.equal(await store.ledgerBalance('u-f3'), 999, 'số dư phải giữ nguyên 999');
+
+      // BIÊN: cấp vừa ĐÚNG trần vẫn phải được (trần là "≤", không phải "<").
+      await svc.grant({ userId: 'u-f3', amount: 1 });
+      assert.equal(await store.ledgerBalance('u-f3'), 1000);
+
+      // Điều chỉnh GIẢM không bị trần số dư chặn (chỉ chặn chiều làm TĂNG).
+      await svc.grant({ userId: 'u-f3', amount: -1000, reason: 'adjustment' });
+      assert.equal(await store.ledgerBalance('u-f3'), 0);
+    } finally {
+      await store.close();
+    }
+  });
+
+  test('HTTP: cấp 999 rồi cấp 2 (trần 1000) ⇒ 201 rồi 400 AMOUNT_TOO_LARGE + /api/config nói ra trần', async () => {
+    const ctx = await startMvp05App({ configOverrides: { BILLING_MAX_BALANCE: '1000' } });
+    try {
+      const ownerJar = newJar();
+      const ownerReg = await register(ctx.base, { email: 'f3-owner@example.com', jar: ownerJar });
+      await ctx.store.updateUser(ownerReg.body.user.id, { role: 'owner' });
+      const target = (await register(ctx.base, { email: 'f3-target@example.com' })).body;
+
+      // Trần phải HIỆN RA cho người vận hành, không chỉ nằm trong mã nguồn.
+      const cfg = await j(await request(ctx.base, '/api/config'));
+      assert.equal(cfg.billing.max_balance, 1000, '/api/config.billing phải trả `max_balance`');
+
+      const ok = await request(ctx.base, `/api/admin/users/${target.user.id}/credit`, {
+        method: 'POST', jar: ownerJar, body: { amount: 999 },
+      });
+      assert.equal(ok.status, 201, `cấp trong trần phải thành công, nhận ${ok.status}`);
+
+      const over = await request(ctx.base, `/api/admin/users/${target.user.id}/credit`, {
+        method: 'POST', jar: ownerJar, body: { amount: 2 },
+      });
+      assert.equal(over.status, 400, `vượt trần số dư phải là 400, nhận ${over.status}`);
+      const body = await j(over);
+      assert.equal(body.error.code, 'AMOUNT_TOO_LARGE');
+      assert.equal(body.error.details.max_balance, 1000, 'lỗi phải nói ra trần số dư');
+      assert.equal(body.error.details.balance, 999, 'lỗi phải nói ra số dư hiện tại');
+      const rows = await ledgerRows(ctx.store, target.user.id);
+      assert.equal(rows.length, 1, 'bị từ chối thì sổ không được thêm dòng');
+      assert.equal(rows[0].amount, 999);
+    } finally {
+      await ctx.close();
+    }
+  });
+});
+
 describe('PB-07 — credit số âm = điều chỉnh giảm', () => {
   test('số âm ⇒ reason adjustment, số dư giảm; giảm quá số dư ⇒ 400 INSUFFICIENT_CREDIT', async () => {
     const ctx = await startMvp05App();

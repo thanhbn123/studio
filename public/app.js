@@ -572,6 +572,9 @@ function onGlobalClick(ev) {
     openvideojob: () => {
       location.hash = `#/video/${btn.dataset.id}`;
     },
+    // ── Gói xuất bản (.zip) — hợp đồng §4 ──
+    exportbundle: () => downloadExportBundle(btn.dataset.exportId),
+    exportmanifest: () => openExportManifest(btn.dataset.exportId),
     // ── MVP-05 — Tài khoản + ví credit ──
     login: () => {
       location.hash = '#/dangnhap';
@@ -810,6 +813,7 @@ function renderJob() {
         </div>
       </div>
     </section>
+    ${exportPanelHtml(job.id, job.status, { kind: job.kind || 'content' })}
     ${body}
   `;
 
@@ -1470,6 +1474,11 @@ function renderImagelab() {
   stopPolling();
   const il = state.config?.imagelab || {};
   const available = il.available !== false;
+  // Khối “Gói xuất bản” (§4) chỉ có ở MÀN JOB; vẽ ở đây rồi BƠM vào `renderIlJob` để hàm render
+  // thuần không phải gọi thêm hàm ngoài (giữ nguyên tập phụ thuộc mà test trích hàm đang bơm).
+  const exportPanel = state.il.job
+    ? exportPanelHtml(state.il.job.job?.id, state.il.job.job?.status, { kind: state.il.job.job?.kind || 'image_translation' })
+    : '';
   app.innerHTML = `
     <section class="panel">
       <div class="spread">
@@ -1491,7 +1500,7 @@ function renderImagelab() {
     </section>
     ${available
       ? state.il.job
-        ? renderIlJob()
+        ? renderIlJob(exportPanel)
         : renderIlUpload()
       : `<section class="panel"><div class="notice error"><strong>Tính năng dịch ảnh chưa sẵn sàng trên máy chủ này (IMAGELAB_UNAVAILABLE).</strong>
            <p style="margin:6px 0 0">Lý do máy chủ báo: ${esc(il.reason || 'không nêu lý do — xem log máy chủ (imagelab.wiring_failed).')}</p>
@@ -1553,7 +1562,7 @@ function renderIlUpload() {
     </section>`;
 }
 
-function renderIlJob() {
+function renderIlJob(exportPanel = '') {
   const data = state.il.job;
   const job = data.job || {};
   const st = job.status || 'queued';
@@ -1578,6 +1587,7 @@ function renderIlJob() {
              <p style="margin:6px 0 0">${esc(job.error_message || 'Không rõ nguyên nhân.')}</p></div>`
         : ''}
     </section>
+    ${exportPanel}
     ${data.asset ? renderIlCompare(data) : ''}
     ${lines.length > 0 ? renderIlReview(data) : renderIlNoLines(data)}
     ${renderIlManual(data)}
@@ -3236,12 +3246,13 @@ function renderIsWarnings(data) {
 }
 
 /** Thân màn “Tạo ảnh” — hàm THUẦN để test trích ra chạy không cần DOM. */
-function renderImagestudioBody() {
+function renderImagestudioBody(exportPanel = '') {
   const cfg = state.config?.imagestudio || {};
   const available = cfg.available !== false;
   const job = state.is?.job;
   return `
     ${isHeaderPanel()}
+    ${exportPanel}
     ${available ? (job ? renderIsJob() : renderIsUpload()) : isUnavailablePanel()}
     ${available && !job ? renderIsOptions('create') : ''}
     ${renderIsOverlayBlocked()}
@@ -3253,8 +3264,12 @@ function renderImagestudio() {
   state.view = 'imagestudio';
   stopPolling();
   stopIlPolling();
+  // Khối “Gói xuất bản” (§4) chỉ có ở MÀN JOB; vẽ ở đây rồi BƠM xuống (xem `renderImagelab`).
+  const exportPanel = state.is?.job
+    ? exportPanelHtml(state.is.job.job?.id, state.is.job.job?.status, { kind: state.is.job.job?.kind || 'image_generation' })
+    : '';
   // Luật #1: khách ẩn danh vẫn tạo ảnh được — chỉ thêm gợi ý nhẹ ở cuối trang, không chặn gì.
-  app.innerHTML = `${renderImagestudioBody()}${authHintHtml()}`;
+  app.innerHTML = `${renderImagestudioBody(exportPanel)}${authHintHtml()}`;
   const cfg = state.config?.imagestudio || {};
   if (cfg.available !== false && !state.is.templates && !state.is.templatesLoading && !state.is.templatesError) {
     loadImagestudioTemplates();
@@ -4453,12 +4468,13 @@ function vsRenderJob() {
 }
 
 /** Thân màn “Video” — hàm THUẦN để test trích ra chạy không cần DOM. */
-function vsRenderBody() {
+function vsRenderBody(exportPanel = '') {
   const cfg = state.config?.videostudio || {};
   const available = cfg.available !== false;
   if (!available) return `${vsHeaderPanel()}${vsUnavailablePanel()}${vsErrorBox()}`;
   const job = state.vs?.job;
   return `${vsHeaderPanel()}
+    ${exportPanel}
     ${job ? vsRenderJob() : `${vsRenderUpload()}${vsRenderScenes()}${vsRenderOptions('create')}`}
     ${vsTextBlockedPanel()}
     ${vsErrorBox()}`;
@@ -4471,7 +4487,11 @@ function vsRenderPage() {
   stopPolling();
   stopIlPolling();
   stopIsPolling();
-  app.innerHTML = `${vsRenderBody()}${authHintHtml()}`;
+  // Khối “Gói xuất bản” (§4) chỉ có ở MÀN JOB; vẽ ở đây rồi BƠM xuống (xem `renderImagelab`).
+  const exportPanel = state.vs?.job
+    ? exportPanelHtml(state.vs.job.job?.id, state.vs.job.job?.status, { kind: state.vs.job.job?.kind || 'video_generation' })
+    : '';
+  app.innerHTML = `${vsRenderBody(exportPanel)}${authHintHtml()}`;
   const cfg = state.config?.videostudio || {};
   if (cfg.available !== false && !vsPresets().length && !state.vs.presetsLoading && !state.vs.presetsError) {
     loadVideoPresets(false);
@@ -4858,6 +4878,356 @@ function wireVideostudioGlobal() {
   document.addEventListener('drop', (ev) => {
     if (ev.target.closest?.('#vs-drop')) pickVideoFiles(ev.dataTransfer?.files);
   });
+}
+
+/* ═════════════════════ GÓI XUẤT BẢN (.zip) — hợp đồng §4 ═════════════════════
+ *
+ * Một nút ở CẢ BỐN màn job (MVP-01 nội dung / MVP-02 dịch ảnh / MVP-03 tạo ảnh / MVP-04 video)
+ * tải `GET /api/exports/jobs/:id/bundle` bằng thẻ `<a download>` — KHÔNG nhồi base64 vào `state`.
+ * Kèm nút phụ “Xem bản kê khai” gọi `GET /api/exports/jobs/:id/manifest` và in NGUYÊN VĂN (đã
+ * `esc()`) thứ máy chủ khai: nhãn kiểm chứng, `mock_steps`, `missing`, `warnings` — không tô hồng.
+ *
+ * Trước khi tải, UI hỏi `/manifest` MỘT lần để BẮT ĐƯỢC lỗi thật (404 khác chủ/không tồn tại,
+ * 400 id rác, 503 EXPORT_UNAVAILABLE) rồi mới bấm tải: thẻ `<a download>` thuần sẽ nuốt lỗi.
+ */
+
+const EXPORT_BUTTON_LABEL = 'TẢI GÓI XUẤT BẢN (.zip)';
+const EXPORT_MANIFEST_LABEL = 'Xem bản kê khai';
+const EXPORT_HONEST_LINE = 'Gói gồm nội dung + ảnh + video đã tạo; các bước dùng dữ liệu giả được ghi rõ trong MANIFEST.json.';
+const EXPORT_RUNNING_LINE = 'Job chưa xong — gói tải về có thể thiếu phần đang chạy.';
+const EXPORT_NO_ID_LINE = 'Job này không có mã định danh nên nút tải gói bị khoá — mở lại job từ Lịch sử rồi thử lại.';
+const EXPORT_UNCONFIGURED_LINE = 'Máy chủ khai tính năng gói xuất bản chưa khả dụng (EXPORT_UNAVAILABLE)';
+const EXPORT_NOT_MANIFEST_LINE = 'Máy chủ trả về dữ liệu KHÔNG phải bản kê khai (thiếu `manifest`) — chưa dám tải gói .zip vì có thể chỉ là trang HTML. Kiểm tra lại sau hoặc báo quản trị.';
+const EXPORT_FALLBACK_LINE = 'Vẫn thử tải trực tiếp tệp .zip';
+
+const EXPORT_ERROR_HINT = {
+  EXPORT_UNAVAILABLE: 'Máy chủ chưa nạp được module gói xuất bản — phần nội dung/ảnh/video của job vẫn xem bình thường.',
+  JOB_NOT_FOUND: 'Không tìm thấy job này: có thể job thuộc phiên hoặc tài khoản khác, hoặc đã bị xoá.',
+  BAD_JOB_ID: 'Mã job không hợp lệ nên máy chủ từ chối.',
+  // R6: trần kích thước gói và cổng giới hạn số lượt dựng gói đồng thời — nói đúng loại lỗi,
+  // không gộp vào câu "thử lại" chung (thử lại y hệt vẫn vượt trần / vẫn bận).
+  BUNDLE_TOO_LARGE: 'Gói vượt trần kích thước máy chủ cho phép nên bị từ chối dựng. Bớt ảnh/video của job rồi thử lại, hoặc nhờ quản trị nâng `EXPORT_MAX_BUNDLE_BYTES`.',
+  EXPORT_BUSY: 'Máy chủ đang dựng một gói xuất bản khác (mỗi lúc chỉ dựng vài gói để không hết bộ nhớ) — chờ vài giây rồi bấm lại.',
+};
+
+function exportBundleUrl(jobId) {
+  return `/api/exports/jobs/${encodeURIComponent(String(jobId ?? ''))}/bundle`;
+}
+
+function exportManifestUrl(jobId) {
+  return `/api/exports/jobs/${encodeURIComponent(String(jobId ?? ''))}/manifest`;
+}
+
+/** Câu nói THẬT khi không tải được gói — theo mã + HTTP status máy chủ trả, không đoán bừa. */
+function exportErrorText(err) {
+  const code = String(err?.code || '').trim();
+  const status = Number(err?.status || 0);
+  const rawMsg = String(err?.payload?.message || err?.message || '').trim();
+  // `api()` đặt message = `HTTP <status>` khi body không phải JSON ⇒ đừng lặp lại vô nghĩa.
+  const real = rawMsg && rawMsg !== `HTTP ${status}` ? rawMsg : '';
+  const server = real ? ` Máy chủ báo: “${real}”` : '';
+  const hint = EXPORT_ERROR_HINT[code] || '';
+  if (code === 'EXPORT_BAD_MANIFEST') return EXPORT_NOT_MANIFEST_LINE;
+  // R6: 413 kèm SỐ ĐO thật trong `details` (bytes/limit) — in số ra, không nói chung chung.
+  if (code === 'BUNDLE_TOO_LARGE' || status === 413) {
+    const details = err?.payload?.details || {};
+    const bytes = Number(details.bytes);
+    const limit = Number(details.limit);
+    const measured = Number.isFinite(bytes) && Number.isFinite(limit)
+      ? ` Gói đo được ${Math.round(bytes / (1024 * 1024) * 10) / 10} MB, trần ${Math.round(limit / (1024 * 1024) * 10) / 10} MB (${limit} byte).`
+      : '';
+    return `Gói xuất bản vượt trần kích thước (413${code ? ` ${code}` : ''}).${measured} ${hint || 'Bớt dữ liệu của job rồi thử lại.'}${server}`;
+  }
+  // R6: 429 do QUÁ TẢI DỰNG GÓI (khác 429 rate-limit theo phiên) — nói đúng loại, có gợi ý chờ.
+  if (code === 'EXPORT_BUSY') {
+    const retry = Number(err?.payload?.retry_after_ms);
+    const wait = Number.isFinite(retry) && retry > 0 ? ` Máy chủ đề nghị chờ ~${Math.ceil(retry / 1000)} giây.` : '';
+    return `Máy chủ đang bận dựng gói xuất bản (429 ${code}).${wait} ${hint || 'Chờ một lát rồi thử lại.'}${server}`;
+  }
+  if (code === 'EXPORT_UNAVAILABLE' || status === 503) {
+    return `Chưa tải được gói xuất bản (503${code ? ` ${code}` : ''}). ${hint || 'Máy chủ báo tính năng gói xuất bản chưa khả dụng.'}${server}`;
+  }
+  if (code === 'JOB_NOT_FOUND' || status === 404) {
+    return `Không tải được gói xuất bản (404${code ? ` ${code}` : ''}). ${hint || 'Job không tồn tại hoặc không thuộc phiên/tài khoản này.'}${server}`;
+  }
+  if (status === 400) {
+    return `Không tải được gói xuất bản (400${code ? ` ${code}` : ''}). ${hint || 'Mã job không hợp lệ.'}${server}`;
+  }
+  if (status === 429) {
+    return `Chưa tải được gói xuất bản (429${code ? ` ${code}` : ''}). Bị giới hạn tần suất — chờ một lát rồi thử lại.${server}`;
+  }
+  const head = status ? `HTTP ${status}${code ? ` ${code}` : ''}` : code || 'lỗi không rõ';
+  return `Không tải được gói xuất bản (${head})${real ? `. Máy chủ báo: “${real}”` : '.'}`;
+}
+
+/** Chuỗi hiển thị an toàn cho một giá trị bất kỳ trong manifest (nơi gọi tự `esc()`). */
+function exportScalarText(value) {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) return value.map((v) => exportScalarText(v)).filter((s) => s !== '').join(', ');
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+/** Một mục của manifest (chuỗi / object / mảng) → mảng dòng chữ để in ra. */
+function exportList(value) {
+  const arr = Array.isArray(value) ? value : value === null || value === undefined || value === '' ? [] : [value];
+  return arr.map((v) => exportScalarText(v)).filter((s) => s !== '');
+}
+
+/** Gộp nhiều nguồn cảnh báo/thiếu (top-level + trong manifest) — KHÔNG được giấu bớt mục nào. */
+function exportUnion(...lists) {
+  const out = [];
+  const seen = new Set();
+  for (const item of lists) {
+    for (const line of exportList(item)) {
+      if (seen.has(line)) continue;
+      seen.add(line);
+      out.push(line);
+    }
+  }
+  return out;
+}
+
+/**
+ * Nhãn kiểm chứng để HIỂN THỊ — CHỈ nhận CHUỖI, giữ nguyên văn (đã trim) thứ máy chủ khai.
+ *
+ * R2 (phản biện vòng 2, LOW): trước đây hàm này còn đọc `v.level`/`v.label` của OBJECT ⇒
+ * `verification: {level:'LIVE_VERIFIED'}` được dịch thành nhãn "LIVE_VERIFIED" và UI tô badge
+ * XANH dù `live_service_called: false`. Object/kiểu lạ ⇒ coi như KHÔNG có nhãn (lý do in kèm).
+ */
+function exportVerificationLabel(manifest) {
+  const v = manifest?.verification;
+  return typeof v === 'string' ? v.trim() : '';
+}
+
+function exportVerificationText(manifest) {
+  const v = manifest?.verification;
+  if (v === null || v === undefined || v === '') return 'Máy chủ không khai nhãn kiểm chứng.';
+  if (typeof v !== 'object') return String(v);
+  const parts = Object.entries(v).map(([k, val]) => `${k}=${exportScalarText(val)}`).filter((s) => !s.endsWith('='));
+  return parts.length ? parts.join(' · ') : 'Máy chủ không khai nhãn kiểm chứng.';
+}
+
+/** Khối danh sách của bản kê khai; rỗng thì NÓI THẲNG là rỗng, không bỏ im lặng. */
+function exportBlockHtml(title, items, opts = {}) {
+  const list = Array.isArray(items) ? items.filter((s) => String(s ?? '').trim() !== '') : [];
+  const head = `<h3 style="margin:12px 0 6px">${esc(title)}</h3>`;
+  if (!list.length) return `${head}<p class="muted small" style="margin:0">${esc(opts.empty || 'Máy chủ không khai mục nào.')}</p>`;
+  const body = `<ul class="bullets">${list.map((s) => `<li>${esc(s)}</li>`).join('')}</ul>`;
+  const cls = String(opts.cls || '').trim();
+  return cls ? `${head}<div class="notice ${esc(cls)}" style="margin:0">${body}</div>` : `${head}${body}`;
+}
+
+/**
+ * Bản kê khai (§3 `/manifest`) — in NGUYÊN VĂN thứ máy chủ khai, đã escape: không thêm, không bớt.
+ * `audio === null` là SỰ THẬT của hợp đồng §0 (“video không tiếng”) nên phải hiện thẳng.
+ */
+function exportManifestHtml(data) {
+  const manifest = data?.manifest && typeof data.manifest === 'object' ? data.manifest : {};
+  const job = manifest.job && typeof manifest.job === 'object' ? manifest.job : {};
+  const label = exportVerificationLabel(manifest);
+  const rawVerification = manifest.verification;
+  // R2: CỔNG NHÃN ở phía UI. Badge XANH ("đã kiểm chứng bằng dịch vụ thật") chỉ được hiện khi:
+  //   (a) nhãn là CHUỖI và sau khi chuẩn hoá (trim + HOA) ra ĐÚNG một mức LIVE, VÀ
+  //   (b) bằng chứng máy chủ khai `verification_detail.live_service_called === true`
+  //       (máy chủ chỉ đặt true khi `transport === 'http'`).
+  // Nhãn KHÔNG chuẩn (`live_verified`, `LIVE_VERIFIED `, object `{level:…}`) không còn lọt badge.
+  const liveLevels = ['LIVE_VERIFIED', 'AUTHENTICATED_LIVE_VERIFIED'];
+  const level = label.toUpperCase();
+  const liveProven = manifest?.verification_detail?.live_service_called === true;
+  const isLive = liveLevels.includes(level) && liveProven;
+  const labelNotes = [];
+  if (!label && rawVerification !== null && rawVerification !== undefined && rawVerification !== '') {
+    labelNotes.push('Máy chủ trả nhãn kiểm chứng KHÔNG phải chuỗi (object/kiểu lạ) ⇒ UI coi như KHÔNG có nhãn và không tự dịch nó thành nhãn.');
+  }
+  if (label && level !== label) {
+    labelNotes.push(`Nhãn đã được CHUẨN HOÁ (trim + chữ hoa) để xét cổng bằng chứng: ${JSON.stringify(label)} → ${level}.`);
+  }
+  if (liveLevels.includes(level) && !liveProven) {
+    labelNotes.push('Nhãn LIVE nhưng bằng chứng máy chủ khai KHÔNG chứng minh đã gọi dịch vụ thật (`live_service_called` không phải true) ⇒ UI KHÔNG hiện badge LIVE.');
+  }
+  const cls = isLive ? 'ok' : label ? 'warn' : '';
+  const audio = manifest.audio === null
+    ? 'audio: KHÔNG có tiếng (video không tiếng)'
+    : manifest.audio === undefined
+      ? 'audio: máy chủ không khai'
+      : 'audio: có khối audio';
+  const counts = manifest.counts && typeof manifest.counts === 'object'
+    ? Object.entries(manifest.counts).map(([k, v]) => `${k}=${exportScalarText(v)}`)
+    : [];
+  const warnings = exportUnion(data?.warnings, manifest.warnings);
+  // D1 + R5: nếu bản kê khai KHÔNG có khoá `mock_steps` (bản cũ/thiếu dữ liệu) thì UI phải nói "không
+  // kiểm được", KHÔNG được khẳng định là "không có bước giả". Và mảng CÓ phần tử nhưng không đọc
+  // được tên bước nào (`[null]`, `[""]`) cũng KHÔNG phải bằng chứng "không có bước giả".
+  const rawMockSteps = Array.isArray(manifest.mock_steps)
+    ? manifest.mock_steps
+    : typeof manifest.mock_steps === 'string' && manifest.mock_steps.trim()
+      ? [manifest.mock_steps]
+      : Array.isArray(data?.manifest?.mock_steps)
+        ? data.manifest.mock_steps
+        : null;
+  const mockSteps = exportList(rawMockSteps);
+  const mockStepsKnown = rawMockSteps !== null;
+  const mockStepsEmpty = rawMockSteps !== null && rawMockSteps.length === 0;
+  const missing = exportUnion(data?.missing, manifest.missing);
+  const providers = exportList(manifest.providers);
+  const jobLine = `Job <span class="mono">${esc(String(job.id || '—'))}</span> · loại ${esc(String(job.kind || '—'))} · trạng thái ${esc(String(job.status || '—'))} · sinh lúc ${esc(String(manifest.generated_at || '—'))}`;
+  return `<div class="notice">
+    <div class="muted small">${jobLine}</div>
+    <div class="row" style="margin-top:8px">
+      <span class="badge ${esc(cls)}">Nhãn kiểm chứng: ${esc(label || 'máy chủ không khai')}</span>
+      <span class="badge">${esc(audio)}</span>
+    </div>
+    ${labelNotes.length ? `<p class="muted small" style="margin:6px 0 0">${esc(labelNotes.join(' '))}</p>` : ''}
+    ${exportBlockHtml('Kiểm chứng (verification)', [exportVerificationText(manifest)])}
+    ${exportBlockHtml('Bước dùng dữ liệu giả (mock_steps)', mockSteps, {
+      cls: mockSteps.length ? 'warn' : '',
+      // D1 (phản biện Gói xuất bản, HIGH): câu này chỉ được nói khi danh sách THẬT SỰ rỗng — trước
+      // đây nó in cả khi máy chủ khai thiếu (mock_steps rỗng do lỗi gom dấu vết), tức UI nói dối.
+      // R5: `[null]`/`[""]` là CÓ dấu vết mock ⇒ tuyệt đối không được khẳng định "không có bước giả".
+      empty: mockStepsEmpty
+        ? 'Máy chủ khai KHÔNG có bước nào dùng dữ liệu giả.'
+        : mockStepsKnown
+          ? `Bản kê khai CÓ mục mock_steps (${rawMockSteps.length} phần tử) nhưng KHÔNG đọc được tên bước nào ⇒ KHÔNG kiểm được job có bước giả hay không.`
+          : 'Bản kê khai KHÔNG có mục mock_steps ⇒ KHÔNG kiểm được job có bước giả hay không.',
+    })}
+    ${exportBlockHtml('Thiếu trong gói (missing)', missing, { cls: 'warn', empty: 'Máy chủ khai KHÔNG thiếu mục nào.' })}
+    ${exportBlockHtml('Cảnh báo của job (warnings)', warnings, { cls: 'warn', empty: 'Máy chủ không trả cảnh báo nào.' })}
+    ${counts.length ? exportBlockHtml('Số lượng trong gói (counts)', counts) : ''}
+    ${exportBlockHtml('Provider đã dùng (providers)', providers, { empty: 'Máy chủ không khai provider.' })}
+    <p class="muted small" style="margin:10px 0 0">Nguyên văn bản kê khai của máy chủ (đã escape) — không thêm, không bớt.</p>
+  </div>`;
+}
+
+/**
+ * Khối “Gói xuất bản” cho MỘT màn job (§4) — HTML thuần nên test trích ra chạy được, không cần DOM.
+ * - không có `jobId` ⇒ nút KHOÁ + nói rõ lý do (§4: “khoá khi job không tồn tại/không có id”);
+ * - `/api/config` khai `exports.available === false` ⇒ vẫn ĐỂ BẤM (để lỗi 503 thật hiện ra) nhưng
+ *   cảnh báo trước bằng lời máy chủ khai — không giả vờ là tải được;
+ * - job đang chạy ⇒ nhắc “job chưa xong, gói có thể thiếu”.
+ */
+function exportPanelHtml(jobId, status, opts = {}) {
+  const id = String(jobId ?? '').trim();
+  const cfg = state.config?.exports;
+  const unavailable = Boolean(cfg) && cfg.available === false;
+  const running = ['queued', 'running', 'awaiting_review'].includes(String(status ?? '').toLowerCase());
+  const locked = !id;
+  const disabled = locked;
+  const url = id ? exportBundleUrl(id) : '';
+  const notes = [`<p class="muted small" style="margin:6px 0 0">${esc(EXPORT_HONEST_LINE)}</p>`];
+  if (running) notes.push(`<p class="small" style="margin:6px 0 0"><strong>⏳ ${esc(EXPORT_RUNNING_LINE)}</strong></p>`);
+  if (locked) notes.push(`<p class="muted small" style="margin:6px 0 0">🔒 ${esc(EXPORT_NO_ID_LINE)}</p>`);
+  // `GET /api/config` §3 chỉ khai `exports = { available, formats }` (KHÔNG có `reason`) ⇒ chỉ đọc cờ.
+  if (unavailable) notes.push(`<p class="small" style="margin:6px 0 0">⚠️ ${esc(`${EXPORT_UNCONFIGURED_LINE}. Bấm nút vẫn thử và sẽ hiện đúng lỗi máy chủ trả.`)}</p>`);
+  const kind = String(opts.kind || '').trim();
+  return `<section class="panel export-panel" data-export-kind="${esc(kind)}">
+    <div class="spread">
+      <div style="min-width:0">
+        <h2 style="margin:0">Gói xuất bản (.zip)</h2>
+        ${notes.join('')}
+      </div>
+      <div class="row">
+        <button class="btn primary" type="button" data-action="exportbundle" data-export-id="${esc(id)}" data-export-url="${esc(url)}"${disabled ? ' disabled aria-disabled="true"' : ''}>${esc(EXPORT_BUTTON_LABEL)}</button>
+        <button class="btn ghost tiny" type="button" data-action="exportmanifest" data-export-id="${esc(id)}"${disabled ? ' disabled' : ''}>${esc(EXPORT_MANIFEST_LABEL)}</button>
+      </div>
+    </div>
+    <div data-export-error></div>
+    <div data-export-manifest hidden></div>
+  </section>`;
+}
+
+/** Gợi ý tên tệp cho thẻ `<a download>` (máy chủ vẫn có thể đặt tên khác ở Content-Disposition). */
+function exportDownloadName(manifest, jobId) {
+  const id = String(jobId ?? '').trim().slice(0, 8);
+  if (!id) return '';
+  const kind = String(manifest?.job?.kind || '').trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  return kind ? `${kind}-${id}.zip` : `goi-xuat-ban-${id}.zip`;
+}
+
+/** Ghi lỗi THẬT của lần tải gói vào panel — không nuốt lỗi, không thay bằng câu chung chung. */
+function exportPaintError(err, jobId) {
+  const box = document.querySelector('[data-export-error]');
+  const text = exportErrorText(err);
+  if (!box) return text;
+  const status = Number(err?.status || 0);
+  const code = String(err?.code || '');
+  // 503/EXPORT_UNAVAILABLE thì tải thẳng cũng hỏng ⇒ KHÔNG mời người dùng bấm thêm một lần vô ích.
+  // R6: 413 (vượt trần) và 429 EXPORT_BUSY cũng vậy — tải thẳng y hệt vẫn bị từ chối.
+  const canFallback = Boolean(jobId) && status !== 503 && status !== 429 && status !== 413 && code !== 'EXPORT_UNAVAILABLE' && code !== 'EXPORT_BAD_MANIFEST' && code !== 'BUNDLE_TOO_LARGE' && code !== 'EXPORT_BUSY';
+  const fallback = canFallback
+    ? `<p style="margin:8px 0 0"><a class="btn tiny ghost" href="${esc(exportBundleUrl(jobId))}" download rel="noopener">${esc(EXPORT_FALLBACK_LINE)}</a></p>`
+    : '';
+  box.innerHTML = `<div class="notice error"><strong>Không tải được gói xuất bản.</strong><p style="margin:6px 0 0">${esc(text)}</p>${fallback}</div>`;
+  return text;
+}
+
+/** Bấm nút tải: hỏi `/manifest` trước để bắt lỗi thật, rồi tải `.zip` bằng thẻ `<a download>`. */
+async function downloadExportBundle(jobId) {
+  const id = String(jobId ?? '').trim();
+  const errBox = document.querySelector('[data-export-error]');
+  if (errBox) errBox.innerHTML = '';
+  if (!id) {
+    if (errBox) errBox.innerHTML = `<div class="notice warn">🔒 ${esc(EXPORT_NO_ID_LINE)}</div>`;
+    return { ok: false, status: 0, code: '', text: EXPORT_NO_ID_LINE };
+  }
+  const url = exportBundleUrl(id);
+  try {
+    const data = await api(exportManifestUrl(id));
+    const manifest = data && typeof data === 'object' ? data.manifest : null;
+    if (!manifest || typeof manifest !== 'object') {
+      // 200 nhưng thân không phải bản kê khai (ví dụ trang HTML) ⇒ KHÔNG tải bừa thành `.zip`.
+      const bad = new Error(EXPORT_NOT_MANIFEST_LINE);
+      bad.code = 'EXPORT_BAD_MANIFEST';
+      bad.status = 0;
+      throw bad;
+    }
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = exportDownloadName(manifest, id);
+    a.rel = 'noopener';
+    a.hidden = true;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    toast('Đang tải gói xuất bản (.zip)…');
+    return { ok: true, status: 200, code: '', url };
+  } catch (err) {
+    const text = exportPaintError(err, id);
+    toast(`Không tải được gói: ${String(err?.code || err?.message || 'lỗi không rõ')}`);
+    return { ok: false, status: Number(err?.status || 0), code: String(err?.code || ''), text };
+  }
+}
+
+/** Mở bản kê khai THẬT của job (verification / mock_steps / missing / warnings). */
+async function openExportManifest(jobId) {
+  const id = String(jobId ?? '').trim();
+  const box = document.querySelector('[data-export-manifest]');
+  const errBox = document.querySelector('[data-export-error]');
+  if (errBox) errBox.innerHTML = '';
+  if (!id) {
+    if (errBox) errBox.innerHTML = `<div class="notice warn">🔒 ${esc(EXPORT_NO_ID_LINE)}</div>`;
+    return { ok: false, status: 0, code: '', text: EXPORT_NO_ID_LINE };
+  }
+  try {
+    const data = await api(exportManifestUrl(id));
+    if (box) {
+      box.hidden = false;
+      box.innerHTML = exportManifestHtml(data);
+    }
+    return { ok: true, status: 200, code: '', data };
+  } catch (err) {
+    const text = exportPaintError(err, id);
+    if (box) {
+      box.hidden = true;
+      box.innerHTML = '';
+    }
+    return { ok: false, status: Number(err?.status || 0), code: String(err?.code || ''), text };
+  }
 }
 
 /* ═════════════════════ MVP-05 — Tài khoản + Ví credit ═════════════════════
