@@ -1741,3 +1741,133 @@ $ node --test test/export-bundle.test.js
    `a5-ui.mjs` đọc mã nguồn `public/app.js`.
 5. **Gói > trần bộ nhớ** chỉ được chặn (`BUNDLE_TOO_LARGE`), chưa đo gói lớn nhất chạy được trên
    máy yếu.
+
+---
+
+## 25. Đo provider THẬT lần 1 — dịch Trung→Việt bằng DeepSeek (2026-10-09)
+
+> **Lần đầu tiên dự án gọi provider TRẢ TIỀN thật.** Trước mục này, **mọi** nhãn liên quan tới
+> provider AI trong tài liệu đều là `MOCK_VERIFIED`. Báo cáo đầy đủ (bảng 5 sản phẩm, nhận xét
+> chất lượng từng câu, chi phí bóc tách): **`docs/LIVE-MEASUREMENT-REPORT.md`**.
+>
+> Harness chạy lại được: `tools/measure-translate-live.mjs`.
+
+### 25.1 Điều kiện đo (để ai cũng kiểm lại được)
+
+| | |
+|---|---|
+| Lệnh | `node tools/measure-translate-live.mjs --env-file <.env> --model deepseek-flash --probe-legacy-model --out live.json` |
+| Thời điểm | **2026-10-09, 15:55–15:56 UTC** (Thứ Sáu) ⇒ khung giá **THẤP ĐIỂM** |
+| Commit | `f8d96a3`, nhánh `thanhbn123/live-measure-translate` |
+| Provider / model | **DeepSeek** `https://api.deepseek.com` · **`deepseek-flash`** (DeepSeek-V4.1-Flash) |
+| API key | `sk-…7467` (đã che — key không bao giờ được in đủ ở bất kỳ đâu) |
+| Đường đi được đo | `createTranslator({ translate: { provider: 'ai' } })` — **đúng đường dịch của sản phẩm** |
+| Trần cứng | `max_calls=5` · `max_input_tokens=3000` · `max_output_tokens=2048` · `budget_usd=0.8` |
+| Mẫu | 5 sản phẩm tiếng Trung tự soạn, mỗi sản phẩm 1 tiêu đề + 5 điểm bán + 1 mô tả + 1–2 vùng thử guardrail = **42 vùng chữ** |
+
+Harness **không tự gọi HTTP thô**: nó chỉ **bọc** provider thật (`createProvider`) bằng lớp
+đo/chặn tiền (`BudgetGuard`) rồi bơm qua tham số `aiProvider`. Prompt, chia lô, parse JSON và
+guardrails đều là mã sản phẩm, không bị thay thế.
+
+### 25.2 SỐ THẬT
+
+```
+5 lời gọi · 5/5 sản phẩm đã gọi được · 4/5 trả về OK · 1/5 FAILED
+
+| SKU            | kết quả | ms    | in tok | hit/miss  | out tok | reasoning | finish | USD      |
+| P1-juicer      | OK      | 2961  | 1049   | 0/1049    | 767     | 453       | stop   | 0.000618 |
+| P2-earbuds     | OK      | 3642  | 1040   | 384/656   | 650     | 359       | stop   | 0.000490 |
+| P3-dress       | FAILED  | 8579  | 1013   | 384/629   | 2048    | 2048      | length | 0.001324 |
+| P4-thermos     | OK      | 3576  | 1072   | 384/688   | 924     | 626       | stop   | 0.000659 |
+| P5-smartwatch  | OK      | 2625  | 1028   | 384/644   | 670     | 388       | stop   | 0.000500 |
+| TỔNG           | 4/5 OK  | TB4277| 5202   | 1536/3666 | 5059    | 3874      |        | 0.003590 |
+
+42 vùng: TRANSLATED 30 · NEEDS_REVIEW 2 · FAILED 7 · SKIPPED_BRAND 1 · SKIPPED_CERTIFICATION 1 · SKIPPED_PRICE 1
+Gửi tới provider: 39/42 — 3 vùng bảo vệ CHƯA BAO GIỜ rời khỏi máy.
+
+TỔNG CHI PHÍ = 0.003590 USD (≈ 94 VNĐ) — ngân sách cấp 1.00 USD ⇒ dùng 0.36%.
+```
+
+**Bảng giá dùng để tính** (nguồn: <https://api-docs.deepseek.com/quick_start/pricing>, **đọc
+2026-10-09**, hiệu lực từ 04:00 UTC 2026-09-10): `deepseek-flash` thấp điểm 0.15 (in miss) /
+0.003 (in hit) / 0.60 (out) USD mỗi 1M token; cao điểm gấp đôi. Đây là **ước tính theo đơn giá
+công bố × token API trả về**, **KHÔNG phải hoá đơn** — chưa đối chiếu bảng kê thanh toán.
+
+### 25.3 Guardrails trên dữ liệu thật — 7/7 mẫu thử + 4/4 ca tiêm bịa
+
+| Lớp | Phép thử | Kết quả |
+|---|---|---|
+| **A** — chặn TRƯỚC khi gọi | `官方旗舰店授权销售` ⇒ `SKIPPED_BRAND`; `已通过质检，附检测报告与合格证` ⇒ `SKIPPED_CERTIFICATION`; `原价￥299 现价￥199` ⇒ `SKIPPED_PRICE` | **3/3 đúng**, cả ba `sent_to_provider: false` |
+| **B** — không tố oan bản dịch trung thực | `保修12个月…` → "Bảo hành 12 tháng…"; `正品行货…` → "Hàng chính hãng…"; `电池容量5000mAh，续航72小时` → "…5000mAh… 72 giờ" | **3/3** `TRANSLATED`, 0 vi phạm |
+| **C** — bắt BỊA | lấy **bản dịch thật** rồi **cố ý tiêm** "bảo hành 24 tháng" / "hàng chính hãng" / "dùng được 15 năm" / "đạt chuẩn ISO 9001" | **4/4 bị chặn** ⇒ `NEEDS_REVIEW`, bắt đúng cả khẳng định, con số và đơn vị |
+
+> Lớp C là **đột biến nhân tạo trên dữ liệu thật** (model thật không bịa, nên không có cách nào
+> quan sát luật chống bịa khởi động mà không tự tiêm). Ghi rõ để không nhập nhằng với hành vi model.
+
+**Trên 30 vùng dịch được, model KHÔNG bịa một ca nào** — không tự thêm bảo hành, chứng nhận,
+chống nước, "số 1", "tốt nhất". Tức `TRANSLATE_SYSTEM_PROMPT` có tác dụng thật, không chỉ trong mock.
+
+### 25.4 Nhãn SAU phép đo này
+
+| Phần | Trước | Sau | Bằng chứng |
+|---|---|---|---|
+| Đường dịch `createTranslator` + `TRANSLATE_PROVIDER=ai` → DeepSeek | `MOCK_VERIFIED` | **`LIVE_VERIFIED`** | 5 lời gọi thật, usage + chi phí ở §25.2 |
+| Guardrail chặn trước khi gọi (brand/cert/price) | `MOCK_VERIFIED` | **`LIVE_VERIFIED`** | 3/3, `sent_to_provider: false` |
+| Guardrail chống bịa (khẳng định / số / đơn vị) | `MOCK_VERIFIED` | **`LIVE_VERIFIED`** | lớp A+B trên bản dịch thật; lớp C là đột biến nhân tạo |
+| Đo chi phí theo usage API thật | chưa có | **`LIVE_VERIFIED`** | §25.2 |
+| Chất lượng dịch Trung→Việt | chưa đo | **`LIVE_VERIFIED`** | 30/42 vùng, ví dụ đúng/sai trong `LIVE-MEASUREMENT-REPORT.md` §4 |
+
+**VẪN là `MOCK_VERIFIED` / `MANUAL_INPUT` — không được suy ra từ phép đo này:**
+
+| Phần | Mức | Vì sao |
+|---|---|---|
+| **Vision** (`src/vision/**`, G07) | `MOCK_VERIFIED` | chưa cấp key vision; gửi ảnh ⇒ token vào gấp nhiều lần, cần ngân sách riêng |
+| **OCR** (`src/imagelab/ocr/**`) | `MOCK_VERIFIED` + `MANUAL_INPUT` | chạy bằng fixture `mock-regions.json`; ảnh thật đi đường **nhập vùng tay (IL-08)** |
+| **Matting / tách nền** (MVP-03) | `MOCK_VERIFIED` | chưa cấp key matting |
+| **TTS** (MVP-04) | `MOCK_VERIFIED` | chưa cấp key TTS |
+| **Render provider HTTP** | `MOCK_VERIFIED` | chưa có máy chủ render thật |
+| Dịch **ảnh thật đầu-cuối** (OCR thật → dịch thật → vẽ lại) | **chưa đo** | khâu OCR còn mock ⇒ chưa nối được chuỗi thật |
+| Chi phí **giờ cao điểm** | **chưa đo** | phép đo rơi vào thấp điểm; chỉ ước tính ×2 |
+| **Hoá đơn thật** DeepSeek | **chưa đối chiếu** | §25.2 là đơn giá công bố × token |
+| `deepseek-v4-pro` | **chưa đo** | ngoài ngân sách lần này |
+
+### 25.5 Ba lỗi THẬT mà mock không bao giờ thấy (đã báo coordinator, CHƯA sửa `src/**`)
+
+| Mã | Mức | Lỗi | Bằng chứng |
+|---|---|---|---|
+| **L1** | **NẶNG** | `P3-dress` mất trắng 7/7 dòng (`TRANSLATE_BAD_JSON`): **toàn bộ** 2048 token ra bị *thinking mode* của V4.1-Flash chiếm hết, không còn token cho JSON. `ai.js:137` ghi cứng `maxTokens: 2048`, mà model mới bật thinking **mặc định** và reasoning token **tính vào** `max_tokens`. Lỗi **xác suất** — 4 sản phẩm kia reasoning 359–626 nên sống sót ⇒ quan sát **~20 %** lượt mất trắng | `finish_reason="length"`, `completion_tokens=2048`, `completion_tokens_details.reasoning_tokens=2048` |
+| **L2** | VỪA | Đơn vị `度` không được nhận ⇒ **tố oan** bản dịch đúng: `保温六小时后水温仍有55度` → "…vẫn còn 55 độ" bị gắn *"Đơn vị 『độ』 không có trong chữ gốc"*. `UNIT_LITERALS['độ']` đã có `度` và `unitAppearsInText()` trả **đúng**, nhưng nhánh `missingUnits` của `checkNumericClaims()` lọc **chỉ bằng `unitsIn()`** nên không gọi tới helper đó. `CN_UNIT_ALIASES` có `摄氏度` mà **thiếu `度` trơn** | `unitsIn(ZH)=['giờ']`, `unitsIn(VI)=['giờ','độ']`, `unitAppearsInText(ZH,'độ')=true` |
+| **L3** | VỪA | `双` (đôi/hai) thiếu trong `CN_NUMERAL_RUN` ⇒ **tố oan**: `双麦克风通话` → "Đàm thoại 2 mic" bị tố *"Số liệu 『2』 không có trong chữ gốc"*. Bảng có `两` nhưng thiếu `双`, `俩`, `半` | `numbersIn(ZH)=[]`, `asciiNumbersIn(VI)=['2']` |
+| **L4** | nhẹ | `PRICE_TABLE` (`src/ai/provider.js:27`) ghi `deepseek-chat: in 0.27 / out 1.1`; đơn giá công bố hiện tại là 0.15/0.60 (thấp điểm) và 0.30/1.20 (cao điểm) cho `deepseek-flash`. Bảng trong mã **không có** cao/thấp điểm lẫn bậc cache-hit ⇒ `estimateCostFromUsage()` lệch ~**1.8×**. Số ở §25.2 **không bị ảnh hưởng** (harness mang bảng giá riêng, có nguồn + ngày) | so §25.2 với mã |
+
+**Hậu quả L2+L3:** 2/32 vùng gửi đi (**6 %**) bị đẩy sang duyệt tay vô ích. Fail-closed nên
+**an toàn**, nhưng tốn công người thật.
+
+### 25.6 ĐÍNH CHÍNH: `deepseek-chat` VẪN SỐNG
+
+Changelog DeepSeek (2026-04-24) và nhiều nguồn bên thứ ba nói `deepseek-chat` bị khai tử từ
+2026-07-24. **Probe thật cho kết quả ngược lại:**
+
+```
+model = "deepseek-chat" → usage { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 }
+```
+
+Endpoint vẫn trả lời bình thường ⇒ `.env` của repo (`AI_MODEL=deepseek-chat`) **không làm sập**
+đường dịch. Nhưng model đó **không còn trên trang giá**, nên **không có đơn giá công bố** để tính
+chi phí trung thực — đó là lý do phép đo dùng `deepseek-flash`.
+
+### 25.7 Bối cảnh test — và một lệch baseline cần ghi
+
+```
+$ env -u DATABASE_URL npm test
+tests 1069 · pass 1063 · fail 0 · skipped 6 · todo 0   (exit 0)
+```
+
+1. **Đừng chạy `npm test` trần** — `DATABASE_URL` trỏ PostgreSQL đã tắt ⇒ 6 test PG fail
+   `ECONNREFUSED`, không phải lỗi mã.
+2. **Lệch baseline:** việc được giao ghi baseline `1090 · 1084 pass`. Trên worktree này
+   (`f8d96a3`) đo được **`1069 · 1063 pass`**, lệch **21 test** — có thể baseline đó lấy từ nhánh
+   khác. `fail = 0` nên vẫn xanh, nhưng ghi lại để không ai tưởng đã mất test.
+
+Phép đo này **không sửa một dòng `src/**` nào** — chỉ thêm `tools/measure-translate-live.mjs`,
+`docs/LIVE-MEASUREMENT-REPORT.md` và mục §25 này.
