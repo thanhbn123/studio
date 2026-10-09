@@ -1904,7 +1904,7 @@ DBA đặt `search_path`) ⇒ **0/4 cột được nới mà KHÔNG một dòng 
 cây CŨ `7a93e9a` và cây đã vá):
 
 ```
-=================== CÂY CŨ (7a93e9a) · schema NGOÀI public ===================
+
 { "init": "OK",
   "columns": [ "pricing.unit_price=real", "usage_events.estimated_cost=real",
                "wallet_ledger.amount=real", "wallet_ledger.balance_after=real" ],
@@ -2061,3 +2061,118 @@ Cách xử lý (Owner chọn, ghi rõ để không ai tưởng là đã tự s�
    ⚠️ Chỉ chạy khi KHÔNG có job đang chạy (khoá ghi sổ theo user vẫn giữ nguyên tiền); script này
    **không** tạo/xoá dòng nào, chỉ sửa `balance_after` của dòng cũ. Hiện **chưa** chạy trên DB nào
    (không có DB production) — đây là hướng dẫn, KHÔNG phải số đo.
+=======
+## 24.5 Vòng vá R1…R6 (phản biện vòng 2) — SỐ ĐO THẬT và phần CHƯA làm
+
+Nguồn phát hiện: `docs/EXPORT-REVIEW.md` §6.2. Luật sau khi vá: `docs/EXPORT-CONTRACT.md` §10.
+Hồi quy: `env -u DATABASE_URL npm test` → **1090 test · 1084 pass · 0 fail · 6 skipped · 0 todo**
+(baseline trước vá: **1069 · 1063 pass · 0 fail · 6 skipped · 0 todo**; +21 test mới ở
+`test/export-r1r6-hardening.test.js`).
+
+### 24.5.1 R6 — đo TRƯỚC/SAU trên CÙNG một script (`/tmp/x-atk/a3c-resource.mjs`)
+
+Job 40 × 1.5 MB = **60 MB dữ liệu ngẫu nhiên (không nén được)**, SQLite in-memory, server + client
+trong cùng tiến trình (cách đo y hệt vòng 1/2 nên so được):
+
+```
+TRƯỚC (vòng 1, a3c — ghi trong docs/EXPORT-REVIEW.md §2 P5/P6):
+  GET /bundle : 200 content-length=62924015 nhận=60.0MB thời gian=1992ms RSS 98→342MB (+245MB)
+  GET /manifest: 200 thân=10KB thời gian=2347ms   (còn dựng cả ZIP)
+TRƯỚC (vòng 2 @3bc139f, EXPORT-REVIEW §6.2 R6): RSS 98→368MB (+270MB), 1788ms
+SAU (vòng vá R1…R6, a3c nguyên bản):
+  GET /bundle : 200 content-length=62924095 nhận=60.0MB thời gian=1963ms RSS 99→346MB (+247MB)
+  GET /manifest: 200 thân=10KB thời gian=63ms   (D5 giữ nguyên: KHÔNG nén)
+  maxTotalBytes=1MB: ném BUNDLE_TOO_LARGE — "Gói vượt trần 1048576 byte …"
+```
+
+**Nói thẳng:** cổng + trần KHÔNG làm một request bớt tốn RAM (vẫn ~3,3–4,5× kích thước asset —
+muốn giảm phải STREAM ZIP, xem 24.5.3). Cái đã vá là **trần** và **sự chồng lấn**:
+
+```
+$ node /tmp/x-atk2/c1-r6-limits.mjs
+resolveExportLimits({}) = {"maxBundleBytes":67108864,"maxConcurrentBundles":1,"maxQueuedBundles":4,"maxWaitMs":30000}
+1) 60MB asset  : 200 nhận=60.0MB 1775ms · RSS 98→294MB (+196MB, 3.26×)
+2) 80MB asset  : HTTP 413 code=BUNDLE_TOO_LARGE 58ms · RSS +0MB
+   message: "…Đo được 73400356 byte, trần cho phép 67108864 byte."
+   details: {"bytes":73400356,"limit":67108864,"max_bundle_bytes":67108864}
+3) 6 request ĐỒNG THỜI (job 60MB): #1…#5 = 200 (1 chạy + 4 xếp hàng) · #6 = 429
+   code=EXPORT_BUSY details={"running":1,"queued":4,"concurrency":1,"queue_limit":4,"retry_after_ms":2000}
+   BỘ ĐẾM THẬT: đỉnh số lượt dựng gói đọc asset ĐỒNG THỜI = 1 (giới hạn 1); cả 6 request: 9258ms
+
+$ EXPORT_MAX_CONCURRENT_BUNDLES=1 node /tmp/x-atk2/c2-r6-concurrency-rss.mjs   # tiến trình riêng
+  2 request song song: [200,200] 120.0MB 3565ms · đỉnh đồng thời = 1 · RSS nền 98MB → đỉnh 421MB (+323MB)
+$ EXPORT_MAX_CONCURRENT_BUNDLES=2 node /tmp/x-atk2/c2-r6-concurrency-rss.mjs
+  2 request song song: [200,200] 120.0MB 4049ms · đỉnh đồng thời = 2 · RSS nền 99MB → đỉnh 485MB (+386MB)
+```
+
+- Ca 2 chứng minh trần hoạt động: vượt 64 MiB ⇒ **413 kèm số đo**, dừng sau **58 ms** thay vì đọc
+  nốt 80 MB.
+- Ca 3/4 chứng minh cổng hoạt động bằng **BỘ ĐẾM** (không chỉ thời gian): mặc định 1 ⇒ không bao
+  giờ có 2 lượt dựng gói chồng nhau; ép 2 ⇒ bộ đếm lên 2 và đỉnh RSS cao hơn (+63 MB) mà **không
+  nhanh hơn** (4049 ms so với 3565 ms) — lý do hợp lệ để mặc định là 1.
+- Số RSS ở (3)(4) gồm cả 2 buffer ZIP 60 MB phía client trong cùng tiến trình (cách đo này ghi ở
+  đầu `c2-r6-concurrency-rss.mjs`); hai cấu hình chịu phần đó như nhau.
+- Trần mặc định của module cũng hạ: `DEFAULT_MAX_TOTAL_BYTES` **512 MiB → 64 MiB** (một nguồn với
+  `EXPORT_MAX_BUNDLE_BYTES`).
+
+### 24.5.2 R1…R5 — script phản biện chạy lại trên bản vá
+
+```
+$ node /tmp/x-atk2/b1-matrix.mjs       → findings: 0
+  ca G (R1): mock_steps=["ocr","translate","render"] | is_mock=true tại 3 đường dẫn providers.imagelab.* — KHỚP
+  R2: 'live_verified' / 'LIVE_VERIFIED ' / object {level} ⇒ label=null + suggested=MOCK_VERIFIED + notes (trước: lọt, notes=0)
+  ma trận 14 ca bất biến "providers.is_mock=true ⇒ mock_steps khác rỗng": OK hết
+$ node /tmp/x-atk2/b3-zipnames.mjs     → findings: 1 (chỉ còn check R4 hardcode, xem 24.5.3 mục 8)
+  12/12 tên chứa ký tự điều khiển (LF/CR/CRLF/NEL/LS/PS/VT/FF/ESC/DEL/RLO) ⇒ BAD_ENTRY_NAME (trước: 8 tên LỌT)
+  mock_steps=[null] ⇒ "Bản kê khai CÓ mục mock_steps (1 phần tử) nhưng KHÔNG đọc được tên bước nào ⇒ KHÔNG kiểm được…"
+$ node /tmp/x-atk2/b2-d5-d4-d6.mjs     → findings: 0   (D5: /manifest deflate=0 inflate=0, /bundle 8/8; D4 404; D6 entries=8≡ZIP, 503)
+$ node /tmp/x-atk/a1-bundle.mjs        → findings: 0
+$ node /tmp/x-atk/a3-api.mjs           → findings: 0
+$ node /tmp/x-atk/a4-edge.mjs          → findings: 0
+$ node /tmp/x-atk/a4b-nostorage.mjs    → 503 EXPORT_UNAVAILABLE như cũ, server sống
+$ node /tmp/x-atk/a5-ui.mjs            → findings: 0
+$ node --test test/export-*.test.js    → 104/104 pass (83 test cũ + 21 test mới), 0 fail, 0 todo
+```
+
+Một thay đổi số liệu của script cũ cần giải thích (KHÔNG phải hồi quy nội dung): `a3-api.mjs` mục 9
+in **“3 gói giống nhau? false”** (vòng 1/2 là `true`). Nguyên nhân: cổng R6 xếp 3 request song song
+thành TUẦN TỰ nên 3 gói được dựng ở 3 mốc mili-giây khác nhau ⇒ `MANIFEST.json.generated_at` khác
+nhau. Kiểm lại từng entry (`/tmp/x-atk2/c3-parallel-payload.mjs`):
+
+```
+sha256 CẢ FILE giống nhau? false
+  payload noi-dung/noi-dung.json  : crc32=43f53d29/43f53d29/43f53d29 giống=true
+  payload noi-dung/noi-dung.txt   : e21a3f11/e21a3f11/e21a3f11 giống=true
+  payload anh/anh-goc-1..3.png    : 80a5b28f/fbd745d3/76405c37 — giống=true cả 3
+  payload bang-chung/usage.json   : ac5bcb5b ×3 giống=true
+  payload bang-chung/evidence.json: 99e21454 ×3 giống=true
+  MANIFEST.json (bỏ generated_at/filename) giống nhau? true
+  generated_at: 08:15:34.518Z · .529Z · .538Z
+```
+
+### 24.5.3 CÒN GÌ CHƯA LÀM / CHƯA ĐO (nói thẳng)
+
+1. **CHƯA STREAM ZIP** — `/bundle` vẫn dựng trọn gói trong RAM rồi mới trả. Trần 64 MiB + cổng 1
+   lượt chỉ **giới hạn thiệt hại**, không giảm khuếch đại ~3,3–4,5× của MỘT request. Muốn giảm thật
+   phải viết `createZip` theo luồng (stream ra `res` + bỏ `content-length`/dùng chunked) — việc lớn,
+   **chưa làm trong vòng này**.
+2. **Giới hạn đồng thời là TRONG MỘT TIẾN TRÌNH** — chạy nhiều process/node cluster thì mỗi tiến
+   trình có cổng riêng (N process × 1 lượt). **Chưa đo** 2 process cùng lúc.
+3. **`/manifest` KHÔNG đi qua cổng** — nó chỉ chịu trần byte (`EXPORT_MAX_BUNDLE_BYTES`); đường này
+   không nén nên khuếch đại ~1×, nhưng nhiều request `/manifest` song song vẫn có thể cộng lại.
+4. **Chưa đo đúng ngưỡng trần** — mới đo 60 MB (qua) và 80 MB (bị chặn ở 73 400 356 byte); chưa đo
+   gói sát trần 64 MiB, chưa đo trên máy yếu.
+5. **Chưa có HTTP header `Retry-After`** — 429 `EXPORT_BUSY` chỉ kèm `retry_after_ms` trong JSON
+   (hạ tầng `sendError` của repo chỉ hỗ trợ field này).
+6. **`EXPORT_MAX_BUNDLE_BYTES`/`EXPORT_MAX_CONCURRENT_BUNDLES`… chưa khai trong `.env.example`** —
+   phạm vi vòng vá chỉ cho sửa `src/exports/**`, `public/app.js` và khối export của
+   `src/http/routes.js`; muốn thêm mẫu env phải mở phạm vi sang `.env.example`/`src/config.js`.
+7. **`/api/config` giữ nguyên `exports = {available, formats}`** — cố ý không thêm field để không
+   phá client/test đã nghiệm thu; trần và giới hạn chỉ hiện ra khi có lỗi (413/429).
+8. **`b3-zipnames.mjs` còn 1 “finding” ở mục R4** — script hardcode `NUL phải là BAD_ENTRY_NAME`,
+   nhưng hợp đồng §10.3 chọn nhánh “HAI mã + lý do khác nhau”: NUL ⇒ `ZIP_NAME_INVALID` (lỗi định
+   dạng, mã đã có từ trước D6), ký tự điều khiển khác ⇒ `BAD_ENTRY_NAME`. Đổi NUL sang
+   `BAD_ENTRY_NAME` sẽ phá test đã nghiệm thu `test/export-zip.test.js:232` — mà `test/**` ngoài
+   phạm vi được sửa. Đây là **quyết định có ghi trong hợp đồng**, không phải chỗ vá sót.
+9. **ZIP64 / Finder / Chrome / PostgreSQL**: giữ nguyên như §24.4 mục 1–4 (mọi phép đo trên đây vẫn
+   chạy SQLite in-memory với `env -u DATABASE_URL`).
