@@ -2339,3 +2339,148 @@ Ghi lại để người sau khỏi vấp lại (đúng tinh thần §5 của `H
 - **Chưa chạy trong CI.** Script cần Google Chrome cài sẵn trên máy; CI hiện **không** có bước này.
 - Kéo-thả được gửi bằng `Input.dispatchDragEvent` của CDP — **đúng đường `dataTransfer.files` của
   trang**, nhưng không phải cử chỉ chuột vật lý của hệ điều hành.
+
+## 27. MVP-07 — Khung đăng bài Facebook Page (DUYỆT TAY): ĐO ĐƯỢC gì, CHƯA có gì
+
+Hợp đồng: [`docs/MVP-07-CONTRACT.md`](MVP-07-CONTRACT.md) · Nhánh `thanhbn123/publish-facebook` · 09/10/2026.
+
+> **CÂU QUAN TRỌNG NHẤT TRƯỚC KHI ĐỌC TIẾP:** sprint này **CHƯA từng đăng một bài nào lên
+> Facebook**. Dự án **chưa có Page ID, chưa có Page Access Token, chưa qua app review của
+> Facebook**. Provider mặc định là **`dry-run`** — chế độ thử, **không gọi mạng**, trả mã bài giả
+> có tiền tố `dry-`. Những gì ghi ở đây là **khung** đã dựng và đã đo, **không phải** bằng chứng
+> đăng thật.
+
+### 27.1 ĐÃ LÀM (đo được bằng lệnh)
+
+| Việc | Nằm ở đâu | Bằng chứng |
+|---|---|---|
+| Hợp đồng ĐÓNG BĂNG trước khi code | `docs/MVP-07-CONTRACT.md` | bản đồ sở hữu file, chữ ký hàm, shape dữ liệu, 16 mã lỗi, định nghĩa XONG (10 điều kiện) |
+| Lớp abstraction `PublishProvider` | `src/publish/provider.js` | `name`/`channel`/`configured`/`isMock`/`probe()`/`publish()` — 3 provider cùng một hình dạng |
+| Provider **`dry-run`** (MẶC ĐỊNH) | `src/publish/providers/dry-run.js` | `post_id` tiền tố `dry-`, `is_mock: true`, `url: null`, **0 lời gọi mạng** |
+| Provider **`facebook`** | `src/publish/providers/facebook.js` | `/{page-id}/feed` + `/{page-id}/photos`, hẹn giờ, `maskToken()`, allowlist = đúng host Graph |
+| Provider **`none`** + fail-closed | `src/publish/providers/none.js` | `PUBLISH_PROVIDER` sai chính tả ⇒ về `none`, **KHÔNG** về `dry-run` |
+| **Cổng duyệt ở tầng DB** | `Store#claimPublishItem` | một câu `UPDATE … WHERE status IN ('approved','failed') AND external_post_id IS NULL` |
+| Hàng đợi duyệt + idempotency | `src/publish/service.js` | `publishItem()` trả `{ item, result, called, idempotent }` |
+| Hai bảng mới + migration cộng thêm | `src/store/schema.sql`, `#applyAdditiveMigrations()` | `publish_items`, `publish_logs`; **4 index tạo SAU migration** |
+| 8 route API | `src/http/routes.js` (chỉ THÊM) | ẩn danh ⇒ 401 · khác chủ ⇒ 404 · `member` duyệt ⇒ 403 · chưa duyệt ⇒ 409 |
+| Màn “Đăng bài” | `public/app.js`, `public/index.html` | tab `#/dangbai`, băng “CHẾ ĐỘ THỬ”, nút DUYỆT/TỪ CHỐI/ĐĂNG NGAY |
+| Cấu hình | `src/config.js` khối `publish` | 11 biến môi trường, mặc định an toàn `dry-run` |
+
+### 27.2 Bằng chứng: lệnh + output thật
+
+```
+$ env -u DATABASE_URL node --test test/publish-provider.test.js
+  ℹ tests 36 · pass 36 · fail 0
+  ✔ KHÔNG gọi mạng: chạy được cả khi `fetch` bị thay bằng hàm NÉM LỖI
+  ✔ publish khi chưa cấu hình ⇒ NOT_CONFIGURED, KHÔNG post_id, KHÔNG gọi mạng
+  ✔ Facebook trả LỖI ⇒ giữ NGUYÊN VĂN message + code/subcode, KHÔNG bịa thành công
+  ✔ token LỌT vào thông báo lỗi của Facebook ⇒ bị `maskToken` che
+  ✔ SSRF: baseUrl nội bộ mà KHÔNG bật allowPrivateNetwork ⇒ FAILED, không ra khỏi máy
+
+$ env -u DATABASE_URL node --test test/publish-gate.test.js
+  ℹ tests 27 · pass 27 · fail 0
+  ✔ bài `pending_review` ⇒ NOT_APPROVED và provider.calls = 0
+  ✔ `claimPublishItem` TỰ NÓ từ chối mọi trạng thái chưa duyệt (cổng ở tầng DB)
+  ✔ approve → publish ⇒ 1 lời gọi, status `published`, 1 dòng log
+  ✔ gọi publish HAI lần ⇒ provider vẫn 1 lời gọi, lần hai `idempotent: true`
+  ✔ HAI lượt ĐỒNG THỜI trên cùng bài ⇒ provider vẫn chỉ 1 lời gọi
+  ✔ tạo → duyệt → đăng với `fetch` bị cấm ⇒ vẫn `published`, post_id `dry-`
+
+$ env -u DATABASE_URL node --test test/publish-api.test.js
+  ℹ tests 25 · pass 25 · fail 0
+  ✔ tất cả 8 route đều 401 UNAUTHENTICATED khi không đăng nhập
+  ✔ CHƯA DUYỆT ⇒ POST …/publish trả 409 NOT_APPROVED và provider.calls KHÔNG tăng
+  ✔ ĐĂNG HAI LẦN ⇒ provider vẫn 1 lời gọi, lần hai `called: false` + `idempotent: true`
+  ✔ `member` gọi approve ⇒ 403 FORBIDDEN, provider 0 lời gọi
+  ✔ IDOR: bài của người khác ⇒ 404 cho member (mọi route)
+  ✔ bài đã duyệt nhưng thiếu token ⇒ bài sang `failed` + NOT_CONFIGURED, KHÔNG bịa post_id
+
+$ env -u DATABASE_URL node --test test/publish-ui.test.js
+  ℹ tests 30 · pass 30 · fail 0
+  ✔ provider `dry-run` ⇒ hiện rõ “CHẾ ĐỘ THỬ — không đăng thật”
+  ✔ provider `facebook` chưa có token ⇒ “chưa cấu hình Facebook (cần Page ID + token)”
+  ✔ bài `draft`/`pending_review` ⇒ nút ĐĂNG NGAY bị `disabled` + câu giải thích
+  ✔ mã bài `dry-` ⇒ nói rõ “id thử — không có bài thật”, KHÔNG có link Facebook
+
+$ env -u DATABASE_URL node --test test/publish-store.test.js
+  ℹ tests 12 · pass 12 · fail 0
+  ✔ bốn index được tạo SAU migration (không nằm trong schema.sql)
+  ✔ `init()` chạy HAI LẦN liên tiếp trên cùng DB không lỗi
+  ✔ DB TRUNG GIAN (bảng đã có, THIẾU cột) ⇒ migration vá tại chỗ, `init()` KHÔNG chết
+```
+
+### 27.3 CÁI GÌ CHƯA CÓ / CHƯA ĐO ĐƯỢC (nói thẳng — đây là phần quan trọng nhất)
+
+1. **CHƯA ĐĂNG THẬT MỘT BÀI NÀO.** Không có `FACEBOOK_PAGE_ID`, không có
+   `FACEBOOK_PAGE_ACCESS_TOKEN`. Toàn bộ phép đo chạy với provider `dry-run` hoặc với **server
+   HTTP giả** trên `127.0.0.1` (`test/publish-helpers.js` → `startFakeGraphServer`). Không một
+   byte nào đi tới `graph.facebook.com`.
+2. **CHƯA QUA APP REVIEW của Facebook.** Để đăng lên Page bằng API cần app Facebook được duyệt
+   quyền `pages_manage_posts` + `pages_read_engagement` (thường mất **ngày đến tuần**). Chủ dự án
+   phải làm bước này; agent **không** tự tạo app, không tự xin quyền.
+3. **CHƯA ĐO API THẬT:** chưa biết Graph API trả gì với nội dung tiếng Việt dài, với emoji, với
+   ảnh thật; chưa biết giới hạn tần suất (rate limit) thật của Page; chưa biết mã lỗi thật nào
+   hay gặp. Mọi mã lỗi trong test là mã **chúng ta tự dựng theo tài liệu**, chưa phải mã Facebook
+   đã trả cho dự án này.
+4. **CHƯA LÀM: tải ảnh từ ĐĨA lên Facebook (multipart `source`).** Bản này chỉ gửi được ảnh có
+   **URL công khai** (`PUBLIC_BASE_URL`). Ảnh chỉ có trên đĩa ⇒ trả thẳng `MEDIA_NOT_PUBLIC`,
+   **không** đăng bài thiếu ảnh và **không** giả vờ thành công.
+5. **CHƯA LÀM: nhiều ảnh trong một bài** (`attached_media`) ⇒ `MEDIA_TOO_MANY`. Sprint này
+   **1 ảnh/bài**.
+6. **CHƯA LÀM: video.** Video của MVP-04 là **GIF không tiếng**; Facebook có đường `/videos`
+   riêng (upload nhiều phần) — chưa dựng.
+7. **CHƯA LÀM: hẹn giờ qua hàng đợi bền.** Provider nhận `scheduledAt` và chuyển thành
+   `scheduled_publish_time` của Facebook (tức **Facebook** giữ lịch), nhưng hệ thống **chưa** có
+   cron tự đăng theo giờ — và đó là **cố ý**: tự đăng theo giờ sẽ phá luật “duyệt tay từng bài”.
+8. **CHƯA LÀM: chính sách nội dung tự động** (chặn ngành hàng/câu chữ trước khi đăng) — mục 3.4
+   của `docs/OWNER-DECISIONS.md` vẫn **chờ chủ dự án quyết** có giới hạn gì.
+9. **CHƯA ĐO: PostgreSQL.** Mọi phép đo của MVP-07 chạy **SQLite** (`DATABASE_URL` trong shell
+   đang trỏ PG đã tắt ⇒ phải chạy `env -u DATABASE_URL npm test`). Hai bảng mới chỉ dùng
+   `TEXT/INTEGER` nên **lẽ ra** chạy được trên PG 16 như các bảng khác, nhưng **chưa có bằng
+   chứng đo**. Riêng câu claim có một chỗ phụ thuộc cú pháp cần chú ý khi đo:
+   `run_key = id || '#' || CAST(attempts + 1 AS TEXT)` (toán tử `||` nối chuỗi — hợp lệ trên cả
+   hai driver, nhưng **chưa chạy thật trên PG**).
+10. **CHƯA ĐO: UI trên trình duyệt thật.** Màn “Đăng bài” chỉ được kiểm bằng cách **trích hàm
+    thật** từ `public/app.js` rồi chạy trong Node (`test/publish-ui.test.js`) — chưa có DOM thật,
+    chưa bấm nút thật, chưa kiểm trên điện thoại.
+11. **CHƯA ĐO: đua liên TIẾN TRÌNH.** Test idempotency chạy hai lượt đồng thời **trong cùng một
+    tiến trình**. Cổng duyệt là một câu `UPDATE` nguyên tử nên **lẽ ra** đúng cả khi hai tiến
+    trình cùng bấm đăng, nhưng chưa dựng phép đo hai tiến trình như sprint R1 đã làm cho ví.
+12. **CHƯA có TikTok / Shopee** (MVP-08). Hợp đồng chốt `channel` là một chuỗi và sprint này chỉ
+    nhận `facebook_page`; kênh khác ⇒ `BAD_INPUT`, **không** giả vờ hỗ trợ.
+
+### 27.3b Toàn bộ bộ test sau khi thêm MVP-07
+
+```
+$ env -u DATABASE_URL npm test
+  ℹ tests 1199 · suites 271 · pass 1193 · fail 0 · skipped 6 · todo 0
+```
+
+Baseline TRƯỚC sprint này trên cùng nhánh: **1069 test · 1063 pass · 0 fail · 6 skipped**
+⇒ MVP-07 thêm **130 test**, **0 test cũ bị vỡ**.
+(⚠️ Phải chạy `env -u DATABASE_URL`: `DATABASE_URL` trong shell đang trỏ PostgreSQL đã tắt,
+`npm test` trần sẽ fail 5–6 ca vì `ECONNREFUSED` — không phải lỗi mã.)
+
+### 27.4 Cách cắm token khi chủ dự án đã có (không sửa một dòng mã nào)
+
+```sh
+# .env  (KHÔNG commit file này)
+PUBLISH_PROVIDER=facebook
+FACEBOOK_PAGE_ID=<id của Page>
+FACEBOOK_PAGE_ACCESS_TOKEN=<Page Access Token sau khi Facebook app review>
+# tuỳ chọn:
+FACEBOOK_API_VERSION=v21.0
+PUBLIC_BASE_URL=https://<tên miền công khai>   # cần nếu muốn đăng kèm ảnh
+```
+
+Sau khi khởi động lại, kiểm bằng hai lệnh (cần tài khoản owner/admin):
+
+```sh
+curl -s localhost:3000/api/config | grep -o '"publish".*'      # provider: facebook, configured: true
+curl -s --cookie "vauth=<token phiên>" localhost:3000/api/publish/provider   # probe() gọi Page thật
+```
+
+`probe()` trả `ok: true` + `page_id` thật ⇒ token sống. Khi đó bài **đã được duyệt** sẽ đăng
+**thật**, và UI đổi băng vàng “CHẾ ĐỘ THỬ” thành băng xanh “bài được DUYỆT sẽ đăng THẬT”.
+**Luật duyệt tay không đổi:** có token hay không, hệ thống vẫn **không bao giờ** đăng khi chưa có
+người bấm DUYỆT.
