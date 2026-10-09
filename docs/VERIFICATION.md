@@ -1783,6 +1783,17 @@ $ DATABASE_URL=postgres://studio:studio@127.0.0.1:55440/pr_test npm test
 $ env -u DATABASE_URL node tools/verify.mjs
 EXIT 0
 ```
+**CI đã chạy lại y hệt trên PostgreSQL 16 / Linux** (PR #28, run `37906501618`, job
+`Test (PostgreSQL 16)` — `ci.yml` đã set `DATABASE_URL` sẵn nên 29 test này tự chạy thật,
+KHÔNG phải sửa `ci.yml`):
+```
+ℹ tests 1098 · pass 1097 · fail 0 · skipped 1 · todo 0          job pass 1m16s
+✔ claimNextJob NGUYÊN TỬ: hai pool song song KHÔNG nhặt trùng một mục (8.957119ms)
+✔ TIỀN ĐI QUA POSTGRESQL KHÔNG ĐƯỢC MẤT CHỮ SỐ (đối chiếu trực tiếp với SQLite) (16.002897ms)
+✔ init() chạy LẦN HAI trên DB ĐÃ CÓ DỮ LIỆU vẫn không lỗi (migration idempotent) (87.344931ms)
+```
+Cả 5 job CI xanh (SQLite 56s · PostgreSQL 16 1m16s · smoke · Docker · quét secret).
+
 Baseline của `develop` trước nhánh này (`f8d96a3`, xem §24): `1069 · 1063 pass · 0 fail ·
 6 skipped`. Số **pass của SQLite không đổi (1063)** ⇒ 29 test mới không làm hỏng đường cũ;
 tổng test tăng đúng 29 (1069 → 1098) và skip tăng đúng 29 (6 → 35).
@@ -1862,7 +1873,9 @@ DB TRẮNG (đi đường schema.sql, KHÔNG qua migration):
 4. **`listOpenJobHolds` / `reconcileStuckRuns`** trên PostgreSQL: chưa phủ (vẫn chỉ SQLite).
    Các method còn lại của `src/billing/**` (`estimate`, `priceOf`, `usageSummary` theo nhóm,
    `billableRunsOfJob`) cũng chưa chạy trên PG.
-5. **PostgreSQL ≠ 16.15**: chỉ đo trên 16.15 (Homebrew, macOS/arm64). CI dùng PostgreSQL 16
-   trên Linux; bản 14/15/17 chưa đo.
+5. **PostgreSQL ≠ 16**: đã đo trên **16.15 macOS/arm64** (máy Owner) **và PostgreSQL 16
+   trên Linux** (CI, run `37906501618`) ⇒ không còn phụ thuộc một máy. Nhưng bản
+   **14 / 15 / 17 vẫn CHƯA đo** — `DOUBLE PRECISION` và `FOR UPDATE SKIP LOCKED` đều có từ
+   lâu nên rủi ro thấp, song đó là suy luận, không phải số đo.
 6. Không liên quan sprint này nhưng vẫn mở: provider thật (OCR/dịch/matting/TTS), trình duyệt
    thật, `deploy/` trên máy chủ thật.
