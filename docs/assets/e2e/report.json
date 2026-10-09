@@ -1,0 +1,357 @@
+{
+  "meta": {
+    "at": "2026-10-09T08:10:12.576Z",
+    "chrome": "Chrome/154.0.8037.98",
+    "chromeBinary": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
+    "headless": false,
+    "node": "v26.7.0",
+    "base": "http://127.0.0.1:56787",
+    "fixture": "/Users/viporder/orca/workspaces/vip-product-studio/e2e-browser-ui/test/fixtures/headphones.png"
+  },
+  "totals": {
+    "flows": 5,
+    "passed": 4,
+    "failed": 0,
+    "not_implemented": 1
+  },
+  "consoleAll": [],
+  "consoleErrorsAll": [],
+  "network4xx5xx": [],
+  "downloads": [
+    {
+      "guid": "1695baab-38d8-498d-a40f-379c0492705d",
+      "url": "http://127.0.0.1:56787/api/imagelab/assets/71f418c3-caed-4c42-bf36-ca11c20a9632/file",
+      "suggested": "imagelab-rendered-71f418c3.png",
+      "state": "completed"
+    },
+    {
+      "guid": "ffb1e095-7a39-4bec-8b14-078089687efd",
+      "url": "http://127.0.0.1:56787/api/videostudio/assets/33fe466a-b4a2-4f5b-b8d3-91bc3df0d382/file",
+      "suggested": "videostudio-rendered-33fe466a.gif",
+      "state": "completed"
+    },
+    {
+      "guid": "948805e8-1260-4445-8bc5-5f5d581cd31a",
+      "url": "http://127.0.0.1:56787/api/imagelab/assets/decf9a25-adbc-42c2-8fdb-6109e5ce9ee3/file",
+      "suggested": "imagelab-rendered-decf9a25.png",
+      "state": "completed"
+    }
+  ],
+  "flows": [
+    {
+      "id": "f1",
+      "title": "4 tab render trên DOM thật, không lỗi console",
+      "status": "passed",
+      "checks": [
+        {
+          "ok": true,
+          "label": "trang chạy trong Chrome thật",
+          "detail": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+        },
+        {
+          "ok": true,
+          "label": "trang nạp được tiêu đề",
+          "detail": "VIP Product Studio — Link sản phẩm → Nội dung bán hàng tiếng Việt"
+        },
+        {
+          "ok": true,
+          "label": "tab Nội dung (#/) vẽ ra nội dung",
+          "detail": "535 ký tự"
+        },
+        {
+          "ok": true,
+          "label": "tab Nội dung có chữ đặc trưng",
+          "detail": "Dán link sản phẩm, nhận nội dung bán hàng tiếng Việt Hỗ trợ Taobao · 1688 · Pinduoduo — hệ thống tự nhận diện nguồn. PHÂN TÍCH SẢN PHẨM Phong cách Bán hàng Ch"
+        },
+        {
+          "ok": true,
+          "label": "tab Dịch ảnh (#/imagelab) vẽ ra nội dung",
+          "detail": "663 ký tự"
+        },
+        {
+          "ok": true,
+          "label": "tab Dịch ảnh có chữ đặc trưng",
+          "detail": "Dịch ảnh Trung → Việt Tải ảnh sản phẩm có chữ Trung: hệ thống đọc chữ → dịch → bạn duyệt từng dòng → render ảnh mới. Ảnh gốc không bị sửa. Sẵn sàng OCR: mock "
+        },
+        {
+          "ok": true,
+          "label": "tab Tạo ảnh (#/taoanh) vẽ ra nội dung",
+          "detail": "1741 ký tự"
+        },
+        {
+          "ok": true,
+          "label": "tab Tạo ảnh có chữ đặc trưng",
+          "detail": "Tạo ảnh marketing từ ảnh thật Tách nền là fail-closed: không đủ tự tin thì hệ thống TỪ CHỐI cắt và chỉ retouch. Nền do hệ thống sinh ra luôn là nền MÔ PHỎNG (k"
+        },
+        {
+          "ok": true,
+          "label": "tab Video (#/video) vẽ ra nội dung",
+          "detail": "1497 ký tự"
+        },
+        {
+          "ok": true,
+          "label": "tab Video có chữ đặc trưng",
+          "detail": "Video bán hàng ngắn từ ảnh thật Ghép 1 hoặc nhiều ảnh thành GIF động có nhịp theo thời lượng từng cảnh, có chữ Việt. Ảnh gốc chỉ được THÊM VIỀN (pad) hoặc CẮT "
+        },
+        {
+          "ok": true,
+          "label": "tab Tài khoản (#/dangnhap) vẽ ra nội dung",
+          "detail": "395 ký tự"
+        },
+        {
+          "ok": true,
+          "label": "tab Tài khoản có chữ đặc trưng",
+          "detail": "Đăng nhập Đăng ký Đăng nhập Tài khoản để lưu lịch sử theo bạn và dùng credit nội bộ. Đăng nhập là TUỲ CHỌN: chưa đăng nhập vẫn dán link và chạy được, chỉ là dữ"
+        },
+        {
+          "ok": true,
+          "label": "tab Quản trị (#/quantri) vẽ ra nội dung",
+          "detail": "113 ký tự"
+        },
+        {
+          "ok": true,
+          "label": "tab Quản trị có chữ đặc trưng",
+          "detail": "Quản trị Bạn chưa đăng nhập (401). Trang quản trị yêu cầu tài khoản vai trò owner/admin. Đăng nhập Về trang chủ"
+        },
+        {
+          "ok": true,
+          "label": "bấm CHUỘT THẬT vào nút \"Video\" trên thanh nav đổi được route",
+          "detail": "#/video"
+        },
+        {
+          "ok": true,
+          "label": "không có lỗi console trong luồng này",
+          "detail": ""
+        }
+      ],
+      "shots": [
+        "docs/assets/e2e/f1-noi-dung.png",
+        "docs/assets/e2e/f1-dich-anh.png",
+        "docs/assets/e2e/f1-tao-anh.png",
+        "docs/assets/e2e/f1-video.png",
+        "docs/assets/e2e/f1-tai-khoan.png",
+        "docs/assets/e2e/f1-quan-tri.png"
+      ],
+      "started": "2026-10-09T08:10:12.595Z",
+      "consoleErrors": [],
+      "finished": "2026-10-09T08:10:20.732Z"
+    },
+    {
+      "id": "f2",
+      "title": "Tạo ảnh (MVP-03): kéo-thả PNG → mẫu nền → TẠO ẢNH → TRƯỚC|SAU → tải được",
+      "status": "passed",
+      "checks": [
+        {
+          "ok": true,
+          "label": "KÉO-THẢ tệp PNG thật vào #is-drop được UI nhận",
+          "detail": "xuất hiện .il-picked img"
+        },
+        {
+          "ok": true,
+          "label": "máy chủ trả danh sách mẫu nền",
+          "detail": "[\"trang\",\"xam-nhat\",\"gradient-xanh\",\"gradient-hong\",\"san-go\"]"
+        },
+        {
+          "ok": true,
+          "label": "chọn được mẫu nền \"trang\" bằng chuột thật",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "bấm TẠO ẢNH tạo job và điều hướng tới màn job",
+          "detail": "#/taoanh/a91e59c5-53ed-41be-858e-9a0631751e0f"
+        },
+        {
+          "ok": true,
+          "label": "màn job hiện cặp \"Ảnh gốc\" | \"Ảnh tạo mới\"",
+          "detail": "Ảnh gốc (bất biến) · image/png · 320×320 sha256 c1323668a1f078e5… Ảnh tạo mới (bản ghi mới, parent = ảnh gốc) · image/png · 320×320 sha256 61738cf71fe38e19… mẫu nền: Trắng — nền MÔ"
+        },
+        {
+          "ok": true,
+          "label": "khối Trước/Sau có >= 2 ảnh",
+          "detail": "[{\"src\":\"/api/imagelab/assets/845b77be-1704-439d-ae2c-92d7072b4b61/file\",\"w\":320,\"h\":320},{\"src\":\"/api/imagelab/assets/71f418c3-caed-4c42-bf36-ca11c20a9632/file\",\"w\":320,\"h\":320}]"
+        },
+        {
+          "ok": true,
+          "label": "cả hai ảnh đều lấy từ endpoint asset thật của máy chủ",
+          "detail": "[\"/api/imagelab/assets/845b77be-1704-439d-ae2c-92d7072b4b61/file\",\"/api/imagelab/assets/71f418c3-caed-4c42-bf36-ca11c20a9632/file\"]"
+        },
+        {
+          "ok": true,
+          "label": "cả hai ảnh đều naturalWidth/Height > 0 — TRÌNH DUYỆT GIẢI MÃ THẬT, không phải link vỡ",
+          "detail": "[{\"src\":\"/api/imagelab/assets/845b77be-1704-439d-ae2c-92d7072b4b61/file\",\"w\":320,\"h\":320},{\"src\":\"/api/imagelab/assets/71f418c3-caed-4c42-bf36-ca11c20a9632/file\",\"w\":320,\"h\":320}]"
+        },
+        {
+          "ok": true,
+          "label": "ảnh SAU là BẢN GHI MỚI (asset id khác ảnh gốc) — ảnh gốc bất biến",
+          "detail": "[\"/api/imagelab/assets/845b77be-1704-439d-ae2c-92d7072b4b61/file\",\"/api/imagelab/assets/71f418c3-caed-4c42-bf36-ca11c20a9632/file\"]"
+        },
+        {
+          "ok": true,
+          "label": "tệp ảnh tạo (PNG) tải về MỞ ĐƯỢC bằng python3",
+          "detail": "/Users/viporder/orca/workspaces/vip-product-studio/e2e-browser-ui/.e2e-data/downloads/1695baab-38d8-498d-a40f-379c0492705d → PNG OK bytes=1964 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
+        },
+        {
+          "ok": true,
+          "label": "không có lỗi console trong luồng này",
+          "detail": ""
+        }
+      ],
+      "shots": [
+        "docs/assets/e2e/f2-01-da-keo-tha-anh.png",
+        "docs/assets/e2e/f2-02-da-chon-mau-nen.png",
+        "docs/assets/e2e/f2-03-truoc-sau.png",
+        "docs/assets/e2e/f2-04-sau-khi-tai.png"
+      ],
+      "started": "2026-10-09T08:10:20.732Z",
+      "downloads": [
+        {
+          "what": "ảnh tạo",
+          "file": "/Users/viporder/orca/workspaces/vip-product-studio/e2e-browser-ui/.e2e-data/downloads/1695baab-38d8-498d-a40f-379c0492705d",
+          "out": "PNG OK bytes=1964 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
+        }
+      ],
+      "consoleErrors": [],
+      "finished": "2026-10-09T08:10:25.295Z"
+    },
+    {
+      "id": "f3",
+      "title": "Video (MVP-04): 2 PNG → TẠO VIDEO → GIF chạy + \"Video KHÔNG có tiếng\" + tải được",
+      "status": "passed",
+      "checks": [
+        {
+          "ok": true,
+          "label": "chọn 2 tệp PNG qua FileList thật của Chrome",
+          "detail": "Tổng thời lượng: 4 giây · 2 cảnh · Dọc 9:16 (TikTok/Reels)"
+        },
+        {
+          "ok": true,
+          "label": "trình duyệt GIẢI MÃ và PHÁT được GIF trong <img>",
+          "detail": "{\"src\":\"/api/videostudio/assets/33fe466a-b4a2-4f5b-b8d3-91bc3df0d382/file\",\"w\":720,\"h\":1280}"
+        },
+        {
+          "ok": true,
+          "label": "máy chủ DÙNG ĐỦ cả 2 cảnh (không có cảnh bị bỏ)",
+          "detail": "không có cảnh báo số cảnh"
+        },
+        {
+          "ok": true,
+          "label": "câu \"Video KHÔNG có tiếng\" hiện NGAY CẠNH kết quả",
+          "detail": "khớp nguyên văn"
+        },
+        {
+          "ok": true,
+          "label": "nhãn không-tiếng đúng là khối #vs-no-audio của hợp đồng MVP-04",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "tệp video (GIF) tải về MỞ ĐƯỢC bằng python3",
+          "detail": "/Users/viporder/orca/workspaces/vip-product-studio/e2e-browser-ui/.e2e-data/downloads/ffb1e095-7a39-4bec-8b14-078089687efd → GIF OK bytes=636921 720x1280 frames=48 trailer=True"
+        },
+        {
+          "ok": true,
+          "label": "tệp tải về là GIF hợp lệ, nhiều khung, có trailer",
+          "detail": "GIF OK bytes=636921 720x1280 frames=48 trailer=True"
+        },
+        {
+          "ok": true,
+          "label": "không có lỗi console trong luồng này",
+          "detail": ""
+        }
+      ],
+      "shots": [
+        "docs/assets/e2e/f3-01-da-chon-2-anh.png",
+        "docs/assets/e2e/f3-02-gif-ket-qua.png",
+        "docs/assets/e2e/f3-03-nhan-khong-co-tieng.png"
+      ],
+      "started": "2026-10-09T08:10:25.295Z",
+      "downloads": [
+        {
+          "what": "video GIF",
+          "file": "/Users/viporder/orca/workspaces/vip-product-studio/e2e-browser-ui/.e2e-data/downloads/ffb1e095-7a39-4bec-8b14-078089687efd",
+          "out": "GIF OK bytes=636921 720x1280 frames=48 trailer=True"
+        }
+      ],
+      "consoleErrors": [],
+      "finished": "2026-10-09T08:10:29.902Z"
+    },
+    {
+      "id": "f4",
+      "title": "Dịch ảnh (MVP-02): tải ảnh → nhập vùng chữ TAY (IL-08) → LƯU VÙNG & DỊCH → bảng duyệt",
+      "status": "passed",
+      "checks": [
+        {
+          "ok": true,
+          "label": "KÉO-THẢ ảnh thật vào #il-drop được nhận",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "khối NHẬP VÙNG CHỮ TAY (IL-08) mở được bằng chuột thật",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "bảng nhập vùng tay có ít nhất một dòng để gõ",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "gõ được toạ độ + chữ Trung bằng BÀN PHÍM THẬT",
+          "detail": "{\"x\":\"40\",\"y\":\"40\",\"w\":\"160\",\"h\":\"48\",\"text\":\"无线蓝牙耳机\"}"
+        },
+        {
+          "ok": true,
+          "label": "nút LƯU VÙNG & DỊCH đang BẤM ĐƯỢC (không disabled) ngay trước khi bấm",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "bảng duyệt (#il-lines) hiện và chứa đúng chữ Trung đã nhập tay",
+          "detail": "2 · Duyệt bản dịch từng dòng Sửa trực tiếp ở cột “chữ Việt”. Vùng nhãn hiệu / chứng nhận / giá bị khoá — chỉ dịch khi bạn bấm “vẫn dịch vùng này”, và thay đổi đó được ghi vết. CHỮ GỐC (TRUNG) CHỮ VI"
+        },
+        {
+          "ok": true,
+          "label": "bảng duyệt có >= 1 dòng",
+          "detail": "4 dòng"
+        },
+        {
+          "ok": true,
+          "label": "tệp ảnh dịch (PNG) tải về MỞ ĐƯỢC bằng python3",
+          "detail": "/Users/viporder/orca/workspaces/vip-product-studio/e2e-browser-ui/.e2e-data/downloads/948805e8-1260-4445-8bc5-5f5d581cd31a → PNG OK bytes=2344 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
+        },
+        {
+          "ok": true,
+          "label": "không có lỗi console trong luồng này",
+          "detail": ""
+        }
+      ],
+      "shots": [
+        "docs/assets/e2e/f4-01-man-job.png",
+        "docs/assets/e2e/f4-02-da-nhap-vung-tay.png",
+        "docs/assets/e2e/f4-03-bang-duyet.png",
+        "docs/assets/e2e/f4-04-anh-da-render.png"
+      ],
+      "started": "2026-10-09T08:10:29.902Z",
+      "downloads": [
+        {
+          "what": "ảnh dịch",
+          "file": "/Users/viporder/orca/workspaces/vip-product-studio/e2e-browser-ui/.e2e-data/downloads/948805e8-1260-4445-8bc5-5f5d581cd31a",
+          "out": "PNG OK bytes=2344 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
+        }
+      ],
+      "consoleErrors": [],
+      "finished": "2026-10-09T08:10:36.540Z"
+    },
+    {
+      "id": "f5",
+      "title": "Gói xuất bản .zip ở màn job",
+      "status": "not_implemented",
+      "error": "CHƯA CÓ TRONG BASELINE NÀY. `grep -rni zip` toàn repo (trừ node_modules + package-lock.json) = 0 dòng trên nhánh đang làm. Theo coordinator, tính năng đang nằm ở nhánh `feat/export-bundle` (chưa merge) và còn đang vá lỗi phản biện ⇒ sẽ test sau khi PR gói xuất bản merge. Màn job hiện chỉ có link tải MỘT tệp (<a download>): ảnh dịch · ảnh tạo · video GIF — cả ba ĐÃ được tải thật qua trình duyệt và kiểm MỞ ĐƯỢC bằng python3 ở f2/f3/f4. Hàm `verifyFileOpens()` trong file này ĐÃ hỗ trợ sẵn nhánh ZIP (zipfile.testzip()), nên khi tính năng merge chỉ cần thêm một luồng bấm nút — không phải viết lại hạ tầng.",
+      "checks": [],
+      "shots": []
+    }
+  ]
+}
