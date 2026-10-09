@@ -90,6 +90,24 @@ export const ANONYMOUS_GROUP_LABEL = '(ẩn danh)';
  */
 export const MONEY_DECIMALS = 6;
 
+/**
+ * BỐN CỘT TIỀN của repo — nguồn sự thật DUY NHẤT cho migration `real` → `double precision`
+ * và cho phép KIỂM TRA SAU MIGRATION (F1, xem `#widenMoneyColumns`).
+ *
+ * Vì sao là hằng số export: test `test/pg-money-migration.test.js` phải khẳng định được
+ * `information_schema.columns.data_type` của **đúng bốn cột này** — danh sách chép tay trong
+ * test sẽ lệch khỏi mã nguồn mà không ai biết.
+ */
+export const MONEY_COLUMNS = Object.freeze([
+  Object.freeze({ table: 'wallet_ledger', column: 'amount' }),
+  Object.freeze({ table: 'wallet_ledger', column: 'balance_after' }),
+  Object.freeze({ table: 'usage_events', column: 'estimated_cost' }),
+  Object.freeze({ table: 'pricing', column: 'unit_price' }),
+]);
+
+/** Mã lỗi CHẶN BOOT khi còn cột tiền kiểu `real` (float4) mà app THẬT SỰ dùng (F1). */
+export const MONEY_COLUMNS_NOT_WIDENED = 'MONEY_COLUMNS_NOT_WIDENED';
+
 /* ── R1 (§3): tham số khoá ghi sổ ở tầng DB — soi gương tham số của src/billing/index.js ── */
 
 /** Số lần THỬ LẠI khi SQLite báo bận (`database is locked`) — hết lượt ⇒ lỗi `LEDGER_BUSY`. */
@@ -272,6 +290,16 @@ function clampInt(value, fallback, min, max) {
 }
 
 /**
+ * Bọc một ĐỊNH DANH SQL trong dấu nháy kép (F1): tên schema/bảng/cột đọc từ `pg_catalog`
+ * phải được trích dẫn lại y nguyên trước khi đưa vào `ALTER TABLE`. Không có bước này thì một
+ * schema tên `"Odd Name"` (hoặc chứa ký tự SQL) làm câu lệnh hỏng — và câu lệnh hỏng ở đây
+ * chính là đường "nới kiểu tiền thất bại im lặng" mà F1 đang bịt.
+ */
+function quoteIdent(name) {
+  return `"${String(name).replaceAll('"', '""')}"`;
+}
+
+/**
  * Dung sai dấu phẩy động khi chặn số dư ÂM (R1: tách ra hằng số module vì luật này dùng ở
  * cả `appendLedger` lẫn transaction của `withLedgerLock`). `amount` là REAL nên một phép trừ
  * "về 0" có thể ra -1e-17; chỉ coi là âm THẬT khi vượt dung sai.
@@ -321,6 +349,12 @@ export class Store {
    * do Store mở, nhờ vậy 20 thao tác ghi song song trong CÙNG tiến trình vẫn chạy tuần tự.
    */
   #txMutexTail = Promise.resolve();
+
+  /**
+   * F1: kết quả QUÉT LẠI kiểu cột tiền sau migration (`moneySchemaStatus()` đọc trường này).
+   * `null` = chưa kiểm (SQLite hoặc chưa `init()`), KHÔNG phải "đã kiểm và đạt".
+   */
+  #moneySchema = null;
 
   get isPostgres() {
     return this.dialect === 'postgres';
@@ -658,37 +692,159 @@ export class Store {
    * SQLite: KHÔNG làm gì — `REAL` ở đó đã là float8, và SQLite cũng không có
    * `ALTER COLUMN … TYPE`.
    *
-   * Idempotent: chỉ `ALTER` đúng cột đang còn kiểu `real` (đọc `information_schema`), nên
-   * `init()` lần hai không phải viết lại bảng. Lỗi chỉ ghi log — DB thiếu bảng/thiếu quyền
-   * KHÔNG được làm chết boot (đúng luật của các migration khác ở đây).
+   * Idempotent: chỉ `ALTER` đúng cột đang còn kiểu `real`, nên `init()` lần hai không phải viết
+   * lại bảng.
+   *
+   * ───────────────────────── F1 (phản biện PR #28) — FAIL-CLOSED ─────────────────────────
+   *
+   * Bản trước lọc cứng `table_schema = 'public'` ⇒ DB có `search_path` trỏ schema khác (triển
+   * khai tách schema, DBA đặt `search_path`) thì **0/4 cột được nới mà KHÔNG một dòng log**:
+   * `information_schema` không trả dòng nào nên vòng lặp `continue` sạch sẽ, app boot bình
+   * thường và ví tiếp tục là float4 ⇒ ĐO ĐƯỢC (schema `app`, không phải `public`): ví 10.000
+   * trừ đúng 1 lượt giá 0,0004 ⇒ số dư **VẪN LÀ 10000** (khoản thu bị nuốt) thay vì 9999.9996.
+   * "Không tìm thấy cột" bị hiểu nhầm thành "không cần nới".
+   *
+   * Luật mới, ba bước:
+   *   1. QUÉT **MỌI SCHEMA** (`pg_catalog`, không lọc `public`) — cột tiền nằm ở đâu cũng thấy.
+   *   2. Thử nới TỪNG cột tìm được (schema-qualified) và ghi log từng cột; lỗi ⇒ log **ERROR**.
+   *   3. QUÉT LẠI: còn cột tiền `real` nào **NHÌN THẤY ĐƯỢC** (`pg_table_is_visible` — tức là
+   *      câu `SELECT … FROM wallet_ledger` không định danh schema của app rơi vào đúng bảng đó)
+   *      ⇒ **NÉM `MONEY_COLUMNS_NOT_WIDENED`**, chặn boot. KHÔNG có nhánh "warn rồi chạy tiếp".
+   *      Cột `real` ở schema NGOÀI `search_path` (app không đọc tới) không chặn boot nhưng bị
+   *      log ERROR + phơi ra `/api/health` (`money_schema_ok: false` + lý do) — không im lặng.
+   *
+   * Ca `pricing.unit_price` rớt lại `real` (không phải chủ bảng ⇒ `ALTER` bị từ chối) nay CŨNG
+   * là chưa đạt: trước đây chỉ warn, và đó là fail-open một phần.
    */
   async #widenMoneyColumns() {
-    if (!this.isPostgres) return;
-    const MONEY_COLUMNS = [
-      ['wallet_ledger', 'amount'],
-      ['wallet_ledger', 'balance_after'],
-      ['usage_events', 'estimated_cost'],
-      ['pricing', 'unit_price'],
-    ];
-    for (const [table, column] of MONEY_COLUMNS) {
+    if (!this.isPostgres) {
+      // SQLite `REAL` ĐÃ là float8 ⇒ không có gì phải kiểm.
+      this.#moneySchema = { ok: true, checked: false, reason: null, not_widened: [] };
+      return;
+    }
+    let before;
+    try {
+      before = await this.#scanMoneyColumns();
+    } catch (err) {
+      // Không ĐỌC được kiểu cột thì KHÔNG được coi là "đã nới" — fail-closed, nói rõ lý do.
+      const reason = `không đọc được kiểu cột tiền từ pg_catalog: ${err?.message || String(err)}`;
+      this.logger?.error('store.migration.money_schema_scan_failed', { error: err?.message || String(err) });
+      this.#moneySchema = { ok: false, checked: false, reason, not_widened: [] };
+      throw Object.assign(new Error(`Không kiểm tra được kiểu cột TIỀN trên PostgreSQL (${reason}).`), {
+        code: MONEY_COLUMNS_NOT_WIDENED,
+        details: { reason },
+        cause: err,
+      });
+    }
+    for (const row of before) {
+      if (String(row.data_type).toLowerCase() !== 'real') continue;
       try {
-        const row = await this.driver.get(
-          `SELECT data_type FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = ? AND column_name = ?`,
-          [table, column],
+        await this.driver.run(
+          `ALTER TABLE ${quoteIdent(row.table_schema)}.${quoteIdent(row.table_name)}
+             ALTER COLUMN ${quoteIdent(row.column_name)} TYPE DOUBLE PRECISION`,
         );
-        // Cột không tồn tại (DB cũ) hoặc đã là double precision ⇒ không làm gì.
-        if (!row || String(row.data_type).toLowerCase() !== 'real') continue;
-        await this.driver.run(`ALTER TABLE ${table} ALTER COLUMN ${column} TYPE DOUBLE PRECISION`);
-        this.logger?.warn('store.migration.money_column_widened', { table, column, from: 'real', to: 'double precision' });
+        this.logger?.warn('store.migration.money_column_widened', {
+          schema: row.table_schema,
+          table: row.table_name,
+          column: row.column_name,
+          from: 'real',
+          to: 'double precision',
+        });
       } catch (err) {
-        this.logger?.warn('store.migration.money_widen_skipped', {
-          table,
-          column,
+        // KHÔNG `continue` im lặng: cột này sẽ được bước 3 phát hiện là còn `real`.
+        this.logger?.error('store.migration.money_widen_failed', {
+          schema: row.table_schema,
+          table: row.table_name,
+          column: row.column_name,
           error: err?.message || String(err),
         });
       }
     }
+    // Bước 3 — QUÉT LẠI bằng mắt mới, không tin kết quả `ALTER` ở trên.
+    const remaining = (await this.#scanMoneyColumns()).filter((r) => String(r.data_type).toLowerCase() === 'real');
+    const notWidened = remaining.map((r) => ({
+      schema: r.table_schema,
+      table: r.table_name,
+      column: r.column_name,
+      data_type: r.data_type,
+      // `true` = app THẬT SỰ đọc/ghi bảng này bằng tên KHÔNG định danh schema.
+      visible: r.is_visible === true,
+    }));
+    const blocking = notWidened.filter((r) => r.visible);
+    const unreachable = notWidened.filter((r) => !r.visible);
+    const describe = (list) => list.map((r) => `${r.schema}.${r.table}.${r.column}`).join(', ');
+    const reason = blocking.length
+      ? `còn cột TIỀN kiểu real (float4) trong schema mà app đang dùng: ${describe(blocking)}`
+      : unreachable.length
+        ? `còn cột TIỀN kiểu real NGOÀI search_path (app hiện không đọc tới): ${describe(unreachable)}`
+        : null;
+    this.#moneySchema = Object.freeze({
+      ok: notWidened.length === 0,
+      checked: true,
+      reason,
+      blocking: Object.freeze(blocking.map((r) => Object.freeze(r))),
+      not_widened: Object.freeze(notWidened.map((r) => Object.freeze(r))),
+    });
+    if (unreachable.length) {
+      this.logger?.error('store.migration.money_columns_not_widened_unreachable', {
+        columns: describe(unreachable),
+        reason: 'cột tiền còn kiểu real nhưng không nằm trong search_path — app không đọc tới, KHÔNG chặn boot',
+      });
+    }
+    if (blocking.length) {
+      const message =
+        `Cột TIỀN chưa được nới sang double precision: ${describe(blocking)} — `
+        + 'app sẽ đọc/ghi tiền bằng float4 (4 byte) và LÀM MẤT chữ số thập phân '
+        + '(ví 10.000 trừ 0,0004 ⇒ số dư KHÔNG đổi). Đã dừng khởi động thay vì chạy tiếp. '
+        + 'Kiểm quyền sở hữu bảng cho role của app rồi chạy lại migration.';
+      this.logger?.error('store.migration.money_columns_not_widened', {
+        code: MONEY_COLUMNS_NOT_WIDENED,
+        columns: describe(blocking),
+      });
+      throw Object.assign(new Error(message), {
+        code: MONEY_COLUMNS_NOT_WIDENED,
+        details: { columns: blocking, unreachable, reason },
+      });
+    }
+  }
+
+  /** Cột tiền của repo ở MỌI schema — kèm cờ "app có nhìn thấy bảng này không" (F1, bước 1/3). */
+  async #scanMoneyColumns() {
+    const rows = [];
+    for (const { table, column } of MONEY_COLUMNS) {
+      // `pg_catalog` chứ KHÔNG `information_schema`: cần `pg_table_is_visible` (độ nhìn thấy
+      // theo `search_path` của chính phiên đang chạy) — thứ quyết định app có rơi vào bảng đó
+      // khi viết `SELECT … FROM wallet_ledger` hay không.
+      const found = await this.driver.all(
+        `SELECT n.nspname AS table_schema,
+                c.relname AS table_name,
+                a.attname AS column_name,
+                format_type(a.atttypid, a.atttypmod) AS data_type,
+                pg_table_is_visible(c.oid) AS is_visible
+           FROM pg_attribute a
+           JOIN pg_class c ON c.oid = a.attrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relkind IN ('r', 'p')
+            AND a.attnum > 0
+            AND NOT a.attisdropped
+            AND c.relname = ?
+            AND a.attname = ?
+          ORDER BY n.nspname, c.relname`,
+        [table, column],
+      );
+      for (const row of Array.isArray(found) ? found : []) rows.push(row);
+    }
+    return rows;
+  }
+
+  /**
+   * TRẠNG THÁI KIỂU CỘT TIỀN của DB này (F1) — `/api/health` đọc để nói thật.
+   *
+   * `ok: false` ⇒ còn cột tiền `real` (float4) trong DB. `checked: false` ⇒ chưa kiểm (SQLite,
+   * hoặc store chưa `init()`), KHÔNG phải "đã kiểm và đạt".
+   */
+  moneySchemaStatus() {
+    return this.#moneySchema ?? { ok: true, checked: false, reason: null, not_widened: [] };
   }
 
   /** Thêm cột nếu thiếu — idempotent trên CẢ hai driver (xem #applyAdditiveMigrations). */
