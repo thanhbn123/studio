@@ -195,17 +195,28 @@ phải tính vào thời gian.
 
 ---
 
-## MVP-08 — Marketplace Publisher
+## MVP-08 — Đăng sản phẩm lên sàn (Shopee / TikTok Shop) — DUYỆT TAY
 
-**Mục tiêu:** đăng sản phẩm lên Shopee / TikTok Shop.
+**Trạng thái: ĐÃ XONG PHẦN LÀM ĐƯỢC KHÔNG CẦN OWNER** (nhánh `thanhbn123/mvp08-marketplace`,
+10/10/2026). Hợp đồng: [`MVP-08-CONTRACT.md`](MVP-08-CONTRACT.md); số đo: [`VERIFICATION.md` §27](VERIFICATION.md).
 
-Phạm vi dự kiến:
-- Kết nối API sàn, map Product Master → schema của sàn.
-- Đồng bộ tồn kho và giá.
-- Xử lý lỗi theo từng sàn, không để một sàn hỏng làm hỏng luồng chung
-  (cùng nguyên tắc cô lập như `ConnectorRegistry`).
+Đã làm: lớp trừu tượng provider (`src/marketplace/provider.js`) + registry cô lập (một kênh hỏng
+không làm hỏng kênh khác) · ba provider: **`dry-run` mặc định** (không gọi mạng, mã `dry-`, `is_mock`),
+`shopee`, `tiktokshop` (thiếu token ⇒ `NOT_CONFIGURED`; có token mà `MARKETPLACE_LIVE_ENABLED=false`
+⇒ `LIVE_DISABLED`) · ánh xạ Product Master + nội dung MVP-01 → payload hai sàn, trường không ánh
+xạ được khai `unmapped[]`, mặc định khai `defaults_applied[]` · `preflight` trả `issues[]` nêu đúng
+tên trường (giá VND, tồn, cân nặng, danh mục **phải do người bán nhập** — không quy đổi giá CNY, không
+đoán danh mục) · nghiệp vụ tạo → DUYỆT TAY → đăng (cổng claim ở tầng DB) → đồng bộ (chỉ đọc), vết
+`marketplace_events` · 7 route `/api/marketplace/*` + `/api/config.marketplace` · tab **“Đăng sàn”**
+(băng “CHẾ ĐỘ THỬ — không đăng thật”, “chưa có token…”, nút khoá kèm lý do, XEM PAYLOAD) · 62 test.
 
-**Phụ thuộc:** cần tài khoản người bán đã được duyệt và quyền gọi API của từng sàn.
+**CHƯA làm (nói thẳng):** chưa từng gọi API thật của sàn nào (chưa có tài khoản người bán được
+duyệt — `OWNER-DECISIONS.md` §3) ⇒ tên trường/cách ký của hai provider thật **cần xác minh** ·
+chưa upload ảnh lên sàn (ảnh chỉ giữ URL nguồn) · chưa ánh xạ biến thể/thuộc tính · chưa đọc
+kênh vận chuyển/kho của shop · chưa có hàng đợi nền/cron thử lại (thử lại bằng tay, trần 3 lượt) ·
+chưa đo PostgreSQL thật cho hai bảng mới.
+
+**Phụ thuộc còn lại:** tài khoản người bán đã được duyệt + token của từng sàn (do Owner cấp).
 
 ---
 

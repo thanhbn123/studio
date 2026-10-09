@@ -272,6 +272,35 @@ export function loadConfig(env = process.env) {
       pricingFromCost: toBool(env.BILLING_PRICING_FROM_COST, true),
     },
 
+    // ── MVP-08: ĐĂNG SẢN PHẨM LÊN SÀN (`docs/MVP-08-CONTRACT.md`) ─────────────
+    // Mặc định AN TOÀN: kênh `dry-run` (không gọi mạng), `liveEnabled=false` (có token cũng chưa
+    // gọi sàn thật cho tới khi bật tay). Bí mật Shopee/TikTok đọc từ env, KHÔNG bao giờ ra /api/config.
+    marketplace: {
+      enabled: toBool(env.MARKETPLACE_ENABLED, true),
+      defaultChannel: toStr(env.MARKETPLACE_DEFAULT_CHANNEL, 'dry-run'),
+      liveEnabled: toBool(env.MARKETPLACE_LIVE_ENABLED, false),
+      // Trần số LƯỢT ĐĂNG cho một listing (mỗi lượt là một lời gọi sàn) — chống spam sàn khi lỗi lặp.
+      maxAttempts: Math.max(1, toInt(env.MARKETPLACE_MAX_ATTEMPTS, 3)),
+      // CHỈ bật khi trỏ URL gốc vào server nội bộ để thử. Mặc định false = chống SSRF.
+      allowPrivateNetwork: toBool(env.MARKETPLACE_ALLOW_PRIVATE_NETWORK, false),
+      shopee: {
+        partnerId: toStr(env.SHOPEE_PARTNER_ID, ''),
+        partnerKey: toStr(env.SHOPEE_PARTNER_KEY, ''),
+        shopId: toStr(env.SHOPEE_SHOP_ID, ''),
+        accessToken: toStr(env.SHOPEE_ACCESS_TOKEN, ''),
+        baseUrl: toStr(env.SHOPEE_BASE_URL, 'https://partner.shopeemobile.com'),
+        timeoutMs: Math.max(1000, toInt(env.SHOPEE_TIMEOUT_MS, 30000)),
+      },
+      tiktokshop: {
+        appKey: toStr(env.TIKTOKSHOP_APP_KEY, ''),
+        appSecret: toStr(env.TIKTOKSHOP_APP_SECRET, ''),
+        shopCipher: toStr(env.TIKTOKSHOP_SHOP_CIPHER, ''),
+        accessToken: toStr(env.TIKTOKSHOP_ACCESS_TOKEN, ''),
+        baseUrl: toStr(env.TIKTOKSHOP_BASE_URL, 'https://open-api.tiktokglobalshop.com'),
+        timeoutMs: Math.max(1000, toInt(env.TIKTOKSHOP_TIMEOUT_MS, 30000)),
+      },
+    },
+
     // ── R1 (sprint độ tin cậy) — hàng đợi BỀN + cron dọn dẹp ────────────────
     // `docs/R1-RELIABILITY-CONTRACT.md` §2.3 (R1-Q) + §4 (R3-S). Tên khoá ĐÓNG BĂNG:
     // R1-Q đọc `queue.*`, R3-S đọc `scheduler.*`; đổi tên là vỡ hợp đồng.
