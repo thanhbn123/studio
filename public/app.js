@@ -5947,6 +5947,10 @@ function renderAdminTopups() {
   if (t.admin === null || t.admin === undefined) return '<p class="muted small">Đang tải yêu cầu nạp…</p>';
   if (!t.admin.length) return '<p class="muted small">Không có yêu cầu nạp nào đang chờ xác nhận.</p>';
   const rate = topupConfig()?.rate_vnd_per_credit;
+  // Người dùng hiện bằng EMAIL khi danh sách người dùng của trang Quản trị đã tải; chưa tải thì
+  // hiện đúng id thật (không bịa). Khai ngay trong hàm để test trích hàm không cần thêm phụ thuộc.
+  const users = Array.isArray(state.auth?.users) ? state.auth.users : [];
+  const topupUserLabel = (id) => users.find((u) => u?.id === id)?.email || String(id || '—');
   const rows = t.admin.map((it) => {
     const id = String(it?.id || '');
     const credits = topupCredits(it?.amount_vnd, rate);
@@ -5954,7 +5958,7 @@ function renderAdminTopups() {
     const rejecting = t.rejectId === id;
     const actions = confirming
       ? `<div class="notice warn">
-          <strong>Xác nhận cộng ${esc(credits === null ? fmtAmount(it?.credits) : fmtAmount(credits))} credit cho ${esc(it?.user_id)}?</strong>
+          <strong>Xác nhận cộng ${esc(credits === null ? fmtAmount(it?.credits) : fmtAmount(credits))} credit cho ${esc(topupUserLabel(it?.user_id))}?</strong>
           <p class="small" style="margin:6px 0 0">Tỷ giá đang dùng ${esc(fmtVnd(rate))} = 1 credit, tiền đã chuyển ${esc(fmtVnd(it?.amount_vnd))}.
           Hãy đối soát mã giao dịch <span class="mono">${esc(it?.reference || '—')}</span> với sao kê ngân hàng TRƯỚC khi xác nhận —
           hệ thống không tự biết tiền đã về.</p>
@@ -5979,7 +5983,7 @@ function renderAdminTopups() {
           </div>`;
     return `<tr>
       <td class="mono small">${esc(fmtTime(it?.created_at))}</td>
-      <td class="mono small">${esc(it?.user_id || '—')}</td>
+      <td class="small">${esc(topupUserLabel(it?.user_id))}</td>
       <td class="mono">${esc(fmtVnd(it?.amount_vnd))}</td>
       <td class="mono">${esc(credits === null ? fmtAmount(it?.credits) : fmtAmount(credits))}</td>
       <td class="mono small">${esc(it?.reference || '—')}</td>
