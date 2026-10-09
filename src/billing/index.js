@@ -988,8 +988,13 @@ export class BillingService {
    * §3.2 — cấp credit bằng tay (MVP-05 CHỈ nạp credit theo cách này).
    * `reason`: 'grant' (tặng khi đăng ký) | 'admin_grant' (admin cấp) | 'adjustment' (cấp bù).
    * Mặc định: có `actorId` ⇒ 'admin_grant', không ⇒ 'grant'.
+   *
+   * MVP-06: `runKey` (tuỳ chọn) được ghi vào CỘT `wallet_ledger.run_key` để một lần cấp credit
+   * có KHOÁ CHỐNG TRÙNG ở tầng DB. Yêu cầu nạp dùng `topup:<request_id>`, và unique index
+   * `uniq_wallet_ledger_topup_run` bảo đảm mỗi yêu cầu chỉ sinh ĐÚNG MỘT dòng sổ — kể cả khi
+   * logic tầng trên có lỗi. Không truyền ⇒ hành vi y như trước (cột `run_key` để NULL).
    */
-  async grant({ userId, amount, reason, actorId = null, note = '' } = {}) {
+  async grant({ userId, amount, reason, actorId = null, note = '', runKey = null } = {}) {
     const uid = this.#requireUserId(userId);
     const raw = toFiniteNumber(amount);
     // PB-06 (vòng 2): `normalizeAmount` TỪ CHỐI tràn số (1e308 ⇒ Infinity) và vượt trần
@@ -1011,7 +1016,12 @@ export class BillingService {
         allowed: [...MANUAL_GRANT_REASONS],
       });
     }
-    const meta = { actor_id: typeof actorId === 'string' && actorId.trim() ? actorId.trim() : null, note: note ? String(note) : '' };
+    const key = typeof runKey === 'string' && runKey.trim() ? runKey.trim() : null;
+    const meta = {
+      actor_id: typeof actorId === 'string' && actorId.trim() ? actorId.trim() : null,
+      note: note ? String(note) : '',
+      ...(key ? { run_key: key } : {}),
+    };
     // R1-B (§3): đọc số dư + ghi dòng `grant` nằm TRONG khoá DB theo user.
     return this.#withLedgerSection(uid, async () => {
       const balanceBefore = await this.#balanceLocked(uid);
@@ -1032,7 +1042,7 @@ export class BillingService {
           );
         }
       }
-      return this.#append({ userId: uid, amount: value, reason: picked, meta, balanceBefore });
+      return this.#append({ userId: uid, amount: value, reason: picked, meta, balanceBefore, runKey: key });
     });
   }
 

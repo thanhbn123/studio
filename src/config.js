@@ -270,6 +270,26 @@ export function loadConfig(env = process.env) {
         Math.max(0, toNum(env.BILLING_MIN_STUCK_RUN_MS, 60 * 1000)),
       // Seed bảng `pricing` từ `config.cost.*` của MVP-01 (nguồn giá mặc định).
       pricingFromCost: toBool(env.BILLING_PRICING_FROM_COST, true),
+
+      // ── MVP-06: NẠP CREDIT THỦ CÔNG (`docs/MVP-06-CONTRACT.md` §2/§4) ──────
+      // Quyết định của Owner (09/10/2026): chuyển khoản tay + quản trị cấp credit. KHÔNG cổng
+      // thanh toán, KHÔNG webhook ngân hàng. Mọi con số dưới đây là DỮ LIỆU CẤU HÌNH; UI lấy
+      // qua `/api/config` và TUYỆT ĐỐI không hardcode số tài khoản trong mã nguồn.
+      topup: {
+        // Tỷ giá VND cho 1 credit. Được GHI LẠI vào từng yêu cầu tại thời điểm DUYỆT (luật #3),
+        // nên đổi giá trị này không làm sai lịch sử. Kẹp > 0: 0 sẽ là "credit miễn phí vô hạn".
+        rateVndPerCredit: Math.max(1, toNum(env.TOPUP_RATE_VND_PER_CREDIT, 26000)),
+        // Khoảng tiền cho MỘT yêu cầu nạp; ngoài khoảng ⇒ 400 `TOPUP_AMOUNT_OUT_OF_RANGE`.
+        minVnd: Math.max(1, toInt(env.TOPUP_MIN_VND, 20000)),
+        maxVnd: Math.max(1, toInt(env.TOPUP_MAX_VND, 50000000)),
+        // Hướng dẫn chuyển khoản do QUẢN TRỊ đặt. Để rỗng ⇒ UI nói thật "quản trị chưa điền
+        // thông tin chuyển khoản" (KHÔNG bịa ra số tài khoản nào).
+        bankName: toStr(env.TOPUP_BANK_NAME, ''),
+        accountNumber: toStr(env.TOPUP_BANK_ACCOUNT_NUMBER, ''),
+        accountHolder: toStr(env.TOPUP_BANK_ACCOUNT_HOLDER, ''),
+        transferNote: toStr(env.TOPUP_TRANSFER_NOTE, ''),
+        instructions: toStr(env.TOPUP_INSTRUCTIONS, ''),
+      },
     },
 
     // ── R1 (sprint độ tin cậy) — hàng đợi BỀN + cron dọn dẹp ────────────────

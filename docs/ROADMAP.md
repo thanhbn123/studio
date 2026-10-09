@@ -169,15 +169,41 @@ Phạm vi dự kiến:
 
 ---
 
-## MVP-06 — Payments
+## MVP-06 — Nạp credit THỦ CÔNG (chuyển khoản tay + quản trị cấp credit)
+
+**Trạng thái: ĐÃ XONG PHẦN CODE theo PHẠM VI ĐÃ CHỐT** (nhánh `thanhbn123/mvp06-topup`,
+09/10/2026). Hợp đồng: [`MVP-06-CONTRACT.md`](MVP-06-CONTRACT.md); bằng chứng số đo:
+[`VERIFICATION.md` §26](VERIFICATION.md).
+
+**Quyết định của Owner (09/10/2026):** pháp nhân là **cá nhân** ⇒ dùng **chuyển khoản ngân hàng
+tay + quản trị viên cấp credit**. Vì vậy MVP-06 bản gốc (cổng thanh toán, webhook có kiểm chữ ký,
+hoá đơn, hoàn tiền tự động) **HOÃN VÔ THỜI HẠN** — xem `OWNER-DECISIONS.md`.
+
+Đã làm (phạm vi đã chốt): bảng `topup_requests` + `topup_events` (index tạo SAU migration) ·
+`src/billing/topup.js` · 4 route `/api/billing/topup-requests*` (tạo / xem / XÁC NHẬN / TỪ CHỐI) ·
+`/api/config.billing.topup` (tỷ giá + khoảng tiền + hướng dẫn chuyển khoản **lấy từ cấu hình**) ·
+UI tab **Tài khoản** (form nạp + hướng dẫn chuyển khoản, KHÔNG hardcode số tài khoản) và tab
+**Quản trị** (danh sách `pending` + XÁC NHẬN/TỪ CHỐI kèm lý do) · 45 test mới
+(`test/topup-*.test.js`).
+
+Ba luật được giữ và đo được: tạo yêu cầu **KHÔNG đụng ví** · xác nhận ⇒ **đúng 1** dòng sổ qua
+`withLedgerLock` (xác nhận lần hai ⇒ 409 `TOPUP_ALREADY_DECIDED`, sổ không đổi) · tỷ giá
+VND/credit **ghi lại tại thời điểm duyệt**.
+
+**CHƯA làm (có chủ ý, theo quyết định của Owner):** chưa có cổng thanh toán · chưa có webhook
+ngân hàng (hệ thống **không tự biết** tiền đã về) · chưa có hoá đơn · chưa đối soát tự động với
+sao kê · chưa tự hết hạn yêu cầu `pending` (`expired` có trong lược đồ nhưng **không có cron**
+nào chuyển trạng thái) · chưa có thông báo email/Zalo khi yêu cầu được duyệt.
+
+### MVP-06 bản gốc — Payments (HOÃN)
 
 **Mục tiêu:** thu tiền thật.
 
 Phạm vi dự kiến: cổng thanh toán (thẻ/chuyển khoản/ví điện tử), hoá đơn, đối soát, hoàn tiền,
 webhook thanh toán có kiểm chữ ký.
 
-**Phụ thuộc:** MVP-05 phải xong trước. Cần Owner quyết nhà cung cấp thanh toán và pháp nhân
-nhận tiền trước khi bắt đầu.
+**Phụ thuộc:** cần Owner quyết nhà cung cấp thanh toán và **pháp nhân doanh nghiệp** nhận tiền
+trước khi bắt đầu (hiện tại pháp nhân là cá nhân ⇒ chưa đủ điều kiện).
 
 ---
 

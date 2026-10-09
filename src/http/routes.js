@@ -36,6 +36,11 @@ const ADMIN_ROLES = new Set(['owner', 'admin']);
 /** Nhóm tổng hợp usage mà `/api/admin/usage` chấp nhận (§3.3). */
 const USAGE_GROUP_BY = Object.freeze(['day', 'operation', 'user']);
 
+/** MVP-06 — trạng thái yêu cầu nạp mà `?status=` chấp nhận (`docs/MVP-06-CONTRACT.md` §2).
+ *  Khai LẠI ở đây (không static-import `src/store/index.js`? — store ĐƯỢC import sẵn cho
+ *  `JOB_STATUS`, nhưng danh sách này là HỢP ĐỒNG HTTP nên giữ ngay cạnh route để đọc một chỗ). */
+const TOPUP_STATUS_LIST = Object.freeze(['pending', 'confirmed', 'rejected', 'expired']);
+
 /**
  * Danh sách operation của bảng giá (§2.1) — chỉ dùng để hỏi giá khi store CHƯA có
  * `listPricing`; không phải bản sao bảng giá (giá vẫn do A2/store quyết định).
@@ -1547,6 +1552,157 @@ export function buildRouter(app) {
     sendJson(res, 200, { pricing: pricing.map(pricingJson) });
   });
 
+  /* ═════════ MVP-06 · NẠP CREDIT THỦ CÔNG (`docs/MVP-06-CONTRACT.md` §3) ═════════
+   *
+   * CHỈ THÊM route, không sửa route cũ. Bốn đường:
+   *   POST /api/billing/topup-requests             (đã đăng nhập) — TẠO yêu cầu, KHÔNG đụng ví
+   *   GET  /api/billing/topup-requests             (chính chủ: của mình; admin: tất cả + ?status=)
+   *   POST /api/billing/topup-requests/:id/confirm (CHỈ admin) — đường DUY NHẤT credit vào ví
+   *   POST /api/billing/topup-requests/:id/reject  (CHỈ admin) — bắt buộc lý do, KHÔNG dòng sổ
+   *
+   * `src/billing/topup.js` được nạp ĐỘNG y như khối MVP-05: một module hỏng KHÔNG được làm chết
+   * MVP-01/02/03. Thiếu module ⇒ 503 `TOPUP_UNAVAILABLE` nói thẳng, KHÔNG im lặng trả rỗng.
+   */
+
+  let topupServicePromise = null;
+  const topupService = async () => {
+    requireWallet(); // ví tắt / chưa nạp ⇒ 503 trước khi nói tới nạp tiền
+    if (!topupServicePromise) {
+      topupServicePromise = (async () => {
+        try {
+          const mod = await import('../billing/topup.js');
+          if (typeof mod?.createTopupService !== 'function') {
+            throw new Error('module nạp credit không xuất `createTopupService`');
+          }
+          return mod.createTopupService(config, { store, billing: walletService(), logger });
+        } catch (err) {
+          logger?.error?.('topup.wiring_failed', {
+            error_name: err?.name || 'Error',
+            error_code: err?.code || null,
+            // KHÔNG đưa cả object lỗi vào log: message/stack của Node chứa đường dẫn tuyệt đối.
+            error_message: scrubPaths(String(err?.message || err)),
+          });
+          return null;
+        }
+      })();
+    }
+    const svc = await topupServicePromise;
+    if (!svc) {
+      throw HttpError.safe(503, 'TOPUP_UNAVAILABLE', 'Chức năng nạp credit chưa nạp được trên máy chủ này — tạm thời chưa tạo/duyệt được yêu cầu nạp.');
+    }
+    return svc;
+  };
+
+  /** Khối cấu hình nạp credit cho `/api/config` — thiếu module ⇒ `null` (UI ẩn form, nói thật). */
+  const topupPublicConfig = async () => {
+    if (!billingAvailable()) return null;
+    try {
+      const svc = await topupService();
+      return svc.publicConfig();
+    } catch {
+      return null;
+    }
+  };
+
+  const isAdminReq = (req) => ADMIN_ROLES.has(String(req?.user?.role || 'member'));
+
+  router.post('/api/billing/topup-requests', async (req, res) => {
+    const user = requireUser(req); // ẩn danh ⇒ 401 (luật §3)
+    const svc = await topupService();
+    // Chống spam yêu cầu nạp: bucket RIÊNG theo IP, dùng limiter CÓ SẴN (không tạo limiter mới).
+    enforce(rateLimiters.requests, `topup:create:${clientKey(req)}`);
+    const body = await readJson(req, { maxBytes: 32 * 1024 });
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      throw HttpError.safe(400, 'BAD_BODY', 'Body phải là một object JSON.');
+    }
+    let request;
+    try {
+      request = await svc.createRequest({
+        userId: user.id,
+        amountVnd: body.amount_vnd ?? body.amountVnd,
+        reference: body.reference,
+        note: body.note,
+      });
+    } catch (err) {
+      throw mapTopupError(err) || mapBillingError(err) || err;
+    }
+    // Hợp đồng §4 — nói thật ngay trong phản hồi: ví KHÔNG hề bị chạm ở bước này.
+    sendJson(res, 201, { request: topupRequestJson(request), wallet_touched: false, note: topupHonestNote(svc) });
+  });
+
+  router.get('/api/billing/topup-requests', async (req, res) => {
+    const user = requireUser(req);
+    const svc = await topupService();
+    const admin = isAdminReq(req);
+    const limit = clampInt(req.query.get('limit'), 50, 1, 200);
+    const offset = clampInt(req.query.get('offset'), 0, 0, 1_000_000);
+    const statusRaw = sanitizeText(req.query.get('status'), { maxLength: 20 }).toLowerCase();
+    if (statusRaw && !TOPUP_STATUS_LIST.includes(statusRaw)) {
+      throw HttpError.safe(400, 'BAD_STATUS', `\`status\` phải là một trong: ${TOPUP_STATUS_LIST.join(', ')}.`);
+    }
+    // `mine=1` cho admin xem RIÊNG yêu cầu của mình (trang Tài khoản của chính admin).
+    const mineOnly = ['1', 'true', 'yes'].includes(String(req.query.get('mine') ?? '').toLowerCase());
+    let out;
+    try {
+      out = await svc.list({
+        userId: user.id,
+        all: admin && !mineOnly,
+        status: statusRaw || null,
+        limit,
+        offset,
+      });
+    } catch (err) {
+      throw mapTopupError(err) || err;
+    }
+    sendJson(res, 200, {
+      items: (out?.items || []).map(topupRequestJson),
+      total: Number(out?.total) || 0,
+      scope: admin && !mineOnly ? 'all' : 'mine',
+      is_admin: admin,
+    });
+  });
+
+  router.post('/api/billing/topup-requests/:id/confirm', async (req, res, params) => {
+    const admin = requireAdmin(req);
+    const svc = await topupService();
+    const body = await readJson(req, { maxBytes: 32 * 1024 }).catch(() => ({}));
+    let out;
+    try {
+      out = await svc.confirm({
+        requestId: String(params?.id ?? ''),
+        actorId: admin.id,
+        credits: body?.credits ?? null,
+        note: body?.note ?? '',
+      });
+    } catch (err) {
+      throw mapTopupError(err) || mapBillingError(err) || err;
+    }
+    const balance = await readBalance(out?.request?.user_id);
+    sendJson(res, 200, {
+      request: topupRequestJson(out?.request),
+      ledger: ledgerJson(out?.ledger),
+      balance: balanceJson(balance),
+    });
+  });
+
+  router.post('/api/billing/topup-requests/:id/reject', async (req, res, params) => {
+    const admin = requireAdmin(req);
+    const svc = await topupService();
+    const body = await readJson(req, { maxBytes: 32 * 1024 });
+    let out;
+    try {
+      out = await svc.reject({
+        requestId: String(params?.id ?? ''),
+        actorId: admin.id,
+        reason: body?.reason ?? '',
+      });
+    } catch (err) {
+      throw mapTopupError(err) || mapBillingError(err) || err;
+    }
+    // Từ chối KHÔNG sinh dòng sổ nào — nói thẳng trong phản hồi để UI khỏi đoán.
+    sendJson(res, 200, { request: topupRequestJson(out?.request), ledger: null });
+  });
+
   /* ────────────────────────── A4-07 → A4-10 · /api/admin/* ────────────────────────── */
 
   router.get('/api/admin/users', async (req, res) => {
@@ -1860,6 +2016,10 @@ export function buildRouter(app) {
         // BR-08: ngưỡng coi một lượt chạy là TREO (ms) — quá ngưỡng thì được thu hồi tự động.
         stuck_run_ms: Number.isFinite(Number(billingConfig().stuckRunMs)) ? Number(billingConfig().stuckRunMs) : null,
         min_stuck_run_ms: Number.isFinite(Number(billingConfig().minStuckRunMs)) ? Number(billingConfig().minStuckRunMs) : null,
+        // MVP-06 (§3) — NẠP CREDIT THỦ CÔNG: tỷ giá + khoảng tiền + hướng dẫn chuyển khoản
+        // LẤY TỪ CẤU HÌNH (UI KHÔNG hardcode số tài khoản). `null` = chưa nạp được module nạp
+        // credit ⇒ UI ẩn form và nói thật, không bịa ra số tài khoản nào.
+        topup: await topupPublicConfig(),
       },
       // §3.4 — trạng thái thật của dịch vụ tài khoản/ví để người vận hành biết VÌ SAO tắt.
       accounts: { available: accountsAvailable(), reason: accountsAvailable() ? null : AUTH_UNAVAILABLE_MESSAGE },
@@ -3556,6 +3716,81 @@ function ledgerJson(row) {
     balance_after: Number.isFinite(Number(row.balance_after)) ? Number(row.balance_after) : null,
     created_at: row.created_at ?? null,
   };
+}
+
+/**
+ * MVP-06 — một YÊU CẦU NẠP trả cho client (`docs/MVP-06-CONTRACT.md` §2/§3).
+ * Danh sách TRẮNG: chỉ field của hợp đồng, không lộ cột nội bộ nào.
+ */
+function topupRequestJson(row) {
+  if (!row || typeof row !== 'object') return null;
+  return {
+    id: row.id ?? null,
+    user_id: row.user_id ?? null,
+    amount_vnd: Number.isFinite(Number(row.amount_vnd)) ? Number(row.amount_vnd) : null,
+    credits: Number.isFinite(Number(row.credits)) ? Number(row.credits) : null,
+    rate_vnd_per_credit: Number.isFinite(Number(row.rate_vnd_per_credit)) ? Number(row.rate_vnd_per_credit) : null,
+    method: row.method ?? null,
+    reference: row.reference ?? '',
+    note: row.note ?? '',
+    status: row.status ?? null,
+    created_at: row.created_at ?? null,
+    decided_at: row.decided_at ?? null,
+    decided_by: row.decided_by ?? null,
+    ledger_entry_id: row.ledger_entry_id ?? null,
+  };
+}
+
+/** Câu nói thật của MVP-06 (lấy từ service để KHÔNG có hai bản chữ lệch nhau). */
+function topupHonestNote(svc) {
+  const text = svc && typeof svc.publicConfig === 'function' ? svc.publicConfig()?.note : null;
+  return typeof text === 'string' && text ? text : null;
+}
+
+/**
+ * Lỗi của MVP-06 → HTTP. Mã lỗi LÀ HỢP ĐỒNG (§3):
+ *   `TOPUP_ALREADY_DECIDED`      ⇒ 409 (xác nhận 2 lần — sổ KHÔNG đổi)
+ *   `TOPUP_REFERENCE_DUPLICATE`  ⇒ 409 (chống khai khống)
+ *   `TOPUP_AMOUNT_OUT_OF_RANGE`  ⇒ 400
+ *   `TOPUP_NOT_FOUND`            ⇒ 404 (kể cả khi yêu cầu là của người khác — không tiết lộ)
+ *   `TOPUP_ANONYMOUS`            ⇒ 401
+ */
+function mapTopupError(err) {
+  if (!err || typeof err !== 'object') return null;
+  const code = String(err.code || '');
+  const details = err.details && typeof err.details === 'object' ? err.details : {};
+  const message = String(err.message || 'Không xử lý được yêu cầu nạp credit.');
+  if (code === 'TOPUP_ALREADY_DECIDED') {
+    return HttpError.safe(409, code, message, {
+      request_id: details.request_id ?? null,
+      status: details.status ?? null,
+      decided_at: details.decided_at ?? null,
+    });
+  }
+  if (code === 'TOPUP_REFERENCE_DUPLICATE') {
+    return HttpError.safe(409, code, message, { reference: details.reference ?? null });
+  }
+  if (code === 'TOPUP_AMOUNT_OUT_OF_RANGE') {
+    return HttpError.safe(400, code, message, {
+      amount_vnd: details.amount_vnd ?? null,
+      min_topup_vnd: details.min_topup_vnd ?? null,
+      max_topup_vnd: details.max_topup_vnd ?? null,
+    });
+  }
+  if (code === 'TOPUP_AMOUNT_INVALID' || code === 'TOPUP_REFERENCE_REQUIRED' || code === 'TOPUP_REASON_REQUIRED'
+      || code === 'TOPUP_CREDITS_INVALID' || code === 'INVALID_TOPUP_AMOUNT') {
+    return HttpError.safe(400, code, message, { amount_vnd: details.amount_vnd ?? null });
+  }
+  if (code === 'TOPUP_NOT_FOUND') {
+    return HttpError.safe(404, code, 'Không tìm thấy yêu cầu nạp.', { request_id: details.request_id ?? null });
+  }
+  if (code === 'TOPUP_ANONYMOUS') {
+    return HttpError.safe(401, 'UNAUTHENTICATED', 'Bạn cần đăng nhập để nạp credit.');
+  }
+  if (code === 'TOPUP_UNAVAILABLE' || code === 'TOPUP_NO_OWNER') {
+    return HttpError.safe(503, 'TOPUP_UNAVAILABLE', message);
+  }
+  return null;
 }
 
 /** Một dòng bảng giá: `{operation, unit_price, currency, note}` (§3.3). */
