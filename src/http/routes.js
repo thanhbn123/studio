@@ -3175,7 +3175,12 @@ export function buildRouter(app) {
   };
 
   /** Cờ cho `/api/config` — CHỈ cờ, không lộ đường dẫn/bí mật/phiên bản module. */
-  const exportsAvailable = async () => exportsEnabled() && Boolean(await loadExportModule());
+  // D6 (LOW): `available` phải phản ánh ĐỦ điều kiện chạy được — thiếu `storage` thì UI không được
+  // hứa "tải được" rồi trả 503/500.
+  const exportsAvailable = async () =>
+    exportsEnabled()
+    && Boolean(await loadExportModule())
+    && Boolean(app?.storage && typeof app.storage.read === 'function');
 
   /**
    * Quyền sở hữu y HỆT route job khác (`requireOwnJob`: id rác ⇒ 400, job lạ/khác tài khoản
@@ -3186,6 +3191,12 @@ export function buildRouter(app) {
    */
   const requireOwnExportJob = async (req, res, id) => {
     const job = await requireOwnJob(req, res, id);
+    // D4 (phản biện, MEDIUM): job KHÔNG có chủ (không `user_id` VÀ không `session_id`) thì gói dữ
+    // liệu đầy đủ KHÔNG được mở cho người lạ — trước đây ai cũng tải được (200 kể cả không cookie).
+    if (job.user_id == null && !job.session_id) {
+      logger?.warn?.('exports.ownerless_job_denied', { job_id: job.id });
+      throw new HttpError(404, 'JOB_NOT_FOUND', 'Không tìm thấy job.');
+    }
     if (job.user_id == null && job.session_id) {
       const sid = sessionId(req, res);
       if (String(sid) !== String(job.session_id)) {
@@ -3204,6 +3215,10 @@ export function buildRouter(app) {
     }
     // Module X1 tự nói nó chưa sẵn sàng (kho ảnh chưa nạp, ...) ⇒ giữ đúng 503 như hợp đồng.
     if (code === 'EXPORT_UNAVAILABLE') return HttpError.safe(503, 'EXPORT_UNAVAILABLE', exportUnavailableMessage());
+    // D6: thiếu `storage` (kho asset chưa nạp) là "chưa sẵn sàng", KHÔNG phải lỗi 500 của gói.
+    if (code === 'BAD_INPUT' && /storage/i.test(String(err?.message ?? ''))) {
+      return HttpError.safe(503, 'EXPORT_UNAVAILABLE', exportUnavailableMessage());
+    }
     logExportError('exports.bundle_build_failed', err);
     return HttpError.safe(500, 'EXPORT_FAILED', 'Không dựng được gói xuất bản. Vui lòng thử lại.');
   };
@@ -3227,16 +3242,32 @@ export function buildRouter(app) {
    * Dựng gói qua module X1. Cả hai route dùng CHUNG hàm này để `manifest` trả qua API và
    * `MANIFEST.json` trong gói luôn là MỘT nguồn sự thật (không có hai bản kê khai lệch nhau).
    */
-  const buildBundleFor = async (jobId) => {
+  const buildBundleFor = async (jobId, { zip = true } = {}) => {
     const mod = await requireExportModule();
     try {
-      const built = await mod.buildExportBundle({
+      // D5 (phản biện Gói xuất bản, MEDIUM): route `/manifest` KHÔNG được dựng cả ZIP rồi bỏ
+      // buffer — job 60 MB asset tốn ~2,3s CPU + ~245 MB RSS cho một phản hồi 10 KB. Module X1 có
+      // đường `buildExportManifest` (chỉ kê khai, không nén); thiếu nó (bản cũ) ⇒ rơi về đường cũ.
+      const onlyManifest = zip === false && typeof mod.buildExportManifest === 'function';
+      if (zip === false && !onlyManifest) {
+        logger?.warn?.('exports.manifest_without_zip_builder', {
+          message: 'Module X1 chưa có `buildExportManifest` ⇒ route /manifest phải dựng cả ZIP (chậm hơn).',
+        });
+      }
+      const built = await (onlyManifest ? mod.buildExportManifest : mod.buildExportBundle)({
         store,
         // Gói chỉ ĐỌC asset đã có trên đĩa; X1 tự quyết cách đọc, routes.js không ghép đường dẫn.
         storage: app?.storage ?? null,
         jobId,
         logger,
       });
+      if (zip === false) {
+        // Đường chỉ-manifest: bắt buộc có `manifest`, KHÔNG cần buffer.
+        if (!built || !built.manifest) {
+          throw Object.assign(new Error('buildExportManifest không trả về manifest hợp lệ'), { code: 'BAD_BUNDLE' });
+        }
+        return built;
+      }
       if (!built || !Buffer.isBuffer(built.buffer) || built.buffer.length === 0) {
         throw Object.assign(new Error('buildExportBundle không trả về buffer hợp lệ'), { code: 'BAD_BUNDLE' });
       }
@@ -3282,7 +3313,8 @@ export function buildRouter(app) {
     const sid = sessionId(req, res);
     enforce(rateLimiters.jobs, `export:${sid}`);
     const job = await requireOwnExportJob(req, res, params.id);
-    const built = await buildBundleFor(job.id);
+    // D5: CHỈ dựng manifest — không tạo ZIP.
+    const built = await buildBundleFor(job.id, { zip: false });
 
     // Đúng ba field hợp đồng §3: manifest + warnings + missing. KHÔNG kèm buffer/đường dẫn.
     sendJson(res, 200, {

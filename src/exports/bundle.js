@@ -29,7 +29,7 @@ import {
   orderMockSteps,
   sha256Hex,
 } from './assets.js';
-import { bundleFilename, collectJobWarnings, manifestFor } from './manifest.js';
+import { bundleFilename, collectJobWarnings, manifestFor, mockStepsFor } from './manifest.js';
 import { renderHumanText } from './text.js';
 
 /** Trần tổng dữ liệu đóng gói (byte) — vượt ⇒ ném `BUNDLE_TOO_LARGE` thay vì ăn hết RAM. */
@@ -131,6 +131,19 @@ function usageTotals(events) {
  *   manifest: object, warnings: string[], missing: string[], files: Array, verified: boolean}>}
  * @throws {ExportError} `JOB_NOT_FOUND` | `BAD_INPUT` | `STORE_READ_FAILED` | `BUNDLE_TOO_LARGE` | `ZIP_SELF_CHECK_FAILED`
  */
+/**
+ * D5 (phản biện Gói xuất bản, MEDIUM) — CHỈ dựng bản kê khai, KHÔNG tạo ZIP.
+ *
+ * Dùng cho `GET /api/exports/jobs/:id/manifest`. Vẫn đọc dữ liệu đã lưu + băm ảnh gốc để
+ * `manifest` qua API và `MANIFEST.json` trong gói là MỘT nguồn sự thật (hợp đồng §3), nhưng
+ * KHÔNG nén, KHÔNG giữ buffer ⇒ rẻ hơn hẳn về CPU/RAM.
+ *
+ * @returns {Promise<{buffer:null, zipped:false, entries:string[], manifest:object, warnings:string[], missing:string[]}>}
+ */
+export async function buildExportManifest(params = {}) {
+  return buildExportBundle({ ...params, zip: false });
+}
+
 export async function buildExportBundle({
   store,
   storage,
@@ -139,6 +152,10 @@ export async function buildExportBundle({
   now = new Date(),
   verify = true,
   maxTotalBytes = DEFAULT_MAX_TOTAL_BYTES,
+  // D5 (phản biện Gói xuất bản, MEDIUM): `zip: false` ⇒ CHỈ dựng bản kê khai, KHÔNG nén ZIP.
+  // Route `/manifest` dùng đường này: trước đây nó dựng cả gói rồi bỏ buffer ⇒ job 60 MB asset
+  // tốn ~2,3s CPU và ~245 MB RSS cho một phản hồi 10 KB.
+  zip = true,
 } = {}) {
   /* ── 0. Kiểm đầu vào ────────────────────────────────────────────────── */
   if (!store || typeof store.getJob !== 'function' || typeof store.listImageAssets !== 'function') {
@@ -305,6 +322,11 @@ export async function buildExportBundle({
   /* ── 6. Bản dễ đọc cho người: chèn NGAY SAU file .json ──────────────── */
   // Cảnh báo mức job đã gộp đủ (gồm cảnh báo phát sinh khi đọc đĩa) TRƯỚC khi in phần
   // "nói thật" ở cuối file .txt — bản .txt không được phép đẹp hơn MANIFEST.json.
+  // D1: MỘT nguồn sự thật cho các bước mock — dùng cho cả bản .txt lẫn MANIFEST.json.
+  const mockStepsAll = orderMockSteps(new Set([
+    ...mockStepsFor(job, assets, usage),
+    ...mockStepsFromAssets(assets),
+  ]));
   const warningsSoFar = collectJobWarnings(job, assets, evidence, extraWarnings);
   if (payload !== null) {
     const humanText = renderHumanText({
@@ -313,7 +335,10 @@ export async function buildExportBundle({
       lines,
       regions,
       warnings: warningsSoFar,
-      mockSteps: orderMockSteps(new Set(mockStepsFromAssets(assets))),
+      // D1 (phản biện, HIGH): bản .txt phải kể CÙNG tập bước mock với MANIFEST.json — trước đây chỉ
+      // lấy từ meta asset nên job MVP-01/02 (dấu vết ở `content_meta`/`usage_events`) in ra bản
+      // "sạch" không một dòng cảnh báo, tức bản dễ đọc ĐẸP HƠN sự thật.
+      mockSteps: mockStepsAll,
       hasVideo: assets.some((a) => classifyAsset(a) === ASSET_GROUPS.VIDEO),
     });
     if (humanText) {
@@ -332,24 +357,58 @@ export async function buildExportBundle({
     usage,
     evidence,
     extra: {
-      entries: payloadEntries.map((e) => e.name),
-      files,
+      // D6: `entries` phải kể cả chính `MANIFEST.json` (file luôn có trong gói) — trước đây thiếu
+      // nên bản kê khai không khớp danh sách entry thật của ZIP.
+      entries: ['MANIFEST.json', ...payloadEntries.map((e) => e.name)],
+      // `files` phải cùng độ dài với `entries` (D6) — bản thân MANIFEST.json không thể tự băm
+      // chính nó, nên ghi `sha256: null` kèm lý do thay vì bịa một giá trị.
+      files: [
+        { path: 'MANIFEST.json', bytes: null, sha256: null, source: 'tự sinh khi đóng gói (không tự băm chính nó)' },
+        ...files,
+      ],
       original_sha256: originalSha256,
       warnings: extraWarnings,
       missing,
       regions,
       filename,
       generated_at: generatedAt,
+      // D1: cùng tập mock đã dùng cho `noi-dung.txt` (khử trùng ở `manifestFor`).
+      mock_steps: mockStepsAll,
     },
   });
 
   // Mọi entry đều là Buffer TRƯỚC khi vào ZIP: nhờ vậy bước tự kiểm so sánh được
   // `data.length` (BYTE) với `size` mà header khai — chuỗi tiếng Việt có số ký tự khác
   // số byte nên so bằng `.length` của chuỗi sẽ báo sai.
+  const entryNames = ['MANIFEST.json', ...payloadEntries.map((e) => e.name)];
   const zipEntries = [
     { name: 'MANIFEST.json', data: toBuffer(`${JSON.stringify(manifest, null, 2)}\n`, 'MANIFEST.json') },
     ...payloadEntries,
   ];
+
+  if (zip === false) {
+    // D5: đường CHỈ-MANIFEST — không gọi `createZip`, không giữ buffer nén.
+    logger?.info?.('exports.manifest_built', {
+      job_id: id,
+      kind: job.kind || 'content',
+      entries: entryNames.length,
+      assets: assets.length,
+      missing: manifest.missing.length,
+      warnings: manifest.warnings.length,
+      mock_steps: manifest.mock_steps.length,
+    });
+    return {
+      buffer: null,
+      zipped: false,
+      filename,
+      bytes: null,
+      entries: entryNames,
+      manifest,
+      warnings: manifest.warnings,
+      missing: manifest.missing,
+      generated_at: generatedAt,
+    };
+  }
 
   /* ── 8. Ghi ZIP + TỰ KIỂM bằng bộ đọc độc lập ───────────────────────── */
   const buffer = createZip({ entries: zipEntries, date });

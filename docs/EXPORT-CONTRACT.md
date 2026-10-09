@@ -113,3 +113,59 @@ Escape mọi text bằng `esc()`.
 - Ảnh gốc bất biến sau khi xuất (`sha256` trước/sau y hệt).
 - IDOR ⇒ 404; ẩn danh (không tài khoản) vẫn tải được gói của chính phiên mình.
 - `env -u DATABASE_URL npm test` xanh; `node tools/verify.mjs` xanh.
+
+---
+
+# VÒNG SỬA PHẢN BIỆN (D1…D6) — chốt lại các điểm lệch
+
+Hai agent độc lập (test + phản biện) bắt TRÙNG nhau 3 lỗi; phán quyết vòng 1 **FAIL**
+(`docs/EXPORT-REVIEW.md`). Những điểm dưới đây ĐỔI so với bản đóng băng đầu.
+
+## 9.1 D1 — GÓI PHẢI TỰ KHAI bước chạy provider GIẢ (từ MỌI dấu vết đã lưu)
+
+- `manifestFor()` gọi **`mockStepsFor(job, assets, usage)`** và hợp với `mockStepsFromAssets` +
+  `extra.mock_steps` (khử trùng, sắp thứ tự cố định). Trước đây chỉ dùng `mockStepsFromAssets` ⇒
+  job MVP-01/02 (dấu vết ở `content_meta.is_mock`, `content_meta.imagelab.mock_steps`,
+  `usage_events.provider = 'mock'`) khai `mock_steps: []` — gói **giấu** bước dùng dữ liệu giả.
+- `bundle.js` tính **MỘT tập** `mockStepsAll` rồi dùng cho **cả** `noi-dung/noi-dung.txt` lẫn
+  `MANIFEST.json` ⇒ bản dễ đọc không bao giờ “đẹp hơn” bản kê khai.
+- UI (`public/app.js`): câu “Máy chủ khai KHÔNG có bước nào dùng dữ liệu giả” chỉ in khi bản kê
+  khai **THẬT SỰ** có mảng `mock_steps` rỗng; thiếu hẳn khoá ⇒ in “KHÔNG kiểm được”.
+
+## 9.2 D2 — `providers.usage[].is_mock` theo CHÍNH dòng usage
+
+- `is_mock = meta.is_mock === true || provider === 'mock'` (và khoá gộp nhóm dùng cùng luật).
+  Trước đây chỉ đọc `meta.is_mock` ⇒ dòng `provider: "mock"` bị khai `is_mock: false`, lệch với
+  `mock_steps` trong cùng một gói.
+
+## 9.3 D3 — nhãn LIVE chỉ khi có BẰNG CHỨNG `transport === 'http'`
+
+- `verificationFor()` bỏ nhãn khi `transport !== 'http'` — **kể cả khi thiếu transport**
+  (`null`/`undefined`). Trước đây điều kiện là `transport !== null && transport !== 'http'` ⇒
+  fail-open: job không lưu `product_master.extraction.transport` vẫn khẳng định
+  `AUTHENTICATED_LIVE_VERIFIED` (trái §0.1 và trái cổng `src/jobs/pipeline.js:48`).
+- Nhãn bị bỏ ⇒ `label = null` (giữ luật “nghi ngờ ⇒ không khai”) và
+  `verification_detail.suggested_level` ghi **mức đúng** (`MANUAL_INPUT` nếu `transport='manual'`,
+  còn lại `MOCK_VERIFIED`) + lý do trong `notes`.
+
+## 9.4 D4 — job KHÔNG có chủ ⇒ 404
+
+- `requireOwnExportJob`: job không có `user_id` **và** không có `session_id` ⇒ **404 JOB_NOT_FOUND**
+  (log `exports.ownerless_job_denied`). Job có `session_id` giữ nguyên luật cũ (cookie phải khớp).
+
+## 9.5 D5 — `/manifest` KHÔNG dựng ZIP
+
+- X1 có thêm **`buildExportManifest()`** (= `buildExportBundle({ zip: false })`): vẫn đọc dữ liệu đã
+  lưu + băm ảnh gốc để hai đường là MỘT nguồn, nhưng **không gọi `createZip`**, không giữ buffer
+  (trả `{ buffer: null, zipped: false }`). Route `/manifest` dùng đường này; route `/bundle` giữ
+  nguyên. Module X1 cũ (chưa có `buildExportManifest`) ⇒ route ghi log
+  `exports.manifest_without_zip_builder` và rơi về đường cũ (không vỡ).
+
+## 9.6 D6 — `entries` đủ, thiếu `storage` ⇒ 503, tên entry CR/LF bị chặn
+
+- `manifest.entries` **kể cả `MANIFEST.json`** (và `files` cùng độ dài; bản thân MANIFEST.json ghi
+  `sha256: null` + lý do “không tự băm chính nó”).
+- Thiếu `storage` ⇒ `config.exports.available = false` và hai route trả **503 `EXPORT_UNAVAILABLE`**
+  (trước đây 500; lỗi `BAD_INPUT` có chữ “storage” được map thành “chưa sẵn sàng”).
+- `normalizeZipName`/`createZip` **từ chối** tên entry chứa CR/LF/NUL với mã riêng
+  **`BAD_ENTRY_NAME`** (NUL trước đây đã bị chặn qua `ZIP_NAME_INVALID`).

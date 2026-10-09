@@ -88,6 +88,15 @@ export function normalizeZipName(raw) {
   if (value.includes('\0')) {
     throw new ExportError(EXPORT_CODES.ZIP_NAME_INVALID, 'Tên entry chứa ký tự NUL.', { name: value.slice(0, 120) });
   }
+  // D6 (phản biện Gói xuất bản, LOW): CR/LF trong tên entry làm hỏng cả bản ghi ZIP lẫn mọi danh
+  // sách in ra văn bản (chèn dòng giả). Mã riêng `BAD_ENTRY_NAME` để tầng gọi phân biệt được.
+  if (/[\r\n]/.test(value)) {
+    throw new ExportError(
+      EXPORT_CODES.BAD_ENTRY_NAME,
+      'Tên entry chứa ký tự xuống dòng (CR/LF) — không hợp lệ trong ZIP.',
+      { name: value.slice(0, 120) },
+    );
+  }
   const name = value.replace(/\\/g, '/');
   if (name.startsWith('/') || /^[A-Za-z]:/.test(name)) {
     throw new ExportError(EXPORT_CODES.ZIP_NAME_INVALID, `Tên entry phải là đường dẫn TƯƠNG ĐỐI: ${name.slice(0, 120)}`, { name: name.slice(0, 120) });

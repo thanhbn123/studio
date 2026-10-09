@@ -22,6 +22,8 @@ export const EXPORT_CODES = Object.freeze({
   STORE_READ_FAILED: 'STORE_READ_FAILED',
   /** Tên entry không hợp lệ (rỗng, tuyệt đối, có `..`, có NUL, kết thúc bằng `/`). */
   ZIP_NAME_INVALID: 'ZIP_NAME_INVALID',
+  /** Tên entry chứa CR/LF (D6) — chèn được dòng giả vào mọi danh sách in ra văn bản. */
+  BAD_ENTRY_NAME: 'BAD_ENTRY_NAME',
   /** Tên entry dài quá 65535 byte UTF-8 — định dạng ZIP cổ điển không biểu diễn được. */
   ZIP_NAME_TOO_LONG: 'ZIP_NAME_TOO_LONG',
   /** Hai entry trùng tên — gói sẽ mơ hồ khi giải nén, phải chặn từ lúc ghi. */

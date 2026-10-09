@@ -71,7 +71,7 @@ export {
   MANIFEST_VERSION,
   TOOL,
 } from './manifest.js';
-export { buildExportBundle, DEFAULT_MAX_TOTAL_BYTES } from './bundle.js';
+export { buildExportBundle, buildExportManifest, DEFAULT_MAX_TOTAL_BYTES } from './bundle.js';
 export { renderHumanText } from './text.js';
 export {
   ASSET_GROUPS,

@@ -5017,6 +5017,9 @@ function exportManifestHtml(data) {
     ? Object.entries(manifest.counts).map(([k, v]) => `${k}=${exportScalarText(v)}`)
     : [];
   const warnings = exportUnion(data?.warnings, manifest.warnings);
+  // D1: nếu bản kê khai KHÔNG có khoá `mock_steps` (bản cũ/thiếu dữ liệu) thì UI phải nói "không
+  // kiểm được", KHÔNG được khẳng định là "không có bước giả".
+  const mockStepsKnown = Array.isArray(manifest.mock_steps) || Array.isArray(data?.manifest?.mock_steps);
   const missing = exportUnion(data?.missing, manifest.missing);
   const mockSteps = exportList(manifest.mock_steps);
   const providers = exportList(manifest.providers);
@@ -5028,7 +5031,14 @@ function exportManifestHtml(data) {
       <span class="badge">${esc(audio)}</span>
     </div>
     ${exportBlockHtml('Kiểm chứng (verification)', [exportVerificationText(manifest)])}
-    ${exportBlockHtml('Bước dùng dữ liệu giả (mock_steps)', mockSteps, { cls: mockSteps.length ? 'warn' : '', empty: 'Máy chủ khai KHÔNG có bước nào dùng dữ liệu giả.' })}
+    ${exportBlockHtml('Bước dùng dữ liệu giả (mock_steps)', mockSteps, {
+      cls: mockSteps.length ? 'warn' : '',
+      // D1 (phản biện Gói xuất bản, HIGH): câu này chỉ được nói khi danh sách THẬT SỰ rỗng — trước
+      // đây nó in cả khi máy chủ khai thiếu (mock_steps rỗng do lỗi gom dấu vết), tức UI nói dối.
+      empty: mockStepsKnown
+        ? 'Máy chủ khai KHÔNG có bước nào dùng dữ liệu giả.'
+        : 'Bản kê khai KHÔNG có mục mock_steps ⇒ KHÔNG kiểm được job có bước giả hay không.',
+    })}
     ${exportBlockHtml('Thiếu trong gói (missing)', missing, { cls: 'warn', empty: 'Máy chủ khai KHÔNG thiếu mục nào.' })}
     ${exportBlockHtml('Cảnh báo của job (warnings)', warnings, { cls: 'warn', empty: 'Máy chủ không trả cảnh báo nào.' })}
     ${counts.length ? exportBlockHtml('Số lượng trong gói (counts)', counts) : ''}

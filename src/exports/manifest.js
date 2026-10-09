@@ -138,7 +138,8 @@ export function providersFor(job, usage = [], evidence = []) {
   for (const row of asArray(usage)) {
     if (!row || typeof row !== 'object') continue;
     const rowMeta = parseMaybeJson(row.meta) || {};
-    const key = `${row.operation ?? ''}\u0000${row.provider ?? ''}\u0000${row.model ?? ''}\u0000${rowMeta.is_mock === true ? '1' : '0'}`;
+    const rowIsMock = rowMeta.is_mock === true || String(row.provider ?? '').toLowerCase() === 'mock';
+    const key = `${row.operation ?? ''}\u0000${row.provider ?? ''}\u0000${row.model ?? ''}\u0000${rowIsMock ? '1' : '0'}`;
     const prev = byOperation.get(key);
     if (prev) prev.events += 1;
     else {
@@ -146,7 +147,10 @@ export function providersFor(job, usage = [], evidence = []) {
         operation: row.operation ?? null,
         provider: row.provider ?? null,
         model: row.model ?? null,
-        is_mock: rowMeta.is_mock === true,
+        // D2 (HIGH — manifest khai SAI): `is_mock` phải theo CHÍNH dòng usage này. Trước đây chỉ
+        // đọc `meta.is_mock` ⇒ dòng `provider: "mock"` (không có meta) bị khai `is_mock: false`,
+        // trong khi `mockStepsFor` coi provider `mock` LÀ mock ⇒ hai chỗ trong cùng gói nói lệch.
+        is_mock: rowMeta.is_mock === true || String(row.provider ?? '').toLowerCase() === 'mock',
         events: 1,
       });
     }
@@ -256,12 +260,24 @@ export function verificationFor(job, evidence = [], mockSteps = []) {
   const mock = orderMockSteps(mockSteps);
 
   const notes = [];
+  // D3: mức ĐÚNG khi không đủ căn cứ LIVE — theo cổng chuẩn của repo (`transport === 'manual'` ⇒
+  // `MANUAL_INPUT`, còn lại ⇒ `MOCK_VERIFIED`; xem `determineVerificationLevel` ở `src/jobs/pipeline.js`).
+  const downgradedLevel = transport === 'manual' ? 'MANUAL_INPUT' : 'MOCK_VERIFIED';
   let label = recorded;
 
-  if (label && LIVE_LEVELS.includes(label) && transport !== null && transport !== 'http') {
+  // D3 (MEDIUM — fail-open): nhãn LIVE chỉ được GIỮ khi dấu vết CHỨNG MINH có `transport === 'http'`.
+  // Trước đây điều kiện là `transport !== null && transport !== 'http'` ⇒ job KHÔNG lưu
+  // `product_master.extraction.transport` (hoặc nhãn đến từ `jobs.evidence`) vẫn khẳng định
+  // `AUTHENTICATED_LIVE_VERIFIED` — trái §0 luật 1 và trái cổng chuẩn `src/jobs/pipeline.js:48`
+  // (`transport !== 'http'` ⇒ KHÔNG LIVE, kể cả khi thiếu transport).
+  if (label && LIVE_LEVELS.includes(label) && transport !== 'http') {
     notes.push(
-      `Dấu vết ghi nhãn "${label}" nhưng transport của lần trích xuất là ${JSON.stringify(transport)} — KHÔNG đủ căn cứ khẳng định đã gọi dịch vụ thật ⇒ gói KHÔNG giữ nhãn này.`,
+      transport === null
+        ? `Dấu vết ghi nhãn "${label}" nhưng KHÔNG có transport của lần trích xuất (thiếu bằng chứng đã gọi dịch vụ thật) ⇒ gói KHÔNG giữ nhãn này. Mức đúng: ${downgradedLevel}.`
+        : `Dấu vết ghi nhãn "${label}" nhưng transport của lần trích xuất là ${JSON.stringify(transport)} — KHÔNG đủ căn cứ khẳng định đã gọi dịch vụ thật ⇒ gói KHÔNG giữ nhãn này. Mức đúng: ${downgradedLevel}.`,
     );
+    // Hợp đồng §0.1 + test đã nghiệm thu: NGHI NGỜ ⇒ trả `null` (gói KHÔNG tự gán nhãn thay),
+    // nhưng ghi rõ MỨC ĐÚNG vào `verification_detail` để người đọc biết phải hiểu thế nào.
     label = null;
   }
   if (label && LIVE_LEVELS.includes(label) && mock.length > 0) {
@@ -285,6 +301,8 @@ export function verificationFor(job, evidence = [], mockSteps = []) {
       http_status: latest?.http_status ?? null,
       transport,
       live_service_called: liveServiceCalled,
+      // D3: mức ĐÚNG theo cổng chuẩn của repo khi nhãn LIVE bị bỏ (null nếu gói vẫn giữ nhãn).
+      suggested_level: label ? null : (recorded ? downgradedLevel : null),
       contains_mock: mock.length > 0,
       mock_steps: mock,
       notes,
@@ -367,7 +385,16 @@ export function manifestFor({ job, assets = [], lines = [], usage = [], evidence
   const originals = assetList.filter((a) => classifyAsset(a) === ASSET_GROUPS.ORIGINAL);
   const images = assetList.filter((a) => classifyAsset(a) === ASSET_GROUPS.IMAGE);
   const videos = assetList.filter((a) => classifyAsset(a) === ASSET_GROUPS.VIDEO);
-  const mockSteps = orderMockSteps(new Set([...mockStepsFromAssets(assetList), ...asArray(ex.mock_steps)]));
+  // D1 (phản biện Gói xuất bản, HIGH — §0 luật 1 “gói phải tự khai”): gom bước MOCK từ MỌI dấu vết
+  // ĐÃ LƯU, không chỉ từ meta asset. Trước đây chỉ dùng `mockStepsFromAssets` ⇒ job MVP-01/02 chạy
+  // provider GIẢ (`content_meta.is_mock`, `content_meta.imagelab.mock_steps`, `usage_events.provider
+  // = 'mock'`) vẫn khai `mock_steps: []` — gói GIẤU bước dùng dữ liệu giả, và UI in câu sai
+  // “Máy chủ khai KHÔNG có bước nào dùng dữ liệu giả”.
+  const mockSteps = orderMockSteps(new Set([
+    ...mockStepsFor(job, assetList, usageList),
+    ...mockStepsFromAssets(assetList),
+    ...asArray(ex.mock_steps),
+  ]));
   const { label: verification, detail: verificationDetail } = verificationFor(job, evidenceList, mockSteps);
 
   // Tiếng: bản offline KHÔNG có tiếng. Chỉ trả object khi có provider THẬT SỰ khai dữ liệu tiếng.
