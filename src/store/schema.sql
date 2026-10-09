@@ -401,3 +401,64 @@ CREATE TABLE IF NOT EXISTS topup_events (
   reason         TEXT,
   created_at     TEXT NOT NULL
 );
+
+-- ============================================================================
+-- MVP-08 — ĐĂNG SẢN PHẨM LÊN SÀN (Shopee / TikTok Shop) — `docs/MVP-08-CONTRACT.md` §1/§5
+--
+-- Bốn luật của hợp đồng phản ánh ở đây:
+--   #1 Không bịa dữ liệu sàn: `issues` (JSON) là danh sách lỗi kiểm tra TRƯỚC khi đăng; listing
+--      chỉ được tạo khi không còn lỗi chặn. `unmapped` (JSON) khai trường KHÔNG ánh xạ được.
+--   #2 Tiền/tồn là của sàn: `remote_snapshot` chỉ là bản ĐỌC VỀ để đối chiếu (`synced_at`).
+--   #3 Không đăng hai lần: unique (job_id, channel, run_key) — index tạo SAU migration; `external_id`
+--      đã có ⇒ không gọi sàn nữa. `attempts` + cổng claim ở store (`UPDATE … WHERE status IN …`).
+--   #4 Lỗi nói rõ sàn nào, mã nào: `error_code` chuẩn hoá + `last_error` nguyên văn (đã che bí mật).
+--
+-- `is_mock = 1` ⇒ kết quả của provider `dry-run` (external_id tiền tố 'dry-', KHÔNG có bài thật).
+-- Chỉ TEXT/INTEGER + ISO-8601 trong TEXT ⇒ chạy trên cả SQLite và PostgreSQL 16.
+-- ⚠️ INDEX KHÔNG đặt ở đây (bài học `wallet_ledger.seq`) — xem `#applyAdditiveMigrations()`.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS marketplace_listings (
+  id               TEXT PRIMARY KEY,
+  job_id           TEXT NOT NULL,
+  user_id          TEXT NOT NULL,                     -- chủ listing; đăng sàn KHÔNG dành cho ẩn danh
+  channel          TEXT NOT NULL,                     -- 'dry-run' | 'shopee' | 'tiktokshop'
+  -- 'draft' | 'pending_review' | 'approved' | 'publishing' | 'published' | 'failed' | 'rejected'
+  status           TEXT NOT NULL DEFAULT 'pending_review',
+  run_key          TEXT NOT NULL,                     -- idempotency theo (job_id, channel, run_key)
+  input            TEXT,                              -- JSON: đầu vào chuẩn hoá (đã qua preflight)
+  overrides        TEXT,                              -- JSON: trường người bán bổ sung (giá VND, tồn, cân nặng…)
+  payload          TEXT,                              -- JSON: payload gửi sàn (giữ NGUYÊN để soi)
+  issues           TEXT,                              -- JSON: issues[] của preflight (chỉ còn warn khi tạo)
+  unmapped         TEXT,                              -- JSON: trường không ánh xạ được
+  defaults_applied TEXT,                              -- JSON: mặc định đã áp (không phải dữ liệu)
+  external_id      TEXT,                              -- id trên sàn; 'dry-…' = chế độ thử
+  external_url     TEXT,
+  is_mock          INTEGER NOT NULL DEFAULT 0,
+  error_code       TEXT,
+  last_error       TEXT,
+  last_result      TEXT,                              -- JSON: ListingResult gần nhất
+  attempts         INTEGER NOT NULL DEFAULT 0,
+  approved_by      TEXT,
+  approved_at      TEXT,
+  rejected_by      TEXT,
+  rejected_at      TEXT,
+  reject_reason    TEXT,
+  published_at     TEXT,
+  remote_snapshot  TEXT,                              -- JSON: giá/tồn ĐỌC từ sàn (chỉ đối chiếu)
+  synced_at        TEXT,
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL
+);
+
+-- Vết mọi bước (tạo / duyệt / từ chối / bắt đầu đăng / đăng xong / đăng lỗi / đồng bộ) — APPEND-ONLY.
+CREATE TABLE IF NOT EXISTS marketplace_events (
+  id             TEXT PRIMARY KEY,
+  listing_id     TEXT NOT NULL,
+  seq            INTEGER NOT NULL DEFAULT 0,    -- thứ tự trong một listing (nhiều sự kiện cùng mili-giây)
+  kind           TEXT NOT NULL,
+  from_status    TEXT,
+  to_status      TEXT,
+  actor_user_id  TEXT,
+  detail         TEXT,                                -- JSON nhỏ (mã lỗi, attempt, run_key…)
+  created_at     TEXT NOT NULL
+);

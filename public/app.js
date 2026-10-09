@@ -259,6 +259,24 @@ const state = {
     rejectDraft: '',
   },
   // 402 INSUFFICIENT_CREDIT gặp ở BẤT KỲ thao tác nào (kể cả trong `api()`) ⇒ băng báo dùng chung.
+  // MVP-08 — Đăng sàn (`docs/MVP-08-CONTRACT.md` §5). Kênh/cờ live lấy từ `/api/config.marketplace`.
+  mk: {
+    listings: null, // bài đăng sàn (null = chưa tải)
+    total: null,
+    jobs: null, // job nội dung của tôi để chọn làm nguồn
+    loading: false,
+    busy: false,
+    draft: { job_id: '', channel: '', price_vnd: '', stock: '', weight_g: '', category_id: '', brand: '', sku: '', length_cm: '', width_cm: '', height_cm: '', title: '', description: '' },
+    issues: null, // issues[] của lần tạo bị 422
+    error: null,
+    notice: null,
+    listError: null,
+    filter: { status: '' },
+    payloadId: null,
+    payloadData: null,
+    rejectId: null,
+    rejectDraft: '',
+  },
   creditAlert: null,
   // MVP-03 — Tạo ảnh (imagestudio). Tách riêng khỏi `il` để không giẫm chân MVP-02.
   is: {
@@ -393,6 +411,15 @@ function route() {
     stopVsPolling();
     renderPublish();
     loadPublishItems({ quiet: true });
+    return;
+  }
+  // MVP-08 (§5) — tab “Đăng sàn”: `#/dangsan`.
+  if (hash.startsWith('#/dangsan')) {
+    stopPolling();
+    stopIlPolling();
+    stopIsPolling();
+    stopVsPolling();
+    openMarketplace();
     return;
   }
   // MVP-04 (§2.5) — tab thứ tư “Video”, route hash riêng: `#/video` và `#/video/:id`.
@@ -692,6 +719,38 @@ function onGlobalClick(ev) {
     topupconfirm: () => decideTopup(btn.dataset.id, { reject: false }),
     topupreject: () => decideTopup(btn.dataset.id, { reject: true }),
     creditdismiss: () => dismissCreditAlert(),
+    // ── MVP-08 — Đăng sàn ──
+    marketplace: () => {
+      if (String(location.hash || '').startsWith('#/dangsan')) openMarketplace();
+      else location.hash = '#/dangsan';
+    },
+    mkcreate: () => submitMkListing(),
+    mkreload: () => {
+      state.mk.filter.status = String($('#mk-filter-status')?.value ?? state.mk.filter.status ?? '');
+      loadMkJobs();
+      loadMkListings(true);
+    },
+    mkapprove: () => mkDecide(btn.dataset.id, { reject: false }),
+    mkrejectopen: () => {
+      state.mk.rejectId = String(btn.dataset.id || '');
+      state.mk.rejectDraft = '';
+      state.mk.listError = null;
+      renderMarketplacePage();
+    },
+    mkreject: () => mkDecide(btn.dataset.id, { reject: true }),
+    mkcancel: () => {
+      state.mk.rejectId = null;
+      state.mk.rejectDraft = '';
+      renderMarketplacePage();
+    },
+    mkpublish: () => mkPublish(btn.dataset.id),
+    mksync: () => mkSync(btn.dataset.id),
+    mkpayload: () => mkShowPayload(btn.dataset.id),
+    mkpayloadclose: () => {
+      state.mk.payloadId = null;
+      state.mk.payloadData = null;
+      renderMarketplacePage();
+    },
   };
   if (handlers[action]) handlers[action](ev);
 }
@@ -6756,6 +6815,12 @@ function wireAuthGlobal() {
     else if (t.id === 'pub-text') state.pub.draft.text = String(t.value ?? '');
     else if (t.id === 'credit-amount') state.auth.creditDraft.amount = String(t.value ?? '');
     else if (t.id === 'credit-note') state.auth.creditDraft.note = String(t.value ?? '');
+    // MVP-08 — giữ bản nháp form đăng sàn (`mk-<ten-truong>` → `state.mk.draft.<ten_truong>`).
+    else if (t.id === 'mk-reject-reason') state.mk.rejectDraft = String(t.value ?? '');
+    else if (t.id.startsWith('mk-')) {
+      const key = t.id.slice(3).replace(/-/g, '_');
+      if (Object.prototype.hasOwnProperty.call(state.mk.draft, key)) state.mk.draft[key] = String(t.value ?? '');
+    }
     // MVP-06 — giữ bản nháp form nạp credit để render lại không mất chữ.
     else if (t.id === 'topup-amount') state.topup.draft.amount_vnd = String(t.value ?? '');
     else if (t.id === 'topup-reference') state.topup.draft.reference = String(t.value ?? '');
@@ -7203,3 +7268,494 @@ async function publishItemAction(id, action) {
 }
 
 boot();
+
+/* ═════════════════════ MVP-08 — Tab “Đăng sàn” (hợp đồng §5) ═════════════════════
+ *
+ * Luật UI (docs/UI-HANDOVER.md §3): không dependency, `esc()` mọi text động (tiêu đề, mã lỗi của sàn,
+ * `issues[]`, `external_id`…), KHÔNG nói quá sự thật (kênh `dry-run` ⇒ băng “CHẾ ĐỘ THỬ — không đăng
+ * thật”; kênh chưa cấu hình ⇒ “chưa có token…”), nút khoá kèm LÝ DO khi thiếu quyền/thiếu điều kiện,
+ * lỗi thật hiện ra (mã + câu tiếng Việt), `issues[]` hiện TỪNG DÒNG.
+ */
+
+const MK_STATUS_LABEL = {
+  draft: 'Nháp',
+  pending_review: 'Chờ duyệt',
+  approved: 'Đã duyệt — chưa đăng',
+  publishing: 'Đang đăng…',
+  published: 'Đã đăng',
+  failed: 'Đăng lỗi',
+  rejected: 'Bị từ chối',
+};
+const MK_STATUS_CLASS = { draft: '', pending_review: 'warn', approved: 'ok', publishing: 'warn', published: 'ok', failed: 'error', rejected: 'error' };
+
+const MK_DRY_RUN_BANNER = 'CHẾ ĐỘ THỬ — không đăng thật';
+
+const MK_ERROR_HINT = {
+  PREFLIGHT_FAILED: 'Chưa đủ dữ liệu để đăng — xem từng dòng lỗi kiểm tra bên dưới.',
+  CHANNEL_NOT_CONFIGURED: 'Kênh này chưa có token (cần tài khoản người bán được duyệt).',
+  CHANNEL_UNKNOWN: 'Kênh không hợp lệ.',
+  NOT_APPROVED: 'Bài phải được DUYỆT trước khi đăng.',
+  LISTING_ALREADY_DECIDED: 'Bài đã được quyết định trước đó.',
+  PUBLISH_IN_PROGRESS: 'Bài đang được đăng bởi một lượt khác — chờ rồi tải lại.',
+  ATTEMPTS_EXCEEDED: 'Đã thử đăng quá số lần cho phép — dừng để không spam sàn.',
+  MARKETPLACE_ERROR: 'Sàn từ chối — xem mã lỗi và nội dung nguyên văn bên dưới.',
+  LISTING_NOT_FOUND: 'Không tìm thấy bài này.',
+  SYNC_UNAVAILABLE: 'Bài chưa có mã trên sàn nên chưa đồng bộ được.',
+  MARKETPLACE_UNAVAILABLE: 'Máy chủ chưa bật được chức năng đăng sàn.',
+  REASON_REQUIRED: 'Từ chối phải có lý do.',
+  BAD_JOB_ID: 'Hãy chọn một job nguồn.',
+};
+
+/** Khối `/api/config.marketplace` — `null` ⇒ máy chủ chưa nạp được module (UI nói thật). */
+function mkConfig() {
+  const m = state.config?.marketplace;
+  return m && typeof m === 'object' ? m : null;
+}
+
+function mkChannelInfo(name) {
+  const list = Array.isArray(mkConfig()?.channels) ? mkConfig().channels : [];
+  return list.find((c) => c?.name === name) || null;
+}
+
+function mkStatusLabel(status) {
+  const key = String(status ?? '');
+  return MK_STATUS_LABEL[key] || key || 'Không rõ';
+}
+
+function mkVnd(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  return `${Math.round(n).toLocaleString('vi-VN')} ₫`;
+}
+
+/** Câu tiếng Việt cho lỗi MVP-08; mã lạ ⇒ dùng câu THẬT của máy chủ. */
+function mkErrorText(err) {
+  const hint = MK_ERROR_HINT[String(err?.code ?? '')];
+  const server = apiErrorText(err);
+  return hint ? `${hint} (${server})` : server;
+}
+
+/**
+ * Băng nói thật cho một kênh: `dry-run` ⇒ “CHẾ ĐỘ THỬ — không đăng thật”; chưa cấu hình ⇒ câu của
+ * máy chủ (“chưa có token Shopee/TikTok Shop…”); có cấu hình nhưng chưa bật live ⇒ nói rõ.
+ */
+function mkBannerHtml(channel) {
+  const info = mkChannelInfo(channel);
+  if (!info) return `<div class="notice warn"><strong>Kênh ${esc(channel || '?')}:</strong> máy chủ không khai kênh này.</div>`;
+  if (info.is_mock) {
+    // Câu của máy chủ thường đã mở đầu bằng đúng băng này ⇒ bỏ phần trùng để không lặp hai lần.
+    const rest = String(info.notice || 'Không gửi gì lên sàn; mã bài có tiền tố "dry-".').replace(/^CHẾ ĐỘ THỬ — không đăng thật\.?\s*/i, '');
+    return `<div class="notice warn" data-mk-banner="dry-run"><strong>${esc(MK_DRY_RUN_BANNER)}.</strong> ${esc(rest)}</div>`;
+  }
+  if (info.error) {
+    return `<div class="notice error" data-mk-banner="broken"><strong>Kênh ${esc(info.name)} lỗi khởi tạo (${esc(info.error.code)}).</strong> ${esc(info.error.message || '')}</div>`;
+  }
+  if (!info.configured) {
+    return `<div class="notice error" data-mk-banner="not-configured"><strong>Kênh ${esc(info.name)}: ${esc(info.notice || 'chưa có token')}.</strong> Tạo được bài và duyệt được, nhưng KHÔNG đăng được cho tới khi quản trị cấu hình.</div>`;
+  }
+  if (mkConfig()?.live_enabled !== true) {
+    return `<div class="notice warn" data-mk-banner="live-off"><strong>Kênh ${esc(info.name)} đã có cấu hình nhưng chưa bật gọi sàn thật</strong> (MARKETPLACE_LIVE_ENABLED=false). ${esc(info.notice || '')}</div>`;
+  }
+  return `<div class="notice ok" data-mk-banner="live"><strong>Kênh ${esc(info.name)} — gọi API THẬT.</strong> ${esc(info.notice || '')} Mỗi lần ĐĂNG là một lời gọi lên sàn thật.</div>`;
+}
+
+/** `issues[]` hiện TỪNG DÒNG: trường · mã · câu. */
+function mkIssuesHtml(issues) {
+  const list = Array.isArray(issues) ? issues : [];
+  if (!list.length) return '';
+  const rows = list.map((i) => `<li class="small${i?.severity === 'warn' ? ' muted' : ''}" data-mk-issue="${esc(i?.field || '')}">
+      <strong>${esc(i?.field || '?')}</strong> · <span class="mono">${esc(i?.code || '')}</span> — ${esc(i?.message || '')}${i?.severity === 'warn' ? ' <em>(cảnh báo, không chặn)</em>' : ''}
+    </li>`).join('');
+  return `<ul class="mk-issues" style="margin:6px 0 0;padding-left:18px">${rows}</ul>`;
+}
+
+function renderMkChannels() {
+  const cfg = mkConfig();
+  if (!cfg) {
+    return `<div class="notice error"><strong>Máy chủ chưa bật được chức năng đăng sàn</strong> (không có khối <span class="mono">marketplace</span> trong /api/config).</div>`;
+  }
+  const chips = (cfg.channels || []).map((c) => {
+    const cls = c.is_mock ? 'warn' : c.error ? 'error' : c.configured ? 'ok' : '';
+    const text = c.is_mock ? 'chế độ thử' : c.error ? 'lỗi khởi tạo' : c.configured ? (cfg.live_enabled ? 'sẵn sàng (live)' : 'có cấu hình, live tắt') : 'chưa có token';
+    return `<span class="badge ${esc(cls)}" title="${esc(c.notice || '')}">${esc(c.name)} · ${esc(text)}</span>`;
+  }).join(' ');
+  return `<div class="row" style="gap:6px;flex-wrap:wrap">${chips}</div>`;
+}
+
+function renderMkJobOptions() {
+  const jobs = Array.isArray(state.mk.jobs) ? state.mk.jobs : [];
+  const picked = String(state.mk.draft.job_id || '');
+  const opts = jobs.map((jb) => `<option value="${esc(jb.id)}"${jb.id === picked ? ' selected' : ''}>${esc(jb.product_name || jb.source_url || jb.id)} · ${esc(jb.status || '')}</option>`).join('');
+  return `<option value=""${picked ? '' : ' selected'}>— chọn job nguồn —</option>${opts}`;
+}
+
+function renderMkForm() {
+  const m = state.mk;
+  const cfg = mkConfig();
+  if (!cfg) return '';
+  const d = m.draft;
+  const channels = (cfg.channels || []).map((c) => `<option value="${esc(c.name)}"${c.name === (d.channel || cfg.default_channel) ? ' selected' : ''}>${esc(c.name)}${c.is_mock ? ' (chế độ thử)' : c.configured ? '' : ' (chưa có token)'}</option>`).join('');
+  const noticeBox = m.notice ? `<div class="notice ok" id="mk-notice">${esc(m.notice)}</div>` : '';
+  const errorBox = m.error ? `<div class="notice error" id="mk-error">${esc(m.error)}${mkIssuesHtml(m.issues)}</div>` : '';
+  const field = (id, label, type = 'text', extra = '') => `<div class="field">
+      <div class="field-head"><label for="mk-${id}">${esc(label)}</label></div>
+      <input class="text-input" id="mk-${id}" type="${type}" value="${esc(d[id.replace(/-/g, '_')] ?? '')}" ${extra} />
+    </div>`;
+  return `<section class="panel" id="mk-form">
+    <h2>Tạo bài đăng sàn từ một job</h2>
+    <p class="muted small">Tên và mô tả lấy từ nội dung tiếng Việt của job (MVP-01). <strong>Giá bán VND, tồn kho, cân nặng, mã danh mục</strong>
+      là dữ liệu của người bán — hệ thống KHÔNG tự quy đổi giá CNY, KHÔNG đoán danh mục. Thiếu là bị chặn, không điền mặc định.</p>
+    ${mkBannerHtml(d.channel || cfg.default_channel)}
+    ${noticeBox}${errorBox}
+    <div class="field">
+      <div class="field-head"><label for="mk-job-id">Job nguồn</label></div>
+      <select class="text-input" id="mk-job-id">${renderMkJobOptions()}</select>
+    </div>
+    <div class="field">
+      <div class="field-head"><label for="mk-channel">Kênh</label></div>
+      <select class="text-input" id="mk-channel">${channels}</select>
+    </div>
+    <div class="row" style="gap:8px;flex-wrap:wrap">
+      ${field('price-vnd', 'Giá bán (VND, số nguyên)', 'number', 'step="1" min="0" inputmode="numeric"')}
+      ${field('stock', 'Tồn kho (cái)', 'number', 'step="1" min="0" inputmode="numeric"')}
+      ${field('weight-g', 'Cân nặng (gram)', 'number', 'step="1" min="0" inputmode="numeric"')}
+      ${field('category-id', 'Mã danh mục của sàn', 'text', 'placeholder="lấy từ Seller Center"')}
+    </div>
+    <details><summary class="small">Tuỳ chọn: thương hiệu, SKU, kích thước gói (cm), ghi đè tên/mô tả</summary>
+      <div class="row" style="gap:8px;flex-wrap:wrap;margin-top:6px">
+        ${field('brand', 'Thương hiệu')}
+        ${field('sku', 'SKU của bạn')}
+        ${field('length-cm', 'Dài (cm)', 'number', 'step="0.1" min="0"')}
+        ${field('width-cm', 'Rộng (cm)', 'number', 'step="0.1" min="0"')}
+        ${field('height-cm', 'Cao (cm)', 'number', 'step="0.1" min="0"')}
+      </div>
+      ${field('title', 'Ghi đè tên sản phẩm (để trống = lấy từ job)')}
+      ${field('description', 'Ghi đè mô tả (để trống = lấy marketplace_description của job)')}
+    </details>
+    <div class="row" style="margin-top:8px">
+      <button class="btn primary" data-action="mkcreate" type="button"${m.busy ? ' disabled' : ''}>TẠO BÀI (kiểm tra trước khi đăng)</button>
+      <button class="btn ghost tiny" data-action="mkreload" type="button">Tải lại danh sách</button>
+    </div>
+  </section>`;
+}
+
+/** Nút kèm LÝ DO khi khoá (title + data-mk-reason) — người dùng phải biết vì sao không bấm được. */
+function mkButton(action, id, label, { enabled, reason = '', cls = 'btn tiny', busy = false } = {}) {
+  const off = !enabled || busy;
+  return `<button class="${esc(cls)}" data-action="${esc(action)}" data-id="${esc(id)}" type="button"${off ? ' disabled' : ''}${!enabled && reason ? ` title="${esc(reason)}" data-mk-reason="${esc(reason)}"` : ''}>${esc(label)}</button>`;
+}
+
+function renderMkTable(items, { isAdmin = false } = {}) {
+  if (items === null || items === undefined) return '<p class="muted small">Đang tải bài đăng sàn…</p>';
+  if (!Array.isArray(items) || !items.length) return '<p class="muted small">Chưa có bài đăng sàn nào.</p>';
+  const m = state.mk;
+  const rows = items.map((it) => {
+    const id = String(it?.id || '');
+    const st = String(it?.status || '');
+    const info = mkChannelInfo(it?.channel);
+    const configured = Boolean(info?.configured);
+    const canApprove = isAdmin && st === 'pending_review';
+    const canReject = isAdmin && ['pending_review', 'approved', 'failed'].includes(st);
+    const canPublish = ['approved', 'failed'].includes(st) && !it?.external_id && configured;
+    const canSync = Boolean(it?.external_id) && configured && Boolean(info?.capabilities?.readListing);
+    const approveReason = !isAdmin ? 'Chỉ owner/admin được duyệt' : st !== 'pending_review' ? `Bài đang ở trạng thái "${mkStatusLabel(st)}", không duyệt được` : '';
+    const rejectReason = !isAdmin ? 'Chỉ owner/admin được từ chối' : `Bài đang ở trạng thái "${mkStatusLabel(st)}", không từ chối được`;
+    const publishReason = it?.external_id ? 'Bài đã có mã trên sàn — không đăng lại' : !configured ? `Kênh ${it?.channel} chưa cấu hình (${info?.notice || 'chưa có token'})` : st === 'pending_review' ? 'Bài chưa được DUYỆT' : st === 'rejected' ? 'Bài đã bị từ chối' : st === 'publishing' ? 'Đang đăng' : '';
+    const syncReason = !it?.external_id ? 'Chưa có mã trên sàn' : !configured ? 'Kênh chưa cấu hình' : 'Kênh không hỗ trợ đọc';
+    const ext = it?.external_id
+      ? (it.external_url ? `<a href="${esc(it.external_url)}" target="_blank" rel="noopener noreferrer" class="mono small">${esc(it.external_id)}</a>` : `<span class="mono small">${esc(it.external_id)}</span>`)
+      : '<span class="muted">—</span>';
+    const mock = it?.is_mock ? ' <span class="badge warn" title="Kết quả của chế độ thử, không có bài thật">THỬ</span>' : '';
+    const err = it?.error_code ? `<div class="small" style="color:#b91c1c"><span class="mono">${esc(it.error_code)}</span> — ${esc(it.last_error || '')}</div>` : '';
+    const rejectBox = m.rejectId === id
+      ? `<div class="notice error" style="margin-top:6px"><strong>Lý do từ chối (bắt buộc)</strong>
+          <input class="text-input" id="mk-reject-reason" type="text" maxlength="300" value="${esc(m.rejectDraft)}" />
+          <div class="row" style="margin-top:6px">
+            ${mkButton('mkreject', id, 'TỪ CHỐI', { enabled: true, busy: m.busy, cls: 'btn tiny' })}
+            <button class="btn ghost tiny" data-action="mkcancel" type="button">Huỷ</button>
+          </div></div>`
+      : '';
+    const snap = it?.remote_snapshot
+      ? `<div class="small muted">Sàn: giá ${esc(mkVnd(it.remote_snapshot.price))} · tồn ${esc(it.remote_snapshot.stock ?? '—')}${it.remote_snapshot.is_mock ? ' (thử)' : ''} · ${esc(fmtTime(it.synced_at))}</div>`
+      : '';
+    return `<tr data-mk-listing="${esc(id)}">
+      <td class="small">${esc(it?.title || it?.job_id || '—')}<div class="muted small mono">${esc(String(it?.job_id || '').slice(0, 8))}…</div></td>
+      <td class="small">${esc(it?.channel || '')}${info?.is_mock ? ' <span class="badge warn">thử</span>' : ''}</td>
+      <td><span class="badge ${esc(MK_STATUS_CLASS[st] ?? '')}">${esc(mkStatusLabel(st))}</span>${mock}${err}${mkIssuesHtml(it?.issues)}${it?.reject_reason ? `<div class="small">Lý do: ${esc(it.reject_reason)}</div>` : ''}</td>
+      <td class="small mono">${esc(mkVnd(it?.price_vnd))}<br>tồn ${esc(it?.stock ?? '—')}</td>
+      <td>${ext}${snap}</td>
+      <td>
+        <div class="row" style="gap:4px;flex-wrap:wrap">
+          ${mkButton('mkpayload', id, 'XEM PAYLOAD', { enabled: true, cls: 'btn ghost tiny' })}
+          ${mkButton('mkapprove', id, 'DUYỆT', { enabled: canApprove, reason: approveReason, busy: m.busy })}
+          ${mkButton('mkrejectopen', id, 'TỪ CHỐI', { enabled: canReject, reason: rejectReason, busy: m.busy, cls: 'btn ghost tiny' })}
+          ${mkButton('mkpublish', id, 'ĐĂNG', { enabled: canPublish, reason: publishReason, busy: m.busy, cls: 'btn primary tiny' })}
+          ${mkButton('mksync', id, 'ĐỒNG BỘ', { enabled: canSync, reason: syncReason, busy: m.busy, cls: 'btn ghost tiny' })}
+        </div>
+        ${rejectBox}
+      </td>
+    </tr>`;
+  }).join('');
+  return `<div class="il-tablewrap"><table class="evidence mk-table">
+    <thead><tr><th>Sản phẩm (job)</th><th>Kênh</th><th>Trạng thái</th><th>Giá · tồn</th><th>Mã trên sàn</th><th>Hành động</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
+/** Hộp XEM PAYLOAD: payload giữ NGUYÊN + trường không ánh xạ + mặc định đã áp + vết sự kiện. */
+function renderMkPayload() {
+  const m = state.mk;
+  if (!m.payloadId) return '';
+  const d = m.payloadData;
+  if (!d) return `<section class="panel" id="mk-payload"><p class="muted small">Đang tải payload…</p></section>`;
+  const l = d.listing || {};
+  const unmapped = (Array.isArray(l.unmapped) ? l.unmapped : []).map((u) => `<li class="small"><strong>${esc(u.field)}</strong>${u.channel ? ` <span class="muted">(${esc(u.channel)})</span>` : ''} — ${esc(u.reason)}</li>`).join('');
+  const defaults = (Array.isArray(l.defaults_applied) ? l.defaults_applied : []).map((u) => `<li class="small"><strong>${esc(u.field)}</strong> = <span class="mono">${esc(String(u.value))}</span>${u.channel ? ` <span class="muted">(${esc(u.channel)})</span>` : ''} — ${esc(u.reason)}</li>`).join('');
+  const events = (Array.isArray(d.events) ? d.events : []).map((e) => `<li class="small mono">${esc(fmtTime(e.created_at))} · ${esc(e.kind)}${e.to_status ? ` → ${esc(e.to_status)}` : ''}${e.detail?.error_code ? ` · ${esc(e.detail.error_code)}` : ''}</li>`).join('');
+  return `<section class="panel" id="mk-payload">
+    <div class="spread">
+      <h2 style="margin:0">Payload gửi sàn — ${esc(l.channel || '')} · ${esc(l.title || l.id || '')}</h2>
+      <button class="btn ghost tiny" data-action="mkpayloadclose" type="button">Đóng</button>
+    </div>
+    ${mkBannerHtml(l.channel)}
+    <p class="muted small">Payload giữ NGUYÊN như sẽ gửi (trường tiền tố <span class="mono">_vps_</span> chỉ để soi, provider thật bỏ đi trước khi gửi).
+      Tên trường theo tài liệu công khai của sàn, <strong>chưa đo với API thật</strong> — xem VERIFICATION.md §29.</p>
+    <pre class="mono small" style="white-space:pre-wrap;max-height:360px;overflow:auto">${esc(JSON.stringify(l.payload ?? null, null, 2))}</pre>
+    ${unmapped ? `<h3 class="small">Trường KHÔNG ánh xạ được (phải xử tay khi có token)</h3><ul>${unmapped}</ul>` : ''}
+    ${defaults ? `<h3 class="small">Mặc định đã áp (không phải dữ liệu từ nguồn)</h3><ul>${defaults}</ul>` : ''}
+    ${mkIssuesHtml(l.issues)}
+    ${events ? `<h3 class="small">Vết</h3><ul>${events}</ul>` : ''}
+  </section>`;
+}
+
+function renderMarketplaceBody() {
+  const user = currentUser();
+  if (!user) {
+    return `<section class="panel">
+      <h2>Đăng sàn</h2>
+      <div class="notice warn"><strong>Đăng sàn cần tài khoản.</strong>
+        <p class="small" style="margin:6px 0 0">Đăng lên Shopee/TikTok Shop là hành động ra ngoài, phải có người chịu trách nhiệm — khách ẩn danh không dùng được tab này (máy chủ trả 401).</p></div>
+      <div class="row">
+        <button class="btn primary" data-action="login" type="button">Đăng nhập / Đăng ký</button>
+        <button class="btn ghost" data-action="home" type="button">Về trang chủ</button>
+      </div>
+    </section>`;
+  }
+  const m = state.mk;
+  const isAdmin = isAdminRole(user.role);
+  const statuses = ['', 'pending_review', 'approved', 'published', 'failed', 'rejected'].map((s) => `<option value="${esc(s)}"${s === (m.filter.status || '') ? ' selected' : ''}>${s ? esc(mkStatusLabel(s)) : 'Mọi trạng thái'}</option>`).join('');
+  return `<section class="panel">
+    <div class="spread">
+      <div style="min-width:0">
+        <h2 style="margin:0 0 4px">Đăng sàn — Shopee / TikTok Shop</h2>
+        <p class="muted small" style="margin:0">Mọi bài phải được <strong>DUYỆT TAY</strong> (owner/admin) trước khi đăng. Hệ thống không bao giờ tự đăng.
+          ${isAdmin ? 'Bạn là owner/admin: thấy bài của mọi người và duyệt được.' : 'Bạn chỉ thấy bài của mình; cần owner/admin duyệt.'}</p>
+      </div>
+    </div>
+    <div style="margin-top:8px">${renderMkChannels()}</div>
+  </section>
+  ${renderMkForm()}
+  ${renderMkPayload()}
+  <section class="panel">
+    <div class="spread">
+      <h2 style="margin:0">Bài đăng sàn${m.total !== null && m.total !== undefined ? ` (${esc(fmtAmount(m.total))})` : ''}</h2>
+      <div class="row">
+        <select class="text-input mini" id="mk-filter-status">${statuses}</select>
+        <button class="btn ghost tiny" data-action="mkreload" type="button">Tải lại</button>
+      </div>
+    </div>
+    ${m.listError ? `<div class="notice error">${esc(m.listError)}</div>` : ''}
+    ${renderMkTable(m.listings, { isAdmin })}
+  </section>`;
+}
+
+function renderMarketplacePage() {
+  state.view = 'marketplace';
+  app.innerHTML = renderMarketplaceBody();
+}
+
+async function openMarketplace() {
+  state.view = 'marketplace';
+  stopPolling();
+  stopIlPolling();
+  stopIsPolling();
+  await loadMe();
+  renderMarketplacePage();
+  if (!currentUser()) return;
+  await Promise.all([loadMkJobs(), loadMkListings(true)]);
+}
+
+async function loadMkJobs() {
+  const m = state.mk;
+  try {
+    const data = await api('/api/jobs?limit=50');
+    const items = Array.isArray(data?.items) ? data.items : Array.isArray(data?.jobs) ? data.jobs : [];
+    // Chỉ job NỘI DUNG đã chạy xong mới có tên + mô tả tiếng Việt để đăng.
+    m.jobs = items.filter((jb) => !jb?.kind || jb.kind === 'content');
+  } catch (err) {
+    m.jobs = [];
+    m.error = mkErrorText(err);
+  }
+  if (state.view === 'marketplace') renderMarketplacePage();
+}
+
+async function loadMkListings(reset = false) {
+  const m = state.mk;
+  if (m.loading) return;
+  m.loading = true;
+  if (reset) m.listings = null;
+  const params = new URLSearchParams({ limit: '100' });
+  if (m.filter.status) params.set('status', m.filter.status);
+  try {
+    const data = await api(`/api/marketplace/listings?${params.toString()}`);
+    m.listings = Array.isArray(data?.items) ? data.items : [];
+    m.total = Number.isFinite(Number(data?.total)) ? Number(data.total) : m.listings.length;
+    m.listError = null;
+  } catch (err) {
+    m.listings = [];
+    m.listError = err?.status === 503 ? null : mkErrorText(err);
+  } finally {
+    m.loading = false;
+  }
+  if (state.view === 'marketplace') renderMarketplacePage();
+}
+
+/** Đọc form vào bản nháp (giữ chữ khi render lại) rồi gửi `POST /api/marketplace/listings`. */
+async function submitMkListing() {
+  const m = state.mk;
+  if (m.busy) return;
+  const read = (id) => String($(`#mk-${id}`)?.value ?? m.draft[id.replace(/-/g, '_')] ?? '').trim();
+  const d = {
+    job_id: read('job-id'), channel: read('channel'), price_vnd: read('price-vnd'), stock: read('stock'), weight_g: read('weight-g'),
+    category_id: read('category-id'), brand: read('brand'), sku: read('sku'), length_cm: read('length-cm'), width_cm: read('width-cm'),
+    height_cm: read('height-cm'), title: read('title'), description: read('description'),
+  };
+  m.draft = { ...m.draft, ...d };
+  if (!d.job_id) {
+    m.error = MK_ERROR_HINT.BAD_JOB_ID;
+    m.issues = null;
+    m.notice = null;
+    renderMarketplacePage();
+    return;
+  }
+  const num = (v) => (v === '' ? undefined : Number(v));
+  const overrides = {
+    ...(d.price_vnd !== '' ? { price_vnd: num(d.price_vnd) } : {}),
+    ...(d.stock !== '' ? { stock: num(d.stock) } : {}),
+    ...(d.weight_g !== '' ? { weight_g: num(d.weight_g) } : {}),
+    ...(d.category_id ? { category_id: d.category_id } : {}),
+    ...(d.brand ? { brand: d.brand } : {}),
+    ...(d.sku ? { sku: d.sku } : {}),
+    ...(d.length_cm !== '' ? { length_cm: num(d.length_cm) } : {}),
+    ...(d.width_cm !== '' ? { width_cm: num(d.width_cm) } : {}),
+    ...(d.height_cm !== '' ? { height_cm: num(d.height_cm) } : {}),
+    ...(d.title ? { title: d.title } : {}),
+    ...(d.description ? { description: d.description } : {}),
+  };
+  m.busy = true;
+  m.error = null;
+  m.issues = null;
+  m.notice = null;
+  renderMarketplacePage();
+  try {
+    const data = await api('/api/marketplace/listings', { method: 'POST', body: { job_id: d.job_id, channel: d.channel || undefined, overrides } });
+    const warns = Array.isArray(data?.issues) ? data.issues.length : 0;
+    m.notice = data?.idempotent
+      ? `Bài cho job này trên kênh ${d.channel || mkConfig()?.default_channel} đã có từ trước — trả lại bài cũ (không tạo trùng).`
+      : `Đã tạo bài (${mkStatusLabel(data?.listing?.status)})${warns ? ` — ${warns} cảnh báo không chặn, xem ở bảng` : ''}. Chờ owner/admin DUYỆT rồi mới ĐĂNG được.`;
+  } catch (err) {
+    m.error = mkErrorText(err);
+    // 422 PREFLIGHT_FAILED: issues[] nằm trong details — hiện TỪNG DÒNG ngay dưới form.
+    m.issues = Array.isArray(err?.payload?.details?.issues) ? err.payload.details.issues : null;
+  } finally {
+    m.busy = false;
+  }
+  renderMarketplacePage();
+  await loadMkListings(true);
+}
+
+async function mkDecide(id, { reject = false } = {}) {
+  const m = state.mk;
+  if (!id || m.busy) return;
+  const reason = reject ? String($('#mk-reject-reason')?.value ?? m.rejectDraft ?? '').trim() : '';
+  if (reject && !reason) {
+    m.listError = MK_ERROR_HINT.REASON_REQUIRED;
+    renderMarketplacePage();
+    return;
+  }
+  m.busy = true;
+  m.listError = null;
+  renderMarketplacePage();
+  try {
+    const data = await api(`/api/marketplace/listings/${encodeURIComponent(id)}/${reject ? 'reject' : 'approve'}`, { method: 'POST', body: reject ? { reason } : {} });
+    m.notice = reject ? `Đã TỪ CHỐI bài ${id}.` : `Đã DUYỆT bài ${id} — giờ mới bấm ĐĂNG được (${mkStatusLabel(data?.listing?.status)}).`;
+    m.rejectId = null;
+    m.rejectDraft = '';
+  } catch (err) {
+    m.listError = mkErrorText(err);
+  } finally {
+    m.busy = false;
+  }
+  renderMarketplacePage();
+  await loadMkListings(true);
+}
+
+async function mkPublish(id) {
+  const m = state.mk;
+  if (!id || m.busy) return;
+  m.busy = true;
+  m.listError = null;
+  renderMarketplacePage();
+  try {
+    const data = await api(`/api/marketplace/listings/${encodeURIComponent(id)}/publish`, { method: 'POST' });
+    const info = mkChannelInfo(data?.listing?.channel);
+    m.notice = data?.idempotent
+      ? `Bài ${id} đã có mã trên sàn từ trước (${data?.external_id}) — không gọi sàn lại.`
+      : data?.is_mock
+        ? `${MK_DRY_RUN_BANNER}: đã "đăng" ở chế độ thử, mã ${data?.external_id}. KHÔNG có bài thật trên sàn nào.`
+        : `Đã đăng lên ${info?.name || data?.listing?.channel}: mã ${data?.external_id}${data?.url ? ` · ${data.url}` : ''}.`;
+  } catch (err) {
+    // 502 MARKETPLACE_ERROR: giữ mã + nguyên văn của sàn, không nuốt.
+    const raw = err?.payload?.details?.raw;
+    const code = err?.payload?.details?.error_code;
+    m.listError = `${mkErrorText(err)}${code ? ` · mã sàn: ${code}` : ''}${raw ? ` · nguyên văn: ${JSON.stringify(raw).slice(0, 400)}` : ''}`;
+  } finally {
+    m.busy = false;
+  }
+  renderMarketplacePage();
+  await loadMkListings(true);
+}
+
+async function mkSync(id) {
+  const m = state.mk;
+  if (!id || m.busy) return;
+  m.busy = true;
+  m.listError = null;
+  renderMarketplacePage();
+  try {
+    const data = await api(`/api/marketplace/listings/${encodeURIComponent(id)}/sync`, { method: 'POST' });
+    const s = data?.snapshot || {};
+    m.notice = `Đã đọc từ sàn${data?.is_mock ? ' (chế độ thử)' : ''}: giá ${mkVnd(s.price)} · tồn ${s.stock ?? '—'}. Hệ thống chỉ ĐỌC để đối chiếu, không sửa gì trên sàn.`;
+  } catch (err) {
+    m.listError = mkErrorText(err);
+  } finally {
+    m.busy = false;
+  }
+  renderMarketplacePage();
+  await loadMkListings(true);
+}
+
+async function mkShowPayload(id) {
+  const m = state.mk;
+  if (!id) return;
+  m.payloadId = id;
+  m.payloadData = null;
+  renderMarketplacePage();
+  try {
+    m.payloadData = await api(`/api/marketplace/listings/${encodeURIComponent(id)}`);
+  } catch (err) {
+    m.payloadId = null;
+    m.listError = mkErrorText(err);
+  }
+  renderMarketplacePage();
+  $('#mk-payload')?.scrollIntoView?.({ behavior: 'smooth', block: 'start' });
+}

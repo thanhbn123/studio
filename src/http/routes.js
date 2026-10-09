@@ -1952,6 +1952,190 @@ export function buildRouter(app) {
     });
   });
 
+  /* ═════════ MVP-08 · ĐĂNG SẢN PHẨM LÊN SÀN (`docs/MVP-08-CONTRACT.md` §4) ═════════
+   *
+   * CHỈ THÊM route. Bảy đường:
+   *   GET  /api/marketplace/channels                 → [{name, configured, capabilities}] (công khai, chỉ cờ)
+   *   POST /api/marketplace/listings                 {job_id, channel, run_key?, overrides?} → 201 {listing, issues[]}
+   *   GET  /api/marketplace/listings?job_id=&channel=&status=  (chính chủ; admin: tất cả, `mine=1` để xem của mình)
+   *   GET  /api/marketplace/listings/:id             → listing + payload + issues + unmapped + events
+   *   POST /api/marketplace/listings/:id/approve|reject (CHỈ owner/admin — DUYỆT TAY)
+   *   POST /api/marketplace/listings/:id/publish     (chủ hoặc admin; chỉ khi đã DUYỆT)
+   *   POST /api/marketplace/listings/:id/sync        (đọc giá/tồn từ sàn — chỉ kênh đã cấu hình)
+   *
+   * Module nạp ĐỘNG như MVP-05/06: hỏng ⇒ 503 `MARKETPLACE_UNAVAILABLE` nói thẳng, không làm chết
+   * MVP-01/02/03. Ẩn danh ⇒ 401 (đăng sàn KHÔNG dành cho ẩn danh). Khác chủ ⇒ 404.
+   */
+
+  let marketplaceServicePromise = null;
+  const marketplaceEnabled = () => config?.marketplace?.enabled !== false;
+  const marketplaceService = async () => {
+    if (!marketplaceEnabled()) {
+      throw HttpError.safe(503, 'MARKETPLACE_UNAVAILABLE', 'Tính năng đăng sàn đang bị tắt bằng cấu hình (MARKETPLACE_ENABLED=false).');
+    }
+    if (!marketplaceServicePromise) {
+      marketplaceServicePromise = (async () => {
+        try {
+          const [{ createMarketplaceRegistry }, { createMarketplaceService }] = await Promise.all([
+            import('../marketplace/registry.js'),
+            import('../marketplace/publish.js'),
+          ]);
+          const registry = app?.marketplaceRegistry || createMarketplaceRegistry(config, { logger });
+          return createMarketplaceService(config, { store, registry, logger });
+        } catch (err) {
+          logger?.error?.('marketplace.wiring_failed', {
+            error_name: err?.name || 'Error',
+            error_code: err?.code || null,
+            error_message: scrubPaths(String(err?.message || err)),
+          });
+          return null;
+        }
+      })();
+    }
+    const svc = await marketplaceServicePromise;
+    if (!svc) throw HttpError.safe(503, 'MARKETPLACE_UNAVAILABLE', 'Chức năng đăng sàn chưa nạp được trên máy chủ này.');
+    return svc;
+  };
+
+  /** Khối cho `/api/config` — thiếu module ⇒ `null` (UI nói thật). */
+  const marketplacePublicConfig = async () => {
+    if (!marketplaceEnabled()) return null;
+    try {
+      const svc = await marketplaceService();
+      return svc.channelsInfo();
+    } catch {
+      return null;
+    }
+  };
+
+  const marketplaceIsAdmin = (req) => ADMIN_ROLES.has(String(req?.user?.role || 'member'));
+
+  router.get('/api/marketplace/channels', async (req, res) => {
+    const svc = await marketplaceService();
+    sendJson(res, 200, svc.channelsInfo());
+  });
+
+  router.post('/api/marketplace/listings', async (req, res) => {
+    const user = requireUser(req); // ẩn danh ⇒ 401
+    const svc = await marketplaceService();
+    enforce(rateLimiters.requests, `marketplace:create:${clientKey(req)}`);
+    const body = await readJson(req, { maxBytes: 256 * 1024 });
+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw HttpError.safe(400, 'BAD_BODY', 'Body phải là một object JSON.');
+    const jobId = String(body.job_id ?? body.jobId ?? '');
+    if (!UUID_RE.test(jobId)) throw HttpError.safe(400, 'BAD_JOB_ID', 'Thiếu hoặc sai `job_id`.');
+    const job = await requireOwnJob(req, res, jobId); // khác chủ ⇒ 404
+    let out;
+    try {
+      out = await svc.createListing({
+        job,
+        userId: user.id,
+        channel: body.channel ?? null,
+        overrides: body.overrides ?? null,
+        runKey: body.run_key ?? body.runKey ?? null,
+      });
+    } catch (err) {
+      throw mapMarketplaceError(err) || err;
+    }
+    sendJson(res, out.idempotent ? 200 : 201, { listing: marketplaceListingJson(out.listing), issues: out.issues || [], idempotent: Boolean(out.idempotent) });
+  });
+
+  router.get('/api/marketplace/listings', async (req, res) => {
+    const user = requireUser(req);
+    const svc = await marketplaceService();
+    const admin = marketplaceIsAdmin(req);
+    const mineOnly = ['1', 'true', 'yes'].includes(String(req.query.get('mine') ?? '').toLowerCase());
+    const jobId = sanitizeText(req.query.get('job_id'), { maxLength: 64 }) || null;
+    const channel = sanitizeText(req.query.get('channel'), { maxLength: 20 }) || null;
+    const status = sanitizeText(req.query.get('status'), { maxLength: 20 }) || null;
+    let out;
+    try {
+      out = await svc.list({
+        userId: user.id,
+        all: admin && !mineOnly,
+        jobId,
+        channel,
+        status,
+        limit: clampInt(req.query.get('limit'), 50, 1, 200),
+        offset: clampInt(req.query.get('offset'), 0, 0, 1_000_000),
+      });
+    } catch (err) {
+      throw mapMarketplaceError(err) || err;
+    }
+    sendJson(res, 200, { items: (out.items || []).map(marketplaceListingJson), total: Number(out.total) || 0, scope: admin && !mineOnly ? 'all' : 'mine', is_admin: admin });
+  });
+
+  router.get('/api/marketplace/listings/:id', async (req, res, params) => {
+    const user = requireUser(req);
+    const svc = await marketplaceService();
+    let listing;
+    try {
+      listing = await svc.get({ id: String(params?.id ?? ''), requesterId: user.id, isAdmin: marketplaceIsAdmin(req) });
+    } catch (err) {
+      throw mapMarketplaceError(err) || err;
+    }
+    const events = await svc.events(listing.id);
+    sendJson(res, 200, { listing: marketplaceListingJson(listing, { full: true }), events });
+  });
+
+  router.post('/api/marketplace/listings/:id/approve', async (req, res, params) => {
+    const admin = requireAdmin(req); // member ⇒ 403
+    const svc = await marketplaceService();
+    let listing;
+    try {
+      listing = await svc.approve({ id: String(params?.id ?? ''), actorId: admin.id });
+    } catch (err) {
+      throw mapMarketplaceError(err) || err;
+    }
+    sendJson(res, 200, { listing: marketplaceListingJson(listing) });
+  });
+
+  router.post('/api/marketplace/listings/:id/reject', async (req, res, params) => {
+    const admin = requireAdmin(req);
+    const svc = await marketplaceService();
+    const body = await readJson(req, { maxBytes: 32 * 1024 }).catch(() => ({}));
+    let listing;
+    try {
+      listing = await svc.reject({ id: String(params?.id ?? ''), actorId: admin.id, reason: body?.reason ?? '' });
+    } catch (err) {
+      throw mapMarketplaceError(err) || err;
+    }
+    sendJson(res, 200, { listing: marketplaceListingJson(listing) });
+  });
+
+  /* ── ĐĂNG — chỉ khi đã DUYỆT (cổng thật ở `Store#claimMarketplaceListing`) ── */
+  router.post('/api/marketplace/listings/:id/publish', async (req, res, params) => {
+    const user = requireUser(req);
+    const svc = await marketplaceService();
+    let out;
+    try {
+      out = await svc.publish({ id: String(params?.id ?? ''), actorId: user.id, requesterId: user.id, isAdmin: marketplaceIsAdmin(req) });
+    } catch (err) {
+      throw mapMarketplaceError(err) || err;
+    }
+    sendJson(res, 200, {
+      listing: marketplaceListingJson(out.listing),
+      status: out.listing?.status ?? null,
+      external_id: out.listing?.external_id ?? null,
+      url: out.listing?.external_url ?? null,
+      error_code: out.listing?.error_code ?? null,
+      is_mock: Boolean(out.listing?.is_mock),
+      called: Boolean(out.called),
+      idempotent: Boolean(out.idempotent),
+    });
+  });
+
+  router.post('/api/marketplace/listings/:id/sync', async (req, res, params) => {
+    const user = requireUser(req);
+    const svc = await marketplaceService();
+    let out;
+    try {
+      out = await svc.sync({ id: String(params?.id ?? ''), actorId: user.id, requesterId: user.id, isAdmin: marketplaceIsAdmin(req) });
+    } catch (err) {
+      throw mapMarketplaceError(err) || err;
+    }
+    sendJson(res, 200, { listing: marketplaceListingJson(out.listing), snapshot: out.snapshot ?? null, is_mock: Boolean(out.result?.is_mock) });
+  });
+
   /* ─────────────────────────── Capabilities ─────────────────────────── */
 
   router.get('/api/config', async (req, res) => {
@@ -2057,6 +2241,8 @@ export function buildRouter(app) {
         topup: await topupPublicConfig(),
       },
       // §3.4 — trạng thái thật của dịch vụ tài khoản/ví để người vận hành biết VÌ SAO tắt.
+      // MVP-08 (§4/§5) — kênh sàn + cờ live cho tab “Đăng sàn”: chỉ cờ, KHÔNG token. `null` = chưa nạp được module.
+      marketplace: await marketplacePublicConfig(),
       accounts: { available: accountsAvailable(), reason: accountsAvailable() ? null : AUTH_UNAVAILABLE_MESSAGE },
     });
   });
@@ -4361,6 +4547,74 @@ const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 export const IMAGELAB_KINDS = Object.freeze(['descriptive', 'brand', 'certification', 'price', 'unknown']);
 
 const asArray = (v) => (Array.isArray(v) ? v : []);
+
+/* ═════════ MVP-08 — tiện ích JSON + ánh xạ lỗi của đăng sàn ═════════ */
+
+/** Một listing trả cho client. `full: true` kèm payload/input/unmapped (màn chi tiết + nút XEM PAYLOAD). */
+function marketplaceListingJson(row, { full = false } = {}) {
+  if (!row || typeof row !== 'object') return null;
+  const base = {
+    id: row.id ?? null,
+    job_id: row.job_id ?? null,
+    user_id: row.user_id ?? null,
+    channel: row.channel ?? null,
+    status: row.status ?? null,
+    run_key: row.run_key ?? null,
+    external_id: row.external_id ?? null,
+    external_url: row.external_url ?? null,
+    is_mock: Boolean(row.is_mock),
+    error_code: row.error_code ?? null,
+    last_error: row.last_error ?? null,
+    attempts: Number.isFinite(Number(row.attempts)) ? Number(row.attempts) : 0,
+    issues: Array.isArray(row.issues) ? row.issues : [],
+    unmapped_count: Array.isArray(row.unmapped) ? row.unmapped.length : 0,
+    title: row.input?.title ?? null,
+    price_vnd: row.input?.price_vnd ?? null,
+    stock: row.input?.stock ?? null,
+    approved_by: row.approved_by ?? null,
+    approved_at: row.approved_at ?? null,
+    rejected_by: row.rejected_by ?? null,
+    rejected_at: row.rejected_at ?? null,
+    reject_reason: row.reject_reason ?? null,
+    published_at: row.published_at ?? null,
+    remote_snapshot: row.remote_snapshot ?? null,
+    synced_at: row.synced_at ?? null,
+    created_at: row.created_at ?? null,
+    updated_at: row.updated_at ?? null,
+  };
+  if (!full) return base;
+  return {
+    ...base,
+    input: row.input ?? null,
+    overrides: row.overrides ?? null,
+    payload: row.payload ?? null,
+    unmapped: Array.isArray(row.unmapped) ? row.unmapped : [],
+    defaults_applied: Array.isArray(row.defaults_applied) ? row.defaults_applied : [],
+    last_result: row.last_result ?? null,
+  };
+}
+
+/**
+ * Lỗi MVP-08 → HTTP (hợp đồng §4): PREFLIGHT_FAILED ⇒ 422 kèm issues[]; CHANNEL_NOT_CONFIGURED,
+ * NOT_APPROVED, LISTING_ALREADY_DECIDED, PUBLISH_IN_PROGRESS ⇒ 409; MARKETPLACE_ERROR ⇒ 502 + raw
+ * (đã che bí mật); LISTING_NOT_FOUND ⇒ 404; ATTEMPTS_EXCEEDED ⇒ 429.
+ */
+function mapMarketplaceError(err) {
+  if (!err || typeof err !== 'object') return null;
+  const code = String(err.code || '');
+  const d = err.details && typeof err.details === 'object' ? err.details : {};
+  const message = String(err.message || 'Không xử lý được yêu cầu đăng sàn.');
+  if (code === 'PREFLIGHT_FAILED') return HttpError.safe(422, code, message, { channel: d.channel ?? null, issues: Array.isArray(d.issues) ? d.issues : [], input: d.input ?? null, listing_id: d.listing_id ?? null });
+  if (code === 'CHANNEL_NOT_CONFIGURED') return HttpError.safe(409, code, message, { channel: d.channel ?? null, notice: d.notice ?? null, listing_id: d.listing_id ?? null });
+  if (code === 'NOT_APPROVED' || code === 'LISTING_ALREADY_DECIDED' || code === 'PUBLISH_IN_PROGRESS' || code === 'SYNC_UNAVAILABLE') return HttpError.safe(409, code, message, { listing_id: d.listing_id ?? null, status: d.status ?? null });
+  if (code === 'ATTEMPTS_EXCEEDED') return HttpError.safe(429, code, message, { listing_id: d.listing_id ?? null, attempts: d.attempts ?? null, max_attempts: d.max_attempts ?? null });
+  if (code === 'MARKETPLACE_ERROR') return HttpError.safe(502, code, message, { channel: d.channel ?? null, listing_id: d.listing_id ?? null, error_code: d.error_code ?? null, raw: d.raw ?? null, attempts: d.attempts ?? null, max_attempts: d.max_attempts ?? null, listing: d.listing ? marketplaceListingJson(d.listing) : null });
+  if (code === 'LISTING_NOT_FOUND') return HttpError.safe(404, code, 'Không tìm thấy listing.', { listing_id: d.listing_id ?? null });
+  if (code === 'CHANNEL_UNKNOWN' || code === 'BAD_INPUT' || code === 'REASON_REQUIRED') return HttpError.safe(400, code, message, { channel: d.channel ?? null });
+  if (code === 'MARKETPLACE_UNAVAILABLE') return HttpError.safe(503, code, message);
+  return null;
+}
+
 
 /** Parse một cột JSON dạng object (SQLite trả TEXT); trả {} nếu không đọc được. */
 function parseJsonObject(value) {

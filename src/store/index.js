@@ -95,6 +95,15 @@ export const topupRunKey = (requestId) => `topup:${String(requestId ?? '')}`;
 /** Kiểu nhóm của `usageAggregate` (hợp đồng §3.4). */
 export const USAGE_GROUP_BY = Object.freeze(['day', 'operation', 'user']);
 
+/** MVP-08 — trạng thái listing đăng sàn (`docs/MVP-08-CONTRACT.md` §5). */
+export const MARKETPLACE_LISTING_STATUSES = Object.freeze(['draft', 'pending_review', 'approved', 'publishing', 'published', 'failed', 'rejected']);
+/** Cột được phép vá qua `updateMarketplaceListing` — danh sách trắng để không ghi đè cột idempotency/chủ. */
+const MARKETPLACE_PATCHABLE = Object.freeze([
+  'status', 'external_id', 'external_url', 'is_mock', 'error_code', 'last_error', 'last_result', 'approved_by', 'approved_at',
+  'rejected_by', 'rejected_at', 'reject_reason', 'published_at', 'remote_snapshot', 'synced_at', 'issues',
+]);
+const MARKETPLACE_JSON_COLUMNS = Object.freeze(['input', 'overrides', 'payload', 'issues', 'unmapped', 'defaults_applied', 'last_result', 'remote_snapshot']);
+
 /** Nhãn nhóm cho usage của job ẩn danh (`jobs.user_id IS NULL`). */
 export const ANONYMOUS_GROUP_LABEL = '(ẩn danh)';
 
@@ -717,6 +726,13 @@ export class Store {
     await this.#createIndexIfPossible('idx_publish_items_status', 'publish_items', 'status, created_at');
     await this.#createIndexIfPossible('idx_publish_items_job', 'publish_items', 'job_id');
     await this.#createIndexIfPossible('idx_publish_logs_item', 'publish_logs', 'item_id, created_at');
+    // MVP-08 (hợp đồng §1): index của `marketplace_*` tạo Ở ĐÂY, SAU migration (bài học `wallet_ledger.seq`).
+    await this.#createIndexIfPossible('idx_marketplace_listings_user', 'marketplace_listings', 'user_id, created_at');
+    await this.#createIndexIfPossible('idx_marketplace_listings_job', 'marketplace_listings', 'job_id, channel');
+    await this.#createIndexIfPossible('idx_marketplace_listings_status', 'marketplace_listings', 'status, created_at');
+    await this.#createIndexIfPossible('idx_marketplace_events_listing', 'marketplace_events', 'listing_id, created_at');
+    // Luật #3 (không đăng hai lần): một (job, kênh, run_key) chỉ có MỘT listing — chốt ở tầng DB.
+    await this.#createUniqueIndexIfPossible('uniq_marketplace_listings_run', 'marketplace_listings', { columns: 'job_id, channel, run_key' });
   }
 
   /** Xoá index nếu tồn tại — dùng để dọn index của bản trung gian; lỗi chỉ ghi log. */
@@ -1008,6 +1024,162 @@ export class Store {
       }
     }
     this.logger?.info('store.pricing_seeded', { operations: USAGE_OPERATIONS.length, currency });
+  }
+
+  /* ═════════ MVP-08 — LISTING ĐĂNG SÀN (`docs/MVP-08-CONTRACT.md` §1/§5) ═════════
+   * Luật #3 nằm ở hai chỗ: unique (job_id, channel, run_key) + `claimMarketplaceListing` là một
+   * câu UPDATE có điều kiện (cổng duyệt ở tầng DB — không claim được thì không ai gọi sàn).
+   */
+
+  #hydrateMarketplaceListing(row) {
+    if (!row || typeof row !== 'object') return null;
+    const out = { ...row };
+    for (const col of MARKETPLACE_JSON_COLUMNS) out[col] = typeof row[col] === 'string' ? fromJson(row[col]) : (row[col] ?? null);
+    out.is_mock = Number(row.is_mock ?? 0) === 1;
+    out.attempts = Number(toNum(row.attempts, 0));
+    return out;
+  }
+
+  #hydrateMarketplaceEvent(row) {
+    if (!row || typeof row !== 'object') return null;
+    return { ...row, detail: typeof row.detail === 'string' ? fromJson(row.detail) : (row.detail ?? null) };
+  }
+
+  async appendMarketplaceEvent({ id = randomUUID(), listingId = null, listing_id = null, kind = '', fromStatus = null, from_status = null, toStatus = null, to_status = null, actorUserId = null, actor_user_id = null, detail = null } = {}) {
+    const lid = String(listingId || listing_id || '');
+    const k = String(kind || '');
+    if (!lid || !k) throw Object.assign(new Error('appendMarketplaceEvent thiếu listingId/kind.'), { code: 'INVALID_MARKETPLACE_EVENT' });
+    const ts = nowIso();
+    // `seq` tăng dần trong phạm vi một listing — hai sự kiện cùng mili-giây vẫn có thứ tự ổn định.
+    const last = await this.#exec().get('SELECT COALESCE(MAX(seq), 0) AS max_seq FROM marketplace_events WHERE listing_id = ?', [lid]);
+    const seq = Number(toNum(last?.max_seq, 0)) + 1;
+    await this.#exec().run(
+      `INSERT INTO marketplace_events (id, listing_id, seq, kind, from_status, to_status, actor_user_id, detail, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?)`,
+      [id, lid, seq, k, fromStatus ?? from_status ?? null, toStatus ?? to_status ?? null, actorUserId ?? actor_user_id ?? null, toJson(detail && typeof detail === 'object' ? detail : null), ts],
+    );
+    return { id, listing_id: lid, seq, kind: k, from_status: fromStatus ?? from_status ?? null, to_status: toStatus ?? to_status ?? null, actor_user_id: actorUserId ?? actor_user_id ?? null, detail: detail ?? null, created_at: ts };
+  }
+
+  async listMarketplaceEvents(listingId, { limit = 200 } = {}) {
+    if (!listingId) return [];
+    const rows = await this.#exec().all(
+      'SELECT * FROM marketplace_events WHERE listing_id = ? ORDER BY seq ASC, created_at ASC, id ASC LIMIT ?',
+      [String(listingId), clampInt(limit, 200, 1, 1000)],
+    );
+    return (rows || []).map((r) => this.#hydrateMarketplaceEvent(r));
+  }
+
+  /**
+   * Tạo listing. Trùng (job_id, channel, run_key) ⇒ KHÔNG chèn (OR IGNORE / ON CONFLICT DO NOTHING),
+   * trả bản đã có kèm `idempotent: true` — idempotency chốt ở tầng DB, không chỉ ở service.
+   */
+  async createMarketplaceListing({ id = randomUUID(), jobId = null, job_id = null, userId = null, user_id = null, channel = 'dry-run', status = 'pending_review', runKey = null, run_key = null, input = null, overrides = null, payload = null, issues = null, unmapped = null, defaultsApplied = null, defaults_applied = null } = {}) {
+    const jid = String(jobId || job_id || '');
+    const uid = String(userId || user_id || '');
+    const key = String(runKey || run_key || '');
+    if (!jid || !uid || !key) throw Object.assign(new Error('createMarketplaceListing thiếu jobId/userId/runKey.'), { code: 'INVALID_MARKETPLACE_LISTING' });
+    const st = MARKETPLACE_LISTING_STATUSES.includes(String(status)) ? String(status) : 'pending_review';
+    const ts = nowIso();
+    const conflict = this.isPostgres ? 'ON CONFLICT DO NOTHING' : 'OR IGNORE';
+    const res = await this.#exec().run(
+      `INSERT ${this.isPostgres ? 'INTO marketplace_listings' : conflict + ' INTO marketplace_listings'}
+         (id, job_id, user_id, channel, status, run_key, input, overrides, payload, issues, unmapped, defaults_applied, attempts, is_mock, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?)${this.isPostgres ? ` ${conflict}` : ''}`,
+      [id, jid, uid, String(channel || 'dry-run'), st, key, toJson(input), toJson(overrides), toJson(payload), toJson(issues), toJson(unmapped), toJson(defaultsApplied ?? defaults_applied), ts, ts],
+    );
+    if (Number(res?.changes ?? res?.rowCount ?? 1) === 0) {
+      const existing = await this.findMarketplaceListingByRunKey({ jobId: jid, channel, runKey: key });
+      if (existing) return { ...existing, idempotent: true };
+    }
+    return this.getMarketplaceListing(id);
+  }
+
+  async getMarketplaceListing(id) {
+    if (!id) return null;
+    const row = await this.#exec().get('SELECT * FROM marketplace_listings WHERE id = ?', [String(id)]);
+    return row ? this.#hydrateMarketplaceListing(row) : null;
+  }
+
+  async findMarketplaceListingByRunKey({ jobId = null, job_id = null, channel = null, runKey = null, run_key = null } = {}) {
+    const jid = String(jobId || job_id || '');
+    const key = String(runKey || run_key || '');
+    if (!jid || !key) return null;
+    const row = await this.#exec().get(
+      'SELECT * FROM marketplace_listings WHERE job_id = ? AND channel = ? AND run_key = ?',
+      [jid, String(channel || 'dry-run'), key],
+    );
+    return row ? this.#hydrateMarketplaceListing(row) : null;
+  }
+
+  #marketplaceWhere({ userId = null, user_id = null, jobId = null, job_id = null, channel = null, status = null } = {}) {
+    const where = [];
+    const params = [];
+    const uid = userId ?? user_id ?? null;
+    if (uid !== null && uid !== undefined && String(uid)) { where.push('user_id = ?'); params.push(String(uid)); }
+    const jid = jobId ?? job_id ?? null;
+    if (jid) { where.push('job_id = ?'); params.push(String(jid)); }
+    if (channel) { where.push('channel = ?'); params.push(String(channel)); }
+    if (status && MARKETPLACE_LISTING_STATUSES.includes(String(status))) { where.push('status = ?'); params.push(String(status)); }
+    return { clause: where.length ? ` WHERE ${where.join(' AND ')}` : '', params };
+  }
+
+  async listMarketplaceListings({ limit = 50, offset = 0, ...filter } = {}) {
+    const { clause, params } = this.#marketplaceWhere(filter);
+    const rows = await this.#exec().all(
+      `SELECT * FROM marketplace_listings${clause} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+      [...params, clampInt(limit, 50, 1, 500), clampInt(offset, 0, 0, 1_000_000)],
+    );
+    return (rows || []).map((r) => this.#hydrateMarketplaceListing(r));
+  }
+
+  async countMarketplaceListings(filter = {}) {
+    const { clause, params } = this.#marketplaceWhere(filter);
+    const row = await this.#exec().get(`SELECT COUNT(*) AS n FROM marketplace_listings${clause}`, params);
+    return Number(toNum(row?.n, 0));
+  }
+
+  /**
+   * Vá có điều kiện. `fromStatus` ⇒ chỉ vá khi trạng thái hiện tại đúng như vậy (thua cuộc đua ⇒ `null`).
+   * Chỉ cột trong danh sách trắng `MARKETPLACE_PATCHABLE` được vá.
+   */
+  async updateMarketplaceListing(id, patch = {}, { fromStatus = null } = {}) {
+    const rid = String(id ?? '');
+    if (!rid) return null;
+    const sets = [];
+    const params = [];
+    for (const [k, v] of Object.entries(patch || {})) {
+      if (!MARKETPLACE_PATCHABLE.includes(k)) continue;
+      sets.push(`${k} = ?`);
+      if (MARKETPLACE_JSON_COLUMNS.includes(k)) params.push(toJson(v));
+      else if (k === 'is_mock') params.push(v ? 1 : 0);
+      else params.push(v === undefined ? null : v);
+    }
+    sets.push('updated_at = ?');
+    params.push(nowIso());
+    const guard = fromStatus ? ' AND status = ?' : '';
+    if (fromStatus) params.push(String(fromStatus));
+    const res = await this.#exec().run(`UPDATE marketplace_listings SET ${sets.join(', ')} WHERE id = ?${guard}`, [...params.slice(0, sets.length), rid, ...(fromStatus ? [String(fromStatus)] : [])]);
+    if (Number(res?.changes ?? res?.rowCount ?? 0) === 0) return null;
+    return this.getMarketplaceListing(rid);
+  }
+
+  /**
+   * CỔNG DUYỆT Ở TẦNG DB (luật §0 "DUYỆT TAY trước mọi lần đăng"): chỉ listing `approved` (hoặc
+   * `failed` để thử lại) CHƯA có `external_id` và dưới trần `maxAttempts` mới chuyển được sang
+   * `publishing`. Không claim được ⇒ `null` ⇒ service KHÔNG gọi sàn.
+   */
+  async claimMarketplaceListing(id, { maxAttempts = 3 } = {}) {
+    const rid = String(id ?? '');
+    if (!rid) return null;
+    const res = await this.#exec().run(
+      `UPDATE marketplace_listings
+          SET status = 'publishing', attempts = attempts + 1, updated_at = ?
+        WHERE id = ? AND status IN ('approved','failed') AND external_id IS NULL AND attempts < ?`,
+      [nowIso(), rid, clampInt(maxAttempts, 3, 1, 100)],
+    );
+    if (Number(res?.changes ?? res?.rowCount ?? 0) === 0) return null;
+    return this.getMarketplaceListing(rid);
   }
 
   async close() {

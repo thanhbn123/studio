@@ -2602,3 +2602,87 @@ thông tin chuyển khoản" thay vì hiện số bịa.
    Node (không DOM, không Chrome).
 10. **`reference` là chuỗi người dùng tự khai** — chống trùng theo `(user_id, reference)`, nên hai
     người khác nhau vẫn khai được cùng một mã (cố ý: không thể biết mã nào là thật).
+
+## 29. MVP-08 — ĐĂNG SẢN PHẨM LÊN SÀN (Shopee / TikTok Shop): cái gì ĐO ĐƯỢC, cái gì CHƯA
+
+Nhánh `thanhbn123/mvp08-marketplace` · 10/10/2026 · hợp đồng `docs/MVP-08-CONTRACT.md` (đóng băng 09/10).
+**Phạm vi làm được không cần Owner** (hợp đồng mở đầu): lớp trừu tượng + ánh xạ + preflight + nghiệp vụ
+DUYỆT TAY + provider `dry-run`. **Lời gọi API thật** cần tài khoản người bán được duyệt (`OWNER-DECISIONS.md` §3)
+— sprint này **CHƯA TỪNG gọi sàn thật**.
+
+### 29.1 Số đo của bộ test (`env -u DATABASE_URL npm test`, SQLite in-memory, MacBook, 10/10/2026 ~02:1x)
+
+| Mốc | tests | pass | fail | skipped |
+|---|---|---|---|---|
+| `develop` `a60a11e` (trước sprint) | 1125 | 1086 | 0 | 39 |
+| nhánh này | **1187** | **1148** | **0** | 39 |
+
++62 test mới, 0 test cũ vỡ. `node tools/verify.mjs` ⇒ "Kiểm chứng cục bộ hoàn tất."
+(39 ca skipped là bộ PostgreSQL — không có `DATABASE_URL` thì bỏ qua; **chưa đo PostgreSQL thật**, xem 27.4.)
+
+| File test | Số ca | Đo cái gì |
+|---|---|---|
+| `test/marketplace-mapping.test.js` | 18 | `buildListingInput` (nguồn gốc từng trường), `preflight` (thiếu trường ⇒ nêu đúng tên; giới hạn theo sàn), ánh xạ Shopee/TikTok hai chiều, `unmapped[]`/`defaults_applied[]`, chữ ký HMAC tất định |
+| `test/marketplace-service.test.js` | 15 | registry cô lập factory hỏng; dry-run trọn luồng với `globalThis.fetch` ném lỗi (**0 mạng**); idempotent (1 bản ghi, 1 lời gọi provider); sàn A lỗi ⇒ chỉ listing A `failed`, B vẫn đăng; trần 3 lượt; provider thật fail-closed (NOT_CONFIGURED / LIVE_DISABLED / BAD_BASE_URL không chạm mạng); fetch giả ⇒ parse đúng, bí mật bị che, trường `_vps_` bị bỏ |
+| `test/marketplace-api.test.js` | 12 | 401 ẩn danh · 404 job người khác · 422 PREFLIGHT_FAILED kèm issues[] · 409 NOT_APPROVED · 403 member duyệt · đăng dry ⇒ `dry-…`/is_mock · idempotent · 409 CHANNEL_NOT_CONFIGURED · từ chối bắt buộc lý do · phân quyền danh sách · `/api/config.marketplace` không lộ bí mật · `MARKETPLACE_ENABLED=false` ⇒ 503 |
+| `test/marketplace-ui.test.js` | 17 | hàm render THẬT của `public/app.js`: băng “CHẾ ĐỘ THỬ — không đăng thật”, “chưa có token…”, issues[] từng dòng, nút khoá kèm lý do, nhãn THỬ, lỗi sàn nguyên văn, escape XSS, hộp XEM PAYLOAD |
+
+### 29.2 Đã làm (có file, có test)
+
+| Phần | File |
+|---|---|
+| Interface provider + `ListingResult` | `src/marketplace/provider.js` |
+| Registry cô lập (factory hỏng ⇒ `PROVIDER_BROKEN`, kênh khác vẫn chạy) | `src/marketplace/registry.js` |
+| Provider `dry-run` (MẶC ĐỊNH, không `fetch`, mã `dry-<sha256-16>`, `is_mock`) | `src/marketplace/providers/dry-run.js` |
+| Provider `shopee` / `tiktokshop` (fail-closed ba lớp: cấu hình → `liveEnabled` → URL https/host sàn) | `src/marketplace/providers/{shopee,tiktokshop,http}.js` |
+| Ánh xạ hai sàn, `unmapped[]`, `defaults_applied[]` | `src/marketplace/mapping/{shopee,tiktokshop}.js` |
+| Đầu vào chuẩn + preflight (`issues[]` nêu đúng tên trường, giới hạn theo sàn) | `src/marketplace/preflight.js` |
+| Nghiệp vụ: tạo → DUYỆT TAY → đăng (cổng claim ở DB) → đồng bộ chỉ đọc; vết `marketplace_events` | `src/marketplace/publish.js` |
+| Bảng `marketplace_listings` + `marketplace_events`; index/unique index tạo SAU migration; 9 method store | `src/store/schema.sql`, `src/store/index.js` |
+| 7 route `/api/marketplace/*` + `/api/config.marketplace` (chỉ THÊM) | `src/http/routes.js` |
+| Cấu hình `marketplace.*` + mẫu env | `src/config.js`, `.env.example` |
+| Tab **“Đăng sàn”** (`#/dangsan`) | `public/app.js`, `public/index.html` (1 nút nav) |
+
+### 29.3 Bằng chứng THẬT
+
+**(1) Trọn luồng dry-run qua HTTP thật, 0 lời gọi mạng** (`test/marketplace-api.test.js`; `globalThis.fetch`
+ra ngoài máy chủ thử bị thay bằng hàm ném lỗi suốt bộ test):
+```
+POST /listings (thiếu overrides)      → 422 PREFLIGHT_FAILED, issues: category_id, price_vnd, stock, weight_g; DB = 0 bản ghi
+POST /listings (đủ overrides)         → 201 pending_review
+POST /:id/publish (chưa duyệt)        → 409 NOT_APPROVED        (provider calls = 0)
+POST /:id/approve (member)            → 403
+POST /:id/approve (owner)             → 200 approved
+POST /:id/publish                     → 200 published, external_id dry-…, is_mock true, url null, called true
+POST /:id/publish (lần 2)             → 200 idempotent true, called false
+POST /:id/sync                        → 200 snapshot {price 199000, stock 5}, is_mock true
+events: created, approved, publish_started, published, synced (seq 1..5)
+```
+**(2) Cô lập lỗi** (`test/marketplace-service.test.js`): provider giả `shopee` trả `error_param` ⇒ listing A `failed`,
+`last_error` giữ nguyên văn *"invalid category"*, `attempts` 1; listing B trên `tiktokshop` giả vẫn `published`.
+Thử lại A ba lượt ⇒ lượt 4 `ATTEMPTS_EXCEEDED`, provider đúng 3 lời gọi.
+**(3) Fail-closed provider thật:** thiếu token ⇒ `NOT_CONFIGURED`; đủ token + `liveEnabled=false` ⇒ `LIVE_DISABLED`;
+`baseUrl` `http://127.0.0.1:9` ⇒ `BAD_BASE_URL` — cả ba ca `fetchImpl` là hàm ném lỗi và **không bị gọi**.
+**(4) Trình duyệt THẬT (Chrome trong Claude desktop, máy chủ `node src/server.js` SQLite tạm, cổng 3188, 10/10 ~02:0x–02:1x):**
+đăng ký tài khoản thử → nâng owner bằng script → tab Đăng sàn: TẠO BÀI thiếu trường ⇒ 422 hiện 4 lỗi + 2 cảnh báo
+**từng dòng** → điền giá/tồn/cân nặng/danh mục ⇒ “Chờ duyệt” → DUYỆT → ĐĂNG ⇒ “Đã đăng · THỬ”, mã `dry-bb25142daacd668f`
+→ ĐỒNG BỘ ⇒ “giá 199.000 ₫ · tồn 5 (chế độ thử)” → XEM PAYLOAD hiện payload + 8 trường không ánh xạ.
+Console: **0 lỗi JavaScript**; duy nhất một dòng trình duyệt tự ghi cho phản hồi HTTP 422 của ca cố ý thiếu trường.
+Ảnh: `docs/assets/mvp08/01-tab-dang-san-form.jpg`, `02-422-issues-tung-dong.jpg`, `03-xem-payload-unmapped.jpg`, `04-bang-che-do-thu-sau-sua.jpg`.
+Lỗi tìm thấy nhờ trình duyệt và đã sửa: băng “CHẾ ĐỘ THỬ” lặp hai lần (câu của máy chủ đã mở đầu bằng cùng băng).
+
+### 29.4 CHƯA LÀM / CHƯA ĐO (nói thẳng)
+
+1. **CHƯA TỪNG GỌI API THẬT** của Shopee hay TikTok Shop — không có tài khoản người bán được duyệt. Tên trường
+   payload, đường dẫn và cách ký trong `providers/{shopee,tiktokshop}.js` và `mapping/*` viết **theo tài liệu công
+   khai nhớ lại** (tra web 10/10/2026 chỉ xác nhận được đường dẫn `POST /product/202309/products`, `/images/upload`
+   và `/product/add_item`; **bảng trường chính thức không mở được**) ⇒ **phải xác minh trước khi bật
+   `MARKETPLACE_LIVE_ENABLED=true`**. Kiến trúc không đổi khi sửa.
+2. **Chưa upload ảnh lên sàn** (`image_id_list` / `main_images[].uri` rỗng, URL nguồn giữ ở `_vps_image_urls`).
+3. **Chưa ánh xạ biến thể/thuộc tính** (1 SKU; khai `unmapped[]`), chưa đọc kênh vận chuyển / kho của shop.
+4. **Chưa có hàng đợi nền/cron thử lại** — thử lại bằng tay, trần `MARKETPLACE_MAX_ATTEMPTS=3`.
+5. **Chưa đo PostgreSQL thật** cho `marketplace_*` (chưa có `test/pg-*.test.js` cho hai bảng mới; DDL chỉ dùng kiểu
+   chung + index tạo sau migration theo luật §25).
+6. **Chưa có luồng e2e CDP** cho tab này (`tools/e2e/**` nằm ở PR #29 chưa gộp); phần trình duyệt ở 27.3 (4) là đo
+   TAY có ảnh, không phải script lặp lại được.
+7. `GET /api/marketplace/channels` công khai (chỉ cờ) — nếu Owner muốn giấu cả tên kênh thì cần thêm `requireUser`.
