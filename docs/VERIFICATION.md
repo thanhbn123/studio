@@ -2484,3 +2484,121 @@ curl -s --cookie "vauth=<token phiên>" localhost:3000/api/publish/provider   # 
 **thật**, và UI đổi băng vàng “CHẾ ĐỘ THỬ” thành băng xanh “bài được DUYỆT sẽ đăng THẬT”.
 **Luật duyệt tay không đổi:** có token hay không, hệ thống vẫn **không bao giờ** đăng khi chưa có
 người bấm DUYỆT.
+
+---
+
+## 28. MVP-06 — NẠP CREDIT THỦ CÔNG: cái gì ĐO ĐƯỢC, cái gì CHƯA
+
+**Phạm vi là quyết định của Owner (09/10/2026):** chuyển khoản ngân hàng TAY + quản trị viên cấp
+credit. KHÔNG cổng thanh toán, KHÔNG webhook ngân hàng, pháp nhân là **cá nhân**, không hoá đơn.
+Hợp đồng đóng băng: [`MVP-06-CONTRACT.md`](MVP-06-CONTRACT.md).
+
+### 28.1 Số đo của bộ test
+
+```
+env -u DATABASE_URL npm test
+ℹ tests 1170 · pass 1131 · fail 0 · skipped 39        (nền trước khi làm: 1125 · 1086 · 0 · 39)
+```
+
++45 test mới, tất cả xanh: `test/topup-api.test.js` (18) · `test/topup-service.test.js` (10) ·
+`test/topup-ui.test.js` (17). ⚠️ Phải chạy với `env -u DATABASE_URL`: `DATABASE_URL` trong môi
+trường trỏ một PostgreSQL đã tắt, nhóm test PG sẽ `ECONNREFUSED` — đó là môi trường, không phải mã.
+
+### 28.2 Đã làm (có file, có test)
+
+| Phần | File |
+|---|---|
+| Bảng `topup_requests` + `topup_events` (KHÔNG index trong file schema) | `src/store/schema.sql` |
+| Index + unique index tạo **SAU** migration; 6 method store | `src/store/index.js` |
+| Nghiệp vụ (tạo / xem / xác nhận / từ chối, tỷ giá, hướng dẫn chuyển khoản) | `src/billing/topup.js` (mới) |
+| `grant()` nhận thêm `runKey` (ghi cột `wallet_ledger.run_key`) | `src/billing/index.js` |
+| 4 route `/api/billing/topup-requests*` + `/api/config.billing.topup` (**chỉ THÊM**) | `src/http/routes.js` |
+| Cấu hình `billing.topup.*` + mẫu env | `src/config.js`, `.env.example` |
+| UI tab **Tài khoản** (form + hướng dẫn + bảng của tôi) và tab **Quản trị** (pending + XÁC NHẬN/TỪ CHỐI) | `public/app.js` |
+
+### 28.3 Bằng chứng THẬT (chạy trên app dựng thật, SQLite in-memory)
+
+**(1) Tạo yêu cầu KHÔNG đụng ví** — luật #1:
+
+```
+sổ trước  : 0 dòng · số dư 0
+POST /api/billing/topup-requests → 201
+  {"status":"pending","amount_vnd":260000,"credits":10,"rate":26000,"ledger_entry_id":null,"wallet_touched":false}
+sổ sau    : 0 dòng · số dư 0
+```
+
+**(2) `reference` trùng của CÙNG người dùng** (chốt cuối là unique index ở DB):
+
+```
+POST /api/billing/topup-requests → 409
+  {"code":"TOPUP_REFERENCE_DUPLICATE","message":"Mã giao dịch này bạn đã nộp cho một yêu cầu nạp khác.",
+   "details":{"reference":"FT-EV-1"}}
+```
+
+**(3) Xác nhận 2 lần** — lần hai 409, sổ KHÔNG đổi:
+
+```
+lần 1 → 200 {"status":"confirmed","credits":10,"rate":26000,"ledger_amount":10,
+             "run_key":"topup:bfa0f0e0-fd0e-4484-b651-64c8ab0d4394","balance":{"amount":10,"currency":"USD"}}
+sổ      : 1 dòng · số dư (TỔNG SỔ) 10
+lần 2 → 409 {"code":"TOPUP_ALREADY_DECIDED","message":"… đã được quyết định (confirmed) — không xử lý lại,
+             sổ credit không đổi.","details":{"status":"confirmed","decided_at":"2026-10-09T16:56:45.522Z"}}
+sổ sau  : 1 dòng · số dư 10
+vết topup_events: ["NULL→pending","pending→confirmed"]
+```
+
+Hai request XÁC NHẬN **đồng thời** (`Promise.all`) trên cùng một yêu cầu cho `[200, 409]` và đúng
+**1** dòng sổ (`test/topup-api.test.js`): `grant()` và câu `UPDATE … WHERE status='pending'` nằm
+trong CÙNG `store.withLedgerLock(user_id)` ⇒ kẻ thua cuộc đua bị ROLLBACK cả dòng sổ.
+
+**(4) Từ chối ⇒ 0 dòng sổ, có lý do trong vết:**
+
+```
+POST …/reject → 200 {"status":"rejected","ledger":null}
+sổ: 1 → 1 dòng · lý do trong vết: "khong thay giao dich trong sao ke"
+```
+
+**(5) Trần số dư `BILLING_MAX_BALANCE=5`, duyệt 260.000 VND (= 10 credit):**
+
+```
+POST …/confirm → 400
+  {"code":"AMOUNT_TOO_LARGE","message":"Cấp 10 credit làm số dư vượt trần 5 (số dư hiện tại 0)…",
+   "details":{"amount":10,"balance":0,"max_balance":5}}
+sổ: 0 dòng · trạng thái yêu cầu: pending
+```
+
+Nghĩa là: **không cộng được tiền thì KHÔNG được coi là đã duyệt** — admin duyệt lại được (đo thật:
+duyệt lại với `credits: 2` ⇒ 200 + đúng 1 dòng sổ).
+
+**(6) Các luật phân quyền/kiểm tra khác (đều có test):** ẩn danh ⇒ **401** (và 0 dòng
+`topup_requests`) · member gọi confirm/reject ⇒ **403** · yêu cầu của người khác ⇒ **404**
+`TOPUP_NOT_FOUND` (cùng mã với "không tồn tại" ⇒ không dò được id) · `amount_vnd` ngoài
+`[20.000, 50.000.000]` ⇒ **400** `TOPUP_AMOUNT_OUT_OF_RANGE` · thiếu mã giao dịch ⇒ **400**
+`TOPUP_REFERENCE_REQUIRED` · từ chối thiếu lý do ⇒ **400** `TOPUP_REASON_REQUIRED` ·
+đổi `TOPUP_RATE_VND_PER_CREDIT` sau khi duyệt ⇒ yêu cầu CŨ giữ nguyên `rate_vnd_per_credit = 26000`
+(luật #3) · `public/app.js` **không chứa số tài khoản nào** (test quét mã nguồn), số tài khoản đến
+từ `/api/config.billing.topup.bank`; chưa khai `TOPUP_BANK_*` ⇒ UI nói thật "quản trị chưa điền
+thông tin chuyển khoản" thay vì hiện số bịa.
+
+### 28.4 CHƯA LÀM (nói thẳng — đây là giới hạn của phạm vi đã chốt)
+
+1. **CHƯA CÓ CỔNG THANH TOÁN.** Không VNPay/MoMo/Stripe/thẻ. Người dùng tự chuyển khoản tay.
+2. **CHƯA CÓ WEBHOOK NGÂN HÀNG** — hệ thống **không kết nối ngân hàng nào** nên **không tự biết**
+   tiền đã về. Credit chỉ vào ví khi owner/admin bấm XÁC NHẬN. Câu này hiện nguyên văn trên UI.
+3. **CHƯA CÓ HOÁ ĐƠN** (không VAT, không e-invoice) — pháp nhân là cá nhân.
+4. **CHƯA ĐỐI SOÁT TỰ ĐỘNG** với sao kê: admin phải tự đối chiếu mã giao dịch bằng mắt. Hệ thống
+   chỉ chặn việc **nộp trùng một mã** của cùng người dùng, KHÔNG xác minh mã đó có thật.
+5. **CHƯA TỰ HẾT HẠN** yêu cầu `pending`: `expired` có trong lược đồ + store nhận chuyển trạng thái
+   này, nhưng **không có cron/scheduler** nào gọi ⇒ trên thực tế không yêu cầu nào tự thành
+   `expired`.
+6. **CHƯA CÓ THÔNG BÁO** (email/Zalo) khi yêu cầu được duyệt/từ chối — người dùng phải vào tab
+   Tài khoản xem trạng thái.
+7. **CHƯA CÓ HOÀN TIỀN VND**: duyệt sai thì chỉ sửa được bằng `POST /api/admin/users/:id/credit`
+   với số âm (`adjustment`); không có đường "hoàn lại tiền chuyển khoản" trong hệ thống.
+8. **CHƯA ĐO TRÊN POSTGRESQL THẬT**: mọi phép đo trên đây chạy SQLite in-memory
+   (`env -u DATABASE_URL`). Lược đồ dùng SQL di động + `DOUBLE PRECISION` cho cột tiền/credit và
+   index tạo sau migration (đúng luật §25), nhưng **chưa có** `test/pg-*.test.js` cho hai bảng mới.
+9. **CHƯA ĐO BẰNG TRÌNH DUYỆT THẬT**: test UI biên dịch hàm render thật của `public/app.js` trong
+   Node (không DOM, không Chrome).
+10. **`reference` là chuỗi người dùng tự khai** — chống trùng theo `(user_id, reference)`, nên hai
+    người khác nhau vẫn khai được cùng một mã (cố ý: không thể biết mã nào là thật).

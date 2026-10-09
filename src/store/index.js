@@ -77,6 +77,21 @@ export const LEDGER_REASONS = Object.freeze([
   'adjustment',
 ]);
 
+/**
+ * MVP-06 — trạng thái của một YÊU CẦU NẠP CREDIT (`docs/MVP-06-CONTRACT.md` §2).
+ * ĐÓNG BĂNG: `pending` → `confirmed` | `rejected` | `expired`; không có đường quay lại.
+ */
+export const TOPUP_STATUSES = Object.freeze(['pending', 'confirmed', 'rejected', 'expired']);
+
+/** Trạng thái CUỐI (đã quyết định) — chuyển tiếp từ đây là vi phạm luật #2. */
+export const TOPUP_FINAL_STATUSES = Object.freeze(['confirmed', 'rejected', 'expired']);
+
+/** Cách nạp duy nhất của giai đoạn này: chuyển khoản tay (KHÔNG có cổng thanh toán). */
+export const TOPUP_METHODS = Object.freeze(['bank_transfer']);
+
+/** `run_key` của dòng sổ sinh ra khi xác nhận một yêu cầu nạp — chống cộng 2 lần. */
+export const topupRunKey = (requestId) => `topup:${String(requestId ?? '')}`;
+
 /** Kiểu nhóm của `usageAggregate` (hợp đồng §3.4). */
 export const USAGE_GROUP_BY = Object.freeze(['day', 'operation', 'user']);
 
@@ -662,6 +677,25 @@ export class Store {
     // mục sống cùng `(job_id, handler)` là HỢP LỆ. Khoá idempotency thật nằm ở `job_queue.id`
     // (id tất định theo `(jobId, handler, runKey)` do JobQueue truyền vào) — xem `enqueueJob`.
     // Dòng dưới chỉ để DỌN index mà bản R1-Q trung gian đã tạo (idempotent, DB mới không có gì).
+    // MVP-06 (`docs/MVP-06-CONTRACT.md` §2) — index của `topup_requests`/`topup_events` tạo Ở ĐÂY,
+    // SAU migration (bài học `wallet_ledger.seq`: index trong `schema.sql` chạy TRƯỚC migration nên
+    // DB cũ thiếu cột sẽ chết `init()`). Lỗi ở đây chỉ ghi log, KHÔNG làm chết boot.
+    await this.#createIndexIfPossible('idx_topup_requests_user', 'topup_requests', 'user_id, created_at');
+    await this.#createIndexIfPossible('idx_topup_requests_status', 'topup_requests', 'status, created_at');
+    await this.#createIndexIfPossible('idx_topup_events_request', 'topup_events', 'request_id, created_at');
+    // Chống KHAI KHỐNG: cùng một người dùng không được nộp hai yêu cầu mang CÙNG mã giao dịch
+    // ngân hàng. Partial unique index (bỏ qua `reference` rỗng) chạy được trên cả hai dialect;
+    // tầng store dịch lỗi UNIQUE thành `TOPUP_REFERENCE_DUPLICATE` (route trả 409).
+    await this.#createUniqueIndexIfPossible('uniq_topup_requests_reference', 'topup_requests', {
+      columns: 'user_id, reference',
+      where: "reference IS NOT NULL AND reference <> ''",
+    });
+    // Chống CỘNG 2 LẦN ở TẦNG DB: mỗi `run_key = 'topup:<id>'` chỉ được có ĐÚNG MỘT dòng sổ.
+    // Dòng `admin_grant` thường có `run_key = NULL` nên index này chỉ chạm vào dòng của MVP-06.
+    await this.#createUniqueIndexIfPossible('uniq_wallet_ledger_topup_run', 'wallet_ledger', {
+      columns: 'user_id, run_key',
+      where: "run_key IS NOT NULL AND reason IN ('admin_grant','grant','adjustment')",
+    });
     await this.#dropIndexIfPossible('uniq_job_queue_live');
     // MVP-07 (§3.2): hai bảng đăng bài là BẢNG MỚI nên `CREATE TABLE IF NOT EXISTS` trong
     // `schema.sql` đã tạo đủ cột trên DB trắng. Những lệnh dưới đây lo cho DB tạo bởi một bản
@@ -2037,6 +2071,225 @@ export class Store {
       await tx.run('SELECT pg_advisory_xact_lock(hashtext(?)::bigint)', [uid]);
       return this.#txAls.run({ tx, userId: uid }, () => fn(this.#txView(tx)));
     });
+  }
+
+  /* ═════════ MVP-06 — YÊU CẦU NẠP CREDIT THỦ CÔNG (`docs/MVP-06-CONTRACT.md` §2) ═════════
+   *
+   * Ba luật của hợp đồng được giữ NGAY Ở TẦNG NÀY:
+   *   #1 KHÔNG tự cộng tiền — ở đây KHÔNG có lời gọi `appendLedger` nào. Tạo yêu cầu chỉ ghi
+   *      `topup_requests` + `topup_events`; ví KHÔNG bị chạm tới.
+   *   #2 Có vết — `createTopupRequest`/`decideTopupRequest` LUÔN ghi kèm một dòng `topup_events`
+   *      trong CÙNG transaction; không có hàm nào sửa `amount_vnd`/`reference` hay xoá yêu cầu.
+   *   #3 Quyết định là NGUYÊN TỬ và MỘT LẦN — `decideTopupRequest` là MỘT câu UPDATE có điều
+   *      kiện `status = 'pending'`; `changes = 0` ⇒ trả `null` ⇒ tầng trên trả 409
+   *      `TOPUP_ALREADY_DECIDED` (hai admin bấm cùng lúc chỉ MỘT người thắng).
+   *
+   * Mọi câu lệnh dùng `#exec()` nên khi được gọi BÊN TRONG `withLedgerLock` (lúc xác nhận)
+   * chúng chạy trong CHÍNH transaction đó ⇒ "chuyển trạng thái + ghi dòng sổ" cùng sống cùng
+   * chết: grant lỗi (vượt trần số dư) ⇒ rollback ⇒ yêu cầu vẫn `pending`.
+   */
+
+  #hydrateTopupRequest(row) {
+    if (!row || typeof row !== 'object') return null;
+    return {
+      id: row.id,
+      user_id: row.user_id ?? null,
+      amount_vnd: Number(toNum(row.amount_vnd, 0)),
+      credits: row.credits === null || row.credits === undefined ? null : roundMoney(row.credits),
+      rate_vnd_per_credit: toNum(row.rate_vnd_per_credit, null),
+      method: row.method || 'bank_transfer',
+      reference: row.reference ?? '',
+      note: row.note ?? '',
+      status: row.status || 'pending',
+      created_at: row.created_at,
+      decided_at: row.decided_at ?? null,
+      decided_by: row.decided_by ?? null,
+      ledger_entry_id: row.ledger_entry_id ?? null,
+      run_key: row.run_key ?? null,
+    };
+  }
+
+  #hydrateTopupEvent(row) {
+    if (!row || typeof row !== 'object') return null;
+    return {
+      id: row.id,
+      request_id: row.request_id,
+      from_status: row.from_status ?? null,
+      to_status: row.to_status,
+      actor_user_id: row.actor_user_id ?? null,
+      reason: row.reason ?? '',
+      created_at: row.created_at,
+    };
+  }
+
+  /** Một dòng vết chuyển trạng thái (append-only). Dùng chung cho tạo và quyết định. */
+  async appendTopupEvent({ id = randomUUID(), requestId = null, request_id = null, fromStatus = null, from_status = null, toStatus = null, to_status = null, actorUserId = null, actor_user_id = null, reason = '' } = {}) {
+    const rid = String(requestId || request_id || '');
+    const to = String(toStatus || to_status || '');
+    if (!rid || !to) {
+      throw Object.assign(new Error('appendTopupEvent thiếu requestId/toStatus.'), { code: 'INVALID_TOPUP_EVENT' });
+    }
+    const ts = nowIso();
+    await this.#exec().run(
+      `INSERT INTO topup_events (id, request_id, from_status, to_status, actor_user_id, reason, created_at)
+       VALUES (?,?,?,?,?,?,?)`,
+      [id, rid, fromStatus ?? from_status ?? null, to, actorUserId ?? actor_user_id ?? null, String(reason ?? ''), ts],
+    );
+    return this.#hydrateTopupEvent({
+      id, request_id: rid, from_status: fromStatus ?? from_status ?? null, to_status: to,
+      actor_user_id: actorUserId ?? actor_user_id ?? null, reason: String(reason ?? ''), created_at: ts,
+    });
+  }
+
+  /**
+   * Tạo yêu cầu nạp — KHÔNG ĐỤNG VÍ (luật #1). `credits`/`rate_vnd_per_credit` ghi ở đây chỉ là
+   * BẢN XEM TRƯỚC theo tỷ giá hiện hành; con số CÓ HIỆU LỰC được ghi lại lúc duyệt (luật #3).
+   *
+   * `reference` trùng của CÙNG người dùng ⇒ lỗi `TOPUP_REFERENCE_DUPLICATE` (unique index ở DB
+   * là chốt cuối, nên hai request đồng thời cũng không lọt).
+   */
+  async createTopupRequest({ id = randomUUID(), userId = null, user_id = null, amountVnd = null, amount_vnd = null, credits = null, rateVndPerCredit = null, rate_vnd_per_credit = null, method = 'bank_transfer', reference = '', note = '', status = 'pending' } = {}) {
+    const uid = String(userId || user_id || '');
+    if (!uid) throw Object.assign(new Error('createTopupRequest thiếu userId (ẩn danh KHÔNG được nạp).'), { code: 'INVALID_TOPUP_REQUEST' });
+    const amount = toIntOrNull(amountVnd ?? amount_vnd);
+    if (amount === null) {
+      throw Object.assign(new Error('createTopupRequest: `amount_vnd` phải là số nguyên.'), { code: 'INVALID_TOPUP_AMOUNT' });
+    }
+    const st = TOPUP_STATUSES.includes(String(status)) ? String(status) : 'pending';
+    const ts = nowIso();
+    const row = [
+      id, uid, amount,
+      credits === null || credits === undefined ? null : roundMoney(credits),
+      toNum(rateVndPerCredit ?? rate_vnd_per_credit, null),
+      TOPUP_METHODS.includes(String(method)) ? String(method) : 'bank_transfer',
+      String(reference ?? ''), String(note ?? ''), st, ts, null, null, null, topupRunKey(id),
+    ];
+    const insert = async () => {
+      await this.#exec().run(
+        `INSERT INTO topup_requests
+           (id, user_id, amount_vnd, credits, rate_vnd_per_credit, method, reference, note, status,
+            created_at, decided_at, decided_by, ledger_entry_id, run_key)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        row,
+      );
+      // Luật #2: tạo yêu cầu cũng là MỘT lần chuyển trạng thái (NULL → pending) ⇒ phải có vết.
+      await this.appendTopupEvent({ requestId: id, fromStatus: null, toStatus: st, actorUserId: uid, reason: 'người dùng tạo yêu cầu nạp' });
+    };
+    try {
+      // Hai câu ghi phải cùng sống cùng chết: yêu cầu KHÔNG được tồn tại mà không có vết.
+      if (this.#activeTx()) await insert();
+      else await this.#inTransaction(() => insert());
+    } catch (err) {
+      const text = `${err?.code ?? ''} ${err?.message ?? ''}`;
+      if (err?.code === '23505' || /UNIQUE|duplicate key/i.test(text)) {
+        throw Object.assign(
+          new Error('Mã giao dịch này bạn đã nộp cho một yêu cầu nạp khác.'),
+          { code: 'TOPUP_REFERENCE_DUPLICATE', details: { user_id: uid, reference: String(reference ?? '') }, cause: err },
+        );
+      }
+      throw err;
+    }
+    return this.getTopupRequest(id);
+  }
+
+  async getTopupRequest(id) {
+    if (!id) return null;
+    const row = await this.#exec().get('SELECT * FROM topup_requests WHERE id = ?', [String(id)]);
+    return row ? this.#hydrateTopupRequest(row) : null;
+  }
+
+  /**
+   * Danh sách yêu cầu nạp. `userId` = null ⇒ TẤT CẢ (chỉ đường admin được gọi như vậy — tầng
+   * route chịu trách nhiệm phân quyền). Sắp theo `created_at` giảm dần, phá hoà bằng `id`
+   * để phân trang KHÔNG trùng/sót khi nhiều dòng cùng mili-giây.
+   */
+  async listTopupRequests({ userId = null, user_id = null, status = null, limit = 50, offset = 0 } = {}) {
+    const uid = userId ?? user_id ?? null;
+    const where = [];
+    const params = [];
+    if (uid !== null && uid !== undefined && String(uid)) {
+      where.push('user_id = ?');
+      params.push(String(uid));
+    }
+    if (status && TOPUP_STATUSES.includes(String(status))) {
+      where.push('status = ?');
+      params.push(String(status));
+    }
+    const clause = where.length ? ` WHERE ${where.join(' AND ')}` : '';
+    const rows = await this.#exec().all(
+      `SELECT * FROM topup_requests${clause} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+      [...params, clampInt(limit, 50, 1, 500), clampInt(offset, 0, 0, 1_000_000)],
+    );
+    return (rows || []).map((row) => this.#hydrateTopupRequest(row));
+  }
+
+  async countTopupRequests({ userId = null, user_id = null, status = null } = {}) {
+    const uid = userId ?? user_id ?? null;
+    const where = [];
+    const params = [];
+    if (uid !== null && uid !== undefined && String(uid)) {
+      where.push('user_id = ?');
+      params.push(String(uid));
+    }
+    if (status && TOPUP_STATUSES.includes(String(status))) {
+      where.push('status = ?');
+      params.push(String(status));
+    }
+    const clause = where.length ? ` WHERE ${where.join(' AND ')}` : '';
+    const row = await this.#exec().get(`SELECT COUNT(*) AS n FROM topup_requests${clause}`, params);
+    return Number(toNum(row?.n, 0));
+  }
+
+  async listTopupEvents(requestId, { limit = 100 } = {}) {
+    if (!requestId) return [];
+    const rows = await this.#exec().all(
+      'SELECT * FROM topup_events WHERE request_id = ? ORDER BY created_at ASC, id ASC LIMIT ?',
+      [String(requestId), clampInt(limit, 100, 1, 1000)],
+    );
+    return (rows || []).map((row) => this.#hydrateTopupEvent(row));
+  }
+
+  /**
+   * CHUYỂN TRẠNG THÁI MỘT LẦN DUY NHẤT (luật #2/#3) — MỘT câu UPDATE có điều kiện
+   * `status = 'pending'`, kèm MỘT dòng `topup_events`.
+   *
+   * @returns {Promise<object|null>} yêu cầu sau khi chuyển, hoặc `null` nếu KHÔNG còn `pending`
+   *   (đã có người quyết định trước) ⇒ tầng trên trả 409 `TOPUP_ALREADY_DECIDED` và sổ KHÔNG đổi.
+   */
+  async decideTopupRequest(id, { toStatus = null, to_status = null, actorUserId = null, actor_user_id = null, reason = '', credits = null, rateVndPerCredit = null, rate_vnd_per_credit = null, ledgerEntryId = null, ledger_entry_id = null } = {}) {
+    const rid = String(id ?? '');
+    const to = String(toStatus || to_status || '');
+    if (!rid || !TOPUP_FINAL_STATUSES.includes(to)) {
+      throw Object.assign(
+        new Error(`decideTopupRequest: trạng thái đích phải là một trong ${TOPUP_FINAL_STATUSES.join('|')}.`),
+        { code: 'INVALID_TOPUP_STATUS', details: { request_id: rid, to_status: to } },
+      );
+    }
+    const ts = nowIso();
+    const apply = async () => {
+      const res = await this.#exec().run(
+        `UPDATE topup_requests
+            SET status = ?, decided_at = ?, decided_by = ?,
+                credits = COALESCE(?, credits),
+                rate_vnd_per_credit = COALESCE(?, rate_vnd_per_credit),
+                ledger_entry_id = COALESCE(?, ledger_entry_id)
+          WHERE id = ? AND status = 'pending'`,
+        [
+          to, ts, actorUserId ?? actor_user_id ?? null,
+          credits === null || credits === undefined ? null : roundMoney(credits),
+          toNum(rateVndPerCredit ?? rate_vnd_per_credit, null),
+          ledgerEntryId ?? ledger_entry_id ?? null,
+          rid,
+        ],
+      );
+      // `changes` là số dòng ĐÃ ĐỔI: 0 ⇒ yêu cầu không còn `pending` (hoặc không tồn tại).
+      const changed = Number(res?.changes ?? res?.rowCount ?? 0);
+      if (!Number.isFinite(changed) || changed <= 0) return null;
+      await this.appendTopupEvent({ requestId: rid, fromStatus: 'pending', toStatus: to, actorUserId: actorUserId ?? actor_user_id ?? null, reason });
+      return this.getTopupRequest(rid);
+    };
+    if (this.#activeTx()) return apply();
+    return this.#inTransaction(() => apply());
   }
 
   /* ───────────────────────── §2.2 — bảng `job_queue` ───────────────────────── */

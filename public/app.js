@@ -243,6 +243,21 @@ const state = {
     creditConfirm: null, // { userId, email, amount, note } — đã xem lại, chờ xác nhận
     roleDraft: {}, // userId → vai trò đang chọn (chưa lưu)
   },
+  // MVP-06 — Nạp credit thủ công (`docs/MVP-06-CONTRACT.md` §4). Giao diện KHÔNG giữ bất kỳ
+  // thông tin ngân hàng cứng nào: số tài khoản lấy từ `/api/config` (`billing.topup.bank`).
+  topup: {
+    requests: null, // yêu cầu của CHÍNH tôi (null = chưa tải)
+    loading: false,
+    busy: false,
+    draft: { amount_vnd: '', reference: '', note: '' },
+    error: null,
+    notice: null,
+    admin: null, // yêu cầu `pending` của MỌI người (trang Quản trị)
+    adminLoading: false,
+    confirmId: null, // đang chờ xác nhận lần hai cho yêu cầu nào
+    rejectId: null, // đang mở ô lý do từ chối cho yêu cầu nào
+    rejectDraft: '',
+  },
   // 402 INSUFFICIENT_CREDIT gặp ở BẤT KỲ thao tác nào (kể cả trong `api()`) ⇒ băng báo dùng chung.
   creditAlert: null,
   // MVP-03 — Tạo ảnh (imagestudio). Tách riêng khỏi `il` để không giẫm chân MVP-02.
@@ -649,6 +664,33 @@ function onGlobalClick(ev) {
     usersreload: () => loadAdminUsers(true),
     usersMore: () => loadAdminUsers(false),
     usageload: () => loadAdminUsage(true),
+    // ── MVP-06 — nạp credit thủ công ──
+    topupsubmit: () => submitTopup(),
+    topupreload: () => loadTopups(true),
+    topupadminreload: () => loadAdminTopups(true),
+    topupreview: () => {
+      state.topup.confirmId = String(btn.dataset.id || '');
+      state.topup.rejectId = null;
+      state.auth.adminError = null;
+      state.auth.adminNotice = null;
+      renderAdminPage();
+    },
+    topuprejectopen: () => {
+      state.topup.rejectId = String(btn.dataset.id || '');
+      state.topup.confirmId = null;
+      state.topup.rejectDraft = '';
+      state.auth.adminError = null;
+      state.auth.adminNotice = null;
+      renderAdminPage();
+    },
+    topupcancel: () => {
+      state.topup.confirmId = null;
+      state.topup.rejectId = null;
+      state.topup.rejectDraft = '';
+      renderAdminPage();
+    },
+    topupconfirm: () => decideTopup(btn.dataset.id, { reject: false }),
+    topupreject: () => decideTopup(btn.dataset.id, { reject: true }),
     creditdismiss: () => dismissCreditAlert(),
   };
   if (handlers[action]) handlers[action](ev);
@@ -5328,7 +5370,69 @@ const AUTH_ERROR_HINT = {
 
 // Nói thẳng, không hứa hẹn: credit nội bộ, chưa có cổng thanh toán.
 const CREDIT_HONEST_NOTE = 'Credit nội bộ — KHÔNG phải tiền thật. Số dư = tổng sổ (append-only), không sửa tay được.';
-const CREDIT_TOPUP_HINT = 'Giai đoạn này CHƯA có cổng thanh toán: credit chỉ do quản trị viên cấp tay (trang Quản trị). Không có khoản thanh toán nào được thực hiện ở đây.';
+const CREDIT_TOPUP_HINT = 'Giai đoạn này CHƯA có cổng thanh toán: bạn chuyển khoản TAY theo hướng dẫn bên dưới rồi gửi yêu cầu nạp; credit vào ví sau khi quản trị XÁC NHẬN.';
+
+/* ───────────────── MVP-06 — Nạp credit thủ công (hợp đồng §4) ───────────────── */
+
+const TOPUP_STATUS_LABEL = {
+  pending: 'Chờ quản trị xác nhận',
+  confirmed: 'Đã cộng credit',
+  rejected: 'Bị từ chối',
+  expired: 'Đã hết hạn',
+};
+
+const TOPUP_STATUS_CLASS = { pending: 'warn', confirmed: 'ok', rejected: 'error', expired: '' };
+
+// Câu NÓI THẬT của hợp đồng §4. Máy chủ cũng trả câu này trong `/api/config`
+// (`billing.topup.note`); khi có thì ưu tiên câu của máy chủ để không có hai bản chữ lệch nhau.
+const TOPUP_HONEST_NOTE = 'Tiền vào ví chỉ sau khi quản trị xác nhận — hệ thống không tự biết tiền đã về tài khoản.';
+
+const TOPUP_ERROR_HINT = {
+  TOPUP_AMOUNT_OUT_OF_RANGE: 'Số tiền nạp nằm ngoài khoảng cho phép.',
+  TOPUP_AMOUNT_INVALID: 'Số tiền phải là số nguyên (đồng VND), ví dụ 260000.',
+  TOPUP_REFERENCE_REQUIRED: 'Cần mã giao dịch / nội dung chuyển khoản để quản trị đối soát với sao kê.',
+  TOPUP_REFERENCE_DUPLICATE: 'Mã giao dịch này bạn đã gửi cho một yêu cầu khác rồi.',
+  TOPUP_ALREADY_DECIDED: 'Yêu cầu này đã được quyết định trước đó — sổ credit không đổi.',
+  TOPUP_REASON_REQUIRED: 'Từ chối phải có lý do.',
+  TOPUP_NOT_FOUND: 'Không tìm thấy yêu cầu nạp này.',
+  TOPUP_UNAVAILABLE: 'Máy chủ chưa bật được chức năng nạp credit.',
+  AMOUNT_TOO_LARGE: 'Số credit làm số dư vượt trần cho phép — hãy duyệt số nhỏ hơn.',
+};
+
+/** Khối cấu hình nạp credit do máy chủ trả (`/api/config`). `null` ⇒ chức năng chưa bật. */
+function topupConfig() {
+  const t = state.config?.billing?.topup;
+  return t && typeof t === 'object' ? t : null;
+}
+
+function topupEnabled() {
+  return Boolean(topupConfig());
+}
+
+function topupNote() {
+  const text = topupConfig()?.note;
+  return typeof text === 'string' && text ? text : TOPUP_HONEST_NOTE;
+}
+
+function topupStatusLabel(status) {
+  const key = String(status ?? '');
+  return TOPUP_STATUS_LABEL[key] || key || 'Không rõ';
+}
+
+/** Tiền VND: có dấu phân cách nghìn để không đọc nhầm 26000 ↔ 260000. */
+function fmtVnd(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  return `${Math.round(n).toLocaleString('vi-VN')} ₫`;
+}
+
+/** Quy đổi VND → credit theo tỷ giá máy chủ. Thiếu tỷ giá ⇒ `null` (KHÔNG tự bịa tỷ giá). */
+function topupCredits(amountVnd, rate = topupConfig()?.rate_vnd_per_credit) {
+  const amount = Number(amountVnd);
+  const r = Number(rate);
+  if (!Number.isFinite(amount) || !Number.isFinite(r) || r <= 0) return null;
+  return Math.round((amount / r) * 1e6) / 1e6;
+}
 
 const LEDGER_PAGE_SIZE = 50;
 const ADMIN_PAGE_SIZE = 50;
@@ -5765,6 +5869,174 @@ function renderPricingTable(pricing) {
     <tbody>${rows}</tbody></table></div>`;
 }
 
+/* ── MVP-06 · Nạp credit thủ công — tab Tài khoản (hợp đồng §4) ───────────── */
+
+/**
+ * HƯỚNG DẪN CHUYỂN KHOẢN — số tài khoản LẤY TỪ CẤU HÌNH MÁY CHỦ (`/api/config`).
+ * ⚠️ TUYỆT ĐỐI không hardcode số tài khoản ở đây: quản trị chưa điền ⇒ nói thật là chưa có,
+ * thà không nạp được còn hơn hiện một số tài khoản bịa và người dùng chuyển tiền đi đâu đó.
+ */
+function renderTopupGuide() {
+  const cfg = topupConfig();
+  const bank = cfg?.bank || null;
+  if (!bank || bank.configured === false) {
+    return `<div class="notice error">
+      <strong>Quản trị chưa điền thông tin chuyển khoản.</strong>
+      <p class="small" style="margin:6px 0 0">Chưa có số tài khoản nào được cấu hình trên máy chủ
+      (<span class="mono">TOPUP_BANK_*</span>), nên giao diện KHÔNG hiện số tài khoản nào —
+      hãy liên hệ quản trị trước khi chuyển tiền.</p>
+    </div>`;
+  }
+  const rows = [
+    ['Ngân hàng', bank.bank_name],
+    ['Số tài khoản', bank.account_number],
+    ['Chủ tài khoản', bank.account_holder],
+    ['Nội dung chuyển khoản', bank.transfer_note],
+  ].filter(([, value]) => value)
+    .map(([label, value]) => `<dt>${esc(label)}</dt><dd class="mono">${esc(value)}</dd>`)
+    .join('');
+  return `<dl class="kv">${rows}</dl>
+    ${bank.instructions ? `<p class="small muted">${esc(bank.instructions)}</p>` : ''}`;
+}
+
+/** Bảng yêu cầu nạp CỦA TÔI. `null` = chưa tải (không hiện "trống" khi chưa biết). */
+function renderTopupTable(items) {
+  if (items === null || items === undefined) return '<p class="muted small">Đang tải yêu cầu nạp…</p>';
+  if (!Array.isArray(items) || items.length === 0) return '<p class="muted small">Bạn chưa có yêu cầu nạp nào.</p>';
+  const rows = items.map((it) => {
+    const badge = TOPUP_STATUS_CLASS[String(it?.status ?? '')] ?? '';
+    return `<tr>
+      <td class="mono small">${esc(fmtTime(it?.created_at))}</td>
+      <td class="mono">${esc(fmtVnd(it?.amount_vnd))}</td>
+      <td class="mono">${it?.credits === null || it?.credits === undefined ? '<span class="muted">—</span>' : esc(fmtAmount(it.credits))}</td>
+      <td class="mono small">${esc(it?.reference || '—')}</td>
+      <td><span class="badge ${esc(badge)}">${esc(topupStatusLabel(it?.status))}</span></td>
+      <td class="mono small">${it?.decided_at ? esc(fmtTime(it.decided_at)) : '<span class="muted">—</span>'}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="il-tablewrap"><table class="evidence topup-table">
+    <thead><tr><th>Thời gian</th><th>Số tiền (VND)</th><th>Credit</th><th>Mã giao dịch</th><th>Trạng thái</th><th>Đã quyết định</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
+/** Form gửi yêu cầu nạp + bản xem trước credit theo tỷ giá máy chủ. */
+function renderTopupPanel() {
+  const t = state.topup;
+  const cfg = topupConfig();
+  if (!cfg) {
+    return `<section class="panel" id="topup-panel">
+      <h2>Nạp credit</h2>
+      <div class="notice error"><strong>Chức năng nạp credit chưa bật trên máy chủ này.</strong>
+      <p class="small" style="margin:6px 0 0">${esc(CREDIT_TOPUP_HINT)}</p></div>
+    </section>`;
+  }
+  const draft = t.draft || { amount_vnd: '', reference: '', note: '' };
+  const preview = topupCredits(String(draft.amount_vnd ?? '').replace(/[^\d]/g, ''));
+  const noticeBox = t.notice ? `<div class="notice ok" id="topup-notice">${esc(t.notice)}</div>` : '';
+  const errorBox = t.error ? `<div class="notice error" id="topup-error">${esc(t.error)}</div>` : '';
+  return `<section class="panel" id="topup-panel">
+    <h2>Nạp credit (chuyển khoản tay)</h2>
+    <div class="notice warn">
+      <strong>${esc(topupNote())}</strong>
+      <p class="small" style="margin:6px 0 0">${esc(CREDIT_TOPUP_HINT)}</p>
+    </div>
+    <h3 class="small" style="margin:12px 0 4px">1 · Chuyển khoản theo hướng dẫn của quản trị</h3>
+    ${renderTopupGuide()}
+    <h3 class="small" style="margin:12px 0 4px">2 · Gửi yêu cầu nạp để quản trị đối soát</h3>
+    <p class="muted small">Tỷ giá đang dùng: <strong>${esc(fmtVnd(cfg.rate_vnd_per_credit))}</strong> = 1 credit ·
+      mỗi lần nạp từ ${esc(fmtVnd(cfg.min_topup_vnd))} đến ${esc(fmtVnd(cfg.max_topup_vnd))}.
+      Tỷ giá được GHI LẠI lúc quản trị duyệt, nên đổi tỷ giá sau đó không làm sai yêu cầu của bạn.</p>
+    ${noticeBox}${errorBox}
+    <div class="field">
+      <div class="field-head"><label for="topup-amount">Số tiền đã chuyển (VND)</label></div>
+      <input class="text-input" id="topup-amount" type="number" inputmode="numeric" step="1"
+             min="${esc(cfg.min_topup_vnd)}" max="${esc(cfg.max_topup_vnd)}" value="${esc(draft.amount_vnd)}" />
+      <p class="small muted">${preview === null ? 'Nhập số tiền để xem sẽ nhận bao nhiêu credit.' : `Sẽ nhận khoảng <strong>${esc(fmtAmount(preview))}</strong> credit (nếu quản trị xác nhận).`}</p>
+    </div>
+    <div class="field">
+      <div class="field-head"><label for="topup-reference">Mã giao dịch / nội dung chuyển khoản</label></div>
+      <input class="text-input" id="topup-reference" type="text" maxlength="64" value="${esc(draft.reference)}"
+             placeholder="Ví dụ: FT24283012345" />
+    </div>
+    <div class="field">
+      <div class="field-head"><label for="topup-note">Ghi chú (tuỳ chọn)</label></div>
+      <input class="text-input" id="topup-note" type="text" maxlength="300" value="${esc(draft.note)}"
+             placeholder="Ví dụ: chuyển lúc 14:05 ngày 09/10" />
+    </div>
+    <div class="row">
+      <button class="btn primary" data-action="topupsubmit" type="button"${t.busy ? ' disabled' : ''}>GỬI YÊU CẦU NẠP</button>
+      <button class="btn ghost tiny" data-action="topupreload" type="button">Tải lại danh sách</button>
+    </div>
+  </section>
+  <section class="panel">
+    <h2>Yêu cầu nạp của tôi</h2>
+    ${renderTopupTable(t.requests)}
+  </section>`;
+}
+
+/* ── MVP-06 · tab Quản trị — duyệt yêu cầu `pending` ─────────────────────── */
+
+/**
+ * Danh sách yêu cầu CHỜ XÁC NHẬN + hai nút: XÁC NHẬN (hiện số credit sẽ cộng + tỷ giá đang
+ * dùng) và TỪ CHỐI (bắt buộc lý do). Xác nhận có bước xem lại — tiền thật thì không bấm một nhịp.
+ */
+function renderAdminTopups() {
+  const t = state.topup;
+  if (!topupEnabled()) {
+    return '<p class="muted small">Máy chủ chưa bật chức năng nạp credit (`billing.topup` không có trong /api/config).</p>';
+  }
+  if (t.admin === null || t.admin === undefined) return '<p class="muted small">Đang tải yêu cầu nạp…</p>';
+  if (!t.admin.length) return '<p class="muted small">Không có yêu cầu nạp nào đang chờ xác nhận.</p>';
+  const rate = topupConfig()?.rate_vnd_per_credit;
+  // Người dùng hiện bằng EMAIL khi danh sách người dùng của trang Quản trị đã tải; chưa tải thì
+  // hiện đúng id thật (không bịa). Khai ngay trong hàm để test trích hàm không cần thêm phụ thuộc.
+  const users = Array.isArray(state.auth?.users) ? state.auth.users : [];
+  const topupUserLabel = (id) => users.find((u) => u?.id === id)?.email || String(id || '—');
+  const rows = t.admin.map((it) => {
+    const id = String(it?.id || '');
+    const credits = topupCredits(it?.amount_vnd, rate);
+    const confirming = t.confirmId === id;
+    const rejecting = t.rejectId === id;
+    const actions = confirming
+      ? `<div class="notice warn">
+          <strong>Xác nhận cộng ${esc(credits === null ? fmtAmount(it?.credits) : fmtAmount(credits))} credit cho ${esc(topupUserLabel(it?.user_id))}?</strong>
+          <p class="small" style="margin:6px 0 0">Tỷ giá đang dùng ${esc(fmtVnd(rate))} = 1 credit, tiền đã chuyển ${esc(fmtVnd(it?.amount_vnd))}.
+          Hãy đối soát mã giao dịch <span class="mono">${esc(it?.reference || '—')}</span> với sao kê ngân hàng TRƯỚC khi xác nhận —
+          hệ thống không tự biết tiền đã về.</p>
+          <div class="row" style="margin-top:8px">
+            <button class="btn primary tiny" data-action="topupconfirm" data-id="${esc(id)}" type="button"${t.busy ? ' disabled' : ''}>XÁC NHẬN CỘNG CREDIT</button>
+            <button class="btn ghost tiny" data-action="topupcancel" type="button">Huỷ</button>
+          </div>
+        </div>`
+      : rejecting
+        ? `<div class="notice error">
+            <strong>Lý do từ chối (bắt buộc)</strong>
+            <input class="text-input" id="topup-reject-reason" type="text" maxlength="300" value="${esc(t.rejectDraft)}"
+                   placeholder="Ví dụ: không thấy giao dịch này trong sao kê" />
+            <div class="row" style="margin-top:8px">
+              <button class="btn tiny" data-action="topupreject" data-id="${esc(id)}" type="button"${t.busy ? ' disabled' : ''}>TỪ CHỐI</button>
+              <button class="btn ghost tiny" data-action="topupcancel" type="button">Huỷ</button>
+            </div>
+          </div>`
+        : `<div class="row">
+            <button class="btn tiny" data-action="topupreview" data-id="${esc(id)}" type="button">XÁC NHẬN…</button>
+            <button class="btn ghost tiny" data-action="topuprejectopen" data-id="${esc(id)}" type="button">TỪ CHỐI…</button>
+          </div>`;
+    return `<tr>
+      <td class="mono small">${esc(fmtTime(it?.created_at))}</td>
+      <td class="small">${esc(topupUserLabel(it?.user_id))}</td>
+      <td class="mono">${esc(fmtVnd(it?.amount_vnd))}</td>
+      <td class="mono">${esc(credits === null ? fmtAmount(it?.credits) : fmtAmount(credits))}</td>
+      <td class="mono small">${esc(it?.reference || '—')}</td>
+      <td class="small">${it?.note ? esc(it.note) : '<span class="muted">—</span>'}</td>
+      <td>${actions}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="il-tablewrap"><table class="evidence admin-table topup-admin-table">
+    <thead><tr><th>Thời gian</th><th>Người dùng</th><th>Tiền (VND)</th><th>Credit sẽ cộng</th><th>Mã giao dịch</th><th>Ghi chú</th><th>Quyết định</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
 function renderAccountBody() {
   const a = state.auth;
   const me = a.me || {};
@@ -5800,12 +6072,9 @@ function renderAccountBody() {
       <dt>Trạng thái</dt><dd>${esc(userStatusLabel(user.status))}</dd>
       <dt>Số dư credit</dt><dd><strong>${esc(creditText(me.balance))}</strong></dd>
     </dl>
-    <div class="notice warn" style="margin-top:12px">
-      <strong>Nạp credit thế nào?</strong>
-      <p class="small" style="margin:6px 0 0">${esc(CREDIT_TOPUP_HINT)}</p>
-    </div>
   </section>
   ${errorBox}
+  ${renderTopupPanel()}
   <section class="panel">
     <div class="spread">
       <h2 style="margin:0">Lịch sử sổ credit</h2>
@@ -5839,7 +6108,7 @@ async function openAccount() {
   // Hỏi máy chủ MỖI lần vào trang: phiên có thể đã hết hạn hoặc số dư vừa đổi — không đoán.
   await loadMe();
   renderAccountPage();
-  await Promise.all([loadLedger(true), loadPricing(true)]);
+  await Promise.all([loadLedger(true), loadPricing(true), loadTopups(true)]);
 }
 
 async function loadLedger(reset = false) {
@@ -5898,6 +6167,140 @@ async function loadPricing(force = false) {
     a.pricingLoading = false;
   }
   if (state.view === 'account') renderAccountPage();
+}
+
+/* ── MVP-06 · gọi API nạp credit (§3) ─────────────────────────────────────── */
+
+/** Câu tiếng Việt cho lỗi MVP-06; không nhận ra mã thì dùng câu THẬT của máy chủ. */
+function topupErrorText(err) {
+  const hint = TOPUP_ERROR_HINT[String(err?.code ?? '')];
+  const server = apiErrorText(err);
+  return hint ? `${hint} (${server})` : server;
+}
+
+async function loadTopups(reset = false) {
+  const t = state.topup;
+  if (t.loading) return;
+  if (!currentUser()) {
+    t.requests = [];
+    if (state.view === 'account') renderAccountPage();
+    return;
+  }
+  t.loading = true;
+  if (reset) t.requests = null;
+  try {
+    // `mine=1`: admin cũng xem yêu cầu CỦA MÌNH ở tab Tài khoản (danh sách tất cả nằm ở tab Quản trị).
+    const data = await api('/api/billing/topup-requests?mine=1&limit=50');
+    t.requests = Array.isArray(data?.items) ? data.items : [];
+    t.error = null;
+  } catch (err) {
+    t.requests = [];
+    // Máy chủ chưa bật chức năng ⇒ KHÔNG hiện lỗi đỏ ở trang Tài khoản; khối form đã nói rõ.
+    if (err?.status !== 503) t.error = topupErrorText(err);
+  } finally {
+    t.loading = false;
+  }
+  if (state.view === 'account') renderAccountPage();
+}
+
+async function submitTopup() {
+  const t = state.topup;
+  if (t.busy) return;
+  const amountRaw = String($('#topup-amount')?.value ?? t.draft.amount_vnd ?? '').trim();
+  const reference = String($('#topup-reference')?.value ?? t.draft.reference ?? '').trim();
+  const note = String($('#topup-note')?.value ?? t.draft.note ?? '').trim();
+  t.draft = { amount_vnd: amountRaw, reference, note };
+  const amount = Number.parseInt(amountRaw.replace(/[^\d-]/g, ''), 10);
+  if (!Number.isFinite(amount)) {
+    t.error = 'Hãy nhập số tiền đã chuyển (VND), ví dụ 260000.';
+    t.notice = null;
+    renderAccountPage();
+    return;
+  }
+  if (!reference) {
+    t.error = TOPUP_ERROR_HINT.TOPUP_REFERENCE_REQUIRED;
+    t.notice = null;
+    renderAccountPage();
+    return;
+  }
+  t.busy = true;
+  t.error = null;
+  t.notice = null;
+  renderAccountPage();
+  try {
+    const data = await api('/api/billing/topup-requests', {
+      method: 'POST',
+      body: { amount_vnd: amount, reference, note },
+    });
+    const credits = data?.request?.credits;
+    t.notice = `Đã gửi yêu cầu nạp ${fmtVnd(amount)}`
+      + `${Number.isFinite(Number(credits)) ? ` (≈ ${fmtAmount(credits)} credit)` : ''}`
+      + ' — ví CHƯA đổi, chờ quản trị xác nhận.';
+    t.draft = { amount_vnd: '', reference: '', note: '' };
+  } catch (err) {
+    t.error = topupErrorText(err);
+  } finally {
+    t.busy = false;
+  }
+  renderAccountPage();
+  await loadTopups(true);
+}
+
+async function loadAdminTopups(reset = false) {
+  const t = state.topup;
+  if (t.adminLoading) return;
+  t.adminLoading = true;
+  if (reset) t.admin = null;
+  try {
+    const data = await api('/api/billing/topup-requests?status=pending&limit=100');
+    t.admin = Array.isArray(data?.items) ? data.items : [];
+    state.auth.adminError = null;
+  } catch (err) {
+    t.admin = [];
+    if (err?.status !== 503) state.auth.adminError = topupErrorText(err);
+  } finally {
+    t.adminLoading = false;
+  }
+  if (state.view === 'admin') renderAdminPage();
+}
+
+async function decideTopup(id, { reject = false } = {}) {
+  const t = state.topup;
+  if (!id || t.busy) return;
+  const reason = reject
+    ? String($('#topup-reject-reason')?.value ?? t.rejectDraft ?? '').trim()
+    : '';
+  if (reject && !reason) {
+    state.auth.adminError = TOPUP_ERROR_HINT.TOPUP_REASON_REQUIRED;
+    renderAdminPage();
+    return;
+  }
+  t.busy = true;
+  state.auth.adminError = null;
+  state.auth.adminNotice = null;
+  renderAdminPage();
+  try {
+    const path = `/api/billing/topup-requests/${encodeURIComponent(id)}/${reject ? 'reject' : 'confirm'}`;
+    const data = await api(path, { method: 'POST', body: reject ? { reason } : {} });
+    state.auth.adminNotice = reject
+      ? `Đã TỪ CHỐI yêu cầu ${id} — KHÔNG có dòng sổ nào được ghi.`
+      : `Đã cộng ${fmtAmount(data?.ledger?.amount)} credit cho ${data?.request?.user_id} (số dư mới: ${creditText(data?.balance)}).`;
+    t.confirmId = null;
+    t.rejectId = null;
+    t.rejectDraft = '';
+    state.auth.users = null; // danh sách người dùng có thể kèm số dư ⇒ nạp lại cho thật
+  } catch (err) {
+    state.auth.adminError = topupErrorText(err);
+    // Đã có người quyết định trước ⇒ đóng hộp xác nhận và nạp lại danh sách cho đúng sự thật.
+    if (err?.code === 'TOPUP_ALREADY_DECIDED' || err?.status === 404) {
+      t.confirmId = null;
+      t.rejectId = null;
+    }
+  } finally {
+    t.busy = false;
+  }
+  renderAdminPage();
+  await Promise.all([loadAdminTopups(true), loadMe()]);
 }
 
 /* ── Trang Quản trị (#/quantri) — CHỈ owner/admin ─────────────────────────── */
@@ -6069,6 +6472,14 @@ function renderAdminBody() {
   </section>
   ${renderAdminCreditForm()}
   <section class="panel">
+    <div class="spread">
+      <h2 style="margin:0">Yêu cầu nạp credit đang chờ</h2>
+      <button class="btn ghost tiny" data-action="topupadminreload" type="button">Tải lại</button>
+    </div>
+    <p class="muted small">${esc(topupNote())}</p>
+    ${renderAdminTopups()}
+  </section>
+  <section class="panel">
     <h2>Số liệu sử dụng</h2>
     <div class="row">
       <label class="small muted" for="admin-usage-group">Nhóm theo</label>
@@ -6099,7 +6510,7 @@ async function openAdmin() {
   if (!state.auth.usageFrom) state.auth.usageFrom = d.from;
   if (!state.auth.usageTo) state.auth.usageTo = d.to;
   renderAdminPage();
-  if (canAdmin()) await Promise.all([loadAdminUsers(true), loadAdminUsage(true)]);
+  if (canAdmin()) await Promise.all([loadAdminUsers(true), loadAdminUsage(true), loadAdminTopups(true)]);
 }
 
 async function loadAdminUsers(reset = false) {
@@ -6286,6 +6697,15 @@ function clearPrivateState() {
   a.creditConfirm = null;
   a.creditDraft = { amount: '', note: '' };
   a.roleDraft = {};
+  // MVP-06: yêu cầu nạp là dữ liệu RIÊNG TƯ (tiền của một người) ⇒ xoá sạch khi đăng xuất.
+  state.topup.requests = null;
+  state.topup.admin = null;
+  state.topup.draft = { amount_vnd: '', reference: '', note: '' };
+  state.topup.confirmId = null;
+  state.topup.rejectId = null;
+  state.topup.rejectDraft = '';
+  state.topup.error = null;
+  state.topup.notice = null;
   a.form = { email: '', display_name: '' };
   a.formError = null;
   a.formNotice = null;
@@ -6336,6 +6756,11 @@ function wireAuthGlobal() {
     else if (t.id === 'pub-text') state.pub.draft.text = String(t.value ?? '');
     else if (t.id === 'credit-amount') state.auth.creditDraft.amount = String(t.value ?? '');
     else if (t.id === 'credit-note') state.auth.creditDraft.note = String(t.value ?? '');
+    // MVP-06 — giữ bản nháp form nạp credit để render lại không mất chữ.
+    else if (t.id === 'topup-amount') state.topup.draft.amount_vnd = String(t.value ?? '');
+    else if (t.id === 'topup-reference') state.topup.draft.reference = String(t.value ?? '');
+    else if (t.id === 'topup-note') state.topup.draft.note = String(t.value ?? '');
+    else if (t.id === 'topup-reject-reason') state.topup.rejectDraft = String(t.value ?? '');
   });
   document.addEventListener('change', (ev) => {
     const t = ev.target;
