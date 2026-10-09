@@ -1741,3 +1741,128 @@ $ node --test test/export-bundle.test.js
    `a5-ui.mjs` đọc mã nguồn `public/app.js`.
 5. **Gói > trần bộ nhớ** chỉ được chặn (`BUNDLE_TOO_LARGE`), chưa đo gói lớn nhất chạy được trên
    máy yếu.
+
+---
+
+## 25. PostgreSQL — phủ NGHIỆP VỤ cho các bảng mới (MVP-03/04/05 + R1)
+
+**Lỗ hổng trước sprint này.** CI có job PostgreSQL 16 thật, nhưng nó chỉ chứng minh
+**`schema.sql` + migration cộng thêm** chạy được. Toàn bộ **nghiệp vụ** của các bảng mới —
+`image_assets.meta` (MVP-03), job `video_generation` (MVP-04), `users`/`user_sessions`/
+`wallet_ledger`/`pricing`/`jobs.user_id` (MVP-05), `job_queue`/`epoch`/`heartbeat_at` (R1) —
+chỉ được đo trên **SQLite in-memory** (`testConfig` ép `DB_DRIVER=sqlite`). Các dòng
+“Chưa đo: PostgreSQL thật…” ở §16.x, §17.x, §18.x, §21.x, §22.7 nói về đúng lỗ này.
+
+### 25.1 Môi trường đo (thật, không mock)
+
+```
+$ postgres --version
+postgres (PostgreSQL) 16.15 (Homebrew)          ← máy này KHÔNG có Docker; dựng bằng initdb/pg_ctl
+$ initdb -D <scratch>/pgdata -U viporder --auth=trust -E UTF8
+$ pg_ctl -D <scratch>/pgdata -o "-p 55440 -c listen_addresses=127.0.0.1 -c unix_socket_directories=''" start
+$ createdb -p 55440 -U studio -O studio studio
+DATABASE_URL=postgres://studio:studio@127.0.0.1:55440/studio
+```
+⚠️ Phải tắt Unix-domain socket (`unix_socket_directories=''`, chỉ chạy TCP): đường
+scratchpad dài hơn **giới hạn 103 byte** của socket PostgreSQL ⇒ `pg_ctl` chết với
+`FATAL: could not create any Unix-domain sockets` nếu không đặt.
+
+### 25.2 Kết quả hai lần chạy TOÀN BỘ bộ test
+
+```
+$ env -u DATABASE_URL npm test
+ℹ tests 1098 · pass 1063 · fail 0 · skipped 35 · todo 0          EXIT 0
+   ← 35 skip = 6 skip PostgreSQL có từ trước + 29 test mới của §25.3 (bỏ qua CÓ KIỂM SOÁT)
+
+$ DATABASE_URL=postgres://studio:studio@127.0.0.1:55440/pr_test npm test
+ℹ tests 1098 · pass 1097 · fail 0 · skipped 1 · todo 0           EXIT 0
+   ← 29 test mới CHẠY THẬT + 6 test PG cũ CHẠY THẬT; 1 skip còn lại là ca ÂM
+     “thiếu DATABASE_URL nhưng chọn driver postgres” (chỉ chạy khi KHÔNG có PG).
+     Chạy trên DB TRẮNG (`createdb pr_test`) ⇒ đi đường `schema.sql`, không nhờ migration.
+
+$ env -u DATABASE_URL node tools/verify.mjs
+EXIT 0
+```
+Baseline của `develop` trước nhánh này (`f8d96a3`, xem §24): `1069 · 1063 pass · 0 fail ·
+6 skipped`. Số **pass của SQLite không đổi (1063)** ⇒ 29 test mới không làm hỏng đường cũ;
+tổng test tăng đúng 29 (1069 → 1098) và skip tăng đúng 29 (6 → 35).
+
+### 25.3 Cái gì GIỜ ĐÃ ĐO ĐƯỢC trên PostgreSQL (29 test mới)
+
+| File | Phủ gì |
+|---|---|
+| `test/pg-wallet.test.js` (9) | số dư = TỔNG SỔ qua cả chu kỳ `grant→hold→settle`; `seq` = 1..n liên tục; số dư **không bao giờ âm** (kể cả gọi thẳng `appendLedger` ⇒ `INSUFFICIENT_CREDIT`, không để lại dòng); `holdForJob` thiếu credit ⇒ sổ không đổi; **idempotent `(job_id, run_key)`** (hold 2 lần ⇒ 1 dòng); **partial unique index** chặn dòng `job_hold` thứ hai và lộ ra `LEDGER_CONFLICT` chứ **không** `25P02 transaction is aborted`; **đua `settle` + `refund`** cùng lượt ⇒ đúng **1** dòng đóng; **đua 2 `holdForJob`** ⇒ giữ tiền 1 lần; `listLedger` phân trang **không trùng/không sót** + thứ tự `seq` giảm dần; **tiền không mất chữ số** (so CÙNG dữ liệu trên 2 dialect) |
+| `test/pg-queue.test.js` (9) | `claimNextJob` **nguyên tử với 2 POOL kết nối riêng** (đua thật, không giả lập): 1 mục/2 worker ⇒ đúng 1 thắng, `attempts` tăng 1 lần; 8 mục/2 worker ⇒ **không mục nào bị nhặt 2 lần, không sót**, mỗi mục `epoch=1`; **epoch/fencing**: runner bị cướp **không** chốt được `done`, thiếu epoch cũng bị từ chối, runner mới chốt được; `failQueueItem` của runner cũ bị đánh `stale`; **`heartbeat_at`**: mục còn nhịp **không** bị cron cướp (cửa sổ 600s), worker lạ/thiếu `workerId` không gia hạn được lease, mất nhịp thì bị thu hồi; `requeueStaleJobs` chốt `failed` khi **chạm trần** (+`failed_job_ids`) và không nhặt lại được; `enqueueJob` cùng khoá idempotency ⇒ **mở lại** mục cũ, `attempts` reset 0, epoch mới, **không đẻ mục thứ hai**; `run_after` (backoff) chặn nhặt sớm; `queueStats` trả **số** (không phải chuỗi BIGINT) |
+| `test/pg-schema.test.js` (11) | `init()` chạy **lần 2 và lần 3** trên DB **đã có dữ liệu** ⇒ không lỗi, dữ liệu cũ còn nguyên; mọi cột do migration thêm **có thật**; 2 partial unique index **tồn tại thật**; `users`/`user_sessions` vòng đời thật + tiếng Việt có dấu round-trip + `COUNT(*)` BIGINT được ép về **number**; `jobs.user_id` lọc đúng chủ sở hữu (`listJobs`/`countJobs`); `pricing` upsert **idempotent** (`ON CONFLICT DO UPDATE`) + có giá cho **mọi** `USAGE_OPERATIONS`; **`usage_events.run_key`** tách chi phí theo TỪNG lượt (và dòng `run_key IS NULL` của DB cũ quy về lượt `#1`); **MVP-03 `image_assets.meta`** JSON lồng nhau round-trip + `updateImageAssetMeta` không mất phần khác; **MVP-04** job `video_generation` vòng đời + `content_meta` round-trip + usage `VIDEO_RENDER`/`VIDEO_ENCODE` mang `run_key` + cột ngoài allowlist bị bỏ qua im lặng; `usageAggregate` trả **number** |
+
+Hai file dùng chung `test/pg-helpers.js`: tự **BỎ QUA** khi thiếu `DATABASE_URL`, mọi dòng mang
+tiền tố `RUN_TAG` riêng cho mỗi lần chạy và được **dọn sạch** ở `after` (DB PostgreSQL là DB
+**dùng chung** — không để rác, và **không** `DELETE FROM job_queue` trần vì đó là thao tác phá
+hoại nếu `DATABASE_URL` trỏ vào DB thật).
+
+### 25.4 LỖI THẬT phát hiện được — tiền MẤT CHỮ SỐ trên PostgreSQL (đã sửa)
+
+Đây là lỗi mà **SQLite không bao giờ lộ ra**, và nó nằm đúng ở môi trường production
+(`deploy/` chạy PostgreSQL; SQLite chỉ là DB dev/test).
+
+**Nguyên nhân.** `schema.sql` khai các cột tiền là `REAL`. `REAL` của SQLite là float **8 byte**,
+nhưng `REAL` của PostgreSQL là **`float4` — 4 byte, chỉ ~7 chữ số có nghĩa**. Đơn vị tiền của repo
+là **6 chữ số thập phân** (`MONEY_DECIMALS = 6`, `MONEY_EPSILON = 1e-6`) ⇒ tiền bị làm tròn mất.
+
+**Bằng chứng (đo qua store THẬT, cùng dữ liệu, hai dialect).**
+```
+grant=100     charge=-0.000001  → PG: 100          (đúng: 99.999999)   SQLite: 99.999999
+grant=10000   charge=-0.0004    → PG: 10000        (đúng: 9999.9996)   SQLite: 9999.9996
+grant=100000  charge=-0.004     → PG: 99999.99     (đúng: 99999.996)   SQLite: 99999.996
+$ psql -c "SELECT 99.999999::real, 1234.567891::real"   →   100 | 1234.5679
+```
+0.0004 và 0.004 là **giá THẬT** của repo (`DEFAULT_PRICING`: `OCR_DETECT = 0.0004`,
+`CONTENT_GENERATE = 0.004` credit/lượt), và ví 10.000 credit là mức bình thường.
+
+**Hệ quả nếu không sửa.** Ví 10.000 credit + giá 0.0004/lượt ⇒ trên PostgreSQL mỗi lượt trừ tiền
+nhưng **số dư không đổi** ⇒ người dùng chạy **miễn phí không giới hạn**. Ở mức 100.000 credit thì
+sổ còn **tự sinh sai số** (lệch −0.006 cho một lần trừ 0.004), phá đúng luật #2 của hợp đồng
+MVP-05 (“số dư = tổng sổ”).
+
+**Cách sửa (2 chỗ, không thêm dependency, không đổi tên hàm/field nào).**
+1. `src/store/schema.sql`: 4 cột tiền `REAL` → **`DOUBLE PRECISION`** —
+   `wallet_ledger.amount`, `wallet_ledger.balance_after`, `usage_events.estimated_cost`,
+   `pricing.unit_price`. Chạy được trên **cả hai** driver: PostgreSQL hiểu là `float8`, còn
+   SQLite coi tên kiểu chứa `DOUB` là **REAL affinity**.
+2. `src/store/index.js` — thêm `#widenMoneyColumns()` vào `#applyAdditiveMigrations()`:
+   `ALTER TABLE … ALTER COLUMN … TYPE DOUBLE PRECISION`, **chỉ PostgreSQL**, và **chỉ** khi
+   `information_schema` còn báo `data_type = 'real'` (nên `init()` lần hai không viết lại bảng).
+   Bắt buộc phải có bước này: `CREATE TABLE IF NOT EXISTS` là **no-op**, nên DB PostgreSQL
+   **đang chạy** sẽ không tự được sửa.
+
+**Đo sau khi sửa.**
+```
+DB ĐANG CHẠY (đi đường migration):
+  trước init(): wallet_ledger.amount = real          … (4 cột)
+  sau   init(): wallet_ledger.amount = double precision … (4 cột)
+  test/pg-wallet.test.js → 9/9 pass
+DB TRẮNG (đi đường schema.sql, KHÔNG qua migration):
+  $ createdb fresh_test && DATABASE_URL=…/fresh_test node --test test/pg-*.test.js
+  ℹ tests 29 · pass 29 · fail 0        4 cột đều = double precision
+```
+
+### 25.5 Cái gì VẪN CHƯA ĐO (đừng ghi là đã đo)
+
+1. **Nhiều TIẾN TRÌNH OS** (không chỉ nhiều pool kết nối): 29 test này chạy trong **một**
+   tiến trình Node với 2 pool riêng. `FOR UPDATE SKIP LOCKED` và `pg_advisory_xact_lock` là
+   khoá ở **phía máy chủ** nên 2 pool là phép thử đúng bản chất, nhưng cảnh “tiến trình bị
+   `kill -9` giữa transaction” thì vẫn chưa đo trên PostgreSQL.
+2. **Lease mất trên PostgreSQL (R3)**: giới hạn ở §22.7/§23.3 (hai tiến trình có thể cùng
+   THỰC THI một mục ⇒ chi phí provider nhân đôi; tiền/trạng thái đã được fence) **chưa**
+   được đo lại trên PostgreSQL.
+3. **Dữ liệu tiền CŨ đã bị `float4` làm tròn**: `ALTER COLUMN … TYPE DOUBLE PRECISION` chỉ nới
+   kiểu cột, **không** phục hồi được chữ số đã mất của dòng ghi trước đó. Chưa có script đối
+   soát/ghi bù cho DB production nào đã chạy bản cũ (hiện **chưa** có DB production nào —
+   `deploy/` chưa từng triển khai thật, xem §DIRECT-DEPLOY).
+4. **`listOpenJobHolds` / `reconcileStuckRuns`** trên PostgreSQL: chưa phủ (vẫn chỉ SQLite).
+   Các method còn lại của `src/billing/**` (`estimate`, `priceOf`, `usageSummary` theo nhóm,
+   `billableRunsOfJob`) cũng chưa chạy trên PG.
+5. **PostgreSQL ≠ 16.15**: chỉ đo trên 16.15 (Homebrew, macOS/arm64). CI dùng PostgreSQL 16
+   trên Linux; bản 14/15/17 chưa đo.
+6. Không liên quan sprint này nhưng vẫn mở: provider thật (OCR/dịch/matting/TTS), trình duyệt
+   thật, `deploy/` trên máy chủ thật.

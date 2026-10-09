@@ -586,6 +586,10 @@ export class Store {
     // (unique trên `(user_id, job_id, run_key)` WHERE `close_kind IS NOT NULL`) — unique theo
     // `reason` không chặn được cặp settle+refund cho cùng lượt.
     await this.#addColumnIfMissing('wallet_ledger', 'close_kind', 'TEXT');
+    // TIỀN KHÔNG ĐƯỢC LÀ `REAL` TRÊN POSTGRESQL (xem ghi chú đầu `schema.sql`).
+    // `CREATE TABLE IF NOT EXISTS` là no-op nên DB PostgreSQL dựng bởi bản TRƯỚC vẫn còn
+    // `float4` ⇒ phải nới kiểu tại chỗ, nếu không tiền tiếp tục bị làm tròn mất.
+    await this.#widenMoneyColumns();
     await this.#createUniqueIndexIfPossible('uniq_wallet_ledger_run_close', 'wallet_ledger', {
       columns: 'user_id, job_id, run_key',
       where: 'close_kind IS NOT NULL AND run_key IS NOT NULL',
@@ -633,6 +637,57 @@ export class Store {
       await this.driver.run(`DROP INDEX IF EXISTS ${name}`);
     } catch (err) {
       this.logger?.warn('store.migration.index_drop_skipped', { name, error: err?.message || String(err) });
+    }
+  }
+
+  /**
+   * NỚI KIỂU CÁC CỘT TIỀN: `real` (float4) → `double precision` (float8) — CHỈ PostgreSQL.
+   *
+   * Vì sao bắt buộc (lỗi đo được, không phải phòng xa): `REAL` của PostgreSQL là float **4
+   * byte**, chỉ ~7 chữ số có nghĩa, trong khi đơn vị tiền của repo là 6 chữ số thập phân
+   * (`MONEY_DECIMALS = 6`). Hệ quả trên DB thật:
+   *
+   *   ví 10.000 credit, trừ 0.0004 credit (giá thật một lượt `OCR_DETECT`)
+   *     → số dư đọc lại VẪN LÀ 10000 ⇒ KHÔNG THU ĐƯỢC TIỀN (chạy miễn phí vô hạn);
+   *   ví 100.000 credit, trừ 0.004 credit → 99999.99 thay vì 99999.996 (sổ tự sinh sai số).
+   *
+   * Cùng dữ liệu đó trên SQLite ĐÚNG TUYỆT ĐỐI (SQLite `REAL` = float8) — nên lỗi này chỉ
+   * lộ ra ở môi trường production (`deploy/` dùng PostgreSQL). `test/pg-wallet.test.js` giữ
+   * luật bằng cách so CÙNG dữ liệu trên hai dialect.
+   *
+   * SQLite: KHÔNG làm gì — `REAL` ở đó đã là float8, và SQLite cũng không có
+   * `ALTER COLUMN … TYPE`.
+   *
+   * Idempotent: chỉ `ALTER` đúng cột đang còn kiểu `real` (đọc `information_schema`), nên
+   * `init()` lần hai không phải viết lại bảng. Lỗi chỉ ghi log — DB thiếu bảng/thiếu quyền
+   * KHÔNG được làm chết boot (đúng luật của các migration khác ở đây).
+   */
+  async #widenMoneyColumns() {
+    if (!this.isPostgres) return;
+    const MONEY_COLUMNS = [
+      ['wallet_ledger', 'amount'],
+      ['wallet_ledger', 'balance_after'],
+      ['usage_events', 'estimated_cost'],
+      ['pricing', 'unit_price'],
+    ];
+    for (const [table, column] of MONEY_COLUMNS) {
+      try {
+        const row = await this.driver.get(
+          `SELECT data_type FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = ? AND column_name = ?`,
+          [table, column],
+        );
+        // Cột không tồn tại (DB cũ) hoặc đã là double precision ⇒ không làm gì.
+        if (!row || String(row.data_type).toLowerCase() !== 'real') continue;
+        await this.driver.run(`ALTER TABLE ${table} ALTER COLUMN ${column} TYPE DOUBLE PRECISION`);
+        this.logger?.warn('store.migration.money_column_widened', { table, column, from: 'real', to: 'double precision' });
+      } catch (err) {
+        this.logger?.warn('store.migration.money_widen_skipped', {
+          table,
+          column,
+          error: err?.message || String(err),
+        });
+      }
     }
   }
 
