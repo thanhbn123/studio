@@ -1814,6 +1814,12 @@ export function buildRouter(app) {
         encoder: videostudioEncoderInfo(),
         audio: false,
       },
+      // MVP-06 (§3 hợp đồng export) — khối cho UI (X3) biết có tải được gói .zip hay không.
+      // CHỈ hai field: cờ khả dụng + định dạng; KHÔNG lộ đường dẫn, tên module hay bí mật.
+      exports: {
+        available: await exportsAvailable(),
+        formats: ['zip'],
+      },
       // MVP-05 (§3.3) — khối `auth`/`billing` cho UI: CHỈ cờ + giới hạn, TUYỆT ĐỐI không
       // lộ bí mật (không token, không khoá ký, không chi tiết nội bộ của dịch vụ).
       auth: {
@@ -3092,6 +3098,230 @@ export function buildRouter(app) {
       'content-disposition': `inline; filename="videostudio-${asset.role || 'video'}-${String(asset.id).slice(0, 8)}.${videostudioExtForMime(mime)}"`,
     });
     res.end(buffer);
+  });
+
+  /* ═══════════ MVP-06 · GÓI XUẤT BẢN (.zip) — hợp đồng docs/EXPORT-CONTRACT.md §3 ═══════════
+   * CHỈ THÊM route mới: khối này không chạm vào bất kỳ route cũ nào.
+   *
+   * Module X1 (`src/exports/**`) do agent khác viết song song nên có thể CHƯA có mặt — xử lý
+   * y như MVP-02/03/04 với module anh em: KHÔNG static-import (một import hỏng sẽ giết cả
+   * MVP-01..05), KHÔNG sửa `src/app.js`; nạp phòng thủ bằng dynamic import trong try/catch
+   * ngay tại route, thiếu module ⇒ 503 `EXPORT_UNAVAILABLE` kèm câu tiếng Việt.
+   */
+
+  const EXPORT_UNAVAILABLE_MESSAGE =
+    'Tính năng gói xuất bản chưa nạp được trên máy chủ này — tạm thời chưa tải được gói (.zip).';
+
+  /**
+   * Log lỗi của khối export: CHỈ tên/mã lỗi + message đã lọc đường dẫn.
+   * KHÔNG log nội dung gói, KHÔNG log `storage_path`/`session_id` (hợp đồng §3).
+   */
+  const logExportError = (event, err) => {
+    const message = String(err?.message ?? err ?? '')
+      .replace(/\/(?:Users|home|private|tmp|var|opt|mnt|Volumes)\/\S*/g, '<path>')
+      .slice(0, 300);
+    logger?.error?.(event, { error_name: err?.name || 'Error', error_code: err?.code || null, error_message: message });
+  };
+
+  /** Nạp module X1 một lần cho mỗi router; lỗi ⇒ `null` (KHÔNG ném ra ngoài). */
+  let exportModulePromise = null;
+  const importExportModule = async () => {
+    try {
+      const mod = await import('../exports/index.js');
+      if (typeof mod?.buildExportBundle !== 'function') {
+        logExportError('exports.module_export_missing', Object.assign(new Error('thiếu export buildExportBundle'), { code: 'EXPORT_EXPORT_MISSING' }));
+        return null;
+      }
+      return mod;
+    } catch (err) {
+      logExportError('exports.module_load_failed', err);
+      return null;
+    }
+  };
+
+  /**
+   * Lấy module X1: ưu tiên `app.exports` (điểm bơm của tầng gộp), nếu không có thì dynamic
+   * import `../exports/index.js`. Kết quả được NHỚ theo router để không import lại mỗi request.
+   */
+  const loadExportModule = () => {
+    const injected = app?.exports;
+    if (injected && typeof injected.buildExportBundle === 'function') return Promise.resolve(injected);
+    if (!exportModulePromise) exportModulePromise = importExportModule();
+    return exportModulePromise;
+  };
+
+  /** Lý do THẬT khi khối export không khả dụng (app.js/tầng gộp có thể bơm câu đã lọc). */
+  const exportUnavailableMessage = () => {
+    const reason = app?.exportsUnavailableReason;
+    return typeof reason === 'string' && reason.trim() ? reason : EXPORT_UNAVAILABLE_MESSAGE;
+  };
+
+  /**
+   * Khối export có được phép chạy không. `app.exportsUnavailableReason` (chuỗi khác rỗng) là
+   * công tắc TẮT tường minh — cùng khuôn `imagelabUnavailableReason`/`videostudioUnavailableReason`
+   * của file này, để tầng gộp (hoặc test) nói được "module chưa nạp" mà không phải xoá file.
+   */
+  const exportsEnabled = () => {
+    const reason = app?.exportsUnavailableReason;
+    return !(typeof reason === 'string' && reason.trim());
+  };
+
+  /** Thiếu module/tắt tường minh ⇒ 503 nói thẳng, KHÔNG mô phỏng gói rỗng (hợp đồng §3). */
+  const requireExportModule = async () => {
+    if (!exportsEnabled()) throw HttpError.safe(503, 'EXPORT_UNAVAILABLE', exportUnavailableMessage());
+    const mod = await loadExportModule();
+    if (!mod) throw HttpError.safe(503, 'EXPORT_UNAVAILABLE', exportUnavailableMessage());
+    return mod;
+  };
+
+  /** Cờ cho `/api/config` — CHỈ cờ, không lộ đường dẫn/bí mật/phiên bản module. */
+  // D6 (LOW): `available` phải phản ánh ĐỦ điều kiện chạy được — thiếu `storage` thì UI không được
+  // hứa "tải được" rồi trả 503/500.
+  const exportsAvailable = async () =>
+    exportsEnabled()
+    && Boolean(await loadExportModule())
+    && Boolean(app?.storage && typeof app.storage.read === 'function');
+
+  /**
+   * Quyền sở hữu y HỆT route job khác (`requireOwnJob`: id rác ⇒ 400, job lạ/khác tài khoản
+   * ⇒ 404, đã đăng nhập thì `jobs.user_id` phải khớp), nhưng chặt thêm MỘT nhịp cho riêng
+   * gói xuất bản: gói chứa TOÀN BỘ nội dung + ảnh + video của job, nên request KHÔNG khai
+   * cookie session nào cũng bị coi là khác chủ (404) — cố ý không nới luật "khách không khai
+   * session" của route chi tiết job MVP-01 cho một tệp chứa tất cả dữ liệu.
+   */
+  const requireOwnExportJob = async (req, res, id) => {
+    const job = await requireOwnJob(req, res, id);
+    // D4 (phản biện, MEDIUM): job KHÔNG có chủ (không `user_id` VÀ không `session_id`) thì gói dữ
+    // liệu đầy đủ KHÔNG được mở cho người lạ — trước đây ai cũng tải được (200 kể cả không cookie).
+    if (job.user_id == null && !job.session_id) {
+      logger?.warn?.('exports.ownerless_job_denied', { job_id: job.id });
+      throw new HttpError(404, 'JOB_NOT_FOUND', 'Không tìm thấy job.');
+    }
+    if (job.user_id == null && job.session_id) {
+      const sid = sessionId(req, res);
+      if (String(sid) !== String(job.session_id)) {
+        throw new HttpError(404, 'JOB_NOT_FOUND', 'Không tìm thấy job.');
+      }
+    }
+    return job;
+  };
+
+  /** Lỗi của module X1 ⇒ HTTP an toàn; KHÔNG BAO GIỜ trả message/stack nội bộ của module. */
+  const mapExportError = (err) => {
+    const code = String(err?.code || '').trim().toUpperCase();
+    if (code === 'JOB_NOT_FOUND') return new HttpError(404, 'JOB_NOT_FOUND', 'Không tìm thấy job.');
+    if (code === 'BAD_JOB_ID' || code === 'INVALID_JOB_ID') {
+      return new HttpError(400, 'BAD_JOB_ID', 'Mã job không hợp lệ.');
+    }
+    // Module X1 tự nói nó chưa sẵn sàng (kho ảnh chưa nạp, ...) ⇒ giữ đúng 503 như hợp đồng.
+    if (code === 'EXPORT_UNAVAILABLE') return HttpError.safe(503, 'EXPORT_UNAVAILABLE', exportUnavailableMessage());
+    // D6: thiếu `storage` (kho asset chưa nạp) là "chưa sẵn sàng", KHÔNG phải lỗi 500 của gói.
+    if (code === 'BAD_INPUT' && /storage/i.test(String(err?.message ?? ''))) {
+      return HttpError.safe(503, 'EXPORT_UNAVAILABLE', exportUnavailableMessage());
+    }
+    logExportError('exports.bundle_build_failed', err);
+    return HttpError.safe(500, 'EXPORT_FAILED', 'Không dựng được gói xuất bản. Vui lòng thử lại.');
+  };
+
+  /**
+   * `Content-Disposition` an toàn: tên tệp của X1 được LỌC LẠI ở đây (bỏ CR/LF/ngoặc kép để
+   * không chèn được header), chỉ nhận tập ký tự ASCII an toàn; tên gốc có ký tự ngoài ASCII
+   * thì thêm biến thể RFC 5987 `filename*=UTF-8''…` cho trình duyệt.
+   */
+  const exportDisposition = (rawName, jobId) => {
+    const raw = String(rawName ?? '').replace(/[\r\n"]/g, '').trim();
+    let safe = raw.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[._-]+/, '').slice(0, 120);
+    if (!safe) safe = `goi-xuat-ban-${String(jobId).slice(0, 8)}.zip`;
+    if (!/\.zip$/i.test(safe)) safe = `${safe}.zip`;
+    const parts = [`attachment; filename="${safe}"`];
+    if (/[^\x20-\x7E]/.test(raw)) parts.push(`filename*=UTF-8''${encodeURIComponent(raw).slice(0, 180)}`);
+    return parts.join('; ');
+  };
+
+  /**
+   * Dựng gói qua module X1. Cả hai route dùng CHUNG hàm này để `manifest` trả qua API và
+   * `MANIFEST.json` trong gói luôn là MỘT nguồn sự thật (không có hai bản kê khai lệch nhau).
+   */
+  const buildBundleFor = async (jobId, { zip = true } = {}) => {
+    const mod = await requireExportModule();
+    try {
+      // D5 (phản biện Gói xuất bản, MEDIUM): route `/manifest` KHÔNG được dựng cả ZIP rồi bỏ
+      // buffer — job 60 MB asset tốn ~2,3s CPU + ~245 MB RSS cho một phản hồi 10 KB. Module X1 có
+      // đường `buildExportManifest` (chỉ kê khai, không nén); thiếu nó (bản cũ) ⇒ rơi về đường cũ.
+      const onlyManifest = zip === false && typeof mod.buildExportManifest === 'function';
+      if (zip === false && !onlyManifest) {
+        logger?.warn?.('exports.manifest_without_zip_builder', {
+          message: 'Module X1 chưa có `buildExportManifest` ⇒ route /manifest phải dựng cả ZIP (chậm hơn).',
+        });
+      }
+      const built = await (onlyManifest ? mod.buildExportManifest : mod.buildExportBundle)({
+        store,
+        // Gói chỉ ĐỌC asset đã có trên đĩa; X1 tự quyết cách đọc, routes.js không ghép đường dẫn.
+        storage: app?.storage ?? null,
+        jobId,
+        logger,
+      });
+      if (zip === false) {
+        // Đường chỉ-manifest: bắt buộc có `manifest`, KHÔNG cần buffer.
+        if (!built || !built.manifest) {
+          throw Object.assign(new Error('buildExportManifest không trả về manifest hợp lệ'), { code: 'BAD_BUNDLE' });
+        }
+        return built;
+      }
+      if (!built || !Buffer.isBuffer(built.buffer) || built.buffer.length === 0) {
+        throw Object.assign(new Error('buildExportBundle không trả về buffer hợp lệ'), { code: 'BAD_BUNDLE' });
+      }
+      return built;
+    } catch (err) {
+      throw mapExportError(err);
+    }
+  };
+
+  /* ── Tải gói .zip (nhị phân) — rate limit CHUNG `rateLimiters.jobs`, key `export:${sid}` ── */
+
+  router.get('/api/exports/jobs/:id/bundle', async (req, res, params) => {
+    // Chế độ TẮT ẩn danh: gói xuất bản là route nghiệp vụ ⇒ bắt buộc đăng nhập (như /api/jobs/*).
+    if (!anonymousAllowed()) requireUser(req);
+    const sid = sessionId(req, res);
+    enforce(rateLimiters.jobs, `export:${sid}`);
+    const job = await requireOwnExportJob(req, res, params.id);
+    const built = await buildBundleFor(job.id);
+
+    res.writeHead(200, {
+      ...SECURITY_HEADERS,
+      'content-type': 'application/zip',
+      'content-length': built.buffer.length,
+      // Gói là dữ liệu riêng của một phiên/tài khoản — cấm mọi cache dùng chung (hợp đồng §3).
+      'cache-control': 'private, no-store',
+      'x-content-type-options': 'nosniff',
+      // Luôn là tệp ĐÍNH KÈM (không bao giờ inline) để trình duyệt tải về chứ không hiển thị.
+      'content-disposition': exportDisposition(built.filename, job.id),
+    });
+    // Chỉ log SỐ LIỆU (byte/số entry) — không log nội dung gói, không log đường dẫn.
+    logger?.info?.('exports.bundle_served', {
+      job_id: job.id,
+      bytes: built.buffer.length,
+      entries: Array.isArray(built.entries) ? built.entries.length : null,
+    });
+    res.end(built.buffer);
+  });
+
+  /* ── Bản kê khai rời (JSON) — cùng nguồn với MANIFEST.json trong gói ── */
+
+  router.get('/api/exports/jobs/:id/manifest', async (req, res, params) => {
+    if (!anonymousAllowed()) requireUser(req);
+    const sid = sessionId(req, res);
+    enforce(rateLimiters.jobs, `export:${sid}`);
+    const job = await requireOwnExportJob(req, res, params.id);
+    // D5: CHỈ dựng manifest — không tạo ZIP.
+    const built = await buildBundleFor(job.id, { zip: false });
+
+    // Đúng ba field hợp đồng §3: manifest + warnings + missing. KHÔNG kèm buffer/đường dẫn.
+    sendJson(res, 200, {
+      manifest: built.manifest ?? null,
+      warnings: Array.isArray(built.warnings) ? built.warnings : [],
+      missing: Array.isArray(built.missing) ? built.missing : [],
+    });
   });
 
   /**

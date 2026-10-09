@@ -1674,3 +1674,70 @@ q3_crashloop : TỔNG handler = 3 (max_attempts=3) · DB cuối failed/attempts=
 q4_steal     : requeued=0 · KHÔNG có B-START · DB cuối done/attempts=1
 q6_orphan    : sau 6 nhịp cron: requeued=1 · B đã chạy được 3 việc
 ```
+
+---
+
+## 24. Gói xuất bản (.zip) — vòng sửa phản biện D1…D6
+
+Phán quyết vòng 1: **FAIL** (`docs/EXPORT-REVIEW.md`, 380 dòng, script `/tmp/x-atk/**`); hai agent
+độc lập bắt trùng 3 lỗi. `env -u DATABASE_URL npm test` → **1069 test · 1063 pass · 0 fail · 6 skip ·
+0 todo** (3 test `{todo}` đã chuyển thành test THẬT và xanh); `node --check` ✓; `verify.mjs` EXIT=0;
+`imagelab-demo.mjs` → `succeeded`; 3 suite UI xanh (`imagelab-ui` 23/23, `imagestudio-ui` 15/15,
+`mvp04-ui` 9/9).
+
+### 24.1 D1/D2/D3 — script phản biện
+
+```
+$ node /tmp/x-atk/a1-bundle.mjs        → findings: 0
+  S1 (MVP-01 mock):   manifest.mock_steps = ["content"]      ← vòng 1: []
+  S2 (asset mock):    manifest.mock_steps = ["ocr"] + note “đường asset hoạt động”
+  S6 (transport lạ):  verification = null · suggested_level = "MOCK_VERIFIED"
+                      notes: 'Dấu vết ghi nhãn "LIVE_VERIFIED" nhưng KHÔNG có transport … ⇒ KHÔNG giữ nhãn'
+  entries == manifest.entries (kể cả "MANIFEST.json")        ← vòng 1: thiếu chính MANIFEST.json
+$ node /tmp/x-atk/a6-e2e.mjs
+  MANIFEST.json providers.content = {"name":"mock","model":"mock-1","is_mock":true,…}
+  providers.usage = [{"operation":"VISION_ANALYSIS","provider":"mock","is_mock":true}, …]
+                                                     ← vòng 1: provider "mock" khai is_mock:false
+```
+
+### 24.2 D4/D5 — script phản biện + test mới
+
+```
+$ node /tmp/x-atk/a3-api.mjs           → findings: 0
+$ node --test test/export-api.test.js
+  ✔ D4: job KHÔNG có chủ (không user_id, không session_id) ⇒ 404 cho cả /bundle và /manifest
+  ✔ D5: `/manifest` KHÔNG dựng ZIP (nhanh hơn hẳn) và vẫn là một nguồn với gói
+$ node --test test/export-bundle.test.js
+  ✔ D5: `buildExportManifest` KHÔNG tạo ZIP và cho ra CÙNG bản kê khai  (zipped=false, buffer=null)
+  ✔ D1: job MVP-01 chạy provider GIẢ ⇒ `noi-dung.txt` PHẢI có dòng cảnh báo mock
+```
+
+### 24.3 D6 — script phản biện
+
+```
+$ node /tmp/x-atk/a4-edge.mjs          → findings: 0
+$ node /tmp/x-atk/a4b-nostorage.mjs
+  config.exports = {"available":false,"formats":["zip"]}      ← vòng 1: available:true
+  GET /bundle   khi app.storage=null: 503 EXPORT_UNAVAILABLE  ← vòng 1: 500
+  GET /manifest khi app.storage=null: 503 EXPORT_UNAVAILABLE  ← vòng 1: 500
+  server sống: 200
+$ node --test test/export-bundle.test.js
+  ✔ D6: `manifest.entries` kể cả MANIFEST.json và `files` cùng độ dài
+  ✔ D6: `createZip` TỪ CHỐI tên entry chứa CR/LF (BAD_ENTRY_NAME)
+  ✔ D6: thiếu `storage` ⇒ lỗi BAD_INPUT nói rõ storage (route map thành 503)
+```
+
+### 24.4 CÁI GÌ CHƯA ĐO ĐƯỢC (nói thẳng)
+
+1. **ZIP64 (> 4 GiB / > 65535 entry) CHƯA kiểm** — bản này chỉ ghi ZIP cổ điển và **từ chối** khi
+   vượt trần (`ZIP_TOO_LARGE`), nên không có ca >4 GiB nào chạy thật; biên đã đo: 1000 entry,
+   ~5 MB, 0 byte (`a1-bundle.mjs` S10).
+2. **Finder/Windows Explorer/Chrome thật CHƯA kiểm** — mới kiểm bằng bộ đọc độc lập trong repo
+   (`inspectZip`) + script Python ngoài (`a2-external.py`); chưa mở gói bằng công cụ hệ điều hành.
+3. **PostgreSQL CHƯA kiểm cho luồng xuất gói** — mọi phép đo chạy SQLite (`DATABASE_URL` đang trỏ
+   PG đã tắt ⇒ phải chạy `env -u DATABASE_URL npm test`); phần đọc store của X1 không có nhánh
+   riêng theo driver nhưng **chưa có bằng chứng đo** trên PG.
+4. **UI thật (trình duyệt) CHƯA kiểm** — chỉ kiểm bằng test DOM (`export-ui.test.js`) + script
+   `a5-ui.mjs` đọc mã nguồn `public/app.js`.
+5. **Gói > trần bộ nhớ** chỉ được chặn (`BUNDLE_TOO_LARGE`), chưa đo gói lớn nhất chạy được trên
+   máy yếu.
