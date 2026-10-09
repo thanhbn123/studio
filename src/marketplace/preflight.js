@@ -16,7 +16,7 @@ import { isMarketplaceChannel } from './provider.js';
  * Giới hạn của từng sàn dùng ở preflight. Nguồn: tài liệu công khai của Shopee Open Platform v2
  * (`product/add_item`) và TikTok Shop Open Platform 202309 (`Create Product`), tra 10/10/2026 —
  * bảng trường chính thức không mở được trong phiên viết nên các con số là **theo trí nhớ tài liệu,
- * cần xác minh** khi có tài khoản (xem `docs/VERIFICATION.md` §27). Kênh `dry-run` dùng mức CHẶT
+ * cần xác minh** khi có tài khoản (xem `docs/VERIFICATION.md` §29). Kênh `dry-run` dùng mức CHẶT
  * hơn của hai sàn để một bài qua được chế độ thử thì cũng qua được cả hai sàn thật.
  */
 export const CHANNEL_LIMITS = Object.freeze({

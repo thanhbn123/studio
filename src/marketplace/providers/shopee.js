@@ -3,7 +3,7 @@
  *
  * ⚠️ CHƯA ĐO VỚI API THẬT (chưa có tài khoản người bán được duyệt). Viết theo tài liệu công khai
  * `open.shopee.com/developer-guide` (tra 10/10/2026; bảng trường chính thức không mở được trong
- * phiên viết — xem `docs/VERIFICATION.md` §27). Mọi tên trường/cách ký ở đây là **cần xác minh**
+ * phiên viết — xem `docs/VERIFICATION.md` §29). Mọi tên trường/cách ký ở đây là **cần xác minh**
  * khi có token; kiến trúc không đổi, chỉ sửa trong file này.
  *
  * Cách ký (theo tài liệu công khai): base = partner_id + path + timestamp + access_token + shop_id;

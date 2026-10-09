@@ -192,6 +192,22 @@ const state = {
       dirtyPaint: false,
     },
   },
+  // MVP-07 — Đăng bài Facebook Page (DUYỆT TAY), hợp đồng §5. Tách riêng khỏi state của các
+  // sprint khác để không giẫm chân nhau. `canApprove` là câu trả lời THẬT của máy chủ
+  // (`can_approve` trong `GET /api/publish/items`) — UI KHÔNG tự suy quyền duyệt từ role.
+  pub: {
+    items: [],
+    total: 0,
+    scope: 'mine',
+    canApprove: false,
+    filter: '',
+    loading: false,
+    creating: false,
+    busyId: null,
+    error: null,
+    jobs: [],
+    draft: { jobId: '', text: '' },
+  },
   // MVP-05 — Tài khoản + ví credit (§3.5). `me` là câu trả lời THẬT của `GET /api/auth/me`.
   auth: {
     me: null, // { user, anonymous, balance } | null = chưa kiểm tra
@@ -226,6 +242,21 @@ const state = {
     creditDraft: { amount: '', note: '' },
     creditConfirm: null, // { userId, email, amount, note } — đã xem lại, chờ xác nhận
     roleDraft: {}, // userId → vai trò đang chọn (chưa lưu)
+  },
+  // MVP-06 — Nạp credit thủ công (`docs/MVP-06-CONTRACT.md` §4). Giao diện KHÔNG giữ bất kỳ
+  // thông tin ngân hàng cứng nào: số tài khoản lấy từ `/api/config` (`billing.topup.bank`).
+  topup: {
+    requests: null, // yêu cầu của CHÍNH tôi (null = chưa tải)
+    loading: false,
+    busy: false,
+    draft: { amount_vnd: '', reference: '', note: '' },
+    error: null,
+    notice: null,
+    admin: null, // yêu cầu `pending` của MỌI người (trang Quản trị)
+    adminLoading: false,
+    confirmId: null, // đang chờ xác nhận lần hai cho yêu cầu nào
+    rejectId: null, // đang mở ô lý do từ chối cho yêu cầu nào
+    rejectDraft: '',
   },
   // 402 INSUFFICIENT_CREDIT gặp ở BẤT KỲ thao tác nào (kể cả trong `api()`) ⇒ băng báo dùng chung.
   // MVP-08 — Đăng sàn (`docs/MVP-08-CONTRACT.md` §5). Kênh/cờ live lấy từ `/api/config.marketplace`.
@@ -370,6 +401,16 @@ function route() {
     stopIsPolling();
     stopVsPolling();
     openAdmin();
+    return;
+  }
+  // MVP-07 (§5) — tab thứ năm “Đăng bài”, route hash riêng `#/dangbai`.
+  if (hash.startsWith('#/dangbai')) {
+    stopPolling();
+    stopIlPolling();
+    stopIsPolling();
+    stopVsPolling();
+    renderPublish();
+    loadPublishItems({ quiet: true });
     return;
   }
   // MVP-08 (§5) — tab “Đăng sàn”: `#/dangsan`.
@@ -602,6 +643,21 @@ function onGlobalClick(ev) {
     // ── Gói xuất bản (.zip) — hợp đồng §4 ──
     exportbundle: () => downloadExportBundle(btn.dataset.exportId),
     exportmanifest: () => openExportManifest(btn.dataset.exportId),
+    // ── MVP-07 — Đăng bài Facebook Page (duyệt tay) ──
+    publish: () => {
+      location.hash = '#/dangbai';
+    },
+    pubreload: () => loadPublishItems(),
+    pubfilter: () => {
+      state.pub.filter = String(btn.dataset.filter ?? '');
+      loadPublishItems();
+    },
+    pubcreate: () => createPublishItem(false),
+    pubcreatesubmit: () => createPublishItem(true),
+    pubsubmit: () => publishItemAction(btn.dataset.id, 'submit'),
+    pubapprove: () => publishItemAction(btn.dataset.id, 'approve'),
+    pubreject: () => publishItemAction(btn.dataset.id, 'reject'),
+    pubpublish: () => publishItemAction(btn.dataset.id, 'publish'),
     // ── MVP-05 — Tài khoản + ví credit ──
     login: () => {
       location.hash = '#/dangnhap';
@@ -635,6 +691,33 @@ function onGlobalClick(ev) {
     usersreload: () => loadAdminUsers(true),
     usersMore: () => loadAdminUsers(false),
     usageload: () => loadAdminUsage(true),
+    // ── MVP-06 — nạp credit thủ công ──
+    topupsubmit: () => submitTopup(),
+    topupreload: () => loadTopups(true),
+    topupadminreload: () => loadAdminTopups(true),
+    topupreview: () => {
+      state.topup.confirmId = String(btn.dataset.id || '');
+      state.topup.rejectId = null;
+      state.auth.adminError = null;
+      state.auth.adminNotice = null;
+      renderAdminPage();
+    },
+    topuprejectopen: () => {
+      state.topup.rejectId = String(btn.dataset.id || '');
+      state.topup.confirmId = null;
+      state.topup.rejectDraft = '';
+      state.auth.adminError = null;
+      state.auth.adminNotice = null;
+      renderAdminPage();
+    },
+    topupcancel: () => {
+      state.topup.confirmId = null;
+      state.topup.rejectId = null;
+      state.topup.rejectDraft = '';
+      renderAdminPage();
+    },
+    topupconfirm: () => decideTopup(btn.dataset.id, { reject: false }),
+    topupreject: () => decideTopup(btn.dataset.id, { reject: true }),
     creditdismiss: () => dismissCreditAlert(),
     // ── MVP-08 — Đăng sàn ──
     marketplace: () => {
@@ -5346,7 +5429,69 @@ const AUTH_ERROR_HINT = {
 
 // Nói thẳng, không hứa hẹn: credit nội bộ, chưa có cổng thanh toán.
 const CREDIT_HONEST_NOTE = 'Credit nội bộ — KHÔNG phải tiền thật. Số dư = tổng sổ (append-only), không sửa tay được.';
-const CREDIT_TOPUP_HINT = 'Giai đoạn này CHƯA có cổng thanh toán: credit chỉ do quản trị viên cấp tay (trang Quản trị). Không có khoản thanh toán nào được thực hiện ở đây.';
+const CREDIT_TOPUP_HINT = 'Giai đoạn này CHƯA có cổng thanh toán: bạn chuyển khoản TAY theo hướng dẫn bên dưới rồi gửi yêu cầu nạp; credit vào ví sau khi quản trị XÁC NHẬN.';
+
+/* ───────────────── MVP-06 — Nạp credit thủ công (hợp đồng §4) ───────────────── */
+
+const TOPUP_STATUS_LABEL = {
+  pending: 'Chờ quản trị xác nhận',
+  confirmed: 'Đã cộng credit',
+  rejected: 'Bị từ chối',
+  expired: 'Đã hết hạn',
+};
+
+const TOPUP_STATUS_CLASS = { pending: 'warn', confirmed: 'ok', rejected: 'error', expired: '' };
+
+// Câu NÓI THẬT của hợp đồng §4. Máy chủ cũng trả câu này trong `/api/config`
+// (`billing.topup.note`); khi có thì ưu tiên câu của máy chủ để không có hai bản chữ lệch nhau.
+const TOPUP_HONEST_NOTE = 'Tiền vào ví chỉ sau khi quản trị xác nhận — hệ thống không tự biết tiền đã về tài khoản.';
+
+const TOPUP_ERROR_HINT = {
+  TOPUP_AMOUNT_OUT_OF_RANGE: 'Số tiền nạp nằm ngoài khoảng cho phép.',
+  TOPUP_AMOUNT_INVALID: 'Số tiền phải là số nguyên (đồng VND), ví dụ 260000.',
+  TOPUP_REFERENCE_REQUIRED: 'Cần mã giao dịch / nội dung chuyển khoản để quản trị đối soát với sao kê.',
+  TOPUP_REFERENCE_DUPLICATE: 'Mã giao dịch này bạn đã gửi cho một yêu cầu khác rồi.',
+  TOPUP_ALREADY_DECIDED: 'Yêu cầu này đã được quyết định trước đó — sổ credit không đổi.',
+  TOPUP_REASON_REQUIRED: 'Từ chối phải có lý do.',
+  TOPUP_NOT_FOUND: 'Không tìm thấy yêu cầu nạp này.',
+  TOPUP_UNAVAILABLE: 'Máy chủ chưa bật được chức năng nạp credit.',
+  AMOUNT_TOO_LARGE: 'Số credit làm số dư vượt trần cho phép — hãy duyệt số nhỏ hơn.',
+};
+
+/** Khối cấu hình nạp credit do máy chủ trả (`/api/config`). `null` ⇒ chức năng chưa bật. */
+function topupConfig() {
+  const t = state.config?.billing?.topup;
+  return t && typeof t === 'object' ? t : null;
+}
+
+function topupEnabled() {
+  return Boolean(topupConfig());
+}
+
+function topupNote() {
+  const text = topupConfig()?.note;
+  return typeof text === 'string' && text ? text : TOPUP_HONEST_NOTE;
+}
+
+function topupStatusLabel(status) {
+  const key = String(status ?? '');
+  return TOPUP_STATUS_LABEL[key] || key || 'Không rõ';
+}
+
+/** Tiền VND: có dấu phân cách nghìn để không đọc nhầm 26000 ↔ 260000. */
+function fmtVnd(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  return `${Math.round(n).toLocaleString('vi-VN')} ₫`;
+}
+
+/** Quy đổi VND → credit theo tỷ giá máy chủ. Thiếu tỷ giá ⇒ `null` (KHÔNG tự bịa tỷ giá). */
+function topupCredits(amountVnd, rate = topupConfig()?.rate_vnd_per_credit) {
+  const amount = Number(amountVnd);
+  const r = Number(rate);
+  if (!Number.isFinite(amount) || !Number.isFinite(r) || r <= 0) return null;
+  return Math.round((amount / r) * 1e6) / 1e6;
+}
 
 const LEDGER_PAGE_SIZE = 50;
 const ADMIN_PAGE_SIZE = 50;
@@ -5783,6 +5928,174 @@ function renderPricingTable(pricing) {
     <tbody>${rows}</tbody></table></div>`;
 }
 
+/* ── MVP-06 · Nạp credit thủ công — tab Tài khoản (hợp đồng §4) ───────────── */
+
+/**
+ * HƯỚNG DẪN CHUYỂN KHOẢN — số tài khoản LẤY TỪ CẤU HÌNH MÁY CHỦ (`/api/config`).
+ * ⚠️ TUYỆT ĐỐI không hardcode số tài khoản ở đây: quản trị chưa điền ⇒ nói thật là chưa có,
+ * thà không nạp được còn hơn hiện một số tài khoản bịa và người dùng chuyển tiền đi đâu đó.
+ */
+function renderTopupGuide() {
+  const cfg = topupConfig();
+  const bank = cfg?.bank || null;
+  if (!bank || bank.configured === false) {
+    return `<div class="notice error">
+      <strong>Quản trị chưa điền thông tin chuyển khoản.</strong>
+      <p class="small" style="margin:6px 0 0">Chưa có số tài khoản nào được cấu hình trên máy chủ
+      (<span class="mono">TOPUP_BANK_*</span>), nên giao diện KHÔNG hiện số tài khoản nào —
+      hãy liên hệ quản trị trước khi chuyển tiền.</p>
+    </div>`;
+  }
+  const rows = [
+    ['Ngân hàng', bank.bank_name],
+    ['Số tài khoản', bank.account_number],
+    ['Chủ tài khoản', bank.account_holder],
+    ['Nội dung chuyển khoản', bank.transfer_note],
+  ].filter(([, value]) => value)
+    .map(([label, value]) => `<dt>${esc(label)}</dt><dd class="mono">${esc(value)}</dd>`)
+    .join('');
+  return `<dl class="kv">${rows}</dl>
+    ${bank.instructions ? `<p class="small muted">${esc(bank.instructions)}</p>` : ''}`;
+}
+
+/** Bảng yêu cầu nạp CỦA TÔI. `null` = chưa tải (không hiện "trống" khi chưa biết). */
+function renderTopupTable(items) {
+  if (items === null || items === undefined) return '<p class="muted small">Đang tải yêu cầu nạp…</p>';
+  if (!Array.isArray(items) || items.length === 0) return '<p class="muted small">Bạn chưa có yêu cầu nạp nào.</p>';
+  const rows = items.map((it) => {
+    const badge = TOPUP_STATUS_CLASS[String(it?.status ?? '')] ?? '';
+    return `<tr>
+      <td class="mono small">${esc(fmtTime(it?.created_at))}</td>
+      <td class="mono">${esc(fmtVnd(it?.amount_vnd))}</td>
+      <td class="mono">${it?.credits === null || it?.credits === undefined ? '<span class="muted">—</span>' : esc(fmtAmount(it.credits))}</td>
+      <td class="mono small">${esc(it?.reference || '—')}</td>
+      <td><span class="badge ${esc(badge)}">${esc(topupStatusLabel(it?.status))}</span></td>
+      <td class="mono small">${it?.decided_at ? esc(fmtTime(it.decided_at)) : '<span class="muted">—</span>'}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="il-tablewrap"><table class="evidence topup-table">
+    <thead><tr><th>Thời gian</th><th>Số tiền (VND)</th><th>Credit</th><th>Mã giao dịch</th><th>Trạng thái</th><th>Đã quyết định</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
+/** Form gửi yêu cầu nạp + bản xem trước credit theo tỷ giá máy chủ. */
+function renderTopupPanel() {
+  const t = state.topup;
+  const cfg = topupConfig();
+  if (!cfg) {
+    return `<section class="panel" id="topup-panel">
+      <h2>Nạp credit</h2>
+      <div class="notice error"><strong>Chức năng nạp credit chưa bật trên máy chủ này.</strong>
+      <p class="small" style="margin:6px 0 0">${esc(CREDIT_TOPUP_HINT)}</p></div>
+    </section>`;
+  }
+  const draft = t.draft || { amount_vnd: '', reference: '', note: '' };
+  const preview = topupCredits(String(draft.amount_vnd ?? '').replace(/[^\d]/g, ''));
+  const noticeBox = t.notice ? `<div class="notice ok" id="topup-notice">${esc(t.notice)}</div>` : '';
+  const errorBox = t.error ? `<div class="notice error" id="topup-error">${esc(t.error)}</div>` : '';
+  return `<section class="panel" id="topup-panel">
+    <h2>Nạp credit (chuyển khoản tay)</h2>
+    <div class="notice warn">
+      <strong>${esc(topupNote())}</strong>
+      <p class="small" style="margin:6px 0 0">${esc(CREDIT_TOPUP_HINT)}</p>
+    </div>
+    <h3 class="small" style="margin:12px 0 4px">1 · Chuyển khoản theo hướng dẫn của quản trị</h3>
+    ${renderTopupGuide()}
+    <h3 class="small" style="margin:12px 0 4px">2 · Gửi yêu cầu nạp để quản trị đối soát</h3>
+    <p class="muted small">Tỷ giá đang dùng: <strong>${esc(fmtVnd(cfg.rate_vnd_per_credit))}</strong> = 1 credit ·
+      mỗi lần nạp từ ${esc(fmtVnd(cfg.min_topup_vnd))} đến ${esc(fmtVnd(cfg.max_topup_vnd))}.
+      Tỷ giá được GHI LẠI lúc quản trị duyệt, nên đổi tỷ giá sau đó không làm sai yêu cầu của bạn.</p>
+    ${noticeBox}${errorBox}
+    <div class="field">
+      <div class="field-head"><label for="topup-amount">Số tiền đã chuyển (VND)</label></div>
+      <input class="text-input" id="topup-amount" type="number" inputmode="numeric" step="1"
+             min="${esc(cfg.min_topup_vnd)}" max="${esc(cfg.max_topup_vnd)}" value="${esc(draft.amount_vnd)}" />
+      <p class="small muted">${preview === null ? 'Nhập số tiền để xem sẽ nhận bao nhiêu credit.' : `Sẽ nhận khoảng <strong>${esc(fmtAmount(preview))}</strong> credit (nếu quản trị xác nhận).`}</p>
+    </div>
+    <div class="field">
+      <div class="field-head"><label for="topup-reference">Mã giao dịch / nội dung chuyển khoản</label></div>
+      <input class="text-input" id="topup-reference" type="text" maxlength="64" value="${esc(draft.reference)}"
+             placeholder="Ví dụ: FT24283012345" />
+    </div>
+    <div class="field">
+      <div class="field-head"><label for="topup-note">Ghi chú (tuỳ chọn)</label></div>
+      <input class="text-input" id="topup-note" type="text" maxlength="300" value="${esc(draft.note)}"
+             placeholder="Ví dụ: chuyển lúc 14:05 ngày 09/10" />
+    </div>
+    <div class="row">
+      <button class="btn primary" data-action="topupsubmit" type="button"${t.busy ? ' disabled' : ''}>GỬI YÊU CẦU NẠP</button>
+      <button class="btn ghost tiny" data-action="topupreload" type="button">Tải lại danh sách</button>
+    </div>
+  </section>
+  <section class="panel">
+    <h2>Yêu cầu nạp của tôi</h2>
+    ${renderTopupTable(t.requests)}
+  </section>`;
+}
+
+/* ── MVP-06 · tab Quản trị — duyệt yêu cầu `pending` ─────────────────────── */
+
+/**
+ * Danh sách yêu cầu CHỜ XÁC NHẬN + hai nút: XÁC NHẬN (hiện số credit sẽ cộng + tỷ giá đang
+ * dùng) và TỪ CHỐI (bắt buộc lý do). Xác nhận có bước xem lại — tiền thật thì không bấm một nhịp.
+ */
+function renderAdminTopups() {
+  const t = state.topup;
+  if (!topupEnabled()) {
+    return '<p class="muted small">Máy chủ chưa bật chức năng nạp credit (`billing.topup` không có trong /api/config).</p>';
+  }
+  if (t.admin === null || t.admin === undefined) return '<p class="muted small">Đang tải yêu cầu nạp…</p>';
+  if (!t.admin.length) return '<p class="muted small">Không có yêu cầu nạp nào đang chờ xác nhận.</p>';
+  const rate = topupConfig()?.rate_vnd_per_credit;
+  // Người dùng hiện bằng EMAIL khi danh sách người dùng của trang Quản trị đã tải; chưa tải thì
+  // hiện đúng id thật (không bịa). Khai ngay trong hàm để test trích hàm không cần thêm phụ thuộc.
+  const users = Array.isArray(state.auth?.users) ? state.auth.users : [];
+  const topupUserLabel = (id) => users.find((u) => u?.id === id)?.email || String(id || '—');
+  const rows = t.admin.map((it) => {
+    const id = String(it?.id || '');
+    const credits = topupCredits(it?.amount_vnd, rate);
+    const confirming = t.confirmId === id;
+    const rejecting = t.rejectId === id;
+    const actions = confirming
+      ? `<div class="notice warn">
+          <strong>Xác nhận cộng ${esc(credits === null ? fmtAmount(it?.credits) : fmtAmount(credits))} credit cho ${esc(topupUserLabel(it?.user_id))}?</strong>
+          <p class="small" style="margin:6px 0 0">Tỷ giá đang dùng ${esc(fmtVnd(rate))} = 1 credit, tiền đã chuyển ${esc(fmtVnd(it?.amount_vnd))}.
+          Hãy đối soát mã giao dịch <span class="mono">${esc(it?.reference || '—')}</span> với sao kê ngân hàng TRƯỚC khi xác nhận —
+          hệ thống không tự biết tiền đã về.</p>
+          <div class="row" style="margin-top:8px">
+            <button class="btn primary tiny" data-action="topupconfirm" data-id="${esc(id)}" type="button"${t.busy ? ' disabled' : ''}>XÁC NHẬN CỘNG CREDIT</button>
+            <button class="btn ghost tiny" data-action="topupcancel" type="button">Huỷ</button>
+          </div>
+        </div>`
+      : rejecting
+        ? `<div class="notice error">
+            <strong>Lý do từ chối (bắt buộc)</strong>
+            <input class="text-input" id="topup-reject-reason" type="text" maxlength="300" value="${esc(t.rejectDraft)}"
+                   placeholder="Ví dụ: không thấy giao dịch này trong sao kê" />
+            <div class="row" style="margin-top:8px">
+              <button class="btn tiny" data-action="topupreject" data-id="${esc(id)}" type="button"${t.busy ? ' disabled' : ''}>TỪ CHỐI</button>
+              <button class="btn ghost tiny" data-action="topupcancel" type="button">Huỷ</button>
+            </div>
+          </div>`
+        : `<div class="row">
+            <button class="btn tiny" data-action="topupreview" data-id="${esc(id)}" type="button">XÁC NHẬN…</button>
+            <button class="btn ghost tiny" data-action="topuprejectopen" data-id="${esc(id)}" type="button">TỪ CHỐI…</button>
+          </div>`;
+    return `<tr>
+      <td class="mono small">${esc(fmtTime(it?.created_at))}</td>
+      <td class="small">${esc(topupUserLabel(it?.user_id))}</td>
+      <td class="mono">${esc(fmtVnd(it?.amount_vnd))}</td>
+      <td class="mono">${esc(credits === null ? fmtAmount(it?.credits) : fmtAmount(credits))}</td>
+      <td class="mono small">${esc(it?.reference || '—')}</td>
+      <td class="small">${it?.note ? esc(it.note) : '<span class="muted">—</span>'}</td>
+      <td>${actions}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="il-tablewrap"><table class="evidence admin-table topup-admin-table">
+    <thead><tr><th>Thời gian</th><th>Người dùng</th><th>Tiền (VND)</th><th>Credit sẽ cộng</th><th>Mã giao dịch</th><th>Ghi chú</th><th>Quyết định</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
 function renderAccountBody() {
   const a = state.auth;
   const me = a.me || {};
@@ -5818,12 +6131,9 @@ function renderAccountBody() {
       <dt>Trạng thái</dt><dd>${esc(userStatusLabel(user.status))}</dd>
       <dt>Số dư credit</dt><dd><strong>${esc(creditText(me.balance))}</strong></dd>
     </dl>
-    <div class="notice warn" style="margin-top:12px">
-      <strong>Nạp credit thế nào?</strong>
-      <p class="small" style="margin:6px 0 0">${esc(CREDIT_TOPUP_HINT)}</p>
-    </div>
   </section>
   ${errorBox}
+  ${renderTopupPanel()}
   <section class="panel">
     <div class="spread">
       <h2 style="margin:0">Lịch sử sổ credit</h2>
@@ -5857,7 +6167,7 @@ async function openAccount() {
   // Hỏi máy chủ MỖI lần vào trang: phiên có thể đã hết hạn hoặc số dư vừa đổi — không đoán.
   await loadMe();
   renderAccountPage();
-  await Promise.all([loadLedger(true), loadPricing(true)]);
+  await Promise.all([loadLedger(true), loadPricing(true), loadTopups(true)]);
 }
 
 async function loadLedger(reset = false) {
@@ -5916,6 +6226,140 @@ async function loadPricing(force = false) {
     a.pricingLoading = false;
   }
   if (state.view === 'account') renderAccountPage();
+}
+
+/* ── MVP-06 · gọi API nạp credit (§3) ─────────────────────────────────────── */
+
+/** Câu tiếng Việt cho lỗi MVP-06; không nhận ra mã thì dùng câu THẬT của máy chủ. */
+function topupErrorText(err) {
+  const hint = TOPUP_ERROR_HINT[String(err?.code ?? '')];
+  const server = apiErrorText(err);
+  return hint ? `${hint} (${server})` : server;
+}
+
+async function loadTopups(reset = false) {
+  const t = state.topup;
+  if (t.loading) return;
+  if (!currentUser()) {
+    t.requests = [];
+    if (state.view === 'account') renderAccountPage();
+    return;
+  }
+  t.loading = true;
+  if (reset) t.requests = null;
+  try {
+    // `mine=1`: admin cũng xem yêu cầu CỦA MÌNH ở tab Tài khoản (danh sách tất cả nằm ở tab Quản trị).
+    const data = await api('/api/billing/topup-requests?mine=1&limit=50');
+    t.requests = Array.isArray(data?.items) ? data.items : [];
+    t.error = null;
+  } catch (err) {
+    t.requests = [];
+    // Máy chủ chưa bật chức năng ⇒ KHÔNG hiện lỗi đỏ ở trang Tài khoản; khối form đã nói rõ.
+    if (err?.status !== 503) t.error = topupErrorText(err);
+  } finally {
+    t.loading = false;
+  }
+  if (state.view === 'account') renderAccountPage();
+}
+
+async function submitTopup() {
+  const t = state.topup;
+  if (t.busy) return;
+  const amountRaw = String($('#topup-amount')?.value ?? t.draft.amount_vnd ?? '').trim();
+  const reference = String($('#topup-reference')?.value ?? t.draft.reference ?? '').trim();
+  const note = String($('#topup-note')?.value ?? t.draft.note ?? '').trim();
+  t.draft = { amount_vnd: amountRaw, reference, note };
+  const amount = Number.parseInt(amountRaw.replace(/[^\d-]/g, ''), 10);
+  if (!Number.isFinite(amount)) {
+    t.error = 'Hãy nhập số tiền đã chuyển (VND), ví dụ 260000.';
+    t.notice = null;
+    renderAccountPage();
+    return;
+  }
+  if (!reference) {
+    t.error = TOPUP_ERROR_HINT.TOPUP_REFERENCE_REQUIRED;
+    t.notice = null;
+    renderAccountPage();
+    return;
+  }
+  t.busy = true;
+  t.error = null;
+  t.notice = null;
+  renderAccountPage();
+  try {
+    const data = await api('/api/billing/topup-requests', {
+      method: 'POST',
+      body: { amount_vnd: amount, reference, note },
+    });
+    const credits = data?.request?.credits;
+    t.notice = `Đã gửi yêu cầu nạp ${fmtVnd(amount)}`
+      + `${Number.isFinite(Number(credits)) ? ` (≈ ${fmtAmount(credits)} credit)` : ''}`
+      + ' — ví CHƯA đổi, chờ quản trị xác nhận.';
+    t.draft = { amount_vnd: '', reference: '', note: '' };
+  } catch (err) {
+    t.error = topupErrorText(err);
+  } finally {
+    t.busy = false;
+  }
+  renderAccountPage();
+  await loadTopups(true);
+}
+
+async function loadAdminTopups(reset = false) {
+  const t = state.topup;
+  if (t.adminLoading) return;
+  t.adminLoading = true;
+  if (reset) t.admin = null;
+  try {
+    const data = await api('/api/billing/topup-requests?status=pending&limit=100');
+    t.admin = Array.isArray(data?.items) ? data.items : [];
+    state.auth.adminError = null;
+  } catch (err) {
+    t.admin = [];
+    if (err?.status !== 503) state.auth.adminError = topupErrorText(err);
+  } finally {
+    t.adminLoading = false;
+  }
+  if (state.view === 'admin') renderAdminPage();
+}
+
+async function decideTopup(id, { reject = false } = {}) {
+  const t = state.topup;
+  if (!id || t.busy) return;
+  const reason = reject
+    ? String($('#topup-reject-reason')?.value ?? t.rejectDraft ?? '').trim()
+    : '';
+  if (reject && !reason) {
+    state.auth.adminError = TOPUP_ERROR_HINT.TOPUP_REASON_REQUIRED;
+    renderAdminPage();
+    return;
+  }
+  t.busy = true;
+  state.auth.adminError = null;
+  state.auth.adminNotice = null;
+  renderAdminPage();
+  try {
+    const path = `/api/billing/topup-requests/${encodeURIComponent(id)}/${reject ? 'reject' : 'confirm'}`;
+    const data = await api(path, { method: 'POST', body: reject ? { reason } : {} });
+    state.auth.adminNotice = reject
+      ? `Đã TỪ CHỐI yêu cầu ${id} — KHÔNG có dòng sổ nào được ghi.`
+      : `Đã cộng ${fmtAmount(data?.ledger?.amount)} credit cho ${data?.request?.user_id} (số dư mới: ${creditText(data?.balance)}).`;
+    t.confirmId = null;
+    t.rejectId = null;
+    t.rejectDraft = '';
+    state.auth.users = null; // danh sách người dùng có thể kèm số dư ⇒ nạp lại cho thật
+  } catch (err) {
+    state.auth.adminError = topupErrorText(err);
+    // Đã có người quyết định trước ⇒ đóng hộp xác nhận và nạp lại danh sách cho đúng sự thật.
+    if (err?.code === 'TOPUP_ALREADY_DECIDED' || err?.status === 404) {
+      t.confirmId = null;
+      t.rejectId = null;
+    }
+  } finally {
+    t.busy = false;
+  }
+  renderAdminPage();
+  await Promise.all([loadAdminTopups(true), loadMe()]);
 }
 
 /* ── Trang Quản trị (#/quantri) — CHỈ owner/admin ─────────────────────────── */
@@ -6087,6 +6531,14 @@ function renderAdminBody() {
   </section>
   ${renderAdminCreditForm()}
   <section class="panel">
+    <div class="spread">
+      <h2 style="margin:0">Yêu cầu nạp credit đang chờ</h2>
+      <button class="btn ghost tiny" data-action="topupadminreload" type="button">Tải lại</button>
+    </div>
+    <p class="muted small">${esc(topupNote())}</p>
+    ${renderAdminTopups()}
+  </section>
+  <section class="panel">
     <h2>Số liệu sử dụng</h2>
     <div class="row">
       <label class="small muted" for="admin-usage-group">Nhóm theo</label>
@@ -6117,7 +6569,7 @@ async function openAdmin() {
   if (!state.auth.usageFrom) state.auth.usageFrom = d.from;
   if (!state.auth.usageTo) state.auth.usageTo = d.to;
   renderAdminPage();
-  if (canAdmin()) await Promise.all([loadAdminUsers(true), loadAdminUsage(true)]);
+  if (canAdmin()) await Promise.all([loadAdminUsers(true), loadAdminUsage(true), loadAdminTopups(true)]);
 }
 
 async function loadAdminUsers(reset = false) {
@@ -6304,6 +6756,15 @@ function clearPrivateState() {
   a.creditConfirm = null;
   a.creditDraft = { amount: '', note: '' };
   a.roleDraft = {};
+  // MVP-06: yêu cầu nạp là dữ liệu RIÊNG TƯ (tiền của một người) ⇒ xoá sạch khi đăng xuất.
+  state.topup.requests = null;
+  state.topup.admin = null;
+  state.topup.draft = { amount_vnd: '', reference: '', note: '' };
+  state.topup.confirmId = null;
+  state.topup.rejectId = null;
+  state.topup.rejectDraft = '';
+  state.topup.error = null;
+  state.topup.notice = null;
   a.form = { email: '', display_name: '' };
   a.formError = null;
   a.formNotice = null;
@@ -6350,6 +6811,8 @@ function wireAuthGlobal() {
     // Giữ bản nháp để render lại không mất chữ. Mật khẩu KHÔNG bao giờ vào state.
     if (t.id === 'auth-email') state.auth.form.email = String(t.value ?? '');
     else if (t.id === 'auth-name') state.auth.form.display_name = String(t.value ?? '');
+    // MVP-07: giữ bản nháp bài đăng để render lại không mất chữ người dùng đang viết.
+    else if (t.id === 'pub-text') state.pub.draft.text = String(t.value ?? '');
     else if (t.id === 'credit-amount') state.auth.creditDraft.amount = String(t.value ?? '');
     else if (t.id === 'credit-note') state.auth.creditDraft.note = String(t.value ?? '');
     // MVP-08 — giữ bản nháp form đăng sàn (`mk-<ten-truong>` → `state.mk.draft.<ten_truong>`).
@@ -6358,12 +6821,21 @@ function wireAuthGlobal() {
       const key = t.id.slice(3).replace(/-/g, '_');
       if (Object.prototype.hasOwnProperty.call(state.mk.draft, key)) state.mk.draft[key] = String(t.value ?? '');
     }
+    // MVP-06 — giữ bản nháp form nạp credit để render lại không mất chữ.
+    else if (t.id === 'topup-amount') state.topup.draft.amount_vnd = String(t.value ?? '');
+    else if (t.id === 'topup-reference') state.topup.draft.reference = String(t.value ?? '');
+    else if (t.id === 'topup-note') state.topup.draft.note = String(t.value ?? '');
+    else if (t.id === 'topup-reject-reason') state.topup.rejectDraft = String(t.value ?? '');
   });
   document.addEventListener('change', (ev) => {
     const t = ev.target;
     if (!t) return;
     if (t.dataset?.roleUser) {
       state.auth.roleDraft[t.dataset.roleUser] = String(t.value || '');
+      return;
+    }
+    if (t.id === 'pub-job') {
+      state.pub.draft.jobId = String(t.value || '');
       return;
     }
     if (t.id === 'admin-usage-group') {
@@ -6375,6 +6847,424 @@ function wireAuthGlobal() {
       state.auth.usageTo = String(t.value || '');
     }
   });
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * MVP-07 — MÀN “ĐĂNG BÀI” (Facebook Page, DUYỆT TAY)
+ * Hợp đồng: `docs/MVP-07-CONTRACT.md` §5.
+ *
+ * Ba điều màn này BẮT BUỘC nói thật, vì chúng là lý do cả sprint tồn tại:
+ *   1. Provider `dry-run` ⇒ băng vàng “CHẾ ĐỘ THỬ — không đăng thật”.
+ *   2. Provider `facebook` chưa có token ⇒ băng đỏ “chưa cấu hình Facebook (cần Page ID + token)”.
+ *   3. Bài chưa duyệt ⇒ nút ĐĂNG NGAY **disabled** + câu giải thích; không bao giờ có đường
+ *      nào trong UI gọi `…/publish` cho bài chưa `approved`.
+ *
+ * Mọi text động đi qua `esc()`.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const PUB_STATUS_LABEL = {
+  draft: 'Nháp',
+  pending_review: 'Chờ duyệt',
+  approved: 'Đã duyệt',
+  publishing: 'Đang đăng',
+  published: 'Đã đăng',
+  failed: 'Lỗi',
+  rejected: 'Bị từ chối',
+};
+
+const PUB_STATUS_CLASS = {
+  draft: '',
+  pending_review: 'warn',
+  approved: 'ok',
+  publishing: 'warn',
+  published: 'ok',
+  failed: 'bad',
+  rejected: 'bad',
+};
+
+/** Bộ lọc trên màn (thứ tự hiển thị). `''` = tất cả. */
+const PUB_FILTERS = [
+  ['', 'Tất cả'],
+  ['draft', 'Nháp'],
+  ['pending_review', 'Chờ duyệt'],
+  ['approved', 'Đã duyệt'],
+  ['published', 'Đã đăng'],
+  ['failed', 'Lỗi'],
+  ['rejected', 'Bị từ chối'],
+];
+
+const PUB_DRY_RUN_LINE = 'CHẾ ĐỘ THỬ — không đăng thật';
+const PUB_NOT_CONFIGURED_LINE = 'chưa cấu hình Facebook (cần Page ID + token)';
+const PUB_MANUAL_LINE = 'Hệ thống KHÔNG BAO GIỜ tự đăng: mỗi bài phải có owner/admin bấm DUYỆT trước.';
+const PUB_NEED_LOGIN_LINE = 'Đăng bài cần đăng nhập — bài đăng phải có người chịu trách nhiệm và có người duyệt.';
+const PUB_NOT_APPROVED_HINT = 'Bài phải được DUYỆT trước khi đăng.';
+
+// ⚠️ Bảng này cố ý KHÔNG tham chiếu các hằng ở trên: bộ test UI trích TỪNG hằng ra khỏi
+// `public/app.js` rồi biên dịch riêng, nên một object tham chiếu hằng khác sẽ không nạp được.
+// Đây là bản sao CÂU CHỮ (copy hiển thị), không phải bản sao LUẬT — luật nằm ở `src/publish/**`.
+const PUB_ERROR_HINT = {
+  PUBLISH_UNAVAILABLE: 'Máy chủ chưa nạp được khối đăng bài — các tính năng khác vẫn dùng bình thường.',
+  UNAUTHENTICATED: 'Đăng bài cần đăng nhập — bài đăng phải có người chịu trách nhiệm và có người duyệt.',
+  FORBIDDEN: 'Chỉ owner/admin được duyệt hoặc từ chối bài.',
+  NOT_APPROVED: 'Bài phải được DUYỆT trước khi đăng.',
+  ITEM_NOT_FOUND: 'Không tìm thấy bài: có thể bài thuộc tài khoản khác, hoặc đã bị xoá.',
+  NOT_CONFIGURED: 'Chưa cấu hình Facebook (cần Page ID + token) nên máy chủ không đăng gì cả.',
+  PROVIDER_DISABLED: 'Đường đăng bài đang tắt bằng cấu hình.',
+  MEDIA_NOT_PUBLIC: 'Ảnh chỉ có trên đĩa máy chủ, Facebook không tải về được. Hãy đăng bài chỉ có chữ, hoặc cấu hình PUBLIC_BASE_URL công khai.',
+  ATTEMPTS_EXHAUSTED: 'Bài đã thử đăng hết số lượt cho phép — xem lỗi gần nhất rồi tạo bài mới.',
+  ALREADY_PUBLISHED: 'Bài này đã đăng rồi — hệ thống không đăng lần hai.',
+  PUBLISH_IN_PROGRESS: 'Một lượt đăng khác đang xử lý bài này.',
+};
+
+/** Câu nói THẬT khi một thao tác đăng bài thất bại — theo mã + HTTP status, không đoán bừa. */
+function pubErrorText(err) {
+  const code = String(err?.code || '').trim();
+  const status = Number(err?.status || 0);
+  const rawMsg = String(err?.payload?.message || err?.message || '').trim();
+  const real = rawMsg && rawMsg !== `HTTP ${status}` ? rawMsg : '';
+  const hint = PUB_ERROR_HINT[code] || '';
+  const head = status ? `HTTP ${status}${code ? ` ${code}` : ''}` : code || 'lỗi không rõ';
+  const server = real ? ` Máy chủ báo: “${real}”` : '';
+  return `${hint ? `${hint} ` : ''}(${head}).${server}`.trim();
+}
+
+function pubStatusBadge(status) {
+  const s = String(status ?? '');
+  const cls = PUB_STATUS_CLASS[s] ?? '';
+  return `<span class="badge ${cls}">${esc(PUB_STATUS_LABEL[s] || s || 'không rõ')}</span>`;
+}
+
+/** Khối `publish` của `/api/config` — thiếu thì coi như chưa khả dụng, KHÔNG đoán là sẵn sàng. */
+function pubConfig() {
+  return state.config?.publish || null;
+}
+
+function pubProvider() {
+  return pubConfig()?.provider || null;
+}
+
+/**
+ * Băng trạng thái provider — luật §5 của hợp đồng. Đây là chỗ UI PHẢI nói thật:
+ * chế độ thử thì nói chế độ thử; chưa có token thì nói chưa có token.
+ */
+function pubProviderNotice() {
+  const cfg = pubConfig();
+  if (!cfg) {
+    return `<div class="notice error"><strong>Chưa biết trạng thái đăng bài</strong>
+      <p class="small" style="margin:6px 0 0">Máy chủ không trả khối <span class="mono">publish</span> trong /api/config — bản máy chủ cũ hơn tính năng này.</p></div>`;
+  }
+  if (!cfg.available) {
+    return `<div class="notice error"><strong>Tính năng đăng bài chưa sẵn sàng (PUBLISH_UNAVAILABLE)</strong>
+      <p class="small" style="margin:6px 0 0">Lý do máy chủ báo: ${esc(cfg.reason || 'không nêu lý do — xem log máy chủ (publish.wiring_failed).')}</p></div>`;
+  }
+  const p = cfg.provider || {};
+  const name = String(p.name || 'none');
+  if (p.is_mock) {
+    return `<div class="notice warn"><strong>${esc(PUB_DRY_RUN_LINE)}</strong>
+      <p class="small" style="margin:6px 0 0">Provider <span class="mono">${esc(name)}</span>: bài KHÔNG được gửi lên Facebook.
+      Mã bài trả về có tiền tố <span class="mono">dry-</span> và được đánh dấu <strong>là giả</strong>.
+      ${esc(PUB_MANUAL_LINE)}</p></div>`;
+  }
+  if (!p.configured) {
+    return `<div class="notice error"><strong>${esc(PUB_NOT_CONFIGURED_LINE)}</strong>
+      <p class="small" style="margin:6px 0 0">Provider <span class="mono">${esc(name)}</span> chưa đủ cấu hình nên máy chủ
+      <strong>không đăng gì cả</strong>. Cần khai <span class="mono">FACEBOOK_PAGE_ID</span> +
+      <span class="mono">FACEBOOK_PAGE_ACCESS_TOKEN</span> (token do chủ dự án cấp sau khi Facebook app review).</p></div>`;
+  }
+  return `<div class="notice ok"><strong>Đã cấu hình Facebook Page — bài được DUYỆT sẽ đăng THẬT.</strong>
+    <p class="small" style="margin:6px 0 0">Provider <span class="mono">${esc(name)}</span>. ${esc(PUB_MANUAL_LINE)}</p></div>`;
+}
+
+/** Xem trước nội dung: giữ nguyên văn, chỉ cắt gọn để danh sách đọc được. */
+function pubPreviewText(text, { max = 400 } = {}) {
+  const s = String(text ?? '');
+  const chars = [...s];
+  return chars.length > max ? `${chars.slice(0, max).join('')}…` : s;
+}
+
+/** Ảnh/video kèm bài — dùng route tệp có sẵn của MVP-02, KHÔNG tự ghép đường dẫn đĩa. */
+function pubMediaHtml(item) {
+  const ids = Array.isArray(item?.media_ids) ? item.media_ids : [];
+  if (ids.length === 0) return '<p class="muted small" style="margin:6px 0 0">Bài chỉ có chữ (không kèm ảnh/video).</p>';
+  return `<div class="row" style="margin-top:8px">${ids
+    .map((id) => {
+      const url = `/api/imagelab/assets/${encodeURIComponent(String(id))}/file`;
+      return `<a href="${esc(url)}" target="_blank" rel="noopener" title="${esc(String(id))}"
+        ><img src="${esc(url)}" alt="Ảnh kèm bài" style="width:96px;height:96px;object-fit:cover;border-radius:8px;border:1px solid var(--line)" /></a>`;
+    })
+    .join('')}</div>`;
+}
+
+/** Kết quả đã đăng — `dry-` phải được nói rõ là id THỬ, không phải bài thật. */
+function pubResultHtml(item) {
+  const id = String(item?.external_post_id ?? '');
+  if (!id) return '';
+  const isDry = item?.is_mock === true || id.startsWith('dry-');
+  const link = !isDry && item?.external_url
+    ? ` · <a href="${esc(String(item.external_url))}" target="_blank" rel="noopener">mở bài trên Facebook</a>`
+    : '';
+  return `<p class="small ${isDry ? 'muted' : ''}" style="margin:6px 0 0">
+    Mã bài: <span class="mono">${esc(id)}</span>${
+    isDry ? ' — <strong>id thử — không có bài thật</strong>' : ''}${link}</p>`;
+}
+
+/** Lỗi gần nhất của bài — NGUYÊN VĂN từ nền tảng, không nuốt, không dịch lại. */
+function pubLastErrorHtml(item) {
+  const msg = String(item?.last_error ?? '').trim();
+  if (!msg) return '';
+  return `<div class="notice error small" style="margin:8px 0 0">
+    <strong>Lỗi lần đăng gần nhất${item?.error_code ? ` (${esc(String(item.error_code))})` : ''}:</strong>
+    <p class="mono" style="margin:6px 0 0;white-space:pre-wrap">${esc(msg)}</p></div>`;
+}
+
+/**
+ * Các nút của MỘT bài. Luật §5: nút ĐĂNG NGAY chỉ BẬT khi bài `approved`/`failed`;
+ * bài chưa duyệt thì nút bị `disabled` kèm câu giải thích — không có đường nào bấm đăng được.
+ */
+function pubItemActions(item) {
+  // Quyền duyệt lấy từ CÂU TRẢ LỜI THẬT của máy chủ (`can_approve` trong GET /api/publish/items),
+  // KHÔNG tự suy từ role trong state: role có thể cũ hơn phiên, còn `can_approve` là thứ chính
+  // máy chủ vừa khẳng định. Không có câu trả lời ⇒ coi như KHÔNG có quyền (fail-closed).
+  const canApprove = state.pub.canApprove === true;
+  const status = String(item?.status ?? '');
+  const id = String(item?.id ?? '');
+  const busy = state.pub.busyId === id;
+  const dis = busy ? ' disabled aria-disabled="true"' : '';
+  const buttons = [];
+  if (status === 'draft') {
+    buttons.push(`<button class="btn tiny" type="button" data-action="pubsubmit" data-id="${esc(id)}"${dis}>GỬI DUYỆT</button>`);
+  }
+  if (canApprove && (status === 'draft' || status === 'pending_review')) {
+    buttons.push(`<button class="btn primary tiny" type="button" data-action="pubapprove" data-id="${esc(id)}"${dis}>DUYỆT</button>`);
+  }
+  if (canApprove && status !== 'published' && status !== 'rejected' && status !== 'publishing') {
+    buttons.push(`<button class="btn tiny danger" type="button" data-action="pubreject" data-id="${esc(id)}"${dis}>TỪ CHỐI</button>`);
+  }
+  const publishable = status === 'approved' || status === 'failed';
+  if (status !== 'published' && status !== 'rejected') {
+    buttons.push(`<button class="btn primary tiny" type="button" data-action="pubpublish" data-id="${esc(id)}"${
+      publishable && !busy ? '' : ' disabled aria-disabled="true"'
+    }>ĐĂNG NGAY</button>`);
+  }
+  const hint = publishable || status === 'published' || status === 'rejected'
+    ? ''
+    : `<p class="muted small" style="margin:6px 0 0">${esc(PUB_NOT_APPROVED_HINT)}</p>`;
+  return `<div class="row" style="margin-top:10px">${buttons.join('')}</div>${hint}`;
+}
+
+/** Một thẻ bài đăng trong danh sách. */
+function pubItemCard(item) {
+  const id = String(item?.id ?? '');
+  const text = pubPreviewText(item?.text);
+  return `<article class="panel" style="margin-top:12px" data-pub-item="${esc(id)}">
+    <div class="spread">
+      <div class="row">
+        ${pubStatusBadge(item?.status)}
+        <span class="badge">${esc(String(item?.channel || 'facebook_page'))}</span>
+        ${item?.is_mock ? '<span class="badge warn">THỬ</span>' : ''}
+        ${item?.attempts ? `<span class="badge">đã thử ${esc(String(item.attempts))} lượt</span>` : ''}
+      </div>
+      <span class="muted small mono">${esc(String(item?.created_at ?? ''))}</span>
+    </div>
+    <div class="field-body" style="margin-top:10px;white-space:pre-wrap">${esc(text) || '<span class="muted">(không có chữ)</span>'}</div>
+    ${pubMediaHtml(item)}
+    <dl class="kv" style="margin-top:10px">
+      <dt>Job nguồn</dt><dd class="mono">${esc(String(item?.job_id ?? '—'))}</dd>
+      ${item?.approved_by ? `<dt>Người duyệt</dt><dd class="mono">${esc(String(item.approved_by))} · ${esc(String(item.approved_at ?? ''))}</dd>` : ''}
+      ${item?.rejected_by ? `<dt>Người từ chối</dt><dd class="mono">${esc(String(item.rejected_by))} · ${esc(String(item.reject_reason ?? ''))}</dd>` : ''}
+      ${item?.published_at ? `<dt>Đăng lúc</dt><dd class="mono">${esc(String(item.published_at))}</dd>` : ''}
+    </dl>
+    ${pubResultHtml(item)}
+    ${pubLastErrorHtml(item)}
+    ${pubItemActions(item)}
+  </article>`;
+}
+
+/** Form tạo bài nháp: chọn job trong lịch sử + ô nội dung (bỏ trống ⇒ lấy gợi ý từ job). */
+function pubCreateFormHtml() {
+  const jobs = Array.isArray(state.pub.jobs) ? state.pub.jobs : [];
+  const selected = String(state.pub.draft.jobId ?? '');
+  const options = jobs.length
+    ? jobs
+      .map((jb) => {
+        const label = `${jb.product_name || jb.source_url || jb.id} · ${jb.status || ''}`;
+        return `<option value="${esc(String(jb.id))}"${String(jb.id) === selected ? ' selected' : ''}>${esc(label)}</option>`;
+      })
+      .join('')
+    : '';
+  return `<section class="panel">
+    <h2>Tạo bài đăng mới</h2>
+    <p class="muted small" style="margin:0 0 10px">Bài mới luôn là <strong>nháp</strong> hoặc <strong>chờ duyệt</strong> — không có đường nào tạo ra bài “đã duyệt”.</p>
+    <div class="field">
+      <div class="field-head"><label for="pub-job">Job nguồn</label></div>
+      ${jobs.length
+    ? `<select id="pub-job" class="text-input">${options}</select>`
+    : `<p class="muted small" style="margin:0">Chưa có job nào trong lịch sử của bạn. Hãy chạy một sản phẩm ở tab “Sản phẩm mới” trước.</p>`}
+    </div>
+    <div class="field">
+      <div class="field-head"><label for="pub-text">Nội dung bài</label><span class="muted small">bỏ trống ⇒ lấy gợi ý từ nội dung job</span></div>
+      <textarea id="pub-text" class="text-input" rows="6" placeholder="Nội dung sẽ đăng lên Facebook Page…">${esc(String(state.pub.draft.text ?? ''))}</textarea>
+    </div>
+    <div class="row">
+      <button class="btn primary" type="button" data-action="pubcreate"${jobs.length && !state.pub.creating ? '' : ' disabled aria-disabled="true"'}>${
+    state.pub.creating ? 'Đang tạo…' : 'TẠO NHÁP'
+  }</button>
+      <button class="btn" type="button" data-action="pubcreatesubmit"${jobs.length && !state.pub.creating ? '' : ' disabled aria-disabled="true"'}>TẠO &amp; GỬI DUYỆT</button>
+    </div>
+  </section>`;
+}
+
+/** Màn “Đăng bài”. */
+function renderPublish() {
+  stopPolling();
+  stopIlPolling();
+  stopIsPolling();
+  stopVsPolling();
+  const cfg = pubConfig();
+  const loggedIn = Boolean(state.auth.me?.user);
+  const items = Array.isArray(state.pub.items) ? state.pub.items : [];
+  const filter = String(state.pub.filter ?? '');
+
+  const body = !loggedIn
+    ? `<section class="panel"><div class="notice warn"><strong>${esc(PUB_NEED_LOGIN_LINE)}</strong>
+         <p class="small" style="margin:8px 0 0"><button class="btn tiny" type="button" data-action="login">ĐĂNG NHẬP</button></p></div></section>`
+    : cfg && cfg.available === false
+      ? ''
+      : `${pubCreateFormHtml()}
+      <section class="panel">
+        <div class="spread">
+          <h2 style="margin:0">Danh sách bài đăng${state.pub.scope === 'all' ? ' (toàn hệ thống)' : ''}</h2>
+          <button class="btn ghost tiny" type="button" data-action="pubreload">Nạp lại</button>
+        </div>
+        <div class="tabs" style="margin-top:10px">
+          ${PUB_FILTERS.map(([id, label]) => `<button class="tab ${filter === id ? 'active' : ''}" type="button" data-action="pubfilter" data-filter="${esc(id)}">${esc(label)}</button>`).join('')}
+        </div>
+        ${state.pub.loading
+        ? '<p class="muted small" style="margin:12px 0 0">Đang nạp…</p>'
+        : items.length === 0
+          ? '<p class="muted small" style="margin:12px 0 0">Chưa có bài nào ở mục này.</p>'
+          : items.map((it) => pubItemCard(it)).join('')}
+      </section>`;
+
+  app.innerHTML = `
+    <section class="panel">
+      <div class="spread">
+        <div style="min-width:0">
+          <h2 style="margin:0 0 4px">Đăng bài — Facebook Page</h2>
+          <p class="muted small" style="margin:0">Tạo bài từ job đã chạy → <strong>owner/admin duyệt tay</strong> → mới đăng. ${esc(PUB_MANUAL_LINE)}</p>
+        </div>
+        <span class="badge ${cfg?.available ? 'ok' : 'bad'}">${cfg?.available ? 'Sẵn sàng' : 'Chưa khả dụng'}</span>
+      </div>
+      ${pubProviderNotice()}
+    </section>
+    ${body}
+    ${authHintHtml()}
+    <div id="pub-error"></div>
+  `;
+  pubPaintError();
+}
+
+/** Vẽ lỗi vào ô riêng để không mất cả màn hình khi một thao tác lỗi. */
+function pubPaintError() {
+  const box = document.querySelector('#pub-error');
+  if (!box) return;
+  box.innerHTML = state.pub.error
+    ? `<div class="notice error"><strong>Không thực hiện được:</strong> ${esc(state.pub.error)}</div>`
+    : '';
+}
+
+/** Nạp danh sách bài + lịch sử job (để chọn job nguồn). */
+async function loadPublishItems({ quiet = false } = {}) {
+  if (!state.auth.me?.user) return;
+  if (!quiet) {
+    state.pub.loading = true;
+    renderPublish();
+  }
+  try {
+    const query = state.pub.filter ? `?status=${encodeURIComponent(state.pub.filter)}` : '';
+    const data = await api(`/api/publish/items${query}`);
+    state.pub.items = Array.isArray(data?.items) ? data.items : [];
+    state.pub.total = Number(data?.total ?? 0);
+    state.pub.scope = String(data?.scope ?? 'mine');
+    state.pub.canApprove = data?.can_approve === true;
+    state.pub.error = null;
+  } catch (err) {
+    state.pub.items = [];
+    state.pub.error = pubErrorText(err);
+  } finally {
+    state.pub.loading = false;
+  }
+  try {
+    const hist = await api('/api/jobs?limit=20');
+    state.pub.jobs = Array.isArray(hist?.items) ? hist.items : Array.isArray(hist?.jobs) ? hist.jobs : [];
+    if (!state.pub.draft.jobId && state.pub.jobs.length) state.pub.draft.jobId = String(state.pub.jobs[0].id);
+  } catch {
+    /* lịch sử không nạp được thì chỉ mất ô chọn job — không chặn cả màn */
+  }
+  renderPublish();
+}
+
+/** Tạo bài nháp (hoặc tạo + gửi duyệt). KHÔNG BAO GIỜ tạo ra bài `approved`. */
+async function createPublishItem(submit) {
+  const jobId = String($('#pub-job')?.value || state.pub.draft.jobId || '').trim();
+  const text = String($('#pub-text')?.value ?? state.pub.draft.text ?? '');
+  state.pub.draft.jobId = jobId;
+  state.pub.draft.text = text;
+  if (!jobId) {
+    state.pub.error = 'Hãy chọn job nguồn cho bài đăng.';
+    pubPaintError();
+    return;
+  }
+  state.pub.creating = true;
+  state.pub.error = null;
+  renderPublish();
+  try {
+    await api('/api/publish/items', { method: 'POST', body: { job_id: jobId, text, submit: submit === true } });
+    state.pub.draft.text = '';
+    toast(submit ? 'Đã tạo bài và gửi duyệt' : 'Đã tạo bài nháp');
+  } catch (err) {
+    state.pub.error = pubErrorText(err);
+  } finally {
+    state.pub.creating = false;
+  }
+  await loadPublishItems({ quiet: true });
+}
+
+/** Một thao tác trên bài: submit / approve / reject / publish. */
+async function publishItemAction(id, action) {
+  const itemId = String(id ?? '').trim();
+  if (!itemId) return;
+  let body;
+  if (action === 'reject') {
+    // `prompt` có thể bị trình duyệt chặn ⇒ coi như không có lý do, vẫn từ chối được.
+    let reason = '';
+    try {
+      reason = window.prompt('Lý do từ chối (có thể để trống):') ?? '';
+    } catch {
+      reason = '';
+    }
+    body = { reason: String(reason) };
+  }
+  state.pub.busyId = itemId;
+  state.pub.error = null;
+  renderPublish();
+  try {
+    const res = await api(`/api/publish/items/${encodeURIComponent(itemId)}/${action}`, { method: 'POST', ...(body ? { body } : {}) });
+    if (action === 'publish') {
+      const r = res?.result || {};
+      if (res?.idempotent === true) toast('Bài này đã đăng trước đó — không đăng lần hai');
+      else if (r.is_mock) toast(`${PUB_DRY_RUN_LINE} · mã thử ${String(r.post_id ?? '')}`);
+      else if (r.status === 'PUBLISHED' || r.status === 'SCHEDULED') toast(`Đã đăng · mã bài ${String(r.post_id ?? '')}`);
+      else state.pub.error = `Đăng KHÔNG thành công (${String(r.error_code ?? r.status ?? 'không rõ')}). Máy chủ/nền tảng báo: “${String(r.error_message ?? '')}”`;
+    } else {
+      toast(action === 'approve' ? 'Đã DUYỆT bài' : action === 'reject' ? 'Đã từ chối bài' : 'Đã gửi duyệt');
+    }
+  } catch (err) {
+    state.pub.error = pubErrorText(err);
+  } finally {
+    state.pub.busyId = null;
+  }
+  await loadPublishItems({ quiet: true });
 }
 
 boot();
@@ -6628,7 +7518,7 @@ function renderMkPayload() {
     </div>
     ${mkBannerHtml(l.channel)}
     <p class="muted small">Payload giữ NGUYÊN như sẽ gửi (trường tiền tố <span class="mono">_vps_</span> chỉ để soi, provider thật bỏ đi trước khi gửi).
-      Tên trường theo tài liệu công khai của sàn, <strong>chưa đo với API thật</strong> — xem VERIFICATION.md §27.</p>
+      Tên trường theo tài liệu công khai của sàn, <strong>chưa đo với API thật</strong> — xem VERIFICATION.md §29.</p>
     <pre class="mono small" style="white-space:pre-wrap;max-height:360px;overflow:auto">${esc(JSON.stringify(l.payload ?? null, null, 2))}</pre>
     ${unmapped ? `<h3 class="small">Trường KHÔNG ánh xạ được (phải xử tay khi có token)</h3><ul>${unmapped}</ul>` : ''}
     ${defaults ? `<h3 class="small">Mặc định đã áp (không phải dữ liệu từ nguồn)</h3><ul>${defaults}</ul>` : ''}

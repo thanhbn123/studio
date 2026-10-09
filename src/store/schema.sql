@@ -282,6 +282,127 @@ CREATE TABLE IF NOT EXISTS pricing (
 );
 
 -- ============================================================================
+-- MVP-07 — ĐĂNG BÀI FACEBOOK PAGE (DUYỆT TAY) — hợp đồng `docs/MVP-07-CONTRACT.md` §3
+--
+-- Vì sao có hai bảng này: chủ dự án đã chốt **duyệt tay từng bài**. `publish_items` là HÀNG ĐỢI
+-- DUYỆT (sổ cái của từng bài: ai duyệt, lúc nào, đã đăng chưa, id bài bên ngoài), còn
+-- `publish_logs` là VẾT của **mọi** lời gọi provider — kể cả lần thất bại, kèm lỗi NGUYÊN VĂN
+-- của nền tảng. Không có `publish_logs` thì `last_error` chỉ giữ lỗi cuối và cả lịch sử đăng
+-- biến mất, đúng kiểu "không chứng minh được" mà repo này cấm.
+--
+-- CỔNG DUYỆT nằm ở tầng DB: `Store#claimPublishItem` là MỘT câu UPDATE có điều kiện
+-- (`status IN ('approved','failed') AND external_post_id IS NULL`). Không claim được ⇒ không có
+-- đường nào gọi tới provider ⇒ hệ thống KHÔNG BAO GIỜ tự đăng khi chưa có người bấm duyệt.
+--
+-- Chỉ dùng TEXT/INTEGER + thời gian ISO-8601 trong TEXT ⇒ CÙNG file schema chạy được trên cả
+-- SQLite (node:sqlite) và PostgreSQL 16.
+--
+-- ⚠️ INDEX KHÔNG ĐẶT Ở ĐÂY — bài học `wallet_ledger.seq` / `job_queue.epoch`: index trong file
+-- này chạy TRƯỚC migration, nên trên DB cũ (bảng đã tồn tại nhưng thiếu cột) `CREATE INDEX` làm
+-- CHẾT `init()`. Bốn index của hai bảng này do `#applyAdditiveMigrations()` tạo SAU migration
+-- (xem src/store/index.js).
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS publish_items (
+  id               TEXT PRIMARY KEY,
+  job_id           TEXT,
+  user_id          TEXT,                              -- chủ bài; route /api/publish/* bắt buộc đăng nhập
+  channel          TEXT NOT NULL DEFAULT 'facebook_page',
+  provider         TEXT,                              -- provider ĐÃ dùng ở lượt đăng gần nhất
+  text             TEXT,
+  media_ids        TEXT,                              -- JSON mảng id của image_assets
+  -- 'draft' | 'pending_review' | 'approved' | 'publishing' | 'published' | 'failed' | 'rejected'
+  status           TEXT NOT NULL DEFAULT 'draft',
+  scheduled_at     TEXT,
+  approved_by      TEXT,                              -- user_id của owner/admin đã bấm DUYỆT
+  approved_at      TEXT,
+  rejected_by      TEXT,
+  rejected_at      TEXT,
+  reject_reason    TEXT,
+  published_at     TEXT,
+  external_post_id TEXT,                              -- id bài trên nền tảng; 'dry-…' = CHẾ ĐỘ THỬ
+  external_url     TEXT,
+  is_mock          INTEGER NOT NULL DEFAULT 0,        -- 1 = kết quả của provider GIẢ (dry-run)
+  error_code       TEXT,
+  last_error       TEXT,
+  attempts         INTEGER NOT NULL DEFAULT 0,
+  run_key          TEXT,                              -- '<itemId>#<n>' — danh tính MỘT lượt đăng
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL
+);
+
+-- Vết MỌI lời gọi provider (luật §0.3 của hợp đồng). APPEND-ONLY: không UPDATE/DELETE nào lên
+-- bảng này trong toàn bộ mã nguồn.
+-- `error_message` giữ NGUYÊN VĂN lỗi nền tảng, nhưng access token đã bị `maskToken()` che TRƯỚC
+-- khi tới đây. `request_summary` chỉ là SỐ LIỆU (endpoint, độ dài chữ, số media) — KHÔNG chứa
+-- nội dung bài, KHÔNG chứa token.
+CREATE TABLE IF NOT EXISTS publish_logs (
+  id               TEXT PRIMARY KEY,
+  item_id          TEXT NOT NULL,
+  attempt          INTEGER NOT NULL DEFAULT 0,
+  run_key          TEXT,
+  provider         TEXT,
+  channel          TEXT,
+  status           TEXT,                              -- PublishResult.status
+  external_post_id TEXT,
+  error_code       TEXT,
+  error_message    TEXT,
+  is_mock          INTEGER NOT NULL DEFAULT 0,
+  request_summary  TEXT,
+  created_at       TEXT NOT NULL
+);
+
+-- ============================================================================
+
+-- MVP-06 — NẠP CREDIT THỦ CÔNG (chuyển khoản tay + quản trị cấp credit)
+-- `docs/MVP-06-CONTRACT.md` §2. Ba luật riêng được phản ánh ngay ở đây:
+--
+--   #1 KHÔNG tự cộng tiền: bảng này KHÔNG có cột số dư nào. Credit chỉ vào ví qua MỘT
+--      đường duy nhất — `wallet_ledger` (admin gọi `grant()` khi xác nhận). Dòng sổ sinh ra
+--      được trỏ lại bằng `ledger_entry_id`, nên luôn đối chiếu được "yêu cầu ↔ dòng sổ".
+--   #2 YÊU CẦU NẠP PHẢI CÓ VẾT: `topup_requests` chỉ CHUYỂN TRẠNG THÁI (pending → confirmed |
+--      rejected | expired) và mỗi lần chuyển ghi MỘT dòng `topup_events`. KHÔNG có đường nào
+--      xoá/sửa nội dung yêu cầu trong mã nguồn (không UPDATE `amount_vnd`/`reference`).
+--   #3 SỐ TIỀN TRÊN YÊU CẦU ≠ TIỀN TRONG VÍ: `amount_vnd` là tiền VND người dùng CHUYỂN,
+--      `credits` là credit vào ví, `rate_vnd_per_credit` là TỶ GIÁ GHI LẠI TẠI THỜI ĐIỂM
+--      DUYỆT ⇒ đổi tỷ giá sau này KHÔNG làm sai lịch sử.
+--
+-- `run_key` = 'topup:<id>' — khoá chống cộng 2 lần, ghi cả vào `wallet_ledger.run_key`
+-- (unique index `uniq_wallet_ledger_topup_run` tạo SAU migration — xem src/store/index.js).
+--
+-- Chỉ TEXT/INTEGER + DOUBLE PRECISION cho cột TIỀN/credit + thời gian ISO-8601 trong TEXT
+-- ⇒ CÙNG file schema chạy trên cả SQLite và PostgreSQL 16 (xem ghi chú đầu file).
+-- ⚠️ INDEX KHÔNG đặt ở đây (bài học `wallet_ledger.seq`): index trong file này chạy TRƯỚC
+-- migration nên trên DB cũ (bảng đã có mà thiếu cột) `CREATE INDEX` làm chết `init()`.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS topup_requests (
+  id                  TEXT PRIMARY KEY,
+  user_id             TEXT,                       -- NULL = ẩn danh (KHÔNG cho nạp — route trả 401)
+  amount_vnd          INTEGER NOT NULL,           -- tiền VND người dùng tự chuyển khoản
+  credits             DOUBLE PRECISION,           -- credit sẽ/đã vào ví (TIỀN: không được là REAL)
+  rate_vnd_per_credit DOUBLE PRECISION,           -- tỷ giá GHI LẠI tại thời điểm duyệt
+  method              TEXT NOT NULL DEFAULT 'bank_transfer',
+  reference           TEXT,                       -- mã giao dịch ngân hàng (người dùng nhập)
+  note                TEXT,
+  status              TEXT NOT NULL DEFAULT 'pending',  -- pending|confirmed|rejected|expired
+  created_at          TEXT NOT NULL,
+  decided_at          TEXT,
+  decided_by          TEXT,                       -- user_id của admin đã quyết định
+  ledger_entry_id     TEXT,                       -- dòng `wallet_ledger` sinh ra khi confirmed
+  run_key             TEXT                        -- 'topup:<id>' — chống cộng 2 lần
+);
+
+-- Vết chuyển trạng thái — APPEND-ONLY, không UPDATE/DELETE ở bất kỳ đâu trong mã nguồn.
+CREATE TABLE IF NOT EXISTS topup_events (
+  id             TEXT PRIMARY KEY,
+  request_id     TEXT NOT NULL,
+  from_status    TEXT,              -- NULL = lúc tạo yêu cầu
+  to_status      TEXT NOT NULL,
+  actor_user_id  TEXT,
+  reason         TEXT,
+  created_at     TEXT NOT NULL
+);
+
+-- ============================================================================
 -- MVP-08 — ĐĂNG SẢN PHẨM LÊN SÀN (Shopee / TikTok Shop) — `docs/MVP-08-CONTRACT.md` §1/§5
 --
 -- Bốn luật của hợp đồng phản ánh ở đây:

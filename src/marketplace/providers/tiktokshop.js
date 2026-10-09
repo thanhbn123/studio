@@ -3,7 +3,7 @@
  *
  * ⚠️ CHƯA ĐO VỚI API THẬT (chưa có tài khoản người bán + app Partner Center được duyệt). Viết theo
  * tài liệu công khai `partner.tiktokshop.com/docv2` (tra 10/10/2026; trang tài liệu chính thức
- * không mở được trong phiên viết — xem `docs/VERIFICATION.md` §27). Tên trường, cách ký và đường
+ * không mở được trong phiên viết — xem `docs/VERIFICATION.md` §29). Tên trường, cách ký và đường
  * dẫn là **cần xác minh** khi có token; kiến trúc không đổi, chỉ sửa trong file này.
  *
  * Cách ký (theo tài liệu công khai): lấy mọi tham số query TRỪ `sign` và `access_token`, sắp theo

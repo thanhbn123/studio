@@ -77,6 +77,21 @@ export const LEDGER_REASONS = Object.freeze([
   'adjustment',
 ]);
 
+/**
+ * MVP-06 — trạng thái của một YÊU CẦU NẠP CREDIT (`docs/MVP-06-CONTRACT.md` §2).
+ * ĐÓNG BĂNG: `pending` → `confirmed` | `rejected` | `expired`; không có đường quay lại.
+ */
+export const TOPUP_STATUSES = Object.freeze(['pending', 'confirmed', 'rejected', 'expired']);
+
+/** Trạng thái CUỐI (đã quyết định) — chuyển tiếp từ đây là vi phạm luật #2. */
+export const TOPUP_FINAL_STATUSES = Object.freeze(['confirmed', 'rejected', 'expired']);
+
+/** Cách nạp duy nhất của giai đoạn này: chuyển khoản tay (KHÔNG có cổng thanh toán). */
+export const TOPUP_METHODS = Object.freeze(['bank_transfer']);
+
+/** `run_key` của dòng sổ sinh ra khi xác nhận một yêu cầu nạp — chống cộng 2 lần. */
+export const topupRunKey = (requestId) => `topup:${String(requestId ?? '')}`;
+
 /** Kiểu nhóm của `usageAggregate` (hợp đồng §3.4). */
 export const USAGE_GROUP_BY = Object.freeze(['day', 'operation', 'user']);
 
@@ -671,7 +686,46 @@ export class Store {
     // mục sống cùng `(job_id, handler)` là HỢP LỆ. Khoá idempotency thật nằm ở `job_queue.id`
     // (id tất định theo `(jobId, handler, runKey)` do JobQueue truyền vào) — xem `enqueueJob`.
     // Dòng dưới chỉ để DỌN index mà bản R1-Q trung gian đã tạo (idempotent, DB mới không có gì).
+    // MVP-06 (`docs/MVP-06-CONTRACT.md` §2) — index của `topup_requests`/`topup_events` tạo Ở ĐÂY,
+    // SAU migration (bài học `wallet_ledger.seq`: index trong `schema.sql` chạy TRƯỚC migration nên
+    // DB cũ thiếu cột sẽ chết `init()`). Lỗi ở đây chỉ ghi log, KHÔNG làm chết boot.
+    await this.#createIndexIfPossible('idx_topup_requests_user', 'topup_requests', 'user_id, created_at');
+    await this.#createIndexIfPossible('idx_topup_requests_status', 'topup_requests', 'status, created_at');
+    await this.#createIndexIfPossible('idx_topup_events_request', 'topup_events', 'request_id, created_at');
+    // Chống KHAI KHỐNG: cùng một người dùng không được nộp hai yêu cầu mang CÙNG mã giao dịch
+    // ngân hàng. Partial unique index (bỏ qua `reference` rỗng) chạy được trên cả hai dialect;
+    // tầng store dịch lỗi UNIQUE thành `TOPUP_REFERENCE_DUPLICATE` (route trả 409).
+    await this.#createUniqueIndexIfPossible('uniq_topup_requests_reference', 'topup_requests', {
+      columns: 'user_id, reference',
+      where: "reference IS NOT NULL AND reference <> ''",
+    });
+    // Chống CỘNG 2 LẦN ở TẦNG DB: mỗi `run_key = 'topup:<id>'` chỉ được có ĐÚNG MỘT dòng sổ.
+    // Dòng `admin_grant` thường có `run_key = NULL` nên index này chỉ chạm vào dòng của MVP-06.
+    await this.#createUniqueIndexIfPossible('uniq_wallet_ledger_topup_run', 'wallet_ledger', {
+      columns: 'user_id, run_key',
+      where: "run_key IS NOT NULL AND reason IN ('admin_grant','grant','adjustment')",
+    });
     await this.#dropIndexIfPossible('uniq_job_queue_live');
+    // MVP-07 (§3.2): hai bảng đăng bài là BẢNG MỚI nên `CREATE TABLE IF NOT EXISTS` trong
+    // `schema.sql` đã tạo đủ cột trên DB trắng. Những lệnh dưới đây lo cho DB tạo bởi một bản
+    // TRUNG GIAN của sprint này (bảng đã có nhưng thiếu cột) — idempotent trên cả hai driver.
+    await this.#addColumnIfMissing('publish_items', 'provider', 'TEXT');
+    await this.#addColumnIfMissing('publish_items', 'external_url', 'TEXT');
+    await this.#addColumnIfMissing('publish_items', 'is_mock', 'INTEGER NOT NULL DEFAULT 0');
+    await this.#addColumnIfMissing('publish_items', 'run_key', 'TEXT');
+    await this.#addColumnIfMissing('publish_items', 'scheduled_at', 'TEXT');
+    await this.#addColumnIfMissing('publish_items', 'rejected_by', 'TEXT');
+    await this.#addColumnIfMissing('publish_items', 'rejected_at', 'TEXT');
+    await this.#addColumnIfMissing('publish_items', 'reject_reason', 'TEXT');
+    await this.#addColumnIfMissing('publish_items', 'last_error', 'TEXT');
+    await this.#addColumnIfMissing('publish_logs', 'run_key', 'TEXT');
+    await this.#addColumnIfMissing('publish_logs', 'request_summary', 'TEXT');
+    // Index tạo SAU khi cột đã tồn tại (bài học `wallet_ledger.seq`): đặt trong `schema.sql` thì
+    // câu index chạy TRƯỚC migration và làm chết `init()` trên DB cũ.
+    await this.#createIndexIfPossible('idx_publish_items_user', 'publish_items', 'user_id, created_at');
+    await this.#createIndexIfPossible('idx_publish_items_status', 'publish_items', 'status, created_at');
+    await this.#createIndexIfPossible('idx_publish_items_job', 'publish_items', 'job_id');
+    await this.#createIndexIfPossible('idx_publish_logs_item', 'publish_logs', 'item_id, created_at');
     // MVP-08 (hợp đồng §1): index của `marketplace_*` tạo Ở ĐÂY, SAU migration (bài học `wallet_ledger.seq`).
     await this.#createIndexIfPossible('idx_marketplace_listings_user', 'marketplace_listings', 'user_id, created_at');
     await this.#createIndexIfPossible('idx_marketplace_listings_job', 'marketplace_listings', 'job_id, channel');
@@ -2191,6 +2245,225 @@ export class Store {
     });
   }
 
+  /* ═════════ MVP-06 — YÊU CẦU NẠP CREDIT THỦ CÔNG (`docs/MVP-06-CONTRACT.md` §2) ═════════
+   *
+   * Ba luật của hợp đồng được giữ NGAY Ở TẦNG NÀY:
+   *   #1 KHÔNG tự cộng tiền — ở đây KHÔNG có lời gọi `appendLedger` nào. Tạo yêu cầu chỉ ghi
+   *      `topup_requests` + `topup_events`; ví KHÔNG bị chạm tới.
+   *   #2 Có vết — `createTopupRequest`/`decideTopupRequest` LUÔN ghi kèm một dòng `topup_events`
+   *      trong CÙNG transaction; không có hàm nào sửa `amount_vnd`/`reference` hay xoá yêu cầu.
+   *   #3 Quyết định là NGUYÊN TỬ và MỘT LẦN — `decideTopupRequest` là MỘT câu UPDATE có điều
+   *      kiện `status = 'pending'`; `changes = 0` ⇒ trả `null` ⇒ tầng trên trả 409
+   *      `TOPUP_ALREADY_DECIDED` (hai admin bấm cùng lúc chỉ MỘT người thắng).
+   *
+   * Mọi câu lệnh dùng `#exec()` nên khi được gọi BÊN TRONG `withLedgerLock` (lúc xác nhận)
+   * chúng chạy trong CHÍNH transaction đó ⇒ "chuyển trạng thái + ghi dòng sổ" cùng sống cùng
+   * chết: grant lỗi (vượt trần số dư) ⇒ rollback ⇒ yêu cầu vẫn `pending`.
+   */
+
+  #hydrateTopupRequest(row) {
+    if (!row || typeof row !== 'object') return null;
+    return {
+      id: row.id,
+      user_id: row.user_id ?? null,
+      amount_vnd: Number(toNum(row.amount_vnd, 0)),
+      credits: row.credits === null || row.credits === undefined ? null : roundMoney(row.credits),
+      rate_vnd_per_credit: toNum(row.rate_vnd_per_credit, null),
+      method: row.method || 'bank_transfer',
+      reference: row.reference ?? '',
+      note: row.note ?? '',
+      status: row.status || 'pending',
+      created_at: row.created_at,
+      decided_at: row.decided_at ?? null,
+      decided_by: row.decided_by ?? null,
+      ledger_entry_id: row.ledger_entry_id ?? null,
+      run_key: row.run_key ?? null,
+    };
+  }
+
+  #hydrateTopupEvent(row) {
+    if (!row || typeof row !== 'object') return null;
+    return {
+      id: row.id,
+      request_id: row.request_id,
+      from_status: row.from_status ?? null,
+      to_status: row.to_status,
+      actor_user_id: row.actor_user_id ?? null,
+      reason: row.reason ?? '',
+      created_at: row.created_at,
+    };
+  }
+
+  /** Một dòng vết chuyển trạng thái (append-only). Dùng chung cho tạo và quyết định. */
+  async appendTopupEvent({ id = randomUUID(), requestId = null, request_id = null, fromStatus = null, from_status = null, toStatus = null, to_status = null, actorUserId = null, actor_user_id = null, reason = '' } = {}) {
+    const rid = String(requestId || request_id || '');
+    const to = String(toStatus || to_status || '');
+    if (!rid || !to) {
+      throw Object.assign(new Error('appendTopupEvent thiếu requestId/toStatus.'), { code: 'INVALID_TOPUP_EVENT' });
+    }
+    const ts = nowIso();
+    await this.#exec().run(
+      `INSERT INTO topup_events (id, request_id, from_status, to_status, actor_user_id, reason, created_at)
+       VALUES (?,?,?,?,?,?,?)`,
+      [id, rid, fromStatus ?? from_status ?? null, to, actorUserId ?? actor_user_id ?? null, String(reason ?? ''), ts],
+    );
+    return this.#hydrateTopupEvent({
+      id, request_id: rid, from_status: fromStatus ?? from_status ?? null, to_status: to,
+      actor_user_id: actorUserId ?? actor_user_id ?? null, reason: String(reason ?? ''), created_at: ts,
+    });
+  }
+
+  /**
+   * Tạo yêu cầu nạp — KHÔNG ĐỤNG VÍ (luật #1). `credits`/`rate_vnd_per_credit` ghi ở đây chỉ là
+   * BẢN XEM TRƯỚC theo tỷ giá hiện hành; con số CÓ HIỆU LỰC được ghi lại lúc duyệt (luật #3).
+   *
+   * `reference` trùng của CÙNG người dùng ⇒ lỗi `TOPUP_REFERENCE_DUPLICATE` (unique index ở DB
+   * là chốt cuối, nên hai request đồng thời cũng không lọt).
+   */
+  async createTopupRequest({ id = randomUUID(), userId = null, user_id = null, amountVnd = null, amount_vnd = null, credits = null, rateVndPerCredit = null, rate_vnd_per_credit = null, method = 'bank_transfer', reference = '', note = '', status = 'pending' } = {}) {
+    const uid = String(userId || user_id || '');
+    if (!uid) throw Object.assign(new Error('createTopupRequest thiếu userId (ẩn danh KHÔNG được nạp).'), { code: 'INVALID_TOPUP_REQUEST' });
+    const amount = toIntOrNull(amountVnd ?? amount_vnd);
+    if (amount === null) {
+      throw Object.assign(new Error('createTopupRequest: `amount_vnd` phải là số nguyên.'), { code: 'INVALID_TOPUP_AMOUNT' });
+    }
+    const st = TOPUP_STATUSES.includes(String(status)) ? String(status) : 'pending';
+    const ts = nowIso();
+    const row = [
+      id, uid, amount,
+      credits === null || credits === undefined ? null : roundMoney(credits),
+      toNum(rateVndPerCredit ?? rate_vnd_per_credit, null),
+      TOPUP_METHODS.includes(String(method)) ? String(method) : 'bank_transfer',
+      String(reference ?? ''), String(note ?? ''), st, ts, null, null, null, topupRunKey(id),
+    ];
+    const insert = async () => {
+      await this.#exec().run(
+        `INSERT INTO topup_requests
+           (id, user_id, amount_vnd, credits, rate_vnd_per_credit, method, reference, note, status,
+            created_at, decided_at, decided_by, ledger_entry_id, run_key)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        row,
+      );
+      // Luật #2: tạo yêu cầu cũng là MỘT lần chuyển trạng thái (NULL → pending) ⇒ phải có vết.
+      await this.appendTopupEvent({ requestId: id, fromStatus: null, toStatus: st, actorUserId: uid, reason: 'người dùng tạo yêu cầu nạp' });
+    };
+    try {
+      // Hai câu ghi phải cùng sống cùng chết: yêu cầu KHÔNG được tồn tại mà không có vết.
+      if (this.#activeTx()) await insert();
+      else await this.#inTransaction(() => insert());
+    } catch (err) {
+      const text = `${err?.code ?? ''} ${err?.message ?? ''}`;
+      if (err?.code === '23505' || /UNIQUE|duplicate key/i.test(text)) {
+        throw Object.assign(
+          new Error('Mã giao dịch này bạn đã nộp cho một yêu cầu nạp khác.'),
+          { code: 'TOPUP_REFERENCE_DUPLICATE', details: { user_id: uid, reference: String(reference ?? '') }, cause: err },
+        );
+      }
+      throw err;
+    }
+    return this.getTopupRequest(id);
+  }
+
+  async getTopupRequest(id) {
+    if (!id) return null;
+    const row = await this.#exec().get('SELECT * FROM topup_requests WHERE id = ?', [String(id)]);
+    return row ? this.#hydrateTopupRequest(row) : null;
+  }
+
+  /**
+   * Danh sách yêu cầu nạp. `userId` = null ⇒ TẤT CẢ (chỉ đường admin được gọi như vậy — tầng
+   * route chịu trách nhiệm phân quyền). Sắp theo `created_at` giảm dần, phá hoà bằng `id`
+   * để phân trang KHÔNG trùng/sót khi nhiều dòng cùng mili-giây.
+   */
+  async listTopupRequests({ userId = null, user_id = null, status = null, limit = 50, offset = 0 } = {}) {
+    const uid = userId ?? user_id ?? null;
+    const where = [];
+    const params = [];
+    if (uid !== null && uid !== undefined && String(uid)) {
+      where.push('user_id = ?');
+      params.push(String(uid));
+    }
+    if (status && TOPUP_STATUSES.includes(String(status))) {
+      where.push('status = ?');
+      params.push(String(status));
+    }
+    const clause = where.length ? ` WHERE ${where.join(' AND ')}` : '';
+    const rows = await this.#exec().all(
+      `SELECT * FROM topup_requests${clause} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+      [...params, clampInt(limit, 50, 1, 500), clampInt(offset, 0, 0, 1_000_000)],
+    );
+    return (rows || []).map((row) => this.#hydrateTopupRequest(row));
+  }
+
+  async countTopupRequests({ userId = null, user_id = null, status = null } = {}) {
+    const uid = userId ?? user_id ?? null;
+    const where = [];
+    const params = [];
+    if (uid !== null && uid !== undefined && String(uid)) {
+      where.push('user_id = ?');
+      params.push(String(uid));
+    }
+    if (status && TOPUP_STATUSES.includes(String(status))) {
+      where.push('status = ?');
+      params.push(String(status));
+    }
+    const clause = where.length ? ` WHERE ${where.join(' AND ')}` : '';
+    const row = await this.#exec().get(`SELECT COUNT(*) AS n FROM topup_requests${clause}`, params);
+    return Number(toNum(row?.n, 0));
+  }
+
+  async listTopupEvents(requestId, { limit = 100 } = {}) {
+    if (!requestId) return [];
+    const rows = await this.#exec().all(
+      'SELECT * FROM topup_events WHERE request_id = ? ORDER BY created_at ASC, id ASC LIMIT ?',
+      [String(requestId), clampInt(limit, 100, 1, 1000)],
+    );
+    return (rows || []).map((row) => this.#hydrateTopupEvent(row));
+  }
+
+  /**
+   * CHUYỂN TRẠNG THÁI MỘT LẦN DUY NHẤT (luật #2/#3) — MỘT câu UPDATE có điều kiện
+   * `status = 'pending'`, kèm MỘT dòng `topup_events`.
+   *
+   * @returns {Promise<object|null>} yêu cầu sau khi chuyển, hoặc `null` nếu KHÔNG còn `pending`
+   *   (đã có người quyết định trước) ⇒ tầng trên trả 409 `TOPUP_ALREADY_DECIDED` và sổ KHÔNG đổi.
+   */
+  async decideTopupRequest(id, { toStatus = null, to_status = null, actorUserId = null, actor_user_id = null, reason = '', credits = null, rateVndPerCredit = null, rate_vnd_per_credit = null, ledgerEntryId = null, ledger_entry_id = null } = {}) {
+    const rid = String(id ?? '');
+    const to = String(toStatus || to_status || '');
+    if (!rid || !TOPUP_FINAL_STATUSES.includes(to)) {
+      throw Object.assign(
+        new Error(`decideTopupRequest: trạng thái đích phải là một trong ${TOPUP_FINAL_STATUSES.join('|')}.`),
+        { code: 'INVALID_TOPUP_STATUS', details: { request_id: rid, to_status: to } },
+      );
+    }
+    const ts = nowIso();
+    const apply = async () => {
+      const res = await this.#exec().run(
+        `UPDATE topup_requests
+            SET status = ?, decided_at = ?, decided_by = ?,
+                credits = COALESCE(?, credits),
+                rate_vnd_per_credit = COALESCE(?, rate_vnd_per_credit),
+                ledger_entry_id = COALESCE(?, ledger_entry_id)
+          WHERE id = ? AND status = 'pending'`,
+        [
+          to, ts, actorUserId ?? actor_user_id ?? null,
+          credits === null || credits === undefined ? null : roundMoney(credits),
+          toNum(rateVndPerCredit ?? rate_vnd_per_credit, null),
+          ledgerEntryId ?? ledger_entry_id ?? null,
+          rid,
+        ],
+      );
+      // `changes` là số dòng ĐÃ ĐỔI: 0 ⇒ yêu cầu không còn `pending` (hoặc không tồn tại).
+      const changed = Number(res?.changes ?? res?.rowCount ?? 0);
+      if (!Number.isFinite(changed) || changed <= 0) return null;
+      await this.appendTopupEvent({ requestId: rid, fromStatus: 'pending', toStatus: to, actorUserId: actorUserId ?? actor_user_id ?? null, reason });
+      return this.getTopupRequest(rid);
+    };
+    if (this.#activeTx()) return apply();
+    return this.#inTransaction(() => apply());
+  }
+
   /* ───────────────────────── §2.2 — bảng `job_queue` ───────────────────────── */
 
   /** Dòng hàng đợi trả ra tầng trên — `payload` đã parse JSON (nhỏ, KHÔNG chứa base64 ảnh). */
@@ -2756,6 +3029,335 @@ export class Store {
       if (group === 'user') out.user_id = row.owner_id ?? null;
       return out;
     });
+  }
+
+  /* ══════════════ MVP-07 — ĐĂNG BÀI (duyệt tay) · hợp đồng §3.3 ══════════════
+   *
+   * Hai luật của khối này, phản ánh ngay trong SQL:
+   *
+   *   #1 CỔNG DUYỆT Ở TẦNG DB. `claimPublishItem` là MỘT câu UPDATE có điều kiện
+   *      (`status IN ('approved','failed') AND external_post_id IS NULL`). Không claim được
+   *      ⇒ trả `null` ⇒ tầng trên KHÔNG có đường nào gọi provider. Nhờ vậy "không bao giờ tự
+   *      đăng khi chưa duyệt" là tính chất của DB, không phải của một câu `if` ai cũng xoá được.
+   *
+   *   #2 MỘT BÀI CHỈ ĐĂNG MỘT LẦN. Điều kiện `external_post_id IS NULL` nằm NGAY trong câu
+   *      claim, nên hai request đồng thời thì đúng MỘT thắng; kẻ thua đọc lại bản ghi và thấy
+   *      `published`/`publishing` — không có lượt gọi mạng thứ hai.
+   */
+
+  /** Bản ghi bài đăng đã HYDRATE: `media_ids` là MẢNG, `is_mock` là BOOLEAN. */
+  #hydratePublishItem(row) {
+    if (!row) return null;
+    const media = fromJson(row.media_ids);
+    return {
+      id: row.id,
+      job_id: row.job_id ?? null,
+      user_id: row.user_id ?? null,
+      channel: row.channel || 'facebook_page',
+      provider: row.provider ?? null,
+      text: row.text ?? '',
+      media_ids: Array.isArray(media) ? media.map((m) => String(m)) : [],
+      status: row.status,
+      scheduled_at: row.scheduled_at ?? null,
+      approved_by: row.approved_by ?? null,
+      approved_at: row.approved_at ?? null,
+      rejected_by: row.rejected_by ?? null,
+      rejected_at: row.rejected_at ?? null,
+      reject_reason: row.reject_reason ?? null,
+      published_at: row.published_at ?? null,
+      external_post_id: row.external_post_id ?? null,
+      external_url: row.external_url ?? null,
+      // SQLite trả 0/1, PostgreSQL có thể trả boolean — ép về boolean để tầng trên không phải đoán.
+      is_mock: row.is_mock === true || Number(toNum(row.is_mock, 0)) === 1,
+      error_code: row.error_code ?? null,
+      last_error: row.last_error ?? null,
+      attempts: Number(toNum(row.attempts, 0)),
+      run_key: row.run_key ?? null,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    };
+  }
+
+  #hydratePublishLog(row) {
+    if (!row) return null;
+    return {
+      id: row.id,
+      item_id: row.item_id,
+      attempt: Number(toNum(row.attempt, 0)),
+      run_key: row.run_key ?? null,
+      provider: row.provider ?? null,
+      channel: row.channel ?? null,
+      status: row.status ?? null,
+      external_post_id: row.external_post_id ?? null,
+      error_code: row.error_code ?? null,
+      error_message: row.error_message ?? '',
+      is_mock: row.is_mock === true || Number(toNum(row.is_mock, 0)) === 1,
+      request_summary: fromJson(row.request_summary),
+      created_at: row.created_at,
+    };
+  }
+
+  /** Tạo bài NHÁP. `status` mặc định `draft` — KHÔNG BAO GIỜ mặc định `approved`. */
+  async createPublishItem({
+    id = randomUUID(),
+    jobId = null,
+    job_id = null,
+    userId = null,
+    user_id = null,
+    channel = 'facebook_page',
+    text = '',
+    mediaIds = [],
+    media_ids = null,
+    status = 'draft',
+    scheduledAt = null,
+    scheduled_at = null,
+  } = {}) {
+    const ts = nowIso();
+    const media = Array.isArray(mediaIds) && mediaIds.length ? mediaIds : Array.isArray(media_ids) ? media_ids : [];
+    await this.driver.run(
+      `INSERT INTO publish_items (id, job_id, user_id, channel, text, media_ids, status, scheduled_at,
+                                  is_mock, attempts, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,0,0,?,?)`,
+      [
+        id,
+        jobId ?? job_id ?? null,
+        userId ?? user_id ?? null,
+        String(channel || 'facebook_page'),
+        String(text ?? ''),
+        toJson(media.map((m) => String(m))),
+        String(status || 'draft'),
+        scheduledAt ?? scheduled_at ?? null,
+        ts,
+        ts,
+      ],
+    );
+    return this.getPublishItem(id);
+  }
+
+  async getPublishItem(id) {
+    const row = await this.driver.get('SELECT * FROM publish_items WHERE id = ?', [String(id ?? '')]);
+    return this.#hydratePublishItem(row);
+  }
+
+  /**
+   * Danh sách bài đăng. `all: true` (hàng đợi duyệt của owner/admin) ⇒ KHÔNG lọc theo chủ;
+   * ngược lại BẮT BUỘC có `userId` — thiếu thì trả mảng rỗng, KHÔNG trả bài của người khác.
+   */
+  async listPublishItems({ userId = null, user_id = null, status = null, jobId = null, job_id = null, all = false, limit = 50, offset = 0 } = {}) {
+    const uid = userId ?? user_id ?? null;
+    const where = [];
+    const params = [];
+    if (!all) {
+      if (!uid) return [];
+      where.push('user_id = ?');
+      params.push(String(uid));
+    }
+    if (status) {
+      const list = (Array.isArray(status) ? status : [status]).map((s) => String(s)).filter(Boolean);
+      if (list.length === 0) return [];
+      where.push(`status IN (${list.map(() => '?').join(',')})`);
+      params.push(...list);
+    }
+    const jid = jobId ?? job_id ?? null;
+    if (jid) {
+      where.push('job_id = ?');
+      params.push(String(jid));
+    }
+    const whereSql = where.length ? ` WHERE ${where.join(' AND ')}` : '';
+    const rows = await this.driver.all(
+      `SELECT * FROM publish_items${whereSql} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+      [...params, clampInt(limit, 50, 1, 200), clampInt(offset, 0, 0, 100000)],
+    );
+    return (Array.isArray(rows) ? rows : []).map((row) => this.#hydratePublishItem(row));
+  }
+
+  async countPublishItems({ userId = null, user_id = null, status = null, all = false } = {}) {
+    const uid = userId ?? user_id ?? null;
+    const where = [];
+    const params = [];
+    if (!all) {
+      if (!uid) return 0;
+      where.push('user_id = ?');
+      params.push(String(uid));
+    }
+    if (status) {
+      const list = (Array.isArray(status) ? status : [status]).map((s) => String(s)).filter(Boolean);
+      if (list.length === 0) return 0;
+      where.push(`status IN (${list.map(() => '?').join(',')})`);
+      params.push(...list);
+    }
+    const whereSql = where.length ? ` WHERE ${where.join(' AND ')}` : '';
+    const row = await this.driver.get(`SELECT COUNT(*) AS n FROM publish_items${whereSql}`, params);
+    return Number(toNum(row?.n, 0));
+  }
+
+  /**
+   * Đổi trạng thái CÓ ĐIỀU KIỆN: chỉ đổi khi trạng thái hiện tại nằm trong `from`.
+   * `null` = KHÔNG đổi được (người khác vừa đổi trước) ⇒ tầng trên phải đọc lại để biết lý do.
+   * `patch` chỉ nhận các cột trong danh sách trắng dưới đây — không ghi cột lạ từ dữ liệu ngoài.
+   */
+  async setPublishItemStatus(id, { from = [], to, patch = {} } = {}) {
+    const itemId = String(id ?? '');
+    const froms = (Array.isArray(from) ? from : [from]).map((s) => String(s)).filter(Boolean);
+    const next = String(to ?? '');
+    if (!itemId || !next || froms.length === 0) return null;
+    const ALLOWED = new Set(['approved_by', 'approved_at', 'rejected_by', 'rejected_at', 'reject_reason', 'text', 'media_ids', 'scheduled_at', 'error_code', 'last_error']);
+    const sets = ['status = ?', 'updated_at = ?'];
+    const params = [next, nowIso()];
+    for (const [key, value] of Object.entries(patch || {})) {
+      if (!ALLOWED.has(key)) continue;
+      sets.push(`${key} = ?`);
+      params.push(key === 'media_ids' ? toJson(Array.isArray(value) ? value.map((m) => String(m)) : []) : value ?? null);
+    }
+    const res = await this.driver.run(
+      `UPDATE publish_items SET ${sets.join(', ')} WHERE id = ? AND status IN (${froms.map(() => '?').join(',')})`,
+      [...params, itemId, ...froms],
+    );
+    if (Number(toNum(res?.changes, 0)) === 0) return null;
+    return this.getPublishItem(itemId);
+  }
+
+  /**
+   * ⚠️ CỔNG DUYỆT (hợp đồng §2.4 bước 1) — câu lệnh quan trọng nhất của MVP-07.
+   *
+   * Nguyên tử trên CẢ SQLite và PostgreSQL vì là MỘT câu UPDATE: bài chỉ chuyển sang
+   * `publishing` khi đang `approved`/`failed` VÀ chưa có `external_post_id`. Trả `null` ⇒
+   * KHÔNG được gọi provider (chưa duyệt / đang có lượt khác giữ / đã đăng rồi).
+   *
+   * `attempts` tăng NGAY trong câu claim (không tăng sau), nên một lượt gọi mạng luôn có đúng
+   * một số thứ tự lượt — `run_key` mang danh tính đó, soi gương `wallet_ledger.run_key`.
+   */
+  async claimPublishItem(id, { provider = null, now = null } = {}) {
+    const itemId = String(id ?? '');
+    if (!itemId) return null;
+    const ts = now || nowIso();
+    const res = await this.driver.run(
+      `UPDATE publish_items
+          SET status = 'publishing',
+              attempts = attempts + 1,
+              run_key = id || '#' || CAST(attempts + 1 AS TEXT),
+              provider = COALESCE(?, provider),
+              error_code = NULL,
+              updated_at = ?
+        WHERE id = ?
+          AND status IN ('approved','failed')
+          AND external_post_id IS NULL`,
+      [provider === null ? null : String(provider), ts, itemId],
+    );
+    if (Number(toNum(res?.changes, 0)) === 0) return null;
+    return this.getPublishItem(itemId);
+  }
+
+  /**
+   * Ghi KẾT QUẢ THẬT của một lượt đăng. Chỉ chấp nhận khi bài đang `publishing` (bài đã bị
+   * tiến trình khác kết thúc thì không ghi đè — cùng tinh thần `epoch` của hàng đợi R1).
+   *
+   * `status` chỉ nhận `published` | `failed`.
+   */
+  async finishPublishItem(id, {
+    status,
+    externalPostId = null,
+    external_post_id = null,
+    externalUrl = null,
+    external_url = null,
+    publishedAt = null,
+    published_at = null,
+    errorCode = null,
+    error_code = null,
+    lastError = null,
+    last_error = null,
+    isMock = null,
+    is_mock = null,
+    provider = null,
+  } = {}) {
+    const itemId = String(id ?? '');
+    const next = String(status ?? '');
+    if (!itemId || (next !== 'published' && next !== 'failed')) return null;
+    const mock = isMock ?? is_mock;
+    const res = await this.driver.run(
+      `UPDATE publish_items
+          SET status = ?,
+              external_post_id = COALESCE(?, external_post_id),
+              external_url = COALESCE(?, external_url),
+              published_at = COALESCE(?, published_at),
+              error_code = ?,
+              last_error = ?,
+              is_mock = COALESCE(?, is_mock),
+              provider = COALESCE(?, provider),
+              updated_at = ?
+        WHERE id = ? AND status = 'publishing'`,
+      [
+        next,
+        externalPostId ?? external_post_id ?? null,
+        externalUrl ?? external_url ?? null,
+        publishedAt ?? published_at ?? null,
+        errorCode ?? error_code ?? null,
+        lastError ?? last_error ?? null,
+        mock === null || mock === undefined ? null : mock ? 1 : 0,
+        provider === null ? null : String(provider),
+        nowIso(),
+        itemId,
+      ],
+    );
+    if (Number(toNum(res?.changes, 0)) === 0) return null;
+    return this.getPublishItem(itemId);
+  }
+
+  /** Ghi MỘT dòng vết cho MỘT lời gọi provider (append-only — luật §0.3). */
+  async appendPublishLog({
+    id = randomUUID(),
+    itemId = null,
+    item_id = null,
+    attempt = 0,
+    runKey = null,
+    run_key = null,
+    provider = null,
+    channel = null,
+    status = null,
+    externalPostId = null,
+    external_post_id = null,
+    errorCode = null,
+    error_code = null,
+    errorMessage = '',
+    error_message = '',
+    isMock = false,
+    is_mock = false,
+    requestSummary = null,
+    request_summary = null,
+  } = {}) {
+    const iid = String(itemId ?? item_id ?? '');
+    if (!iid) throw Object.assign(new Error('appendPublishLog thiếu item_id.'), { code: 'INVALID_PUBLISH_LOG' });
+    const mock = isMock || is_mock;
+    await this.driver.run(
+      `INSERT INTO publish_logs (id, item_id, attempt, run_key, provider, channel, status,
+                                 external_post_id, error_code, error_message, is_mock,
+                                 request_summary, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        id,
+        iid,
+        clampInt(attempt, 0, 0, 1000000),
+        runKey ?? run_key ?? null,
+        provider === null ? null : String(provider),
+        channel === null ? null : String(channel),
+        status === null ? null : String(status),
+        externalPostId ?? external_post_id ?? null,
+        errorCode ?? error_code ?? null,
+        // Lỗi nền tảng giữ NGUYÊN VĂN, chỉ chặn trần độ dài để một thông báo khổng lồ không phình DB.
+        String(errorMessage || error_message || '').slice(0, 4000),
+        mock ? 1 : 0,
+        toJson(requestSummary ?? request_summary ?? null),
+        nowIso(),
+      ],
+    );
+  }
+
+  async listPublishLogs(itemId, { limit = 50 } = {}) {
+    const rows = await this.driver.all(
+      'SELECT * FROM publish_logs WHERE item_id = ? ORDER BY created_at ASC, id ASC LIMIT ?',
+      [String(itemId ?? ''), clampInt(limit, 50, 1, 500)],
+    );
+    return (Array.isArray(rows) ? rows : []).map((row) => this.#hydratePublishLog(row));
   }
 }
 

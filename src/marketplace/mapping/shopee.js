@@ -4,7 +4,7 @@
  *
  * Nguồn trường: tài liệu công khai `open.shopee.com/documents` mục Product → `v2.product.add_item`,
  * tra 10/10/2026 — bảng trường chính thức KHÔNG mở được trong phiên viết (xem
- * `docs/VERIFICATION.md` §27), nên từng trường dưới đây ghi *(theo trí nhớ tài liệu, cần xác minh)*.
+ * `docs/VERIFICATION.md` §29), nên từng trường dưới đây ghi *(theo trí nhớ tài liệu, cần xác minh)*.
  *
  * Luật §3: trường nào KHÔNG ánh xạ được thì khai vào `unmapped[]` (không bỏ im lặng); giá trị mặc
  * định KHÔNG phải dữ liệu (trạng thái niêm yết, tình trạng hàng) khai vào `defaults_applied[]`.

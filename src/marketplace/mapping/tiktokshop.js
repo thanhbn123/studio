@@ -3,7 +3,7 @@
  *
  * Nguồn trường: tài liệu công khai `partner.tiktokshop.com/docv2` mục Product → Create Product
  * (API 202309), tra 10/10/2026 — trang tài liệu chính thức KHÔNG mở được trong phiên viết (xem
- * `docs/VERIFICATION.md` §27) ⇒ từng trường ghi *(theo trí nhớ tài liệu, cần xác minh)*.
+ * `docs/VERIFICATION.md` §29) ⇒ từng trường ghi *(theo trí nhớ tài liệu, cần xác minh)*.
  *
  * Luật §3: không ánh xạ được ⇒ `unmapped[]`; mặc định không phải dữ liệu ⇒ `defaults_applied[]`.
  */

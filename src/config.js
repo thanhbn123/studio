@@ -270,6 +270,26 @@ export function loadConfig(env = process.env) {
         Math.max(0, toNum(env.BILLING_MIN_STUCK_RUN_MS, 60 * 1000)),
       // Seed bảng `pricing` từ `config.cost.*` của MVP-01 (nguồn giá mặc định).
       pricingFromCost: toBool(env.BILLING_PRICING_FROM_COST, true),
+
+      // ── MVP-06: NẠP CREDIT THỦ CÔNG (`docs/MVP-06-CONTRACT.md` §2/§4) ──────
+      // Quyết định của Owner (09/10/2026): chuyển khoản tay + quản trị cấp credit. KHÔNG cổng
+      // thanh toán, KHÔNG webhook ngân hàng. Mọi con số dưới đây là DỮ LIỆU CẤU HÌNH; UI lấy
+      // qua `/api/config` và TUYỆT ĐỐI không hardcode số tài khoản trong mã nguồn.
+      topup: {
+        // Tỷ giá VND cho 1 credit. Được GHI LẠI vào từng yêu cầu tại thời điểm DUYỆT (luật #3),
+        // nên đổi giá trị này không làm sai lịch sử. Kẹp > 0: 0 sẽ là "credit miễn phí vô hạn".
+        rateVndPerCredit: Math.max(1, toNum(env.TOPUP_RATE_VND_PER_CREDIT, 26000)),
+        // Khoảng tiền cho MỘT yêu cầu nạp; ngoài khoảng ⇒ 400 `TOPUP_AMOUNT_OUT_OF_RANGE`.
+        minVnd: Math.max(1, toInt(env.TOPUP_MIN_VND, 20000)),
+        maxVnd: Math.max(1, toInt(env.TOPUP_MAX_VND, 50000000)),
+        // Hướng dẫn chuyển khoản do QUẢN TRỊ đặt. Để rỗng ⇒ UI nói thật "quản trị chưa điền
+        // thông tin chuyển khoản" (KHÔNG bịa ra số tài khoản nào).
+        bankName: toStr(env.TOPUP_BANK_NAME, ''),
+        accountNumber: toStr(env.TOPUP_BANK_ACCOUNT_NUMBER, ''),
+        accountHolder: toStr(env.TOPUP_BANK_ACCOUNT_HOLDER, ''),
+        transferNote: toStr(env.TOPUP_TRANSFER_NOTE, ''),
+        instructions: toStr(env.TOPUP_INSTRUCTIONS, ''),
+      },
     },
 
     // ── MVP-08: ĐĂNG SẢN PHẨM LÊN SÀN (`docs/MVP-08-CONTRACT.md`) ─────────────
@@ -327,6 +347,37 @@ export function loadConfig(env = process.env) {
       retryBaseMs: Math.max(0, toInt(env.QUEUE_RETRY_BASE_MS, 2000)),
 },
 
+    // ── MVP-07: đăng bài Facebook Page (DUYỆT TAY) ──────────────────────────
+    // Đây là ĐƯỜNG CẤU HÌNH DUY NHẤT của MVP-07 (`docs/MVP-07-CONTRACT.md` §4.1). Tên khoá
+    // ĐÓNG BĂNG: P1 đọc `publish.*`, P3 đọc cả `publish.facebook.*` để dựng `/api/config`.
+    //
+    // ⚠️ MẶC ĐỊNH `dry-run` (chế độ thử, KHÔNG gọi mạng, post_id có tiền tố `dry-`). Dự án CHƯA
+    // có Page ID + Page Access Token (cần Facebook app review), nên mặc định an toàn phải là
+    // "không đăng đi đâu cả". Cắm token thật = khai 3 biến, KHÔNG sửa mã:
+    //   PUBLISH_PROVIDER=facebook · FACEBOOK_PAGE_ID=… · FACEBOOK_PAGE_ACCESS_TOKEN=…
+    publish: {
+      enabled: toBool(env.PUBLISH_ENABLED, true),
+      provider: toStr(env.PUBLISH_PROVIDER, 'dry-run').toLowerCase(),
+      // Trần độ dài bài của Facebook. Vượt ⇒ TEXT_TOO_LONG (KHÔNG tự cắt: cắt âm thầm là sửa
+      // nội dung đã được người duyệt đọc).
+      maxTextLength: Math.max(1, toInt(env.PUBLISH_MAX_TEXT_LENGTH, 63206)),
+      // Sprint này 1 ảnh/bài: nhiều ảnh (`attached_media`) và tải ảnh từ đĩa (multipart) CHƯA làm.
+      maxMedia: Math.max(1, toInt(env.PUBLISH_MAX_MEDIA, 1)),
+      // Trần số LƯỢT ĐĂNG cho một bài (mỗi lượt là một lời gọi provider thật).
+      maxAttempts: Math.max(1, toInt(env.PUBLISH_MAX_ATTEMPTS, 3)),
+      facebook: {
+        // Hai giá trị dưới đây do CHỦ DỰ ÁN cấp. Thiếu một trong hai ⇒ provider trả
+        // NOT_CONFIGURED và KHÔNG gọi mạng (không bịa `post_id`).
+        pageId: toStr(env.FACEBOOK_PAGE_ID, ''),
+        accessToken: toStr(env.FACEBOOK_PAGE_ACCESS_TOKEN, ''),
+        apiVersion: toStr(env.FACEBOOK_API_VERSION, 'v21.0'),
+        baseUrl: toStr(env.FACEBOOK_GRAPH_BASE_URL, 'https://graph.facebook.com'),
+        timeoutMs: Math.max(1000, toInt(env.FACEBOOK_TIMEOUT_MS, 30000)),
+        // Chỉ bật khi trỏ Graph base URL vào server nội bộ (test). Mặc định FALSE = chống SSRF.
+        allowPrivateNetwork: toBool(env.PUBLISH_ALLOW_PRIVATE_NETWORK, false),
+      },
+    },
+
     scheduler: {
       // true (mặc định) = cron dọn dẹp chạy cùng server; false = không tạo timer nào.
       enabled: toBool(env.SCHEDULER_ENABLED, true),
@@ -338,6 +389,12 @@ export function loadConfig(env = process.env) {
   if (!AI_PROVIDERS.includes(cfg.vision.provider)) {
     // Không throw ở đây: provider lạ sẽ do tầng provider báo lỗi rõ ràng.
     cfg.vision.providerUnknown = true;
+  }
+
+  if (!['dry-run', 'facebook', 'none'].includes(cfg.publish.provider)) {
+    // Provider đăng bài lạ sẽ FAIL-CLOSED về `none` ở tầng provider (KHÔNG về `dry-run`);
+    // cờ này để `/api/config` và log chẩn đoán nói được vì sao.
+    cfg.publish.providerUnknown = true;
   }
 
   if (!['mock', 'http', 'none'].includes(cfg.ocr.provider)) {

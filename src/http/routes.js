@@ -36,6 +36,11 @@ const ADMIN_ROLES = new Set(['owner', 'admin']);
 /** Nhóm tổng hợp usage mà `/api/admin/usage` chấp nhận (§3.3). */
 const USAGE_GROUP_BY = Object.freeze(['day', 'operation', 'user']);
 
+/** MVP-06 — trạng thái yêu cầu nạp mà `?status=` chấp nhận (`docs/MVP-06-CONTRACT.md` §2).
+ *  Khai LẠI ở đây (không static-import `src/store/index.js`? — store ĐƯỢC import sẵn cho
+ *  `JOB_STATUS`, nhưng danh sách này là HỢP ĐỒNG HTTP nên giữ ngay cạnh route để đọc một chỗ). */
+const TOPUP_STATUS_LIST = Object.freeze(['pending', 'confirmed', 'rejected', 'expired']);
+
 /**
  * Danh sách operation của bảng giá (§2.1) — chỉ dùng để hỏi giá khi store CHƯA có
  * `listPricing`; không phải bản sao bảng giá (giá vẫn do A2/store quyết định).
@@ -49,6 +54,38 @@ const PRICING_OPERATIONS = Object.freeze([
 
 /** Câu DUY NHẤT cho mọi ca sai thông tin đăng nhập (khớp hằng số trong `buildRouter`). */
 const BAD_CREDENTIALS_TEXT = 'Email hoặc mật khẩu không đúng.';
+
+/* ══════════════ MVP-07 · hằng số ĐÓNG BĂNG (hợp đồng §2.6/§3.1) ══════════════
+ * Khai ở cấp MODULE để `/api/config` và hàm ánh xạ lỗi dùng CHUNG một nguồn. Cố ý KHÔNG
+ * static-import `src/publish/**`: routes.js phải nạp được kể cả khi khối MVP-07 chưa có mặt
+ * (app.js nạp phòng thủ bằng dynamic import) — một import hỏng ở đây sẽ làm chết cả MVP-01..06.
+ */
+
+/** Trạng thái bài đăng (bản sao ĐỌC-CHỈ của `PUBLISH_STATUSES` cho tầng HTTP). */
+const PUBLISH_STATUS_LIST = Object.freeze([
+  'draft', 'pending_review', 'approved', 'publishing', 'published', 'failed', 'rejected',
+]);
+
+/** `PublishError.code` ⇒ mã HTTP (hợp đồng §2.6). Mã lạ ⇒ 500 + log, KHÔNG đoán. */
+const PUBLISH_ERROR_STATUS = Object.freeze({
+  BAD_INPUT: 400,
+  BAD_SCHEDULE: 400,
+  TEXT_TOO_LONG: 400,
+  MEDIA_TOO_MANY: 400,
+  BAD_STATE: 409,
+  MEDIA_NOT_PUBLIC: 422,
+  ITEM_NOT_FOUND: 404,
+  // Mã QUAN TRỌNG NHẤT của sprint: bài chưa duyệt ⇒ 409, và provider chưa hề được gọi.
+  NOT_APPROVED: 409,
+  ITEM_REJECTED: 409,
+  PUBLISH_IN_PROGRESS: 409,
+  ALREADY_PUBLISHED: 409,
+  NOT_CONFIGURED: 409,
+  PROVIDER_DISABLED: 503,
+  PROVIDER_FAILED: 502,
+  ATTEMPTS_EXHAUSTED: 429,
+  STORE_WRITE_FAILED: 500,
+});
 
 const AUTH_CODE_SETS = Object.freeze({
   EMAIL_TAKEN: new Set(['EMAIL_TAKEN', 'EMAIL_EXISTS', 'DUPLICATE_EMAIL', 'USER_EXISTS', 'EMAIL_IN_USE']),
@@ -1547,6 +1584,157 @@ export function buildRouter(app) {
     sendJson(res, 200, { pricing: pricing.map(pricingJson) });
   });
 
+  /* ═════════ MVP-06 · NẠP CREDIT THỦ CÔNG (`docs/MVP-06-CONTRACT.md` §3) ═════════
+   *
+   * CHỈ THÊM route, không sửa route cũ. Bốn đường:
+   *   POST /api/billing/topup-requests             (đã đăng nhập) — TẠO yêu cầu, KHÔNG đụng ví
+   *   GET  /api/billing/topup-requests             (chính chủ: của mình; admin: tất cả + ?status=)
+   *   POST /api/billing/topup-requests/:id/confirm (CHỈ admin) — đường DUY NHẤT credit vào ví
+   *   POST /api/billing/topup-requests/:id/reject  (CHỈ admin) — bắt buộc lý do, KHÔNG dòng sổ
+   *
+   * `src/billing/topup.js` được nạp ĐỘNG y như khối MVP-05: một module hỏng KHÔNG được làm chết
+   * MVP-01/02/03. Thiếu module ⇒ 503 `TOPUP_UNAVAILABLE` nói thẳng, KHÔNG im lặng trả rỗng.
+   */
+
+  let topupServicePromise = null;
+  const topupService = async () => {
+    requireWallet(); // ví tắt / chưa nạp ⇒ 503 trước khi nói tới nạp tiền
+    if (!topupServicePromise) {
+      topupServicePromise = (async () => {
+        try {
+          const mod = await import('../billing/topup.js');
+          if (typeof mod?.createTopupService !== 'function') {
+            throw new Error('module nạp credit không xuất `createTopupService`');
+          }
+          return mod.createTopupService(config, { store, billing: walletService(), logger });
+        } catch (err) {
+          logger?.error?.('topup.wiring_failed', {
+            error_name: err?.name || 'Error',
+            error_code: err?.code || null,
+            // KHÔNG đưa cả object lỗi vào log: message/stack của Node chứa đường dẫn tuyệt đối.
+            error_message: scrubPaths(String(err?.message || err)),
+          });
+          return null;
+        }
+      })();
+    }
+    const svc = await topupServicePromise;
+    if (!svc) {
+      throw HttpError.safe(503, 'TOPUP_UNAVAILABLE', 'Chức năng nạp credit chưa nạp được trên máy chủ này — tạm thời chưa tạo/duyệt được yêu cầu nạp.');
+    }
+    return svc;
+  };
+
+  /** Khối cấu hình nạp credit cho `/api/config` — thiếu module ⇒ `null` (UI ẩn form, nói thật). */
+  const topupPublicConfig = async () => {
+    if (!billingAvailable()) return null;
+    try {
+      const svc = await topupService();
+      return svc.publicConfig();
+    } catch {
+      return null;
+    }
+  };
+
+  const isAdminReq = (req) => ADMIN_ROLES.has(String(req?.user?.role || 'member'));
+
+  router.post('/api/billing/topup-requests', async (req, res) => {
+    const user = requireUser(req); // ẩn danh ⇒ 401 (luật §3)
+    const svc = await topupService();
+    // Chống spam yêu cầu nạp: bucket RIÊNG theo IP, dùng limiter CÓ SẴN (không tạo limiter mới).
+    enforce(rateLimiters.requests, `topup:create:${clientKey(req)}`);
+    const body = await readJson(req, { maxBytes: 32 * 1024 });
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      throw HttpError.safe(400, 'BAD_BODY', 'Body phải là một object JSON.');
+    }
+    let request;
+    try {
+      request = await svc.createRequest({
+        userId: user.id,
+        amountVnd: body.amount_vnd ?? body.amountVnd,
+        reference: body.reference,
+        note: body.note,
+      });
+    } catch (err) {
+      throw mapTopupError(err) || mapBillingError(err) || err;
+    }
+    // Hợp đồng §4 — nói thật ngay trong phản hồi: ví KHÔNG hề bị chạm ở bước này.
+    sendJson(res, 201, { request: topupRequestJson(request), wallet_touched: false, note: topupHonestNote(svc) });
+  });
+
+  router.get('/api/billing/topup-requests', async (req, res) => {
+    const user = requireUser(req);
+    const svc = await topupService();
+    const admin = isAdminReq(req);
+    const limit = clampInt(req.query.get('limit'), 50, 1, 200);
+    const offset = clampInt(req.query.get('offset'), 0, 0, 1_000_000);
+    const statusRaw = sanitizeText(req.query.get('status'), { maxLength: 20 }).toLowerCase();
+    if (statusRaw && !TOPUP_STATUS_LIST.includes(statusRaw)) {
+      throw HttpError.safe(400, 'BAD_STATUS', `\`status\` phải là một trong: ${TOPUP_STATUS_LIST.join(', ')}.`);
+    }
+    // `mine=1` cho admin xem RIÊNG yêu cầu của mình (trang Tài khoản của chính admin).
+    const mineOnly = ['1', 'true', 'yes'].includes(String(req.query.get('mine') ?? '').toLowerCase());
+    let out;
+    try {
+      out = await svc.list({
+        userId: user.id,
+        all: admin && !mineOnly,
+        status: statusRaw || null,
+        limit,
+        offset,
+      });
+    } catch (err) {
+      throw mapTopupError(err) || err;
+    }
+    sendJson(res, 200, {
+      items: (out?.items || []).map(topupRequestJson),
+      total: Number(out?.total) || 0,
+      scope: admin && !mineOnly ? 'all' : 'mine',
+      is_admin: admin,
+    });
+  });
+
+  router.post('/api/billing/topup-requests/:id/confirm', async (req, res, params) => {
+    const admin = requireAdmin(req);
+    const svc = await topupService();
+    const body = await readJson(req, { maxBytes: 32 * 1024 }).catch(() => ({}));
+    let out;
+    try {
+      out = await svc.confirm({
+        requestId: String(params?.id ?? ''),
+        actorId: admin.id,
+        credits: body?.credits ?? null,
+        note: body?.note ?? '',
+      });
+    } catch (err) {
+      throw mapTopupError(err) || mapBillingError(err) || err;
+    }
+    const balance = await readBalance(out?.request?.user_id);
+    sendJson(res, 200, {
+      request: topupRequestJson(out?.request),
+      ledger: ledgerJson(out?.ledger),
+      balance: balanceJson(balance),
+    });
+  });
+
+  router.post('/api/billing/topup-requests/:id/reject', async (req, res, params) => {
+    const admin = requireAdmin(req);
+    const svc = await topupService();
+    const body = await readJson(req, { maxBytes: 32 * 1024 });
+    let out;
+    try {
+      out = await svc.reject({
+        requestId: String(params?.id ?? ''),
+        actorId: admin.id,
+        reason: body?.reason ?? '',
+      });
+    } catch (err) {
+      throw mapTopupError(err) || mapBillingError(err) || err;
+    }
+    // Từ chối KHÔNG sinh dòng sổ nào — nói thẳng trong phản hồi để UI khỏi đoán.
+    sendJson(res, 200, { request: topupRequestJson(out?.request), ledger: null });
+  });
+
   /* ────────────────────────── A4-07 → A4-10 · /api/admin/* ────────────────────────── */
 
   router.get('/api/admin/users', async (req, res) => {
@@ -2012,6 +2200,9 @@ export function buildRouter(app) {
         encoder: videostudioEncoderInfo(),
         audio: false,
       },
+      // MVP-07 (§4 hợp đồng đăng bài) — khối cho UI (P4): provider nào đang chạy, có phải CHẾ ĐỘ
+      // THỬ không, đã cấu hình Facebook chưa. CHỈ cờ + giới hạn: KHÔNG token, KHÔNG Page ID.
+      publish: publishConfigBlock(),
       // MVP-06 (§3 hợp đồng export) — khối cho UI (X3) biết có tải được gói .zip hay không.
       // CHỈ hai field: cờ khả dụng + định dạng; KHÔNG lộ đường dẫn, tên module hay bí mật.
       exports: {
@@ -2044,6 +2235,10 @@ export function buildRouter(app) {
         // BR-08: ngưỡng coi một lượt chạy là TREO (ms) — quá ngưỡng thì được thu hồi tự động.
         stuck_run_ms: Number.isFinite(Number(billingConfig().stuckRunMs)) ? Number(billingConfig().stuckRunMs) : null,
         min_stuck_run_ms: Number.isFinite(Number(billingConfig().minStuckRunMs)) ? Number(billingConfig().minStuckRunMs) : null,
+        // MVP-06 (§3) — NẠP CREDIT THỦ CÔNG: tỷ giá + khoảng tiền + hướng dẫn chuyển khoản
+        // LẤY TỪ CẤU HÌNH (UI KHÔNG hardcode số tài khoản). `null` = chưa nạp được module nạp
+        // credit ⇒ UI ẩn form và nói thật, không bịa ra số tài khoản nào.
+        topup: await topupPublicConfig(),
       },
       // §3.4 — trạng thái thật của dịch vụ tài khoản/ví để người vận hành biết VÌ SAO tắt.
       // MVP-08 (§4/§5) — kênh sàn + cờ live cho tab “Đăng sàn”: chỉ cờ, KHÔNG token. `null` = chưa nạp được module.
@@ -3641,6 +3836,349 @@ export function buildRouter(app) {
     });
   });
 
+  /* ══════════════════════════════════════════════════════════════════════════
+   * MVP-07 — ĐĂNG BÀI FACEBOOK PAGE (DUYỆT TAY) · hợp đồng `docs/MVP-07-CONTRACT.md` §4
+   *
+   * Tám route dưới đây là route MỚI (chỉ THÊM, không sửa route cũ). Ba luật của khối:
+   *
+   *   1. **Bắt buộc đăng nhập** cho MỌI `/api/publish/*` — ẩn danh ⇒ 401. Đăng bài là hành động
+   *      ra ngoài, phải có người chịu trách nhiệm và phải có người duyệt.
+   *   2. **Khác chủ ⇒ 404** (không xác nhận sự tồn tại), y hệt chính sách `requireOwnJob`.
+   *      owner/admin thấy và duyệt được bài của MỌI người — đó chính là hàng đợi duyệt.
+   *   3. **Chỉ `approved` mới được đăng.** Route `…/publish` không tự kiểm bằng `if`: nó gọi
+   *      `PublishService.publishItem()`, và cổng thật nằm ở câu UPDATE có điều kiện trong
+   *      `Store#claimPublishItem` (xem src/store/index.js).
+   * ══════════════════════════════════════════════════════════════════════════ */
+
+  const PUBLISH_UNAVAILABLE_MESSAGE =
+    'Khối đăng bài chưa nạp được trên máy chủ này — tính năng đăng bài tạm thời không dùng được.';
+
+  /** Lý do THẬT do `src/app.js` ghi lại (hoặc cấu hình tắt) — cùng khuôn `imagelabUnavailableReason`. */
+  const publishUnavailableReason = () => {
+    const reason = app?.publishUnavailableReason;
+    return typeof reason === 'string' && reason.trim() ? reason : PUBLISH_UNAVAILABLE_MESSAGE;
+  };
+
+  const publishEnabled = () => config?.publish?.enabled !== false;
+
+  const publishService = () =>
+    app?.publishService && typeof app.publishService.publishItem === 'function' ? app.publishService : null;
+
+  const publishAvailable = () =>
+    publishEnabled()
+    && Boolean(publishService())
+    && typeof store?.createPublishItem === 'function'
+    && typeof store?.claimPublishItem === 'function';
+
+  /** Thiếu module/store cũ/tắt tường minh ⇒ 503 nói thẳng, KHÔNG mô phỏng danh sách rỗng. */
+  const requirePublish = () => {
+    if (!publishEnabled()) {
+      throw HttpError.safe(503, 'PUBLISH_UNAVAILABLE', 'Tính năng đăng bài đang bị tắt bằng cấu hình (PUBLISH_ENABLED=false).');
+    }
+    const svc = publishService();
+    if (!svc) throw HttpError.safe(503, 'PUBLISH_UNAVAILABLE', publishUnavailableReason());
+    if (typeof store?.claimPublishItem !== 'function' || typeof store?.createPublishItem !== 'function') {
+      throw HttpError.safe(503, 'PUBLISH_UNAVAILABLE', 'Store trên máy chủ này chưa có bảng/hàm đăng bài (DB chưa nâng cấp?).');
+    }
+    return svc;
+  };
+
+  /** Khối `publish` cho `/api/config` — CHỈ cờ + giới hạn; KHÔNG token, KHÔNG Page ID. */
+  const publishConfigBlock = () => {
+    const svc = publishService();
+    const info = svc ? svc.providerInfo() : { name: 'none', channel: 'facebook_page', configured: false, is_mock: false, notice: '' };
+    return {
+      available: publishAvailable(),
+      enabled: publishEnabled(),
+      reason: publishAvailable() ? null : publishUnavailableReason(),
+      channel: String(info.channel || 'facebook_page'),
+      // Luật bất biến của sprint: hệ thống KHÔNG BAO GIỜ tự đăng — UI phải nói rõ điều này.
+      manual_approval_required: true,
+      provider: { name: info.name, configured: Boolean(info.configured), is_mock: Boolean(info.is_mock), notice: String(info.notice || '') },
+      statuses: [...PUBLISH_STATUS_LIST],
+      limits: {
+        max_text_length: Number(config?.publish?.maxTextLength) || 63206,
+        max_media: Number(config?.publish?.maxMedia) || 1,
+        max_attempts: Number(config?.publish?.maxAttempts) || 3,
+      },
+    };
+  };
+
+  /** `PublishError.code` ⇒ HTTP theo hợp đồng §2.6. KHÔNG BAO GIỜ lộ stack/token của module. */
+  const mapPublishError = (err) => {
+    if (err instanceof HttpError) return err;
+    const code = String(err?.code || '').trim().toUpperCase();
+    const message = String(err?.message ?? '').trim();
+    const status = PUBLISH_ERROR_STATUS[code];
+    if (status) {
+      // Câu tiếng Việt do chính repo viết (module P1 không chứa token/đường dẫn) ⇒ hiện thẳng.
+      return HttpError.safe(status, code, message || 'Không thực hiện được yêu cầu đăng bài.', err?.details ?? {});
+    }
+    logger?.error?.('publish.route_failed', {
+      error_name: err?.name || 'Error',
+      error_code: err?.code || null,
+      error_message: scrubPaths(err?.message || err),
+    });
+    return HttpError.safe(500, 'PUBLISH_FAILED', 'Không xử lý được yêu cầu đăng bài. Vui lòng thử lại.');
+  };
+
+  /** Người gọi là owner/admin hay không (dùng để mở hàng đợi duyệt, KHÔNG để nới cổng duyệt). */
+  const isPublishAdmin = (req) => ADMIN_ROLES.has(String(req?.user?.role || 'member'));
+
+  /**
+   * Bài đăng của CHÍNH người gọi (hoặc bất kỳ bài, nếu người gọi là owner/admin).
+   * Khác chủ ⇒ **404** (không xác nhận sự tồn tại) — cùng chính sách `requireOwnJob`.
+   */
+  const requireOwnPublishItem = async (req, id) => {
+    if (!UUID_RE.test(String(id ?? ''))) throw new HttpError(400, 'BAD_ITEM_ID', 'Mã bài đăng không hợp lệ.');
+    const item = await store.getPublishItem(String(id));
+    if (!item) throw new HttpError(404, 'ITEM_NOT_FOUND', 'Không tìm thấy bài đăng.');
+    if (isPublishAdmin(req)) return item;
+    const uid = String(req?.user?.id ?? '');
+    if (!uid || String(item.user_id ?? '') !== uid) throw new HttpError(404, 'ITEM_NOT_FOUND', 'Không tìm thấy bài đăng.');
+    return item;
+  };
+
+  /**
+   * `MediaRef[]` cho provider: id media → asset THẬT trong store, kèm URL công khai nếu dựng
+   * được từ `PUBLIC_BASE_URL`.
+   *
+   * ⚠️ `PUBLIC_BASE_URL` rỗng ⇒ `url` rỗng ⇒ provider `facebook` trả `MEDIA_NOT_PUBLIC` (nói
+   * thẳng là Facebook không tải được ảnh về), KHÔNG dựng URL `127.0.0.1` rồi để Facebook lỗi
+   * mơ hồ. Asset không thuộc chủ bài ⇒ bỏ qua (không bao giờ đăng ảnh của người khác).
+   */
+  const publishMediaRefs = async (item) => {
+    const ids = Array.isArray(item?.media_ids) ? item.media_ids : [];
+    if (ids.length === 0 || typeof store?.getImageAsset !== 'function') return [];
+    const base = String(config?.publicBaseUrl ?? '').trim().replace(/\/+$/, '');
+    const out = [];
+    for (const id of ids) {
+      let asset = null;
+      try {
+        asset = await store.getImageAsset(String(id));
+      } catch {
+        asset = null;
+      }
+      if (!asset) continue;
+      const owner = asset.user_id ?? null;
+      if (owner && String(owner) !== String(item.user_id ?? '')) {
+        logger?.warn?.('publish.media_owner_mismatch', { item_id: item.id });
+        continue;
+      }
+      out.push({
+        id: String(asset.id),
+        mime: String(asset.mime ?? ''),
+        bytes: Number(asset.bytes ?? 0),
+        // Route tệp ảnh đã có từ MVP-02 — dùng lại, KHÔNG tự ghép đường dẫn đĩa.
+        url: base ? `${base}/api/imagelab/assets/${encodeURIComponent(String(asset.id))}/file` : '',
+      });
+    }
+    return out;
+  };
+
+  /** Bài đăng trả ra API — ĐÚNG các field hợp đồng; KHÔNG lộ `session_id`, KHÔNG lộ token. */
+  const publicPublishItem = (item) => ({
+    id: item.id,
+    job_id: item.job_id,
+    channel: item.channel,
+    provider: item.provider,
+    text: item.text,
+    media_ids: item.media_ids,
+    status: item.status,
+    scheduled_at: item.scheduled_at,
+    approved_by: item.approved_by,
+    approved_at: item.approved_at,
+    rejected_by: item.rejected_by,
+    rejected_at: item.rejected_at,
+    reject_reason: item.reject_reason,
+    published_at: item.published_at,
+    external_post_id: item.external_post_id,
+    external_url: item.external_url,
+    is_mock: item.is_mock,
+    error_code: item.error_code,
+    last_error: item.last_error,
+    attempts: item.attempts,
+    created_at: item.created_at,
+    updated_at: item.updated_at,
+  });
+
+  /* ── Tạo bài NHÁP từ một job ── */
+
+  router.post('/api/publish/items', async (req, res) => {
+    const svc = requirePublish();
+    const user = requireUser(req);
+    enforce(rateLimiters.jobs, `publish:${sessionId(req, res)}`);
+    const body = await readJson(req, { maxBytes: 256 * 1024 });
+    const jobId = String(body?.job_id ?? body?.jobId ?? '').trim();
+    if (!jobId) throw new HttpError(400, 'BAD_INPUT', 'Thiếu `job_id` — bài đăng phải xuất phát từ một job đã chạy.');
+    // Job phải là job CỦA CHÍNH NGƯỜI GỌI (khác chủ ⇒ 404) — kể cả owner/admin: tạo bài là
+    // hành động của chủ nội dung, duyệt mới là việc của quản trị.
+    const job = await requireOwnJob(req, res, jobId);
+    try {
+      const created = await svc.createItem({
+        job,
+        userId: user.id,
+        text: body?.text,
+        mediaIds: body?.media_ids ?? body?.mediaIds ?? [],
+        channel: body?.channel,
+        scheduledAt: body?.scheduled_at ?? body?.scheduledAt ?? null,
+        submit: body?.submit === true,
+      });
+      sendJson(res, 201, {
+        item: publicPublishItem(created.item),
+        warnings: created.warnings ?? [],
+        dropped_media: created.dropped_media ?? 0,
+        provider: svc.providerInfo(),
+      });
+    } catch (err) {
+      throw mapPublishError(err);
+    }
+  });
+
+  /* ── Hàng đợi duyệt: owner/admin thấy MỌI bài, member chỉ thấy bài của mình ── */
+
+  router.get('/api/publish/items', async (req, res) => {
+    const svc = requirePublish();
+    const user = requireUser(req);
+    enforce(rateLimiters.requests, `publish-read:${sessionId(req, res)}`);
+    const url = new URL(req.url, 'http://local');
+    const statusRaw = String(url.searchParams.get('status') ?? '').trim();
+    if (statusRaw && !PUBLISH_STATUS_LIST.includes(statusRaw)) {
+      throw new HttpError(400, 'BAD_STATUS', `Trạng thái không hợp lệ (chỉ nhận: ${PUBLISH_STATUS_LIST.join(', ')}).`);
+    }
+    const jobId = String(url.searchParams.get('job_id') ?? '').trim();
+    const all = isPublishAdmin(req);
+    const [items, total] = await Promise.all([
+      store.listPublishItems({
+        userId: user.id,
+        all,
+        status: statusRaw || null,
+        jobId: jobId || null,
+        limit: clampInt(url.searchParams.get('limit'), 50, 1, 200),
+        offset: clampInt(url.searchParams.get('offset'), 0, 0, 100000),
+      }),
+      store.countPublishItems({ userId: user.id, all, status: statusRaw || null }),
+    ]);
+    sendJson(res, 200, {
+      items: asArray(items).map((it) => publicPublishItem(it)),
+      total,
+      scope: all ? 'all' : 'mine',
+      can_approve: all,
+      provider: svc.providerInfo(),
+      statuses: [...PUBLISH_STATUS_LIST],
+    });
+  });
+
+  /* ── Chi tiết + VẾT mọi lần gọi provider (kể cả lỗi nguyên văn của Facebook) ── */
+
+  router.get('/api/publish/items/:id', async (req, res, params) => {
+    const svc = requirePublish();
+    requireUser(req);
+    enforce(rateLimiters.requests, `publish-read:${sessionId(req, res)}`);
+    const item = await requireOwnPublishItem(req, params.id);
+    const logs = typeof store.listPublishLogs === 'function' ? asArray(await store.listPublishLogs(item.id, { limit: 50 })) : [];
+    sendJson(res, 200, {
+      item: publicPublishItem(item),
+      logs: logs.map((l) => ({
+        id: l.id,
+        attempt: l.attempt,
+        provider: l.provider,
+        status: l.status,
+        external_post_id: l.external_post_id,
+        error_code: l.error_code,
+        // NGUYÊN VĂN lỗi nền tảng (token đã bị `maskToken` che ở tầng provider).
+        error_message: l.error_message,
+        is_mock: l.is_mock,
+        request_summary: l.request_summary,
+        created_at: l.created_at,
+      })),
+      provider: svc.providerInfo(),
+    });
+  });
+
+  /* ── Chủ bài gửi duyệt: draft → pending_review ── */
+
+  router.post('/api/publish/items/:id/submit', async (req, res, params) => {
+    const svc = requirePublish();
+    requireUser(req);
+    enforce(rateLimiters.jobs, `publish:${sessionId(req, res)}`);
+    const item = await requireOwnPublishItem(req, params.id);
+    try {
+      sendJson(res, 200, { item: publicPublishItem(await svc.submit(item.id)) });
+    } catch (err) {
+      throw mapPublishError(err);
+    }
+  });
+
+  /* ── DUYỆT / TỪ CHỐI — CHỈ owner/admin (member ⇒ 403) ── */
+
+  router.post('/api/publish/items/:id/approve', async (req, res, params) => {
+    const svc = requirePublish();
+    const admin = requireAdmin(req);
+    enforce(rateLimiters.jobs, `publish:${sessionId(req, res)}`);
+    const item = await requireOwnPublishItem(req, params.id);
+    try {
+      sendJson(res, 200, { item: publicPublishItem(await svc.approve(item.id, { by: admin.id })) });
+    } catch (err) {
+      throw mapPublishError(err);
+    }
+  });
+
+  router.post('/api/publish/items/:id/reject', async (req, res, params) => {
+    const svc = requirePublish();
+    const admin = requireAdmin(req);
+    enforce(rateLimiters.jobs, `publish:${sessionId(req, res)}`);
+    const item = await requireOwnPublishItem(req, params.id);
+    const body = await readJson(req, { maxBytes: 16 * 1024 }).catch(() => null);
+    try {
+      const next = await svc.reject(item.id, { by: admin.id, reason: sanitizeText(String(body?.reason ?? ''), { maxLength: 1000 }) });
+      sendJson(res, 200, { item: publicPublishItem(next) });
+    } catch (err) {
+      throw mapPublishError(err);
+    }
+  });
+
+  /* ── ĐĂNG — CHỈ chạy khi bài đã `approved` (cổng thật ở `Store#claimPublishItem`) ── */
+
+  router.post('/api/publish/items/:id/publish', async (req, res, params) => {
+    const svc = requirePublish();
+    const user = requireUser(req);
+    enforce(rateLimiters.jobs, `publish:${sessionId(req, res)}`);
+    const item = await requireOwnPublishItem(req, params.id);
+    const media = await publishMediaRefs(item);
+    try {
+      const out = await svc.publishItem(item.id, { actorId: user.id, media });
+      sendJson(res, 200, {
+        item: publicPublishItem(out.item),
+        result: {
+          status: out.result?.status ?? null,
+          post_id: out.result?.post_id ?? null,
+          url: out.result?.url ?? null,
+          error_code: out.result?.error_code ?? null,
+          error_message: String(out.result?.error_message ?? ''),
+          is_mock: Boolean(out.result?.is_mock),
+          provider: out.result?.provider ?? null,
+          scheduled_at: out.result?.scheduled_at ?? null,
+        },
+        // `called = false` ⇒ provider KHÔNG được gọi (bài đã đăng trước đó) — luật "một bài
+        // chỉ đăng một lần" quan sát được từ ngoài, không phải chỉ nằm trong mã.
+        called: out.called === true,
+        idempotent: out.idempotent === true,
+      });
+    } catch (err) {
+      throw mapPublishError(err);
+    }
+  });
+
+  /* ── Trạng thái provider (có thể gọi mạng) — CHỈ owner/admin ── */
+
+  router.get('/api/publish/provider', async (req, res) => {
+    const svc = requirePublish();
+    requireAdmin(req);
+    enforce(rateLimiters.requests, `publish-read:${sessionId(req, res)}`);
+    sendJson(res, 200, { provider: svc.providerInfo(), probe: await svc.probe() });
+  });
+
   /**
    * MVP-05 — gắn middleware `attachUser` (+ cổng "bắt buộc đăng nhập" khi chủ hệ thống tắt
    * chế độ ẩn danh) cho MỌI route đã đăng ký ở trên.
@@ -3742,6 +4280,81 @@ function ledgerJson(row) {
     balance_after: Number.isFinite(Number(row.balance_after)) ? Number(row.balance_after) : null,
     created_at: row.created_at ?? null,
   };
+}
+
+/**
+ * MVP-06 — một YÊU CẦU NẠP trả cho client (`docs/MVP-06-CONTRACT.md` §2/§3).
+ * Danh sách TRẮNG: chỉ field của hợp đồng, không lộ cột nội bộ nào.
+ */
+function topupRequestJson(row) {
+  if (!row || typeof row !== 'object') return null;
+  return {
+    id: row.id ?? null,
+    user_id: row.user_id ?? null,
+    amount_vnd: Number.isFinite(Number(row.amount_vnd)) ? Number(row.amount_vnd) : null,
+    credits: Number.isFinite(Number(row.credits)) ? Number(row.credits) : null,
+    rate_vnd_per_credit: Number.isFinite(Number(row.rate_vnd_per_credit)) ? Number(row.rate_vnd_per_credit) : null,
+    method: row.method ?? null,
+    reference: row.reference ?? '',
+    note: row.note ?? '',
+    status: row.status ?? null,
+    created_at: row.created_at ?? null,
+    decided_at: row.decided_at ?? null,
+    decided_by: row.decided_by ?? null,
+    ledger_entry_id: row.ledger_entry_id ?? null,
+  };
+}
+
+/** Câu nói thật của MVP-06 (lấy từ service để KHÔNG có hai bản chữ lệch nhau). */
+function topupHonestNote(svc) {
+  const text = svc && typeof svc.publicConfig === 'function' ? svc.publicConfig()?.note : null;
+  return typeof text === 'string' && text ? text : null;
+}
+
+/**
+ * Lỗi của MVP-06 → HTTP. Mã lỗi LÀ HỢP ĐỒNG (§3):
+ *   `TOPUP_ALREADY_DECIDED`      ⇒ 409 (xác nhận 2 lần — sổ KHÔNG đổi)
+ *   `TOPUP_REFERENCE_DUPLICATE`  ⇒ 409 (chống khai khống)
+ *   `TOPUP_AMOUNT_OUT_OF_RANGE`  ⇒ 400
+ *   `TOPUP_NOT_FOUND`            ⇒ 404 (kể cả khi yêu cầu là của người khác — không tiết lộ)
+ *   `TOPUP_ANONYMOUS`            ⇒ 401
+ */
+function mapTopupError(err) {
+  if (!err || typeof err !== 'object') return null;
+  const code = String(err.code || '');
+  const details = err.details && typeof err.details === 'object' ? err.details : {};
+  const message = String(err.message || 'Không xử lý được yêu cầu nạp credit.');
+  if (code === 'TOPUP_ALREADY_DECIDED') {
+    return HttpError.safe(409, code, message, {
+      request_id: details.request_id ?? null,
+      status: details.status ?? null,
+      decided_at: details.decided_at ?? null,
+    });
+  }
+  if (code === 'TOPUP_REFERENCE_DUPLICATE') {
+    return HttpError.safe(409, code, message, { reference: details.reference ?? null });
+  }
+  if (code === 'TOPUP_AMOUNT_OUT_OF_RANGE') {
+    return HttpError.safe(400, code, message, {
+      amount_vnd: details.amount_vnd ?? null,
+      min_topup_vnd: details.min_topup_vnd ?? null,
+      max_topup_vnd: details.max_topup_vnd ?? null,
+    });
+  }
+  if (code === 'TOPUP_AMOUNT_INVALID' || code === 'TOPUP_REFERENCE_REQUIRED' || code === 'TOPUP_REASON_REQUIRED'
+      || code === 'TOPUP_CREDITS_INVALID' || code === 'INVALID_TOPUP_AMOUNT') {
+    return HttpError.safe(400, code, message, { amount_vnd: details.amount_vnd ?? null });
+  }
+  if (code === 'TOPUP_NOT_FOUND') {
+    return HttpError.safe(404, code, 'Không tìm thấy yêu cầu nạp.', { request_id: details.request_id ?? null });
+  }
+  if (code === 'TOPUP_ANONYMOUS') {
+    return HttpError.safe(401, 'UNAUTHENTICATED', 'Bạn cần đăng nhập để nạp credit.');
+  }
+  if (code === 'TOPUP_UNAVAILABLE' || code === 'TOPUP_NO_OWNER') {
+    return HttpError.safe(503, 'TOPUP_UNAVAILABLE', message);
+  }
+  return null;
 }
 
 /** Một dòng bảng giá: `{operation, unit_price, currency, note}` (§3.3). */
