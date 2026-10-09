@@ -381,6 +381,13 @@ select.text-input.mini { min-width: 132px; }
 .credit-minus { color: #ffb3b3; font-weight: 700; }
 .credit-zero { color: var(--muted); font-weight: 700; }
 
+/* ── Gói xuất bản (.zip) — hợp đồng §4 ─────────────────────────────────────── */
+.export-panel .spread { align-items: flex-start; }
+.export-panel [data-export-error]:empty { display: none; }
+.export-panel [data-export-manifest] { margin-top: 10px; }
+.export-panel [data-export-manifest] .notice { margin: 0; }
+.export-panel [data-export-manifest] h3 { margin: 12px 0 6px; }
+
 @media (max-width: 640px) {
   .account-bar { padding-bottom: 12px; }
   .text-input.mini { width: 100%; }
