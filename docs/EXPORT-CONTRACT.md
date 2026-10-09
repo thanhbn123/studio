@@ -167,5 +167,81 @@ Hai agent độc lập (test + phản biện) bắt TRÙNG nhau 3 lỗi; phán q
   `sha256: null` + lý do “không tự băm chính nó”).
 - Thiếu `storage` ⇒ `config.exports.available = false` và hai route trả **503 `EXPORT_UNAVAILABLE`**
   (trước đây 500; lỗi `BAD_INPUT` có chữ “storage” được map thành “chưa sẵn sàng”).
-- `normalizeZipName`/`createZip` **từ chối** tên entry chứa CR/LF/NUL với mã riêng
-  **`BAD_ENTRY_NAME`** (NUL trước đây đã bị chặn qua `ZIP_NAME_INVALID`).
+- Tên entry chứa ký tự điều khiển bị **từ chối**, nhưng bằng **HAI mã có lý do khác nhau** — câu
+  “CR/LF/NUL ⇒ `BAD_ENTRY_NAME`” ở bản trước là SAI và đã được sửa ở §9.7 (R4).
+
+---
+
+# VÒNG VÁ R1…R6 — chốt lại các điểm lệch của vòng 2
+
+Nguồn: `docs/EXPORT-REVIEW.md` §6.2 (R1–R6, đo tại `3bc139f`) + script `/tmp/x-atk2/**`
+(`b1-matrix`, `b2-d5-d4-d6`, `b3-zipnames`, `c1-r6-limits`, `c2-r6-concurrency-rss`).
+Số đo thật + phần CHƯA làm được: `docs/VERIFICATION.md` §24.5.
+
+## 10.1 R1 — `mock_steps` KHÔNG BAO GIỜ mâu thuẫn với `providers`
+
+- `mockStepsFor(job, assets, usage, evidence)` đọc thêm cờ **`content_meta.imagelab.{ocr,translate,render}.is_mock`**
+  (đúng ba field mà `providersFor()` in ra ở `providers.imagelab.*`), và coi
+  **`content_meta.provider = "mock"`** là bước `content` chạy bằng provider giả (cùng luật D2 đang
+  áp cho từng dòng `usage_events`).
+- **CHỐT CHẶN:** sau khi gom, gói đối chiếu lại với CHÍNH object `providers` sẽ in ra
+  (`mockStepsFromProviders`). Nếu còn `is_mock === true` ở bất kỳ đường dẫn nào mà không suy ra
+  được bước cụ thể ⇒ `mock_steps` ghi **`"unknown"`** kèm một cảnh báo giải thích trong
+  `warnings[]` (KHÔNG bao giờ để rỗng khi có provider mock). `verification_detail.contains_mock`
+  theo đúng mảng này.
+
+## 10.2 R2 — cổng nhãn kiểm chứng: CHUẨN HOÁ trước khi xét
+
+- `normalizeVerificationLevel(raw)` (manifest.js): `trim()` + **chữ HOA**; nhận cả OBJECT qua
+  `level`/`label`/`status`/`verification`. Mọi phép so khớp LIVE (`LIVE_VERIFIED`,
+  `AUTHENTICATED_LIVE_VERIFIED`) chạy trên giá trị **đã chuẩn hoá**, nên `'live_verified'`,
+  `'LIVE_VERIFIED '` (dấu cách) và `{level:'LIVE_VERIFIED'}` đều đi qua **cùng một cổng**:
+  chỉ giữ nhãn khi `transport === 'http'`, còn lại ⇒ `label = null` + lý do trong
+  `verification_detail.notes` + `suggested_level`.
+- Object/kiểu lạ KHÔNG đọc được mức ⇒ coi như **KHÔNG có nhãn** + ghi lý do; `recorded_level` giữ
+  nguyên bản để truy vết, `recorded_level_normalized` là bản đã chuẩn hoá.
+- **UI:** badge XANH “đã kiểm chứng bằng dịch vụ thật” chỉ hiện khi nhãn là CHUỖI, chuẩn hoá ra
+  đúng một mức LIVE **VÀ** `verification_detail.live_service_called === true`. `exportVerificationLabel`
+  KHÔNG còn dịch object thành nhãn; lý do không hiện badge được in ngay dưới badge.
+
+## 10.3 R3 + R4 — tên entry: mọi ký tự điều khiển, hai mã lỗi
+
+- `normalizeZipName` chặn **`\p{Cc}`** (C0/C1, gồm CR/LF/TAB/VT/FF/ESC/DEL/NEL), **`\p{Zl}`/`\p{Zp}`**
+  (LS/PS) và các ký tự điều khiển hướng hiển thị (`LRE/RLE/PDF/LRO/RLO`, isolate, `LRM/RLM/ALM`)
+  + BOM. **Cố ý KHÔNG chặn toàn bộ `\p{Cf}`** vì `Cf` gồm ZWJ (U+200D) — chặn nó là phá tên tệp
+  emoji ghép; chữ có dấu + emoji vẫn được giữ nguyên.
+- **HAI MÃ, lý do khác nhau** (thay cho câu sai ở §9.6):
+
+  | Tên entry | Mã lỗi | Vì sao |
+  |---|---|---|
+  | chứa **NUL (U+0000)** | `ZIP_NAME_INVALID` | NUL làm tên không biểu diễn được trong ZIP (mọi công cụ đọc theo C-string cắt tại đó) ⇒ lỗi ĐỊNH DẠNG đường dẫn; mã này đã dùng cho NUL từ trước D6, giữ nguyên để không phá client đang bắt mã đó |
+  | rỗng / tuyệt đối / `..` / `\` / đuôi `/` | `ZIP_NAME_INVALID` | tên không dùng được làm đường dẫn entry |
+  | chứa ký tự điều khiển **khác NUL** | `BAD_ENTRY_NAME` | tên ĐÚNG dạng đường dẫn nhưng chèn được dòng giả vào danh sách tệp / bịa được đuôi tệp. `details` nêu rõ `{char, code_point, name, position}` |
+  | dài quá 65535 byte UTF-8 | `ZIP_NAME_TOO_LONG` | giới hạn định dạng ZIP cổ điển |
+
+## 10.4 R5 — `mock_steps` có phần tử nhưng không đọc được tên
+
+- `usableMockSteps(raw)` tách phần dùng được khỏi phần dị dạng. Mảng **RỖNG thật** (`[]`) vẫn là
+  “không có bước giả”; mảng **CÓ phần tử mà không đọc được tên nào** (`[null]`, `[""]`, `[{}]`)
+  ⇒ ghi `"unknown"` + cảnh báo (manifest) và UI in **“KHÔNG kiểm được”** thay vì câu khẳng định.
+- UI chỉ in câu “Máy chủ khai KHÔNG có bước nào dùng dữ liệu giả” khi `mock_steps` **THẬT SỰ rỗng**.
+
+## 10.5 R6 — trần kích thước gói + giới hạn số lượt dựng gói ĐỒNG THỜI
+
+Bối cảnh đo được: `/bundle` dựng trọn gói trong RAM, **60 MB asset ⇒ +196…270 MB RSS (~3,3–4,5×)**
+và ~1,8 s; trần cũ 512 MiB ⇒ một request hợp lệ có thể cấp phát ~2 GB, không giới hạn đồng thời.
+
+| Cấu hình (env) | Mặc định | Ý nghĩa |
+|---|---|---|
+| `EXPORT_MAX_BUNDLE_BYTES` | **67108864** (64 MiB) | Trần tổng byte của gói. Vượt ⇒ `BUNDLE_TOO_LARGE` (**HTTP 413**) kèm `details = {bytes, limit, max_bundle_bytes}`, dừng NGAY khi vượt (không đọc nốt phần còn lại). Áp cho **cả** `/bundle` lẫn `/manifest` |
+| `EXPORT_MAX_CONCURRENT_BUNDLES` | **1** | Số lượt dựng gói chạy song song (`/bundle`). Lượt vượt ⇒ xếp hàng, không dựng chồng |
+| `EXPORT_MAX_QUEUED_BUNDLES` | **4** | Số request được chờ trong hàng đợi. Đầy ⇒ `EXPORT_BUSY` (**HTTP 429**, `retry_after_ms`) |
+| `EXPORT_MAX_WAIT_MS` | **30000** | Chờ tối đa trong hàng đợi; quá hạn ⇒ `EXPORT_BUSY` (429) thay vì treo request |
+
+- Giá trị env sai/âm/không phải số ⇒ rơi về **mặc định** (không bao giờ thành “không giới hạn”).
+- `EXPORT_BUSY` (429, quá tải dựng gói) **KHÁC** `RATE_LIMITED` (429, trần 10 job/phút theo phiên).
+- UI nói đúng loại lỗi: 413 in **số đo** (MB đo được / trần), 429 `EXPORT_BUSY` in thời gian chờ đề
+  nghị; cả hai **không** mời “thử tải trực tiếp” (bấm lại y hệt vẫn hỏng).
+- `/api/config.exports` **giữ nguyên** `{available, formats}` (không thêm field ⇒ không phá client cũ);
+  trần/giới hạn là cấu hình vận hành, thông báo lỗi mới là nơi nói con số.
+

@@ -17,6 +17,14 @@
  * Nhãn kiểm chứng: chỉ giữ `LIVE_VERIFIED`/`AUTHENTICATED_LIVE_VERIFIED` khi dấu vết đã lưu
  * chứng minh lần trích xuất đi bằng transport `http`. Nghi ngờ ⇒ trả `null` + ghi lý do
  * trong `verification_detail.notes` (thà thiếu nhãn còn hơn nhận đã kiểm chứng bằng dịch vụ thật).
+ *
+ * VÒNG VÁ R1/R2/R5 (phản biện vòng 2 — `docs/EXPORT-REVIEW.md` §6.2):
+ *  · R1 — `mock_steps` đối chiếu với CHÍNH `providers` sẽ in ra ⇒ không bao giờ có
+ *    `providers.*.is_mock = true` mà `mock_steps` rỗng; bí bước cụ thể ⇒ ghi `"unknown"` + cảnh báo.
+ *  · R2 — nhãn kiểm chứng được CHUẨN HOÁ (trim + HOA, nhận object qua `.level`) TRƯỚC khi xét cổng
+ *    ⇒ `'live_verified'`/`'LIVE_VERIFIED '`/`{level:…}` không còn lọt qua cổng bằng chứng.
+ *  · R5 — `mock_steps` có phần tử nhưng không đọc được tên (`[null]`) KHÔNG bị coi là "không có
+ *    bước giả": ghi `"unknown"` thay vì rỗng.
  */
 
 import { ExportError, EXPORT_CODES } from './errors.js';
@@ -122,11 +130,17 @@ export function providersFor(job, usage = [], evidence = []) {
   const latest = asArray(evidence)[0] || null;
 
   // MVP-01: `content_meta` CHÍNH LÀ `gen.meta` (provider/model/is_mock nằm ở cấp cao nhất).
+  const contentProvider = meta.provider ?? null;
+  const contentIsMock = meta.is_mock === true || String(contentProvider ?? '').trim().toLowerCase() === 'mock';
   const content = meta.provider || meta.model
     ? {
-        name: meta.provider ?? null,
+        name: contentProvider,
         model: meta.model ?? null,
-        is_mock: meta.is_mock ?? null,
+        // R1 (phản biện vòng 2, LOW): provider tên `mock` ⇒ bước này CHẠY BẰNG PROVIDER GIẢ, kể cả
+        // khi dấu vết thiếu cờ `is_mock` — ĐÚNG luật D2 đang áp cho từng dòng `usage_events`
+        // (`provider === 'mock'` ⇒ `is_mock: true`). Trước đây nhánh content chỉ đọc `meta.is_mock`
+        // nên cùng một job có thể khai `providers.content.name = "mock"` mà `is_mock: null`.
+        is_mock: contentIsMock ? true : (meta.is_mock ?? null),
         style: meta.style ?? null,
         length: meta.length ?? null,
         generated_at: meta.generated_at ?? null,
@@ -207,22 +221,119 @@ const OPERATION_STEP = Object.freeze({
   VIDEO_ENCODE: 'video_encode',
 });
 
+/** Tên bước dùng khi có dấu vết MOCK nhưng KHÔNG đọc được bước cụ thể nào (R1/R5). */
+export const UNKNOWN_MOCK_STEP = 'unknown';
+
+/**
+ * Tách một giá trị `mock_steps` ĐÃ LƯU thành phần DÙNG ĐƯỢC và phần dị dạng — R5
+ * (phản biện vòng 2, LOW): mảng `[null]`/`[""]`/`[{}]` là CÓ dấu vết mock nhưng không đọc được
+ * tên bước. Coi nó như "không có bước giả" chính là để bản kê khai tự mâu thuẫn.
+ *
+ * Chấp nhận: mảng chuỗi, một chuỗi đơn (dữ liệu cũ ghi thiếu mảng), object có `.step`/`.name`.
+ *
+ * @returns {{steps: string[], unusable: number, present: boolean}}
+ *          `present` = trường có mặt trong dấu vết; `unusable` = số phần tử không đọc được.
+ */
+export function usableMockSteps(raw) {
+  const steps = [];
+  let unusable = 0;
+  const take = (value) => {
+    if (typeof value === 'string') {
+      const text = value.trim();
+      if (text) steps.push(text);
+      else unusable += 1;
+      return;
+    }
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const named = [value.step, value.name, value.id].find((v) => typeof v === 'string' && v.trim());
+      if (named) steps.push(named.trim());
+      else unusable += 1;
+      return;
+    }
+    unusable += 1;
+  };
+  if (Array.isArray(raw)) {
+    for (const value of raw) take(value);
+    return { steps, unusable, present: true };
+  }
+  if (typeof raw === 'string') {
+    if (!raw.trim()) return { steps, unusable, present: false };
+    take(raw);
+    return { steps, unusable, present: true };
+  }
+  if (raw && typeof raw === 'object') {
+    take(raw);
+    return { steps, unusable, present: true };
+  }
+  return { steps, unusable, present: false };
+}
+
+/**
+ * Bước MOCK suy TRỰC TIẾP từ `providers` của bản kê khai — CHỐT CHẶN CUỐI của R1: nếu bất kỳ
+ * chỗ nào trong `providers` khai `is_mock === true` thì `mock_steps` KHÔNG được rỗng. Không suy
+ * ra được bước cụ thể ⇒ trả cờ `unknown` để tầng gọi ghi `"unknown"` + chú thích (không im lặng).
+ *
+ * @param {object} providers kết quả `providersFor()`
+ * @returns {{steps: string[], unknown: boolean}}
+ */
+export function mockStepsFromProviders(providers) {
+  const steps = new Set();
+  let hasMockFlag = false;
+  const walk = (node) => {
+    if (!node || typeof node !== 'object') return;
+    for (const [key, value] of Object.entries(node)) {
+      if (key === 'is_mock' && value === true) hasMockFlag = true;
+      else if (value && typeof value === 'object') walk(value);
+    }
+  };
+  walk(providers);
+
+  if (providers?.content?.is_mock === true) steps.add('content');
+  if (providers?.imagelab?.ocr?.is_mock === true) steps.add('ocr');
+  if (providers?.imagelab?.translate?.is_mock === true) steps.add('translate');
+  if (providers?.imagelab?.render?.is_mock === true) steps.add('render');
+  if (providers?.imagestudio?.matting?.is_mock === true) steps.add('matting');
+  if (providers?.imagestudio?.retouch?.is_mock === true) steps.add('retouch');
+  if (providers?.videostudio?.encoder?.is_mock === true) steps.add('video_encode');
+  for (const row of asArray(providers?.usage)) {
+    if (row?.is_mock !== true) continue;
+    const step = OPERATION_STEP[row?.operation] || String(row?.operation ?? '').toLowerCase();
+    if (step) steps.add(step);
+  }
+  return { steps: [...steps], unknown: hasMockFlag && steps.size === 0 };
+}
+
 /**
  * Các bước đã chạy bằng provider GIẢ, gom từ MỌI dấu vết ĐÃ LƯU:
  *   · `content_meta.imagelab.mock_steps` (pipeline MVP-02 ghi lúc chạy);
- *   · `content_meta.is_mock` (MVP-01: `content_meta` chính là `gen.meta` của bước nội dung);
+ *   · `content_meta.imagelab.{ocr,translate,render}.is_mock` (R1 — pipeline MVP-02 ghi cùng lúc
+ *     với `mock_steps`, nhưng DB cũ/sửa tay có thể chỉ có một trong hai);
+ *   · `content_meta.is_mock` + provider tên `mock` (MVP-01: `content_meta` chính là `gen.meta`);
  *   · `content_meta.imagestudio.providers.*.is_mock`, `content_meta.videostudio.providers.encoder.is_mock`;
  *   · `meta.*.is_mock` trên từng asset (MVP-02/03/04);
- *   · `usage_events.meta.is_mock` + provider tên `mock` (bằng chứng bước đó đã chạy).
+ *   · `usage_events.meta.is_mock` + provider tên `mock` (bằng chứng bước đó đã chạy);
+ *   · CHỐT CHẶN: đối chiếu với chính `providers` mà bản kê khai sẽ in ra ⇒ không bao giờ có
+ *     chuyện `providers.*.is_mock = true` mà `mock_steps` rỗng (khi bí ⇒ `"unknown"`).
  *
  * KHÔNG suy từ cấu hình đang chạy: bật provider thật rồi đọc lại job cũ vẫn phải ra MOCK.
  */
-export function mockStepsFor(job, assets = [], usage = []) {
+export function mockStepsFor(job, assets = [], usage = [], evidence = []) {
   const steps = new Set(mockStepsFromAssets(assets));
   const meta = job?.content_meta && typeof job.content_meta === 'object' ? job.content_meta : {};
+  const il = meta.imagelab && typeof meta.imagelab === 'object' ? meta.imagelab : {};
 
-  for (const s of asArray(meta.imagelab?.mock_steps)) if (s) steps.add(String(s));
-  if (meta.is_mock === true) steps.add('content');
+  // R5: `[null]`/`[""]` vẫn là DẤU VẾT mock ⇒ không được lặng lẽ bỏ qua rồi khai "không có bước giả".
+  const ilSteps = usableMockSteps(il.mock_steps);
+  for (const s of ilSteps.steps) steps.add(s);
+  if (ilSteps.present && ilSteps.steps.length === 0 && ilSteps.unusable > 0) steps.add(UNKNOWN_MOCK_STEP);
+
+  // R1: đọc cả ba cờ `is_mock` lồng trong `content_meta.imagelab.*` — đúng những field mà
+  // `providersFor()` in ra ở `providers.imagelab.{ocr,translate,render}`.
+  if (il.ocr?.is_mock) steps.add('ocr');
+  if (il.translate?.is_mock) steps.add('translate');
+  if (il.render?.is_mock) steps.add('render');
+
+  if (meta.is_mock === true || String(meta.provider ?? '').trim().toLowerCase() === 'mock') steps.add('content');
   if (meta.imagestudio?.providers?.matting?.is_mock) steps.add('matting');
   if (meta.imagestudio?.providers?.retouch?.is_mock) steps.add('retouch');
   if (meta.videostudio?.providers?.encoder?.is_mock) steps.add('video_encode');
@@ -236,10 +347,68 @@ export function mockStepsFor(job, assets = [], usage = []) {
     if (step) steps.add(step);
   }
 
+  // CHỐT CHẶN R1: hai mục của cùng một bản kê khai không bao giờ được nói ngược nhau.
+  const fromProviders = mockStepsFromProviders(providersFor(job, usage, evidence));
+  for (const s of fromProviders.steps) steps.add(s);
+  if (fromProviders.unknown) steps.add(UNKNOWN_MOCK_STEP);
+
   return orderMockSteps(steps);
 }
 
 /* ───────────────────────── nhãn kiểm chứng ───────────────────────── */
+
+/** Tập mức kiểm chứng đã đóng băng của store (`VERIFICATION_LEVELS`) + hai mức LIVE. */
+export const KNOWN_LEVELS = Object.freeze([
+  ...LIVE_LEVELS,
+  'MOCK_VERIFIED',
+  'MANUAL_INPUT',
+  'BLOCKED',
+  'UNSUPPORTED',
+]);
+
+/**
+ * Chuẩn hoá nhãn kiểm chứng ĐÃ GHI về CHUỖI chuẩn (trim + HOA) — R2 (phản biện vòng 2, LOW).
+ *
+ * Trước đây cổng chỉ so khớp CHÍNH XÁC nên `'live_verified'` (chữ thường), `'LIVE_VERIFIED '`
+ * (dấu cách cuối) hay object `{level:'LIVE_VERIFIED'}` đều LỌT qua cổng "chỉ giữ LIVE khi có
+ * `transport === 'http'`" ⇒ gói khẳng định đã kiểm chứng bằng dịch vụ thật mà không có bằng chứng.
+ * Giá trị không phải chuỗi/không đọc được mức ⇒ coi như KHÔNG có nhãn + ghi `reason`.
+ *
+ * @param {*} raw giá trị `verification` đã lưu
+ * @returns {{level: string|null, raw: *, reason: string|null}}
+ */
+export function normalizeVerificationLevel(raw) {
+  if (raw === null || raw === undefined || raw === '') return { level: null, raw: raw ?? null, reason: null };
+  if (typeof raw === 'string') {
+    const level = raw.trim().toUpperCase();
+    return level
+      ? { level, raw, reason: null }
+      : { level: null, raw, reason: 'Nhãn kiểm chứng chỉ có khoảng trắng ⇒ coi như KHÔNG có nhãn.' };
+  }
+  if (typeof raw === 'object' && !Array.isArray(raw)) {
+    for (const key of ['level', 'label', 'status', 'verification']) {
+      const value = raw[key];
+      if (typeof value === 'string' && value.trim()) {
+        return {
+          level: value.trim().toUpperCase(),
+          raw,
+          reason: `Nhãn kiểm chứng được lưu dưới dạng OBJECT (đã đọc \`${key}\`) — bản kê khai chỉ nhận CHUỖI nên gói chuẩn hoá về chuỗi TRƯỚC khi xét cổng bằng chứng.`,
+        };
+      }
+    }
+    return { level: null, raw, reason: 'Nhãn kiểm chứng là OBJECT nhưng KHÔNG có `level`/`label`/`status` dạng chuỗi ⇒ coi như KHÔNG có nhãn.' };
+  }
+  return {
+    level: null,
+    raw,
+    reason: `Nhãn kiểm chứng có kiểu dữ liệu lạ (${Array.isArray(raw) ? 'array' : typeof raw}) ⇒ coi như KHÔNG có nhãn.`,
+  };
+}
+
+/** Nhãn (đã chuẩn hoá) có phải KHẲNG ĐỊNH "đã kiểm chứng bằng dịch vụ thật" hay không. */
+export function isLiveClaim(level) {
+  return typeof level === 'string' && /LIVE/.test(level.toUpperCase());
+}
 
 /**
  * Nhãn kiểm chứng của job + phần giải thích. Quy tắc bất khả xâm phạm (hợp đồng §0.1):
@@ -250,9 +419,15 @@ export function mockStepsFor(job, assets = [], usage = []) {
 export function verificationFor(job, evidence = [], mockSteps = []) {
   const rows = asArray(evidence);
   const latest = rows[0] || null; // `store.getEvidence` sắp `created_at DESC`
-  const recordedLevels = dedupeStrings(rows.map((r) => r?.verification).filter(Boolean));
   const fromJobEvidence = job?.evidence?.verification || null;
-  const recorded = latest?.verification || fromJobEvidence || null;
+  const recordedRaw = latest?.verification ?? fromJobEvidence ?? null;
+  // "Có bản ghi" ≠ "đọc được mức": `0`/`false` vẫn là CÓ ghi (đừng nói "job chưa ghi bằng chứng").
+  const hasRecorded = recordedRaw !== null && recordedRaw !== undefined && recordedRaw !== '';
+  // R2: CHUẨN HOÁ trước khi xét cổng. `recorded` = chuỗi chuẩn (dùng cho mọi phép so khớp),
+  // `recorded_level` trong detail giữ NGUYÊN BẢN đã lưu để còn truy vết.
+  const normalized = normalizeVerificationLevel(recordedRaw);
+  const recorded = normalized.level;
+  const recordedLevels = dedupeStrings(rows.map((r) => normalizeVerificationLevel(r?.verification).level).filter(Boolean));
 
   const transport = job?.product_master?.extraction?.transport ?? null;
   const extractionMethod = latest?.extraction_method || job?.evidence?.extraction_method || '';
@@ -260,17 +435,16 @@ export function verificationFor(job, evidence = [], mockSteps = []) {
   const mock = orderMockSteps(mockSteps);
 
   const notes = [];
+  if (normalized.reason) notes.push(normalized.reason);
   // D3: mức ĐÚNG khi không đủ căn cứ LIVE — theo cổng chuẩn của repo (`transport === 'manual'` ⇒
   // `MANUAL_INPUT`, còn lại ⇒ `MOCK_VERIFIED`; xem `determineVerificationLevel` ở `src/jobs/pipeline.js`).
   const downgradedLevel = transport === 'manual' ? 'MANUAL_INPUT' : 'MOCK_VERIFIED';
   let label = recorded;
 
-  // D3 (MEDIUM — fail-open): nhãn LIVE chỉ được GIỮ khi dấu vết CHỨNG MINH có `transport === 'http'`.
-  // Trước đây điều kiện là `transport !== null && transport !== 'http'` ⇒ job KHÔNG lưu
-  // `product_master.extraction.transport` (hoặc nhãn đến từ `jobs.evidence`) vẫn khẳng định
-  // `AUTHENTICATED_LIVE_VERIFIED` — trái §0 luật 1 và trái cổng chuẩn `src/jobs/pipeline.js:48`
-  // (`transport !== 'http'` ⇒ KHÔNG LIVE, kể cả khi thiếu transport).
-  if (label && LIVE_LEVELS.includes(label) && transport !== 'http') {
+  // D3 (MEDIUM — fail-open) + R2 (LOW — cổng so khớp CHÍNH XÁC): nhãn LIVE chỉ được GIỮ khi dấu
+  // vết CHỨNG MINH có `transport === 'http'`. Nhãn đã chuẩn hoá nên `live_verified`,
+  // `LIVE_VERIFIED ` (dấu cách) hay object `{level:…}` đều đi qua CHÍNH cổng này.
+  if (label && isLiveClaim(label) && transport !== 'http') {
     notes.push(
       transport === null
         ? `Dấu vết ghi nhãn "${label}" nhưng KHÔNG có transport của lần trích xuất (thiếu bằng chứng đã gọi dịch vụ thật) ⇒ gói KHÔNG giữ nhãn này. Mức đúng: ${downgradedLevel}.`
@@ -280,12 +454,15 @@ export function verificationFor(job, evidence = [], mockSteps = []) {
     // nhưng ghi rõ MỨC ĐÚNG vào `verification_detail` để người đọc biết phải hiểu thế nào.
     label = null;
   }
-  if (label && LIVE_LEVELS.includes(label) && mock.length > 0) {
+  if (label && isLiveClaim(label) && mock.length > 0) {
     notes.push(
       `Job có nguồn trích xuất THẬT (transport "http") nhưng vẫn có bước chạy provider GIẢ: ${mock.join(', ')} — phần dữ liệu của các bước đó KHÔNG phải kết quả của dịch vụ thật.`,
     );
   }
-  if (!recorded) {
+  if (recorded && !KNOWN_LEVELS.includes(recorded)) {
+    notes.push(`Nhãn "${recorded}" không nằm trong tập mức kiểm chứng đã đóng băng của store — gói giữ NGUYÊN VĂN nhãn đã lưu nhưng KHÔNG coi đó là một mức chuẩn.`);
+  }
+  if (!hasRecorded) {
     notes.push('Job chưa ghi bằng chứng trích xuất nào (bảng extraction_evidence rỗng, jobs.evidence chưa có `verification`) ⇒ không có nhãn kiểm chứng để khai.');
   }
 
@@ -293,7 +470,9 @@ export function verificationFor(job, evidence = [], mockSteps = []) {
     label: label || null,
     detail: {
       label: label || null,
-      recorded_level: recorded,
+      // Nguyên bản đã lưu (có thể là object/giá trị lạ nếu DB bị sửa tay) + bản đã chuẩn hoá.
+      recorded_level: recordedRaw,
+      recorded_level_normalized: recorded,
       recorded_levels: recordedLevels,
       source: latest ? 'extraction_evidence' : fromJobEvidence ? 'jobs.evidence' : 'none',
       connector: latest?.connector ?? null,
@@ -390,10 +569,14 @@ export function manifestFor({ job, assets = [], lines = [], usage = [], evidence
   // provider GIẢ (`content_meta.is_mock`, `content_meta.imagelab.mock_steps`, `usage_events.provider
   // = 'mock'`) vẫn khai `mock_steps: []` — gói GIẤU bước dùng dữ liệu giả, và UI in câu sai
   // “Máy chủ khai KHÔNG có bước nào dùng dữ liệu giả”.
+  // R1/R5: `mockStepsFor` đọc thêm cờ `is_mock` lồng trong `content_meta.imagelab.*`, đối chiếu
+  // với chính `providers` sẽ in ra, và KHÔNG bỏ qua dấu vết `mock_steps` dị dạng (`[null]`…).
+  const extraMock = usableMockSteps(ex.mock_steps);
   const mockSteps = orderMockSteps(new Set([
-    ...mockStepsFor(job, assetList, usageList),
+    ...mockStepsFor(job, assetList, usageList, evidenceList),
     ...mockStepsFromAssets(assetList),
-    ...asArray(ex.mock_steps),
+    ...extraMock.steps,
+    ...(extraMock.present && extraMock.steps.length === 0 && extraMock.unusable > 0 ? [UNKNOWN_MOCK_STEP] : []),
   ]));
   const { label: verification, detail: verificationDetail } = verificationFor(job, evidenceList, mockSteps);
 
@@ -412,6 +595,13 @@ export function manifestFor({ job, assets = [], lines = [], usage = [], evidence
   const hasEntry = (predicate) => (packaged ? [...packaged].some(predicate) : null);
 
   const warnings = collectJobWarnings(job, assetList, evidenceList, ex.warnings);
+  // R1/R5: `"unknown"` là lời khai THẬT "có dấu vết provider giả nhưng không đọc được bước nào" —
+  // phải kèm chú thích, không được để người đọc tự đoán.
+  if (mockSteps.includes(UNKNOWN_MOCK_STEP)) {
+    warnings.push(
+      'Dấu vết của job có bước chạy provider GIẢ nhưng KHÔNG đọc được tên bước nào (thiếu/dị dạng ở `content_meta.imagelab.mock_steps` hoặc `usage_events`) ⇒ `mock_steps` ghi "unknown" thay vì để rỗng — gói KHÔNG khẳng định là không có bước giả.',
+    );
+  }
   const missing = [];
   const extraMissing = asArray(ex.missing).map((m) => (typeof m === 'string' ? m : JSON.stringify(m)));
   missing.push(...extraMissing);

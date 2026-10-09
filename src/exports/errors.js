@@ -22,7 +22,12 @@ export const EXPORT_CODES = Object.freeze({
   STORE_READ_FAILED: 'STORE_READ_FAILED',
   /** Tên entry không hợp lệ (rỗng, tuyệt đối, có `..`, có NUL, kết thúc bằng `/`). */
   ZIP_NAME_INVALID: 'ZIP_NAME_INVALID',
-  /** Tên entry chứa CR/LF (D6) — chèn được dòng giả vào mọi danh sách in ra văn bản. */
+  /**
+   * Tên entry ĐÚNG dạng đường dẫn nhưng chứa KÝ TỰ ĐIỀU KHIỂN (D6: CR/LF; R3: NEL/LS/PS/VT/FF/
+   * ESC/DEL/RLO/isolate/BOM…) — chèn được dòng giả vào mọi danh sách in ra văn bản hoặc bịa
+   * được đuôi tệp. `details` nêu rõ ký tự vi phạm. NUL là ngoại lệ có chủ đích: nó làm tên không
+   * biểu diễn được trong ZIP nên đi theo `ZIP_NAME_INVALID` (hợp đồng §9.6).
+   */
   BAD_ENTRY_NAME: 'BAD_ENTRY_NAME',
   /** Tên entry dài quá 65535 byte UTF-8 — định dạng ZIP cổ điển không biểu diễn được. */
   ZIP_NAME_TOO_LONG: 'ZIP_NAME_TOO_LONG',
@@ -36,6 +41,8 @@ export const EXPORT_CODES = Object.freeze({
   ZIP_SELF_CHECK_FAILED: 'ZIP_SELF_CHECK_FAILED',
   /** Tổng dữ liệu đóng gói vượt trần an toàn của tiến trình. */
   BUNDLE_TOO_LARGE: 'BUNDLE_TOO_LARGE',
+  /** R6: quá nhiều lượt dựng gói đồng thời / hàng đợi đầy / chờ quá lâu ⇒ X2 map 429. */
+  EXPORT_BUSY: 'EXPORT_BUSY',
   /** Dữ liệu entry không phải Buffer/Uint8Array/string. */
   INVALID_BUFFER: 'INVALID_BUFFER',
 });

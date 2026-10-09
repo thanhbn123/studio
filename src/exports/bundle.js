@@ -31,9 +31,16 @@ import {
 } from './assets.js';
 import { bundleFilename, collectJobWarnings, manifestFor, mockStepsFor } from './manifest.js';
 import { renderHumanText } from './text.js';
+import { DEFAULT_MAX_BUNDLE_BYTES } from './limits.js';
 
-/** Trần tổng dữ liệu đóng gói (byte) — vượt ⇒ ném `BUNDLE_TOO_LARGE` thay vì ăn hết RAM. */
-export const DEFAULT_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
+/**
+ * Trần tổng dữ liệu đóng gói (byte) — vượt ⇒ ném `BUNDLE_TOO_LARGE` thay vì ăn hết RAM.
+ * R6 (phản biện vòng 2, MEDIUM): hạ từ 512 MiB xuống CÙNG mặc định với tầng dịch vụ
+ * (`EXPORT_MAX_BUNDLE_BYTES`, 64 MiB) — 60 MB asset đo được ~+270 MB RSS (~4,5×), nên trần
+ * 512 MiB cho phép một request cấp phát ~2 GB. Tầng route truyền trần đã cấu hình qua
+ * `maxTotalBytes`; giá trị ở đây là mức chặn cuối cho người gọi trực tiếp module.
+ */
+export const DEFAULT_MAX_TOTAL_BYTES = DEFAULT_MAX_BUNDLE_BYTES;
 
 /** Thứ tự nhóm asset trong ZIP cho dễ nhìn: ảnh gốc → ảnh tạo → video. */
 const GROUP_RANK = Object.freeze({ [ASSET_GROUPS.ORIGINAL]: 0, [ASSET_GROUPS.IMAGE]: 1, [ASSET_GROUPS.VIDEO]: 2 });
@@ -323,8 +330,10 @@ export async function buildExportBundle({
   // Cảnh báo mức job đã gộp đủ (gồm cảnh báo phát sinh khi đọc đĩa) TRƯỚC khi in phần
   // "nói thật" ở cuối file .txt — bản .txt không được phép đẹp hơn MANIFEST.json.
   // D1: MỘT nguồn sự thật cho các bước mock — dùng cho cả bản .txt lẫn MANIFEST.json.
+  // R1 (phản biện vòng 2, LOW): truyền cả `evidence` để `mockStepsFor` đối chiếu được với CHÍNH
+  // `providers` mà bản kê khai in ra (không bao giờ có `is_mock=true` mà `mock_steps` rỗng).
   const mockStepsAll = orderMockSteps(new Set([
-    ...mockStepsFor(job, assets, usage),
+    ...mockStepsFor(job, assets, usage, evidence),
     ...mockStepsFromAssets(assets),
   ]));
   const warningsSoFar = collectJobWarnings(job, assets, evidence, extraWarnings);
