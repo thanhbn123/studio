@@ -74,11 +74,54 @@ function toEntryBuffer(value, name) {
 }
 
 /**
+ * Ký tự ĐIỀU KHIỂN / điều khiển hướng hiển thị bị CẤM trong tên entry — R3 (phản biện vòng 2, LOW).
+ *
+ * Vòng vá D6 mới chặn CR/LF, nhưng cùng loại "chèn dòng giả / bịa tên tệp" còn tới được bằng
+ * NEL (U+0085), LS/PS (U+2028/9), VT, FF, ESC, DEL và RLO (U+202E — đảo chiều hiển thị để giả
+ * đuôi tệp): `"\n".join(namelist()).splitlines()` của Python biến 8 tên thành 13 dòng.
+ *
+ * Tập bị chặn = `\p{Cc}` (mọi ký tự điều khiển C0/C1, gồm NEL) + `\p{Zl}`/`\p{Zp}` (LS/PS) +
+ * các ký tự ĐIỀU KHIỂN HƯỚNG HIỂN THỊ (`Cf` nguy hiểm: LRE/RLE/PDF/LRO/RLO, các isolate,
+ * LRM/RLM/ALM) + BOM. CỐ Ý KHÔNG chặn toàn bộ `\p{Cf}` vì `Cf` bao gồm ZWJ (U+200D) — chặn nó
+ * là phá tên tệp emoji ghép (👨‍👩‍👧) mà hợp đồng yêu cầu giữ nguyên.
+ */
+const UNSAFE_NAME_CHARS = /[\p{Cc}\p{Zl}\p{Zp}\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c\ufeff]/u;
+
+/** Tên thông dụng của vài ký tự điều khiển hay gặp (để `details` đọc được, không nhét ký tự thô). */
+const CONTROL_CHAR_NAMES = Object.freeze({
+  0x09: 'TAB', 0x0a: 'LF', 0x0b: 'VT', 0x0c: 'FF', 0x0d: 'CR', 0x1b: 'ESC', 0x7f: 'DEL', 0x85: 'NEL',
+  0x061c: 'ALM', 0x200e: 'LRM', 0x200f: 'RLM', 0x2028: 'LS', 0x2029: 'PS', 0x202a: 'LRE', 0x202b: 'RLE',
+  0x202c: 'PDF', 0x202d: 'LRO', 0x202e: 'RLO', 0x2066: 'LRI', 0x2067: 'RLI', 0x2068: 'FSI', 0x2069: 'PDI',
+  0xfeff: 'BOM/ZWNBSP',
+});
+
+/** Mô tả MÁY ĐỌC ĐƯỢC của ký tự vi phạm: `{ char, code_point, name, position }`. */
+function controlCharDetails(char, position) {
+  const cp = char.codePointAt(0) ?? 0;
+  const hex = cp.toString(16).toUpperCase().padStart(4, '0');
+  return {
+    char: `\\u${hex}`,
+    code_point: `U+${hex}`,
+    name: CONTROL_CHAR_NAMES[cp] || null,
+    position,
+  };
+}
+
+/**
  * Kiểm và chuẩn hoá tên entry:
  *  - không rỗng, không NUL;
+ *  - KHÔNG chứa ký tự điều khiển/điều khiển hướng hiển thị (R3 — xem `UNSAFE_NAME_CHARS`);
  *  - đường dẫn TƯƠNG ĐỐI (chặn `/etc/…`, `C:\…`, `../…` — zip-slip);
  *  - không kết thúc bằng `/` (repository này không sinh entry thư mục rỗng);
  *  - dài ≤ 65535 byte UTF-8.
+ *
+ * HAI MÃ LỖI, có lý do khác nhau (R4 — hợp đồng §9.6 khai "CR/LF/NUL ⇒ BAD_ENTRY_NAME" là SAI):
+ *  · `ZIP_NAME_INVALID`   — tên không dùng được làm ĐƯỜNG DẪN entry. NUL thuộc nhóm này: byte 0
+ *    không biểu diễn được trong ZIP (mọi công cụ đọc theo C-string sẽ cắt tên tại đó) và mã này
+ *    đã được dùng cho NUL từ trước vòng D6 — giữ nguyên để không phá client đang bắt mã đó.
+ *  · `BAD_ENTRY_NAME`     — tên ĐÚNG dạng đường dẫn nhưng chứa KÝ TỰ ĐIỀU KHIỂN (CR/LF/NEL/LS/PS/
+ *    VT/FF/ESC/DEL/RLO…) ⇒ chèn dòng giả vào mọi danh sách in ra văn bản, hoặc bịa đuôi tệp.
+ *    `details` nêu rõ ký tự vi phạm (`char`, `code_point`, `name`, `position`).
  */
 export function normalizeZipName(raw) {
   const value = typeof raw === 'string' ? raw : '';
@@ -86,15 +129,17 @@ export function normalizeZipName(raw) {
     throw new ExportError(EXPORT_CODES.ZIP_NAME_INVALID, 'Tên entry rỗng — ZIP cần tên thật.', { name: String(raw ?? '') });
   }
   if (value.includes('\0')) {
-    throw new ExportError(EXPORT_CODES.ZIP_NAME_INVALID, 'Tên entry chứa ký tự NUL.', { name: value.slice(0, 120) });
+    throw new ExportError(EXPORT_CODES.ZIP_NAME_INVALID, 'Tên entry chứa ký tự NUL.', { name: value.slice(0, 120), ...controlCharDetails('\0', value.indexOf('\0')) });
   }
-  // D6 (phản biện Gói xuất bản, LOW): CR/LF trong tên entry làm hỏng cả bản ghi ZIP lẫn mọi danh
-  // sách in ra văn bản (chèn dòng giả). Mã riêng `BAD_ENTRY_NAME` để tầng gọi phân biệt được.
-  if (/[\r\n]/.test(value)) {
+  // R3 (phản biện vòng 2, LOW): mọi ký tự điều khiển KHÁC NUL ⇒ `BAD_ENTRY_NAME` kèm ký tự vi phạm.
+  const unsafe = UNSAFE_NAME_CHARS.exec(value);
+  if (unsafe) {
+    const info = controlCharDetails(unsafe[0], unsafe.index);
+    const label = info.name ? `${info.name} (${info.char})` : info.char;
     throw new ExportError(
       EXPORT_CODES.BAD_ENTRY_NAME,
-      'Tên entry chứa ký tự xuống dòng (CR/LF) — không hợp lệ trong ZIP.',
-      { name: value.slice(0, 120) },
+      `Tên entry chứa ký tự điều khiển ${label} — ký tự này chèn được dòng giả vào danh sách tệp hoặc bịa được đuôi tệp, không hợp lệ trong ZIP.`,
+      { name: value.slice(0, 120), ...info },
     );
   }
   const name = value.replace(/\\/g, '/');
