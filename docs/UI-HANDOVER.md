@@ -1,0 +1,65 @@
+# BÀN GIAO PHẦN HTML / UI — giao cho Claude làm tiếp
+
+> Người bàn giao: phiên DSH · Ngày: **09/10/2026** · Nhánh nền: **`develop`**
+> Đọc kèm: [`HANDOVER.md`](../HANDOVER.md) · [`VERIFICATION.md`](VERIFICATION.md) · [`EXPORT-CONTRACT.md`](EXPORT-CONTRACT.md) §4 · [`MVP-06-CONTRACT.md`](MVP-06-CONTRACT.md) §4 · [`MVP-08-CONTRACT.md`](MVP-08-CONTRACT.md) §5
+
+---
+
+## 1. Hiện trạng UI (đã chạy thật trên Chrome 154)
+
+| | |
+|---|---|
+| File | `public/index.html` · `public/app.js` (~5.000 dòng) · `public/styles.css` |
+| Công nghệ | **Vanilla JS, KHÔNG framework, KHÔNG build step, KHÔNG dependency** — giữ nguyên như vậy |
+| Tab hiện có | **Nội dung** · **Dịch ảnh** · **Tạo ảnh** · **Video** · **Tài khoản / Quản trị** |
+| Đã kiểm | `npm run test:e2e` — **Chrome THẬT** qua CDP (`tools/e2e/**`), 4/4 luồng, **0 lỗi console**, kéo-thả thật, gõ bàn phím thật, tải file rồi giải mã lại |
+
+Mẫu code đang dùng (giữ nhất quán): `route()` định tuyến, `state` toàn cục, `api()` gọi HTTP,
+`toast()` báo, mỗi tab một hàm `renderXxx()`, poll **1,5 giây** khi job đang chạy, thuộc tính
+`data-*` để test bám vào, `esc()` escape **mọi** text động.
+
+## 2. Việc UI còn lại (làm tiếp ở đây)
+
+| Việc | Hợp đồng | Ghi chú |
+|---|---|---|
+| **MVP-06** — form “Nạp credit” + hướng dẫn chuyển khoản (số tài khoản lấy từ **cấu hình**, không hardcode) + bảng yêu cầu của mình; tab **Quản trị**: danh sách `pending` + **XÁC NHẬN** (hiện số credit + tỷ giá) / **TỪ CHỐI** (bắt buộc lý do) | `MVP-06-CONTRACT.md` §4 | Phải nói thật: **“Tiền vào ví chỉ sau khi quản trị xác nhận — hệ thống không tự biết tiền đã về.”** |
+| **MVP-07** — màn “Đăng bài”: danh sách nháp/chờ duyệt/đã đăng, xem trước nội dung + ảnh/video, nút **DUYỆT / TỪ CHỐI / ĐĂNG**; banner **“CHẾ ĐỘ THỬ — không đăng thật”** khi `dry-run` | PR #32 | Thiếu token ⇒ nói rõ “chưa cấu hình Facebook (cần Page ID + token)” |
+| **MVP-08** — tab mới **“Đăng sàn”**: sản phẩm → kênh → trạng thái → `external_id`/link → nút **XEM PAYLOAD / DUYỆT / TỪ CHỐI / ĐĂNG / ĐỒNG BỘ**; hiện `issues[]` **từng dòng** | `MVP-08-CONTRACT.md` §5 | Kênh `dry-run` ⇒ banner **“CHẾ ĐỘ THỬ — không đăng thật”** |
+| **Gói xuất bản (.zip)** — panel đã có ở 4 màn job (đã merge) | `EXPORT-CONTRACT.md` §4 | Nếu thêm màn mới (MVP-06/07/08) thì **cân nhắc** thêm nút tải gói ở đó |
+
+## 3. Luật cứng của phần UI (không được nới)
+
+1. **Không thêm dependency, không build step.** Nếu thấy cần thư viện ⇒ **hỏi trước**, đừng tự thêm.
+2. **`esc()` mọi text động** (tên job, tiêu đề, ghi chú, `issues[]`, mã lỗi từ sàn…). Có test XSS.
+3. **Không bao giờ nói quá sự thật**: nhãn `MOCK_VERIFIED` / `MANUAL_INPUT` phải hiện đúng; **không** hiện badge “LIVE” nếu chưa gọi dịch vụ thật; video **không tiếng** phải nói rõ; gói `.zip` phải nói rõ “các bước dùng dữ liệu giả ghi trong MANIFEST.json”.
+4. **Lỗi thật phải hiện ra** (mã + câu tiếng Việt), không nuốt lỗi, không “thành công” giả. Nút **disabled** khi thiếu id/thiếu quyền, kèm **lý do**.
+5. **Không phá tab cũ.** Mọi hàm render bị test trích phải **giữ chữ ký** hoặc thêm tham số **có mặc định** (bài học: một lần gọi `exportPanelHtml` trong `renderIlJob` đã làm **đỏ 22 test** vì harness biên dịch từng hàm với bộ phụ thuộc cố định — cách sửa đúng là **bơm slot HTML qua tham số**, **không** dùng `typeof` guard để giấu tính năng).
+6. Tiếng Việt, câu ngắn, không viết hoa toàn bộ (trừ nút hành động chính). Không dùng từ ngữ marketing sáo rỗng.
+
+## 4. Cách kiểm (bắt buộc trước khi mở PR)
+
+```bash
+env -u DATABASE_URL npm test      # 0 fail — ⚠️ đừng chạy `npm test` trần: DATABASE_URL trỏ PG đã tắt
+node tools/verify.mjs
+npm run test:e2e                  # Chrome THẬT qua CDP; phải 0 lỗi console
+```
+
+- **Test hàm thật**: theo mẫu `test/*-ui-helpers.js` (trích **nguyên văn** hàm từ `public/app.js` + DOM giả).
+- **Test trình duyệt thật**: thêm luồng vào `tools/e2e/run.mjs` cho màn mới (MVP-06/07/08) — mỗi luồng phải có **ảnh chụp** + **0 lỗi console**.
+- Bằng chứng phải là **output thật** dán vào báo cáo, không phải lời kể.
+
+## 5. Khoảng trống đã biết của UI (chưa ai làm — đáng làm)
+
+1. **Mobile/viewport nhỏ** chưa từng đo (chỉ desktop).
+2. **Firefox/Safari** chưa đo (mới Chrome).
+3. **A11y** chưa soát: nhãn `aria-*`, thứ tự tab, tương phản màu, dùng được chỉ bằng bàn phím.
+4. **Trạng thái tải**: một số nút chưa có spinner/khoá khi đang gọi API (bấm 2 lần có thể gửi 2 request).
+5. **Poll 1,5 giây** vẽ lại cả khối ⇒ khối “Xem bản kê khai” bị đóng khi đang chạy (đã ghi nhận, chưa sửa).
+6. Chưa có **tìm kiếm/lọc** trong danh sách job (khi job nhiều sẽ khó dùng).
+
+## 6. Định nghĩa XONG cho một PR UI
+
+- `npm test` **0 fail** · `verify.mjs` EXIT 0 · **`npm run test:e2e` 0 lỗi console**, luồng mới PASS.
+- Ảnh chụp màn hình mới (đặt ở `docs/assets/` nếu là màn quan trọng).
+- Không thêm dependency; không sửa `test/**` của sprint khác (trừ khi thêm file mới).
+- Cập nhật `docs/VERIFICATION.md`: màn nào **đã đo trên trình duyệt thật**, màn nào **chưa**.
