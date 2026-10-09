@@ -370,6 +370,8 @@ CREATE TABLE IF NOT EXISTS publish_logs (
 -- ⇒ CÙNG file schema chạy trên cả SQLite và PostgreSQL 16 (xem ghi chú đầu file).
 -- ⚠️ INDEX KHÔNG đặt ở đây (bài học `wallet_ledger.seq`): index trong file này chạy TRƯỚC
 -- migration nên trên DB cũ (bảng đã có mà thiếu cột) `CREATE INDEX` làm chết `init()`.
+);
+
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS topup_requests (
   id                  TEXT PRIMARY KEY,
