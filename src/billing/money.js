@@ -68,6 +68,23 @@ export function roundMoney(value) {
 export const DEFAULT_MAX_AMOUNT = 1e9;
 
 /**
+ * F3 (vòng vá PR #28) — TRẦN SỐ DƯ mặc định của ví.
+ *
+ * Vì sao có trần: tiền là số thực nhị phân. `float8` giữ được **6 chữ số thập phân** chỉ tới
+ * `2^53 / 1e6 = 9.007.199.254,74` credit (`MONEY_FLOAT8_CEILING`); vượt mức đó, phép trừ một
+ * khoản tiền nhỏ bị nuốt chữ số (đo được: số dư `1e11`, 1.000 lượt trừ `0,0004` ⇒ lệch `2,83e-3`).
+ * Trần mặc định `1e9` nằm sâu dưới giới hạn đó ~9 lần ⇒ mọi phép cộng/trừ trong dải này vẫn
+ * đúng 6 chữ số. Giá trị hiệu lực lấy từ `config.billing.maxBalance` (`BILLING_MAX_BALANCE`).
+ */
+export const DEFAULT_MAX_BALANCE = 1e9;
+
+/**
+ * Giới hạn CỨNG của kiểu tiền: `2^53 / 10^6` credit — trên mức này `float8` không còn đủ 6 chữ
+ * số thập phân. Chỉ dùng để GIẢI THÍCH con số trong tài liệu/log, không phải giá trị chặn.
+ */
+export const MONEY_FLOAT8_CEILING = 2 ** 53 / SCALE;
+
+/**
  * Chuẩn hoá một khoản tiền ĐỂ GHI SỔ — nghiêm ngặt, KHÔNG bao giờ trả `Infinity`/`NaN`.
  *
  * @param {unknown} value

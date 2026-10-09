@@ -1707,10 +1707,24 @@ export function buildRouter(app) {
       dbOk = false;
       dbError = err.message;
     }
+    const moneySchema = typeof store?.moneySchemaStatus === 'function'
+      ? store.moneySchemaStatus()
+      : { ok: true, checked: false, reason: null, not_widened: [] };
     sendJson(res, dbOk ? 200 : 503, {
       status: dbOk ? 'ok' : 'degraded',
       time: new Date().toISOString(),
       db: { dialect: store.dialect, ok: dbOk, error: dbError },
+      // F1 (phản biện PR #28): KIỂU CỘT TIỀN phải HIỆN RA ở health, không im lặng.
+      // `money_schema_ok: false` = DB còn cột tiền `real` (float4) — migration nới kiểu đã bị
+      // chặn (app không boot tới được đây) HOẶC cột nằm NGOÀI `search_path` nên app không đọc tới.
+      // `checked: false` = chưa kiểm được (SQLite, store dựng tay) — KHÔNG phải "đã kiểm và đạt".
+      money_schema_ok: moneySchema.ok !== false,
+      money_schema_reason: moneySchema.reason ?? null,
+      money_schema: {
+        checked: moneySchema.checked === true,
+        ok: moneySchema.ok !== false,
+        not_widened: Array.isArray(moneySchema.not_widened) ? moneySchema.not_widened : [],
+      },
       jobs: queue.stats(),
       connectors: registry.list(),
       connector_init_failures: registry.initFailures,
@@ -1840,6 +1854,9 @@ export function buildRouter(app) {
         // PB-02: trần số lượt chạy có tính tiền cho mỗi job (vượt ⇒ 429 RERUN_LIMIT_EXCEEDED).
         max_runs_per_job: Number.isFinite(Number(billingConfig().maxRunsPerJob)) ? Number(billingConfig().maxRunsPerJob) : 10,
         max_amount: Number.isFinite(Number(billingConfig().maxAmount)) ? Number(billingConfig().maxAmount) : null,
+        // F3 (vòng vá PR #28): trần SỐ DƯ ví (vượt ⇒ 400 `AMOUNT_TOO_LARGE`) — UI/admin phải
+        // biết con số này, nếu không họ chỉ thấy lỗi 400 mà không hiểu vì sao.
+        max_balance: Number.isFinite(Number(billingConfig().maxBalance)) ? Number(billingConfig().maxBalance) : null,
         // BR-08: ngưỡng coi một lượt chạy là TREO (ms) — quá ngưỡng thì được thu hồi tự động.
         stuck_run_ms: Number.isFinite(Number(billingConfig().stuckRunMs)) ? Number(billingConfig().stuckRunMs) : null,
         min_stuck_run_ms: Number.isFinite(Number(billingConfig().minStuckRunMs)) ? Number(billingConfig().minStuckRunMs) : null,
@@ -3598,11 +3615,15 @@ function mapBillingError(err) {
     );
   }
   // PB-06: khoản tiền không hợp lệ / vượt trần ⇒ 400 (trước đây `grant(1e308)` ghi sổ 0 mà vẫn 201).
+  // F3 (vòng vá PR #28): `AMOUNT_TOO_LARGE` nay còn dùng cho TRẦN SỐ DƯ ví (`max_balance`) —
+  // chi tiết trả thêm `balance`/`max_balance` để UI/admin biết vì sao bị từ chối.
   if (code === 'INVALID_AMOUNT' || code === 'AMOUNT_TOO_LARGE' || code === 'INVALID_REASON') {
     const d = err.details && typeof err.details === 'object' ? err.details : {};
     return HttpError.safe(400, code, String(err.message || 'Số credit không hợp lệ.'), {
       amount: d.amount ?? null,
       max: d.max ?? null,
+      balance: Number.isFinite(Number(d.balance)) ? Number(d.balance) : null,
+      max_balance: Number.isFinite(Number(d.max_balance)) ? Number(d.max_balance) : null,
     });
   }
   if (code !== 'INSUFFICIENT_CREDIT' && Number(err.status) !== 402) return null;

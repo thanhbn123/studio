@@ -1744,6 +1744,324 @@ $ node --test test/export-bundle.test.js
 
 ---
 
+## 25. PostgreSQL — phủ NGHIỆP VỤ cho các bảng mới (MVP-03/04/05 + R1)
+
+**Lỗ hổng trước sprint này.** CI có job PostgreSQL 16 thật, nhưng nó chỉ chứng minh
+**`schema.sql` + migration cộng thêm** chạy được. Toàn bộ **nghiệp vụ** của các bảng mới —
+`image_assets.meta` (MVP-03), job `video_generation` (MVP-04), `users`/`user_sessions`/
+`wallet_ledger`/`pricing`/`jobs.user_id` (MVP-05), `job_queue`/`epoch`/`heartbeat_at` (R1) —
+chỉ được đo trên **SQLite in-memory** (`testConfig` ép `DB_DRIVER=sqlite`). Các dòng
+“Chưa đo: PostgreSQL thật…” ở §16.x, §17.x, §18.x, §21.x, §22.7 nói về đúng lỗ này.
+
+### 25.1 Môi trường đo (thật, không mock)
+
+```
+$ postgres --version
+postgres (PostgreSQL) 16.15 (Homebrew)          ← máy này KHÔNG có Docker; dựng bằng initdb/pg_ctl
+$ initdb -D <scratch>/pgdata -U viporder --auth=trust -E UTF8
+$ pg_ctl -D <scratch>/pgdata -o "-p 55440 -c listen_addresses=127.0.0.1 -c unix_socket_directories=''" start
+$ createdb -p 55440 -U studio -O studio studio
+DATABASE_URL=postgres://studio:studio@127.0.0.1:55440/studio
+```
+⚠️ Phải tắt Unix-domain socket (`unix_socket_directories=''`, chỉ chạy TCP): đường
+scratchpad dài hơn **giới hạn 103 byte** của socket PostgreSQL ⇒ `pg_ctl` chết với
+`FATAL: could not create any Unix-domain sockets` nếu không đặt.
+
+### 25.2 Kết quả hai lần chạy TOÀN BỘ bộ test
+
+```
+$ env -u DATABASE_URL npm test
+ℹ tests 1098 · pass 1063 · fail 0 · skipped 35 · todo 0          EXIT 0
+   ← 35 skip = 6 skip PostgreSQL có từ trước + 29 test mới của §25.3 (bỏ qua CÓ KIỂM SOÁT)
+
+$ DATABASE_URL=postgres://studio:studio@127.0.0.1:55440/pr_test npm test
+ℹ tests 1098 · pass 1097 · fail 0 · skipped 1 · todo 0           EXIT 0
+   ← 29 test mới CHẠY THẬT + 6 test PG cũ CHẠY THẬT; 1 skip còn lại là ca ÂM
+     “thiếu DATABASE_URL nhưng chọn driver postgres” (chỉ chạy khi KHÔNG có PG).
+     Chạy trên DB TRẮNG (`createdb pr_test`) ⇒ đi đường `schema.sql`, không nhờ migration.
+
+$ env -u DATABASE_URL node tools/verify.mjs
+EXIT 0
+```
+**CI đã chạy lại y hệt trên PostgreSQL 16 / Linux** (PR #28, run `37906501618`, job
+`Test (PostgreSQL 16)` — `ci.yml` đã set `DATABASE_URL` sẵn nên 29 test này tự chạy thật,
+KHÔNG phải sửa `ci.yml`):
+```
+ℹ tests 1098 · pass 1097 · fail 0 · skipped 1 · todo 0          job pass 1m16s
+✔ claimNextJob NGUYÊN TỬ: hai pool song song KHÔNG nhặt trùng một mục (8.957119ms)
+✔ TIỀN ĐI QUA POSTGRESQL KHÔNG ĐƯỢC MẤT CHỮ SỐ (đối chiếu trực tiếp với SQLite) (16.002897ms)
+✔ init() chạy LẦN HAI trên DB ĐÃ CÓ DỮ LIỆU vẫn không lỗi (migration idempotent) (87.344931ms)
+```
+Cả 5 job CI xanh (SQLite 56s · PostgreSQL 16 1m16s · smoke · Docker · quét secret).
+
+Baseline của `develop` trước nhánh này (`f8d96a3`, xem §24): `1069 · 1063 pass · 0 fail ·
+6 skipped`. Số **pass của SQLite không đổi (1063)** ⇒ 29 test mới không làm hỏng đường cũ;
+tổng test tăng đúng 29 (1069 → 1098) và skip tăng đúng 29 (6 → 35).
+
+### 25.3 Cái gì GIỜ ĐÃ ĐO ĐƯỢC trên PostgreSQL (29 test mới)
+
+| File | Phủ gì |
+|---|---|
+| `test/pg-wallet.test.js` (9) | số dư = TỔNG SỔ qua cả chu kỳ `grant→hold→settle`; `seq` = 1..n liên tục; số dư **không bao giờ âm** (kể cả gọi thẳng `appendLedger` ⇒ `INSUFFICIENT_CREDIT`, không để lại dòng); `holdForJob` thiếu credit ⇒ sổ không đổi; **idempotent `(job_id, run_key)`** (hold 2 lần ⇒ 1 dòng); **partial unique index** chặn dòng `job_hold` thứ hai và lộ ra `LEDGER_CONFLICT` chứ **không** `25P02 transaction is aborted`; **đua `settle` + `refund`** cùng lượt ⇒ đúng **1** dòng đóng; **đua 2 `holdForJob`** ⇒ giữ tiền 1 lần; `listLedger` phân trang **không trùng/không sót** + thứ tự `seq` giảm dần; **tiền không mất chữ số** (so CÙNG dữ liệu trên 2 dialect) |
+| `test/pg-queue.test.js` (9) | `claimNextJob` **nguyên tử với 2 POOL kết nối riêng** (đua thật, không giả lập): 1 mục/2 worker ⇒ đúng 1 thắng, `attempts` tăng 1 lần; 8 mục/2 worker ⇒ **không mục nào bị nhặt 2 lần, không sót**, mỗi mục `epoch=1`; **epoch/fencing**: runner bị cướp **không** chốt được `done`, thiếu epoch cũng bị từ chối, runner mới chốt được; `failQueueItem` của runner cũ bị đánh `stale`; **`heartbeat_at`**: mục còn nhịp **không** bị cron cướp (cửa sổ 600s), worker lạ/thiếu `workerId` không gia hạn được lease, mất nhịp thì bị thu hồi; `requeueStaleJobs` chốt `failed` khi **chạm trần** (+`failed_job_ids`) và không nhặt lại được; `enqueueJob` cùng khoá idempotency ⇒ **mở lại** mục cũ, `attempts` reset 0, epoch mới, **không đẻ mục thứ hai**; `run_after` (backoff) chặn nhặt sớm; `queueStats` trả **số** (không phải chuỗi BIGINT) |
+| `test/pg-schema.test.js` (11) | `init()` chạy **lần 2 và lần 3** trên DB **đã có dữ liệu** ⇒ không lỗi, dữ liệu cũ còn nguyên; mọi cột do migration thêm **có thật**; 2 partial unique index **tồn tại thật**; `users`/`user_sessions` vòng đời thật + tiếng Việt có dấu round-trip + `COUNT(*)` BIGINT được ép về **number**; `jobs.user_id` lọc đúng chủ sở hữu (`listJobs`/`countJobs`); `pricing` upsert **idempotent** (`ON CONFLICT DO UPDATE`) + có giá cho **mọi** `USAGE_OPERATIONS`; **`usage_events.run_key`** tách chi phí theo TỪNG lượt (và dòng `run_key IS NULL` của DB cũ quy về lượt `#1`); **MVP-03 `image_assets.meta`** JSON lồng nhau round-trip + `updateImageAssetMeta` không mất phần khác; **MVP-04** job `video_generation` vòng đời + `content_meta` round-trip + usage `VIDEO_RENDER`/`VIDEO_ENCODE` mang `run_key` + cột ngoài allowlist bị bỏ qua im lặng; `usageAggregate` trả **number** |
+
+Hai file dùng chung `test/pg-helpers.js`: tự **BỎ QUA** khi thiếu `DATABASE_URL`, mọi dòng mang
+tiền tố `RUN_TAG` riêng cho mỗi lần chạy và được **dọn sạch** ở `after` (DB PostgreSQL là DB
+**dùng chung** — không để rác, và **không** `DELETE FROM job_queue` trần vì đó là thao tác phá
+hoại nếu `DATABASE_URL` trỏ vào DB thật).
+
+### 25.4 LỖI THẬT phát hiện được — tiền MẤT CHỮ SỐ trên PostgreSQL (đã sửa)
+
+Đây là lỗi mà **SQLite không bao giờ lộ ra**, và nó nằm đúng ở môi trường production
+(`deploy/` chạy PostgreSQL; SQLite chỉ là DB dev/test).
+
+**Nguyên nhân.** `schema.sql` khai các cột tiền là `REAL`. `REAL` của SQLite là float **8 byte**,
+nhưng `REAL` của PostgreSQL là **`float4` — 4 byte, chỉ ~7 chữ số có nghĩa**. Đơn vị tiền của repo
+là **6 chữ số thập phân** (`MONEY_DECIMALS = 6`, `MONEY_EPSILON = 1e-6`) ⇒ tiền bị làm tròn mất.
+
+**Bằng chứng (đo qua store THẬT, cùng dữ liệu, hai dialect).**
+```
+grant=100     charge=-0.000001  → PG: 100          (đúng: 99.999999)   SQLite: 99.999999
+grant=10000   charge=-0.0004    → PG: 10000        (đúng: 9999.9996)   SQLite: 9999.9996
+grant=100000  charge=-0.004     → PG: 99999.99     (đúng: 99999.996)   SQLite: 99999.996
+$ psql -c "SELECT 99.999999::real, 1234.567891::real"   →   100 | 1234.5679
+```
+0.0004 và 0.004 là **giá THẬT** của repo (`DEFAULT_PRICING`: `OCR_DETECT = 0.0004`,
+`CONTENT_GENERATE = 0.004` credit/lượt), và ví 10.000 credit là mức bình thường.
+
+**Hệ quả nếu không sửa.** Ví 10.000 credit + giá 0.0004/lượt ⇒ trên PostgreSQL mỗi lượt trừ tiền
+nhưng **số dư không đổi** ⇒ người dùng chạy **miễn phí không giới hạn**. Ở mức 100.000 credit thì
+sổ còn **tự sinh sai số** (lệch −0.006 cho một lần trừ 0.004), phá đúng luật #2 của hợp đồng
+MVP-05 (“số dư = tổng sổ”).
+
+**Cách sửa (2 chỗ, không thêm dependency, không đổi tên hàm/field nào).**
+1. `src/store/schema.sql`: 4 cột tiền `REAL` → **`DOUBLE PRECISION`** —
+   `wallet_ledger.amount`, `wallet_ledger.balance_after`, `usage_events.estimated_cost`,
+   `pricing.unit_price`. Chạy được trên **cả hai** driver: PostgreSQL hiểu là `float8`, còn
+   SQLite coi tên kiểu chứa `DOUB` là **REAL affinity**.
+2. `src/store/index.js` — thêm `#widenMoneyColumns()` vào `#applyAdditiveMigrations()`:
+   `ALTER TABLE … ALTER COLUMN … TYPE DOUBLE PRECISION`, **chỉ PostgreSQL**, và **chỉ** khi
+   `information_schema` còn báo `data_type = 'real'` (nên `init()` lần hai không viết lại bảng).
+   Bắt buộc phải có bước này: `CREATE TABLE IF NOT EXISTS` là **no-op**, nên DB PostgreSQL
+   **đang chạy** sẽ không tự được sửa.
+
+**Đo sau khi sửa.**
+```
+DB ĐANG CHẠY (đi đường migration):
+  trước init(): wallet_ledger.amount = real          … (4 cột)
+  sau   init(): wallet_ledger.amount = double precision … (4 cột)
+  test/pg-wallet.test.js → 9/9 pass
+DB TRẮNG (đi đường schema.sql, KHÔNG qua migration):
+  $ createdb fresh_test && DATABASE_URL=…/fresh_test node --test test/pg-*.test.js
+  ℹ tests 29 · pass 29 · fail 0        4 cột đều = double precision
+```
+
+### 25.5 Cái gì VẪN CHƯA ĐO (đừng ghi là đã đo)
+
+1. **Nhiều TIẾN TRÌNH OS** (không chỉ nhiều pool kết nối): 29 test này chạy trong **một**
+   tiến trình Node với 2 pool riêng. `FOR UPDATE SKIP LOCKED` và `pg_advisory_xact_lock` là
+   khoá ở **phía máy chủ** nên 2 pool là phép thử đúng bản chất, nhưng cảnh “tiến trình bị
+   `kill -9` giữa transaction” thì vẫn chưa đo trên PostgreSQL.
+2. **Lease mất trên PostgreSQL (R3)**: giới hạn ở §22.7/§23.3 (hai tiến trình có thể cùng
+   THỰC THI một mục ⇒ chi phí provider nhân đôi; tiền/trạng thái đã được fence) **chưa**
+   được đo lại trên PostgreSQL.
+3. **Dữ liệu tiền CŨ đã bị `float4` làm tròn**: `ALTER COLUMN … TYPE DOUBLE PRECISION` chỉ nới
+   kiểu cột, **không** phục hồi được chữ số đã mất của dòng ghi trước đó. Hệ quả cụ thể (bất biến
+   “dòng cuối = số dư” vỡ trên DB đã nâng cấp) + cách xử lý: xem **§25.9**. Hiện **chưa** có DB
+   production nào — `deploy/` chưa từng triển khai thật, xem §DIRECT-DEPLOY.
+4. **`listOpenJobHolds` / `reconcileStuckRuns`** trên PostgreSQL: chưa phủ (vẫn chỉ SQLite).
+   Các method còn lại của `src/billing/**` (`estimate`, `priceOf`, `usageSummary` theo nhóm,
+   `billableRunsOfJob`) cũng chưa chạy trên PG.
+5. **PostgreSQL ≠ 16**: đã đo trên **16.15 macOS/arm64** (máy Owner) **và PostgreSQL 16
+   trên Linux** (CI, run `37906501618`) ⇒ không còn phụ thuộc một máy. Nhưng bản
+   **14 / 15 / 17 vẫn CHƯA đo** — `DOUBLE PRECISION` và `FOR UPDATE SKIP LOCKED` đều có từ
+   lâu nên rủi ro thấp, song đó là suy luận, không phải số đo.
+6. Không liên quan sprint này nhưng vẫn mở: provider thật (OCR/dịch/matting/TTS), trình duyệt
+   thật, `deploy/` trên máy chủ thật.
+
+### 25.6 VÒNG VÁ F1 — migration cột tiền nay **FAIL-CLOSED** (không còn im lặng bỏ qua schema khác)
+
+**Bộ test sau vòng vá (2 chế độ, `--test-concurrency=1`):**
+
+```
+$ env -u DATABASE_URL npm test                             → tests 1104 · pass 1065 · fail 0 · skipped 39  EXIT 0
+$ DATABASE_URL=postgres://…@127.0.0.1:55921/studio npm test → tests 1104 · pass 1103 · fail 0 · skipped 1 EXIT 0
+$ env -u DATABASE_URL node tools/verify.mjs                → tests 1104 · pass 1065 · fail 0 · skipped 39  EXIT 0
+$ env -u DATABASE_URL node tools/imagelab-demo.mjs         → Trạng thái job: succeeded                  EXIT 0
+```
+So với §25.2 (1098 test): **+4 test** của §25.7 (PostgreSQL, skip khi thiếu `DATABASE_URL`) và
+**+2 test** của §25.8 (chạy ở CẢ hai chế độ) ⇒ 1104. Bỏ qua ở chế độ SQLite: 35 + 4 = 39.
+PG cục bộ dựng bằng `initdb`/`pg_ctl` (máy KHÔNG Docker): cổng **55921**, socket dir ngắn
+`/tmp/f123pg/sock`, role+db `studio` (xem §25.1).
+
+**Lỗi (phản biện độc lập, `docs/PG-MONEY-REVIEW.md` F1 — TRUNG BÌNH).** `#widenMoneyColumns()`
+lọc cứng `table_schema = 'public'`. DB có `search_path` trỏ schema khác (triển khai tách schema /
+DBA đặt `search_path`) ⇒ **0/4 cột được nới mà KHÔNG một dòng log**, app vẫn boot, ví vẫn là
+`float4` ⇒ **chạy miễn phí**.
+
+**Đo lại trên schema KHÔNG phải `public`** (`search_path=app_*`, cùng dữ liệu, hai cây mã nguồn —
+cây CŨ `7a93e9a` và cây đã vá):
+
+```
+
+{ "init": "OK",
+  "columns": [ "pricing.unit_price=real", "usage_events.estimated_cost=real",
+               "wallet_ledger.amount=real", "wallet_ledger.balance_after=real" ],
+  "widened_logs": 0, "logs": [], "balance_after_1_run": 10000 }      ← ví 10.000 trừ 0,0004 ⇒ KHÔNG thu được gì
+
+=================== CÂY ĐÃ VÁ · cùng schema, cùng luồng tiền ===================
+{ "init": "OK",
+  "columns": [ "pricing.unit_price=double precision", "usage_events.estimated_cost=double precision",
+               "wallet_ledger.amount=double precision", "wallet_ledger.balance_after=double precision" ],
+  "widened_logs": 4, "balance_after_1_run": 9999.9996 }
+```
+
+**Cách vá (`src/store/index.js`).** Ba bước, không có nhánh "warn rồi chạy tiếp":
+
+1. **Quét MỌI schema** (`pg_catalog`, bỏ lọc `public`): `MONEY_COLUMNS` (hằng số export — dùng
+   CHUNG cho migration, kiểm tra và test) × `pg_attribute`/`pg_class`/`pg_namespace`, kèm
+   `pg_table_is_visible` = app có "nhìn thấy" bảng đó theo `search_path` không.
+2. **Nới TỪNG cột** tìm được, `ALTER TABLE "<schema>"."<table>" ALTER COLUMN "<col>" TYPE DOUBLE
+   PRECISION` (định danh được trích dẫn), log từng cột; lỗi ⇒ log **ERROR** (`money_widen_failed`).
+3. **QUÉT LẠI** (không tin kết quả bước 2):
+   · còn cột `real` **nhìn thấy được** ⇒ **NÉM `MONEY_COLUMNS_NOT_WIDENED`**, chặn boot, thông điệp
+     + `details.columns` nêu ĐÚNG tên cột (ca `pricing.unit_price` rớt lại `real` cũng bị coi là
+     chưa đạt — trước đây chỉ warn);
+   · còn cột `real` ở schema **NGOÀI `search_path`** ⇒ không chặn boot (app không đọc tới) nhưng
+     log **ERROR** + phơi ra `/api/health`.
+· Không ĐỌC được `pg_catalog` cũng là fail-closed (không được coi là "đã nới").
+
+**Bằng chứng 1 — `migrate.js` trên DB cột tiền `real` mà `ALTER` bị từ chối (lỗi THẬT của PG:
+cột được dùng bởi cột sinh), `search_path` = schema riêng:**
+
+```
+$ DATABASE_URL='postgres://…/studio?options=-c+search_path%3Dapp_f4427b' node src/store/migrate.js --driver postgres
+{"level":"error","msg":"store.migration.money_widen_failed","ctx":{"schema":"app_f4427b","table":"wallet_ledger",
+  "column":"amount","error":"cannot alter type of a column used by a generated column"}}
+{"level":"warn","msg":"store.migration.money_column_widened","ctx":{"schema":"app_f4427b","table":"wallet_ledger","column":"balance_after",…}}
+{"level":"warn","msg":"store.migration.money_column_widened","ctx":{…"usage_events","estimated_cost"…}}
+{"level":"warn","msg":"store.migration.money_column_widened","ctx":{…"pricing","unit_price"…}}
+{"level":"error","msg":"store.migration.money_columns_not_widened","ctx":{"code":"MONEY_COLUMNS_NOT_WIDENED",
+  "columns":"app_f4427b.wallet_ledger.amount"}}
+Migration thất bại: Cột TIỀN chưa được nới sang double precision: app_f4427b.wallet_ledger.amount — app sẽ đọc/ghi
+tiền bằng float4 (4 byte) và LÀM MẤT chữ số thập phân (ví 10.000 trừ 0,0004 ⇒ số dư KHÔNG đổi). Đã dừng khởi động
+thay vì chạy tiếp. Kiểm quyền sở hữu bảng cho role của app rồi chạy lại migration.
+EXIT=1                      ← 3/4 cột VẪN được nới (amount=real, balance_after/estimated_cost/unit_price=double precision)
+```
+
+**Bằng chứng 2 — `/api/health` nói thật khi cột `real` nằm NGOÀI `search_path` (app vẫn phục vụ):**
+
+```
+LOG error store.migration.money_widen_failed {"schema":"stray_dec4be","table":"wallet_ledger","column":"amount", …}
+LOG error store.migration.money_columns_not_widened_unreachable {"columns":"stray_dec4be.wallet_ledger.amount",
+  "reason":"cột tiền còn kiểu real nhưng không nằm trong search_path — app không đọc tới, KHÔNG chặn boot"}
+GET /api/health → HTTP 200 · status=ok
+{ "money_schema_ok": false,
+  "money_schema_reason": "còn cột TIỀN kiểu real NGOÀI search_path (app hiện không đọc tới): stray_dec4be.wallet_ledger.amount",
+  "money_schema": { "checked": true, "ok": false,
+    "not_widened": [ { "schema":"stray_dec4be","table":"wallet_ledger","column":"amount","data_type":"real","visible":false } ] } }
+```
+(`checked: false` = CHƯA KIỂM — SQLite hoặc store dựng tay; KHÔNG phải "đã kiểm và đạt".)
+
+### 25.7 VÒNG VÁ F2 — test BẢO VỆ đường migration (`test/pg-money-migration.test.js`, 4 test mới)
+
+**Lỗi (F2 — THẤP).** Không test nào phủ đường migration: tắt hẳn `#widenMoneyColumns()` thì
+**29/29 test PostgreSQL cũ vẫn xanh**; không test nào khẳng định `data_type`.
+
+**Test mới (PostgreSQL thật, tự skip khi thiếu `DATABASE_URL`; mỗi ca một SCHEMA riêng theo
+`RUN_TAG`, xoá sạch trong `finally`):**
+
+| Test | Đo gì |
+|---|---|
+| `DB dựng bằng schema CŨ (4 cột real) ở schema KHÁC public ⇒ init() nới CẢ 4 CỘT` | DDL "cũ" **suy ra từ chính `schema.sql`** (đổi 4 cột tiền sang `REAL`, có chốt chặn nếu không đổi được) → `init()` → `information_schema.columns.data_type` của **đủ 4 cột** = `double precision`; dữ liệu cũ (`balance_after=10000`) không bị đụng; `SUM(amount)` sau khi thêm dòng `-0,0004` = **9999.9996**; `init()` lần hai vẫn đúng (idempotent) |
+| `cột TIỀN bị hạ cấp NGƯỢC về real trên DB đã nâng cấp ⇒ init() nới LẠI` | DB đã `double precision` → `ALTER TABLE pricing ALTER COLUMN unit_price TYPE REAL` → `init()` phải nới LẠI; không được coi "DB đã nâng cấp rồi" là xong |
+| `còn cột TIỀN real trong schema ĐANG DÙNG ⇒ init() NÉM MONEY_COLUMNS_NOT_WIDENED` | Chặn `ALTER` bằng **lỗi thật của PostgreSQL** (cột dùng bởi cột sinh) ⇒ `init()` **phải ném**, `code=MONEY_COLUMNS_NOT_WIDENED`, thông điệp nêu `wallet_ledger.amount`, `visible=true`; 3 cột còn lại VẪN được nới |
+| `cột TIỀN real NGOÀI search_path ⇒ app vẫn boot nhưng /api/health nói money_schema_ok:false` | Schema "mồ côi" ngoài `search_path` ⇒ init OK, `/api/health` trả `money_schema_ok:false` + lý do + `not_widened[]`; dọn schema mồ côi ⇒ trạng thái chuyển `true` (chứng minh quét MỌI schema) |
+
+```
+$ DATABASE_URL=postgres://studio:***@127.0.0.1:55921/studio node --test --test-concurrency=1 test/pg-money-migration.test.js
+▶ Migration cột TIỀN trên PostgreSQL thật (F2)
+  ✔ DB dựng bằng schema CŨ (4 cột real) ở schema KHÁC `public` ⇒ init() nới CẢ 4 CỘT (73.85575ms)
+  ✔ cột TIỀN bị hạ cấp NGƯỢC về real trên DB đã nâng cấp ⇒ init() nới LẠI (không cần dựng lại DB) (37.598708ms)
+  ✔ còn cột TIỀN real trong schema ĐANG DÙNG ⇒ init() NÉM MONEY_COLUMNS_NOT_WIDENED (34.409542ms)
+  ✔ cột TIỀN real NGOÀI search_path ⇒ app vẫn boot nhưng /api/health nói money_schema_ok:false (104.552208ms)
+ℹ tests 4 · pass 4 · fail 0 · skipped 0
+$ psql -tAc "SELECT nspname FROM pg_namespace WHERE nspname LIKE 'pgtmoney%'"     → (trống: đã dọn sạch)
+```
+
+**Kiểm chứng NGƯỢC (mutation trên bản sao — test phải ĐỎ khi bản vá bị vô hiệu hoá):**
+
+| Mutation | Kết quả |
+|---|---|
+| **A** — bó hẹp quét về đúng `public` (tái hiện F1) | **fail 4/4** |
+| **B** — quét mọi schema nhưng TẮT nhánh ném (quay lại "warn rồi chạy tiếp") | **fail 1/4** — đúng ca fail-closed; ca `/api/health` vẫn xanh vì trạng thái được tính từ vẫn-quét-lại |
+
+### 25.8 VÒNG VÁ F3 — TRẦN SỐ DƯ ví ⇒ 400 `AMOUNT_TOO_LARGE`
+
+**Lỗi (F3 — THẤP).** `float8` chỉ giữ đủ 6 chữ số thập phân tới `2^53/1e6 = 9.007.199.254,74`
+credit; trần MỘT LỆNH cấp (`maxAmount = 1e9`) không chặn được điều đó (~9 lệnh cấp trần là vượt).
+Đo của phản biện: số dư `1e11`, 1.000 lượt trừ `0,0004` ⇒ lệch **2,83e-3**.
+
+**Cách vá.** `config.billing.maxBalance` (`BILLING_MAX_BALANCE`, mặc định `1e9`, hằng số
+`DEFAULT_MAX_BALANCE`/`MONEY_FLOAT8_CEILING` ở `src/billing/money.js`). `grant()` đọc số dư TRONG
+khoá sổ rồi chặn chiều LÀM TĂNG: `roundMoney(balanceBefore + value) > maxBalance` ⇒
+`AMOUNT_TOO_LARGE` (400) kèm `balance`/`max_balance`; điều chỉnh GIẢM không bị chặn.
+`GET /api/config.billing` công bố `max_balance`.
+
+```
+$ env -u DATABASE_URL REPO=$PWD node /tmp/f123pg/f3-http.mjs        (app THẬT + HTTP THẬT, BILLING_MAX_BALANCE=1000)
+GET /api/config → billing.max_balance = 1000 | max_amount = 1000000000
+POST /api/admin/users/<id>/credit {amount:999} → HTTP 201   {"balance":999,"ledger":"admin_grant"}
+POST /api/admin/users/<id>/credit {amount:2}   → HTTP 400
+    {"code":"AMOUNT_TOO_LARGE","message":"Cấp 2 credit làm số dư vượt trần 1000 (số dư hiện tại 999).
+      Trần số dư giữ tiền trong dải mà float8 còn đủ 6 chữ số thập phân (giới hạn cứng 9007199254 credit).",
+     "details":{"amount":2,"max":1000000000,"balance":999,"max_balance":1000}}
+sổ ví sau 2 lệnh: [{"amount":999,"reason":"admin_grant","balance_after":999}]      ← KHÔNG thêm dòng
+số dư đọc lại: 999
+```
+
+Hai test mới trong `test/mvp05-round2-hardening.test.js` (chạy ở CẢ hai chế độ, không cần PG):
+tầng dịch vụ (vượt trần ⇒ không ghi sổ; **đúng** trần vẫn cho; điều chỉnh giảm không bị chặn) và
+HTTP (201 → 400 + `/api/config.billing.max_balance`).
+
+### 25.9 (PHỤ) Bất biến “dòng cuối = số dư” VỠ trên DB ĐÃ NÂNG CẤP — và cách xử lý
+
+`ALTER COLUMN … TYPE DOUBLE PRECISION` chỉ nới **kiểu cột**, không phục hồi chữ số đã bị `float4`
+nuốt của các dòng ghi TRƯỚC đó. Đo được (mục 25.7, test 1 — dòng sổ CŨ giữ nguyên giá trị):
+
+```
+dòng seq=1  amount=+10000     balance_after=10000     ← ghi bằng float4 trước migration (giữ nguyên)
+dòng seq=2  amount=-0.0004    balance_after=10000     ← khoản trừ bị float4 nuốt khi ghi
+SUM(amount) sau migration = 9999.9996   ≠   balance_after dòng cuối = 10000      ← LỆCH 0,0004
+```
+
+Hệ quả: bất biến “`balance_after` dòng mới nhất === số dư” **vỡ trên DB đã nâng cấp** (lệch đúng
+phần đã bị float4 nuốt trước đây). Hướng lệch là **còn nợ tiền** (khách đã tiêu mà sổ chưa trừ),
+**không thất thoát thêm**; màn đối soát sẽ thấy lệch cho tới khi có dòng mới ghi bằng float8.
+
+Cách xử lý (Owner chọn, ghi rõ để không ai tưởng là đã tự sửa):
+1. **Chấp nhận + ghi rõ** (mặc định khuyến nghị khi chưa có DB production nào — `deploy/` chưa từng
+   triển khai thật): số dư THẬT là `SUM(amount)` (float8) và mọi dòng MỚI đã đúng; chỉ các dòng cũ
+   lệch. `/api/health` + `money_schema_ok` đã nói ra trạng thái kiểu cột.
+2. **Đồng bộ lại `balance_after` theo thứ tự `seq`** (chỉ chạy khi Owner muốn sổ khớp từng dòng —
+   thao tác GHI vào sổ append-only, phải sao lưu trước):
+   ```sql
+   -- SAO LƯU TRƯỚC: CREATE TABLE wallet_ledger_bak_20261009 AS SELECT * FROM wallet_ledger;
+   BEGIN;
+   WITH running AS (
+     SELECT id, SUM(amount) OVER (PARTITION BY user_id ORDER BY seq, created_at, id
+                                  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS total
+       FROM wallet_ledger
+   )
+   UPDATE wallet_ledger w SET balance_after = round(r.total::numeric, 6)
+     FROM running r WHERE r.id = w.id AND w.balance_after IS DISTINCT FROM round(r.total::numeric, 6);
+   COMMIT;
+   ```
+   ⚠️ Chỉ chạy khi KHÔNG có job đang chạy (khoá ghi sổ theo user vẫn giữ nguyên tiền); script này
+   **không** tạo/xoá dòng nào, chỉ sửa `balance_after` của dòng cũ. Hiện **chưa** chạy trên DB nào
+   (không có DB production) — đây là hướng dẫn, KHÔNG phải số đo.
+=======
 ## 24.5 Vòng vá R1…R6 (phản biện vòng 2) — SỐ ĐO THẬT và phần CHƯA làm
 
 Nguồn phát hiện: `docs/EXPORT-REVIEW.md` §6.2. Luật sau khi vá: `docs/EXPORT-CONTRACT.md` §10.

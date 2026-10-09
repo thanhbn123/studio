@@ -85,6 +85,12 @@ pricing (
 --   image_assets.user_id TEXT NULL
 ```
 
+⚠️ **KIỂU SỐ CỦA 4 CỘT TIỀN** (`wallet_ledger.amount`, `wallet_ledger.balance_after`,
+`usage_events.estimated_cost`, `pricing.unit_price`): `schema.sql` khai **`DOUBLE PRECISION`**
+(`float8` trên PostgreSQL, REAL affinity trên SQLite) — **KHÔNG** dùng `REAL` (`float4` chỉ ~7 chữ
+số có nghĩa ⇒ mất chữ số thập phân của tiền). DB PostgreSQL dựng bởi bản cũ được **nới kiểu tại
+chỗ** khi `init()`, **fail-closed** nếu còn cột `real` mà app dùng, trần số dư `1e9`: xem **§9**.
+
 ### 2.2 Quy ước
 - `jobs.session_id` **giữ nguyên** (dùng cho ẩn danh + tương thích ngược); `jobs.user_id` là mới.
 - Ẩn danh: `user_id = NULL`, không có ví, KHÔNG trừ credit, vẫn bị rate limit theo `session_id`.
@@ -189,6 +195,11 @@ GET  /api/admin/usage?from&to&group_by=day|operation|user → 200 { rows }
 - `src/app.js`: nạp **phòng thủ** `accountService` + `billingService` (try/catch + dynamic import như
   MVP-02/03); lỗi ⇒ log `accounts.wiring_failed`/`billing.wiring_failed` **mức error** và đặt `null`,
   **MVP-01/02/03 vẫn boot**; `/api/health` + `/api/config` trả `accounts: { available, reason }`.
+- **Kiểu cột TIỀN (§9.1)** + migration `#widenMoneyColumns()`: `real` (float4) → `double precision`
+  (float8), **chỉ PostgreSQL**, idempotent (chỉ `ALTER` cột còn `real`). Đây là **fail-closed**
+  (§9.2): sau khi nới, `init()` **quét lại MỌI schema**; còn cột tiền `real` mà app nhìn thấy
+  (`search_path`) ⇒ **ném `MONEY_COLUMNS_NOT_WIDENED`**, KHÔNG boot. `store.moneySchemaStatus()` và
+  `/api/health.money_schema_ok` nói ra trạng thái thật (SQLite: `checked: false`, không có gì phải nới).
 - Hook tính tiền trong `src/jobs/pipeline.js`, `src/imagelab/pipeline.js`, `src/imagestudio/pipeline.js`:
   **chỉ khi** job có `user_id` (đăng nhập) ⇒ `holdForJob` trước khi chạy, `settleForJob` sau khi xong,
   `refundForJob` khi `failed`. Ẩn danh ⇒ bỏ qua hoàn toàn (không gọi billing).
@@ -239,6 +250,8 @@ billing: {
   defaultGrant: 0,            // BILLING_DEFAULT_GRANT (credit tặng khi đăng ký; 0 = không tặng)
   holdBeforeJob: true,        // BILLING_HOLD_BEFORE_JOB (giữ tiền trước khi chạy job)
   pricingFromCost: true,      // BILLING_PRICING_FROM_COST (seed bảng pricing từ config.cost hiện có)
+  maxAmount: 1e9,             // BILLING_MAX_AMOUNT (trần MỘT lệnh cấp/điều chỉnh — PB-06)
+  maxBalance: 1e9,            // BILLING_MAX_BALANCE (F3 — trần SỐ DƯ ví, xem §9.3)
 },
 ```
 
@@ -482,3 +495,56 @@ Phán quyết vòng 4: **PASS**, kèm 2 cảnh báo không chặn (sửa cho s�
     (`{user_id, job_id, run_key, reason}`).
 - Nhờ vậy đọc sổ là phân biệt được "job không tốn gì" (`none`) với "không quy được usage"
   (`unavailable`) — không còn dòng `actual_cost = 0` im lặng.
+
+---
+
+## 9. VÒNG VÁ PR #28 — TIỀN TRÊN POSTGRESQL (F1/F2/F3)
+
+Ba phát hiện của phản biện độc lập (`docs/PG-MONEY-REVIEW.md`) đã được vá. Số đo + output thật:
+`docs/VERIFICATION.md` §25.6–§25.9.
+
+### 9.1 Kiểu cột TIỀN (ĐÓNG BĂNG)
+
+- Bốn cột tiền khai `DOUBLE PRECISION` trong `schema.sql`: `wallet_ledger.amount`,
+  `wallet_ledger.balance_after`, `usage_events.estimated_cost`, `pricing.unit_price`.
+  PostgreSQL hiểu là **`float8`**; SQLite coi tên kiểu chứa `DOUB` là **REAL affinity** (float8)
+  ⇒ **cùng một file schema** chạy được cả hai driver.
+- Danh sách 4 cột là hằng số export `MONEY_COLUMNS` (`src/store/index.js`) — migration, kiểm tra
+  sau migration và test dùng CHUNG một nguồn, không chép tay.
+- **KHÔNG** đổi sang `NUMERIC` ở vòng này: SQLite không có kiểu đó (affinity NUMERIC ⇒ REAL) nên
+  hai dialect sẽ lệch hành vi; `DOUBLE PRECISION` giữ đủ 6 chữ số thập phân trong dải đã đo (§9.3).
+  DB PostgreSQL dựng bởi bản CŨ (cột `real`) được nới TẠI CHỖ khi `init()`.
+
+### 9.2 F1 — migration cột tiền là FAIL-CLOSED (ĐÓNG BĂNG)
+
+- `#widenMoneyColumns()` quét **MỌI schema** (`pg_catalog`, KHÔNG lọc `table_schema = 'public'`),
+  thử nới TỪNG cột tìm được (log từng cột, lỗi ⇒ log **ERROR**), rồi **QUÉT LẠI**.
+- Còn cột tiền `real` **nhìn thấy được** theo `search_path` (`pg_table_is_visible`) ⇒ `init()`
+  **NÉM `MONEY_COLUMNS_NOT_WIDENED`** (chặn boot; thông điệp + `details.columns` nêu ĐÚNG tên cột).
+  KHÔNG có nhánh "warn rồi chạy tiếp" — đó chính là lỗi F1: bảng ngoài `public` ⇒ 0/4 cột được nới,
+  không một dòng log, ví 10.000 chạy 1 lượt giá 0,0004 mà số dư vẫn 10000 (**chạy miễn phí**).
+- Cột `real` ở schema **ngoài `search_path`** (app không đọc tới) KHÔNG chặn boot, nhưng bị log
+  **ERROR** (`store.migration.money_columns_not_widened_unreachable`) và phơi ra `/api/health`.
+- `/api/health` thêm: `money_schema_ok` (boolean), `money_schema_reason` (chuỗi | `null`) và
+  `money_schema: { checked, ok, not_widened: [{schema, table, column, data_type, visible}] }`.
+  `checked: false` = CHƯA KIỂM (SQLite / store dựng tay) — KHÔNG phải "đã kiểm và đạt".
+- `store.moneySchemaStatus()` là API đọc trạng thái này (dùng cho health + test).
+
+### 9.3 F3 — TRẦN SỐ DƯ ví (ĐÓNG BĂNG)
+
+- `billing.maxBalance` (`BILLING_MAX_BALANCE`, mặc định `1e9`). Cấp credit làm **số dư vượt trần**
+  ⇒ **400 `AMOUNT_TOO_LARGE`** (chi tiết `balance`, `max_balance`), sổ **KHÔNG** thêm dòng.
+  Điều chỉnh **GIẢM** không bị trần này chặn (trần chỉ chặn chiều làm tăng số dư).
+- Vì sao có trần: `float8` chỉ giữ đủ 6 chữ số thập phân tới `2^53/1e6 = 9.007.199.254,74` credit
+  (`MONEY_FLOAT8_CEILING`, `src/billing/money.js`); vượt mức đó thì phép trừ tiền nhỏ bị nuốt chữ số
+  (đo được: số dư `1e11`, 1.000 lượt trừ `0,0004` ⇒ lệch `2,83e-3`). Trần `1e9` nằm dưới giới hạn
+  cứng ~9 lần. Trần MỘT LỆNH cấp (`maxAmount`) KHÔNG thay được trần này: ~9 lệnh cấp trần là vượt.
+- `GET /api/config.billing` công bố `max_amount` + `max_balance` để UI/admin biết vì sao bị 400.
+
+### 9.4 Điều KHÔNG hứa (ghi rõ để không hiểu nhầm)
+
+- Nới kiểu cột **không phục hồi** chữ số đã mất của dòng sổ ghi bằng `float4` trước đó. Vì vậy trên
+  DB đã nâng cấp, dòng sổ CŨ có thể giữ `balance_after` lệch với `SUM(amount)` mới (hướng "còn nợ
+  tiền", không thất thoát thêm) — xem cách xử lý ở `docs/VERIFICATION.md` §25.9.
+- Trần số dư KHÔNG chặn được số dư đã vượt trần từ TRƯỚC khi bật (dữ liệu cũ); nó chặn mọi lệnh
+  cấp credit làm số dư vượt trần kể từ nay.

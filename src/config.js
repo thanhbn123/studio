@@ -247,6 +247,12 @@ export function loadConfig(env = process.env) {
       maxRunsPerJob: Math.max(1, toInt(env.BILLING_MAX_RUNS_PER_JOB, 10)),
       // PB-06: trần credit cho MỘT thao tác cấp/điều chỉnh (chặn `grant(1e308)` ⇒ sổ ghi 0).
       maxAmount: Math.max(1, toNum(env.BILLING_MAX_AMOUNT, 1e9)),
+      // F3 (vòng vá PR #28): trần SỐ DƯ ví. Vì sao cần: `DOUBLE PRECISION` (float8) chỉ giữ đủ
+      // 6 chữ số thập phân của đơn vị tiền tới `2^53/1e6 = 9.007.199.254,74` credit; VƯỢT mức đó
+      // thì phép trừ tiền nhỏ lại sai (đo được: số dư 1e11, 1.000 lượt trừ 0,0004 ⇒ lệch 2,83e-3).
+      // Trần mặc định 1e9 nằm SÂU dưới giới hạn float8 ~9 lần nên còn dư địa.
+      // Cấp credit làm số dư VƯỢT trần ⇒ `AMOUNT_TOO_LARGE` (HTTP 400), sổ KHÔNG thêm dòng.
+      maxBalance: Math.max(1, toNum(env.BILLING_MAX_BALANCE, 1e9)),
       // BR-08 (vòng 4): ngưỡng coi một lượt chạy là TREO (có `job_hold` mà không có dòng đóng).
       // Quá ngưỡng ⇒ `reconcileStuckRuns` HOÀN 100% khoản giữ và đóng lượt (job chạy lại được).
       // Mặc định 15 phút — đủ dài để không cắt ngang job đang chạy thật.
