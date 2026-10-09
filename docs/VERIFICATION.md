@@ -2176,3 +2176,166 @@ sha256 CẢ FILE giống nhau? false
    phạm vi được sửa. Đây là **quyết định có ghi trong hợp đồng**, không phải chỗ vá sót.
 9. **ZIP64 / Finder / Chrome / PostgreSQL**: giữ nguyên như §24.4 mục 1–4 (mọi phép đo trên đây vẫn
    chạy SQLite in-memory với `env -u DATABASE_URL`).
+
+## 26. UI TRÊN TRÌNH DUYỆT THẬT (E2E) — lỗ hổng lớn nhất của dự án, nay đã bịt phần chính
+
+> Trước mục này, **mọi** kết luận về UI trong tài liệu đều đến từ việc *trích hàm render của
+> `public/app.js` rồi chạy trong Node* (`test/*-ui-helpers.js`, `test/*-ui.test.js`). Cách đó đo được
+> chuỗi HTML sinh ra, nhưng **không** đo được: DOM thật, CSS thật, kéo-thả thật, `FileList` thật,
+> XHR thật, poll thật, `<img>` có giải mã được không, tệp tải về có mở được không, và **có lỗi
+> console hay không**. §26 đo đúng những thứ đó.
+
+### 26.1 Cách chạy
+
+```bash
+npm run test:e2e              # mở CỬA SỔ Google Chrome thật
+E2E_HEADLESS=1 npm run test:e2e   # cùng engine Chrome, chế độ --headless=new
+E2E_KEEP=1 npm run test:e2e       # giữ Chrome + máy chủ lại để soi bằng mắt
+```
+
+**KHÔNG thêm dependency nào** — `package.json` vẫn chỉ có `dependencies: { pg }` và **không có**
+`devDependencies`. Công cụ điều khiển trình duyệt là `tools/e2e/cdp.mjs`: một khách
+**Chrome DevTools Protocol** tự viết, chạy trên `WebSocket` **toàn cục có sẵn của Node 24+** và
+Google Chrome **đã cài sẵn trên máy**. Không Playwright, không Puppeteer, không jsdom.
+
+Script tự dựng máy chủ riêng (cổng rảnh ngẫu nhiên, SQLite + thư mục ảnh riêng trong `.e2e-data/`,
+`AI_PROVIDER=mock`, `OCR_PROVIDER=mock`, `env -u DATABASE_URL`) nên không đụng dữ liệu phát triển.
+
+### 26.2 Môi trường đã đo (lấy từ `docs/assets/e2e/report.json`)
+
+```json
+{ "chrome": "Chrome/154.0.8037.98",
+  "chromeBinary": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
+  "headless": false, "node": "v26.7.0" }
+```
+
+### 26.3 Kết quả — 4/4 luồng PASS, **0 lỗi console**, **0 phản hồi HTTP ≥ 400**
+
+```
+$ npm run test:e2e
+PASS                 f1  4 tab render trên DOM thật, không lỗi console
+PASS                 f2  Tạo ảnh (MVP-03): kéo-thả PNG → mẫu nền → TẠO ẢNH → TRƯỚC|SAU → tải được
+PASS                 f3  Video (MVP-04): 2 PNG → TẠO VIDEO → GIF chạy + "Video KHÔNG có tiếng" + tải được
+PASS                 f4  Dịch ảnh (MVP-02): tải ảnh → nhập vùng chữ TAY (IL-08) → LƯU VÙNG & DỊCH → bảng duyệt
+CHƯA CÓ TÍNH NĂNG    f5  Gói xuất bản .zip ở màn job
+────────────────────────────────────────────────────────────────────────
+Chrome: Chrome/154.0.8037.98 (headless=false) · 4 PASS · 0 FAIL · 1 chưa có tính năng
+Lỗi console toàn phiên: 0
+HTTP >= 400 toàn phiên: 0 []
+```
+
+**Chạy lại được, không rung (flaky):** 3 lượt `E2E_HEADLESS=1 npm run test:e2e` liên tiếp đều
+`4 PASS · 0 FAIL · exit=0`, cộng 2 lượt chạy **cửa sổ Chrome thật** cũng `4 PASS · 0 FAIL`.
+
+**Không đụng gì tới bộ test nền.** Thay đổi của §26 chỉ gồm `tools/e2e/**`, một dòng
+`"test:e2e"` trong `scripts`, một dòng `.e2e-data/` trong `.gitignore` và bằng chứng trong
+`docs/assets/e2e/` — **không thêm test nào vào `test/`**, không sửa `src/**`, không sửa `public/**`:
+
+```
+$ env -u DATABASE_URL npm test      → tests 986 · pass 980 · fail 0 · skipped 6 · todo 0
+$ env -u DATABASE_URL npm run verify → EXIT 0  ("Kiểm chứng cục bộ hoàn tất…")
+```
+
+Lỗi console được thu bằng **bốn** kênh CDP cùng lúc, không chỉ `console.error`:
+`Runtime.consoleAPICalled` · `Runtime.exceptionThrown` (ngoại lệ chưa bắt) · `Log.entryAdded`
+(lỗi của chính trình duyệt: CSP, ảnh hỏng, mixed content…) · `Network.loadingFailed`.
+`docs/assets/e2e/console.log` của lượt chạy trên: **trống**.
+
+| Luồng | Thao tác THẬT đã làm | Bằng chứng |
+|---|---|---|
+| **f1** | Nạp `/`, đi qua 6 route; bấm **chuột thật** (`Input.dispatchMouseEvent`) vào nút “Video” trên thanh nav | `f1-noi-dung.png` · `f1-dich-anh.png` · `f1-tao-anh.png` · `f1-video.png` · `f1-tai-khoan.png` · `f1-quan-tri.png` |
+| **f2** | **Kéo-thả** `headphones.png` vào `#is-drop` (`Input.dispatchDragEvent` mang tệp ⇒ đi đúng đường `dataTransfer.files`), chọn mẫu nền `trang` bằng chuột, bấm **TẠO ẢNH**, chờ job xong, tải ảnh | `f2-01-da-keo-tha-anh.png` · `f2-02-da-chon-mau-nen.png` · `f2-03-truoc-sau.png` · `f2-04-sau-khi-tai.png` |
+| **f3** | Chọn **2 tệp PNG** qua `FileList` thật của Chrome (`DOM.setFileInputFiles`), bấm **TẠO VIDEO**, chờ encode, tải GIF | `f3-01-da-chon-2-anh.png` · `f3-02-gif-ket-qua.png` · `f3-03-nhan-khong-co-tieng.png` |
+| **f4** | Kéo-thả ảnh, mở khối **IL-08**, gõ **bàn phím thật** (`Input.insertText`) toạ độ `40/40/160/48` + chữ Trung `无线蓝牙耳机`, bấm **LƯU VÙNG & DỊCH**, rồi **RENDER ẢNH** và tải về | `f4-01-man-job.png` · `f4-02-da-nhap-vung-tay.png` · `f4-03-bang-duyet.png` · `f4-04-anh-da-render.png` |
+
+Những khẳng định **không chỉ đọc chữ trên màn hình** (trích `report.json`):
+
+```
+f2  cả hai ảnh đều naturalWidth/Height > 0 — TRÌNH DUYỆT GIẢI MÃ THẬT, không phải link vỡ
+    [{"src":"/api/imagelab/assets/8e6b629d…/file","w":320,"h":320},
+     {"src":"/api/imagelab/assets/f5df09f7…/file","w":320,"h":320}]
+f2  ảnh SAU là BẢN GHI MỚI (asset id khác ảnh gốc) — ảnh gốc bất biến
+f3  trình duyệt GIẢI MÃ và PHÁT được GIF trong <img>
+    {"src":"/api/videostudio/assets/aaf5ef66…/file","w":720,"h":1280}
+f3  máy chủ DÙNG ĐỦ cả 2 cảnh (không có cảnh bị bỏ)
+f3  nhãn không-tiếng đúng là khối #vs-no-audio của hợp đồng MVP-04
+f4  gõ được toạ độ + chữ Trung bằng BÀN PHÍM THẬT
+    {"x":"40","y":"40","w":"160","h":"48","text":"无线蓝牙耳机"}
+f4  bảng duyệt (#il-lines) hiện và chứa đúng chữ Trung đã nhập tay   (4 dòng)
+```
+
+### 26.4 Tệp TẢI VỀ phải **mở được**, không chỉ “có tải”
+
+Tệp được tải bằng cách **bấm chuột thật vào nút tải** trong trang; Chrome ghi xuống đĩa qua
+`Browser.setDownloadBehavior`, test chờ `Page.downloadProgress` = `completed`, rồi **giải mã lại
+bằng `python3 -I`** (PNG: duyệt chunk + `zlib.decompress` toàn bộ IDAT; GIF: header + đếm khung +
+kiểm trailer; ZIP: `zipfile.testzip()`):
+
+```
+f2 ảnh tạo   → PNG OK bytes=1964   320x320  idat_raw=409920 chunks=IHDR,IDAT,IEND
+f3 video GIF → GIF OK bytes=636921 720x1280 frames=48 trailer=True   (2 cảnh × 24 khung)
+f4 ảnh dịch  → PNG OK bytes=2344   320x320  idat_raw=409920 chunks=IHDR,IDAT,IEND
+```
+
+### 26.5 Luồng 5 “gói xuất bản `.zip`” — **CHƯA CÓ trong baseline này**
+
+```
+$ grep -rni 'zip' --exclude-dir=node_modules --exclude-dir=.git . | grep -v package-lock
+   (0 dòng)
+```
+
+Không có endpoint, không có nút, không có tài liệu nào mô tả gói `.zip`. Màn job chỉ có link tải
+**một** tệp (`<a download>`): ảnh dịch (`public/app.js:1623`), ảnh tạo (`:2906`), video GIF (`:4249`)
+— cả ba đã được tải thật và kiểm mở được ở §26.4. Theo coordinator, tính năng đang nằm ở nhánh
+`feat/export-bundle` **chưa merge**, nên **sẽ test sau khi PR gói xuất bản merge**. Hàm
+`verifyFileOpens()` trong `tools/e2e/run.mjs` **đã hỗ trợ sẵn nhánh ZIP**, khi đó chỉ cần thêm một
+luồng bấm nút.
+
+### 26.6 Một hành vi THẬT mà chỉ chạy trên trình duyệt mới lộ ra (và nó ĐÚNG)
+
+Lần đầu làm f3, ảnh thứ hai được tạo bằng cách **copy y hệt** ảnh thứ nhất. UI hiện đúng một
+cảnh báo đỏ — ảnh chụp `f3-03-nhan-khong-co-tieng.png` của lượt đó:
+
+```
+Số cảnh KHÔNG khớp
+• Bạn gửi 2 cảnh nhưng kế hoạch của máy chủ có 1 cảnh — có cảnh KHÔNG được dùng.
+GIF OK bytes=303273 720x1280 frames=24   ← chỉ 1 cảnh
+```
+
+Đây **không phải lỗi**: hai ảnh trùng từng byte (cùng `sha256`) nên máy chủ gộp còn một cảnh, và
+UI **nói thẳng ra** thay vì im lặng — đúng luật “không bịa” của dự án. Nhưng nó cho thấy test suýt
+đo nhầm: *tưởng* đang đo video 2 cảnh trong khi chỉ đo đường gộp trùng. Test nay sinh ảnh thứ hai
+**khác thật** (bàn cờ vàng/xanh, dựng bằng `encodePng` của `tools/make-test-image.mjs`) và có thêm
+khẳng định `máy chủ DÙNG ĐỦ cả 2 cảnh`; kết quả `frames=48` = 2 cảnh × 24 khung xác nhận điều đó.
+
+### 26.7 Ba lỗi do chính E2E này tìm ra — **đều là lỗi của test, KHÔNG phải lỗi sản phẩm**
+
+Ghi lại để người sau khỏi vấp lại (đúng tinh thần §5 của `HANDOVER.md`):
+
+1. **Khẳng định bắt nhầm chữ ở chỗ khác.** Chờ “màn job hiện TRƯỚC|SAU” bằng cách tìm chuỗi
+   `TRƯỚC` trong `#app` thì **khớp ngay lập tức** — vì chuỗi đó cũng nằm trong phần trợ giúp của
+   bảng tham số (“…phải tự kiểm ảnh TRƯỚC|SAU”). Test tưởng job xong trong khi job còn đang chạy
+   (ảnh chụp lúc hỏng: trạng thái “Đang xử lý · Retouch trong ngưỡng”). ⇒ **Khẳng định phải bám vào
+   khối kết quả thật** (`.il-compare figure img`), không bám vào chữ.
+2. **Bấm vào nút đang `disabled` là bấm vào hư không.** Nút “LƯU VÙNG & DỊCH” bị khoá khi job còn
+   chạy OCR/dịch (UI ghi rõ “JOB ĐANG CHẠY — CHỜ XONG”). Test bấm sớm rồi chờ 90 giây trong im lặng.
+   ⇒ Phải **chờ nút hết `disabled`** rồi mới bấm, và khẳng định điều đó thành một bước riêng.
+3. **Khối IL-08 có HAI trạng thái, không phải một.** “đang thu gọn” ≠ “đang mở nhưng chưa có dòng
+   nào”. Dùng chung một phép thử (có ô `x` không?) thì cú bấm “Mở ra” lại **ĐÓNG** mất khối đang mở.
+   ⇒ Phân biệt bằng sự có mặt của nút “Thêm vùng”.
+
+### 26.8 Vẫn CHƯA đo (nói thẳng, đừng suy ra thừa)
+
+- **Chỉ đo trên Chrome 154/macOS.** Chưa đo Safari/WebKit, chưa đo Firefox, chưa đo trình duyệt di
+  động hay màn hình hẹp (layout responsive **chưa** có test).
+- **Chỉ đo đường THÀNH CÔNG + provider `mock`.** Chưa đo trên trình duyệt: 402 hết credit, 429
+  rate-limit, 5xx, mất mạng giữa chừng, job `failed`, các khối cảnh báo fail-closed (TỪ CHỐI cắt
+  nền, chữ overlay bị chặn, vùng bị từ chối).
+- **Chưa đo tab “Nội dung” (MVP-01) chạy thật**: f1 chỉ chứng minh tab đó **render**; dán link
+  Taobao/1688/Pinduoduo rồi chạy thật cần mạng ra ngoài ⇒ để ngoài phạm vi.
+- **Chưa đo đăng nhập / ví credit / trang quản trị khi ĐÃ đăng nhập**: f1 chỉ chứng minh
+  `#/dangnhap` render và `#/quantri` trả đúng câu “chưa đăng nhập (401)”.
+- **Chưa chạy trong CI.** Script cần Google Chrome cài sẵn trên máy; CI hiện **không** có bước này.
+- Kéo-thả được gửi bằng `Input.dispatchDragEvent` của CDP — **đúng đường `dataTransfer.files` của
+  trang**, nhưng không phải cử chỉ chuột vật lý của hệ điều hành.
