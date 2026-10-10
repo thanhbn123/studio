@@ -19,6 +19,7 @@ import { createServer } from 'node:net';
 import { mkdirSync, writeFileSync, rmSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { launchChrome, Cdp, Page, waitFor, sleep } from './cdp.mjs';
 
 const ROOT = resolve(import.meta.dirname, '../..');
@@ -34,6 +35,27 @@ const IGNORED_CONSOLE = [
 
 const results = [];
 let page;
+/** Lỗi console được PHÉP trong ĐÚNG MỘT luồng vì luồng đó cố ý gây ra (ghi lý do vào báo cáo). */
+const INTENTIONAL_CONSOLE = [];
+
+/**
+ * DỮ LIỆU GIEO SẴN cho f5–f8 (MVP-06/07/08 + gói .zip).
+ *
+ * Vì sao phải gieo: tạo job NỘI DUNG qua giao diện bắt buộc dán link Taobao/1688 rồi máy chủ tải trang
+ * thật ⇒ e2e sẽ gọi mạng ra ngoài và chập chờn theo sàn. Nên job nội dung (đã xong, có ảnh https + mô tả
+ * cho sàn) được ghi THẲNG vào SQLite riêng của e2e trước khi bật máy chủ. Owner được tạo bằng ĐÚNG đường
+ * `accounts.bootstrapOwner()` mà `npm run make-owner` dùng. Mọi bước còn lại đi qua giao diện bằng chuột
+ * và bàn phím thật. Mật khẩu là chuỗi ngẫu nhiên sinh MỖI lần chạy, chỉ nằm trong bộ nhớ, không ghi ra file.
+ */
+const SEED = {
+  ownerEmail: 'owner-e2e@example.test',
+  ownerPassword: `e2e-owner-${randomBytes(9).toString('hex')}`,
+  memberEmail: 'member-e2e@example.test',
+  memberPassword: `e2e-member-${randomBytes(9).toString('hex')}`,
+  bankName: 'NGÂN HÀNG THỬ (E2E)',
+  bankAccount: '0000000000',
+  jobId: null,
+};
 
 function freePort() {
   return new Promise((res, rej) => {
@@ -46,7 +68,7 @@ function freePort() {
   });
 }
 
-async function startServer(port) {
+function serverEnv(port) {
   const env = { ...process.env };
   delete env.DATABASE_URL; // cạm bẫy đã ghi trong HANDOVER.md: PG trong shell đã tắt
   Object.assign(env, {
@@ -54,7 +76,7 @@ async function startServer(port) {
     HOST: '127.0.0.1',
     PORT: String(port),
     DB_DRIVER: 'sqlite',
-    SQLITE_PATH: './.e2e-data/e2e.db',
+    SQLITE_PATH: join(ROOT, '.e2e-data/e2e.db'),
     AI_PROVIDER: 'mock',
     OCR_PROVIDER: 'mock',
     IMAGELAB_DIR: './.e2e-data/imagelab',
@@ -62,7 +84,67 @@ async function startServer(port) {
     VIDEOSTUDIO_DIR: './.e2e-data/videostudio',
     SCHEDULER_ENABLED: 'false',
     LOG_LEVEL: 'warn',
+    // MVP-06: hướng dẫn chuyển khoản là DỮ LIỆU CẤU HÌNH — e2e dùng giá trị THỬ ghi rõ là thử.
+    TOPUP_BANK_NAME: SEED.bankName,
+    TOPUP_BANK_ACCOUNT_NUMBER: SEED.bankAccount,
+    TOPUP_BANK_ACCOUNT_HOLDER: 'TAI KHOAN THU E2E',
+    TOPUP_TRANSFER_NOTE: 'E2E <email>',
+    TOPUP_RATE_VND_PER_CREDIT: '26000',
+    // MVP-07/08: mặc định đã là dry-run; khai rõ để report.json ghi đúng cấu hình đã đo.
+    PUBLISH_PROVIDER: 'dry-run',
+    MARKETPLACE_LIVE_ENABLED: 'false',
   });
+  return env;
+}
+
+/** Gieo owner + một job nội dung đã xong vào SQLite e2e (xem chú thích `SEED`). */
+async function seedFixtures(env) {
+  const { loadConfig } = await import('../../src/config.js');
+  const { createStore } = await import('../../src/store/index.js');
+  const { createAccountService } = await import('../../src/accounts/index.js');
+  const quiet = { info() {}, warn() {}, error() {}, debug() {} };
+  quiet.child = () => quiet;
+  const config = loadConfig(env);
+  const store = await createStore(config, quiet);
+  try {
+    await store.init?.();
+    const accounts = createAccountService(config, { store, logger: quiet });
+    const boot = await accounts.bootstrapOwner({ email: SEED.ownerEmail, password: SEED.ownerPassword });
+    const ownerId = boot?.user?.id;
+    if (!ownerId) throw new Error(`không tạo được owner e2e: ${JSON.stringify({ created: boot?.created, reason: boot?.reason })}`);
+    const jobId = randomUUID();
+    await store.createJob({
+      id: jobId, sessionId: 'e2e-seed-session-000001', userId: ownerId, kind: 'content', source: '1688',
+      sourceUrl: 'https://detail.1688.com/offer/e2e-0001.html', canonicalUrl: 'https://detail.1688.com/offer/e2e-0001.html', sourceProductId: 'e2e-0001',
+    });
+    await store.updateJob(jobId, {
+      status: 'succeeded',
+      stage: 'done',
+      product_name: 'Tai nghe chụp tai không dây (dữ liệu gieo e2e)',
+      content: {
+        product_name: 'Tai nghe chụp tai không dây (dữ liệu gieo e2e)',
+        headline: 'Nghe rõ, đeo êm cả ngày',
+        short_description: 'Tai nghe chụp tai không dây, gập gọn. Dữ liệu gieo cho e2e.',
+        selling_points: ['Đệm tai mềm', 'Gập gọn bỏ túi'],
+        marketplace_description: '- Tai nghe chụp tai không dây\n- Đệm tai mềm, gập gọn\n- Dữ liệu gieo e2e, người bán tự kiểm lại trước khi đăng.',
+        facebook_caption: 'Tai nghe chụp tai không dây — dữ liệu gieo e2e.',
+        hashtags: ['#tainghe', '#e2e'],
+      },
+      product_master: {
+        source: '1688', canonical_url: 'https://detail.1688.com/offer/e2e-0001.html', source_product_id: 'e2e-0001',
+        images: [{ url: 'https://img.example.com/e2e/tai-nghe-1.jpg', type: 'cover', status: 'FOUND', provenance: 'source' }],
+        price: { raw: '¥38.00', currency: 'CNY', status: 'FOUND', kind: 'fixed', tiers: [] },
+        variants: [], attributes: [],
+      },
+    });
+    SEED.jobId = jobId;
+    return { ownerId, jobId };
+  } finally {
+    await store.close?.();
+  }
+}
+
+async function startServer(port, env) {
   const logFile = join(OUT, 'server.log');
   const proc = spawn(process.execPath, ['src/server.js'], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
   let log = '';
@@ -88,8 +170,13 @@ async function startServer(port) {
 }
 
 /** Một luồng = một mục trong báo cáo. Mọi khẳng định đi qua `expect`. */
-async function flow(id, title, fn) {
+async function flow(id, title, fn, { allowConsole = [], allowReason = '' } = {}) {
   const rec = { id, title, status: 'running', checks: [], shots: [], started: new Date().toISOString() };
+  if (allowConsole.length) {
+    rec.allowedConsole = { patterns: allowConsole.map(String), reason: allowReason };
+    INTENTIONAL_CONSOLE.push(...allowConsole);
+  }
+  const ignore = [...IGNORED_CONSOLE, ...allowConsole];
   results.push(rec);
   const before = page ? page.console.length : 0;
   const expect = (ok, label, detail = '') => {
@@ -108,7 +195,7 @@ async function flow(id, title, fn) {
   try {
     await fn({ expect, shot });
     // Lỗi console phát sinh TRONG luồng này
-    const errs = page.realErrors({ ignore: IGNORED_CONSOLE });
+    const errs = page.realErrors({ ignore });
     const mine = errs.filter((e) => page.console.indexOf(e) >= before);
     rec.consoleErrors = mine;
     if (mine.length) {
@@ -123,7 +210,7 @@ async function flow(id, title, fn) {
   } catch (err) {
     rec.status = 'failed';
     rec.error = err.message;
-    rec.consoleErrors = page ? page.realErrors({ ignore: IGNORED_CONSOLE }).slice(before) : [];
+    rec.consoleErrors = page ? page.realErrors({ ignore }).slice(before) : [];
     process.stdout.write(`  ✗ FAIL: ${err.message}\n`);
     if (page) {
       try {
@@ -133,6 +220,29 @@ async function flow(id, title, fn) {
   }
   rec.finished = new Date().toISOString();
   return rec;
+}
+
+/** Đăng nhập (hoặc đăng ký) bằng FORM THẬT: gõ phím vào ô email/mật khẩu rồi bấm nút gửi. */
+async function uiLogin(email, password, { register = false, name = '' } = {}) {
+  await page.eval('location.hash = "#/dangnhap";');
+  await waitFor('form đăng nhập hiện ra', () => page.eval('return Boolean(document.querySelector("#auth-email"));'), { timeoutMs: 10000 });
+  // Form NHỚ chế độ lần trước (state.auth.mode) ⇒ luôn chọn rõ chế độ, nếu không lượt "đăng nhập"
+  // sau một lượt "đăng ký" sẽ gửi nhầm sang /api/auth/register (409 EMAIL_TAKEN — đã vấp lượt chạy đầu).
+  await page.click(`[data-action="authmode"][data-mode="${register ? 'register' : 'login'}"]`);
+  await waitFor(`chuyển sang chế độ ${register ? 'đăng ký' : 'đăng nhập'}`,
+    () => page.eval(`return ${register ? '' : '!'}Boolean(document.querySelector("#auth-name"));`), { timeoutMs: 5000 });
+  await page.eval('for (const id of ["auth-email","auth-password","auth-name"]) { const el = document.getElementById(id); if (el) el.value = ""; }');
+  await page.type('#auth-email', email);
+  await page.type('#auth-password', password);
+  if (register && name) await page.type('#auth-name', name);
+  await page.click('#auth-submit');
+  await waitFor(`đăng nhập xong (${email})`, () => page.eval(`return (document.querySelector("#account-bar")?.innerText || "").includes(${JSON.stringify(email)});`), { timeoutMs: 15000 });
+}
+
+async function uiLogout() {
+  if (!(await page.eval('return Boolean(document.querySelector(\'[data-action="logout"]\'));'))) return;
+  await page.click('[data-action="logout"]');
+  await waitFor('đăng xuất xong', () => page.eval('return !document.querySelector(\'[data-action="logout"]\');'), { timeoutMs: 10000 });
 }
 
 /** Kiểm tệp tải về có MỞ ĐƯỢC thật bằng python3 (không chỉ xem đuôi tệp). */
@@ -181,10 +291,22 @@ async function clickDownload(page, selector, { expect, label }) {
   const before = new Set(
     readdirSync(DOWNLOADS).map((f) => join(DOWNLOADS, f)),
   );
+  const knownGuids = new Set(page.downloads.map((d) => d.guid));
   await page.click(selector);
+  // Bám vào sự kiện tải của CHÍNH trang (Page.downloadWillBegin → downloadProgress=completed): Chrome
+  // tự tải tệp thành phần (CRX, đầu "Cr24") vào cùng thư mục, nên "tệp mới nhất trong thư mục" có thể
+  // là tệp KHÔNG do nút này sinh ra (đã vấp ở f5 lượt chạy đầu). Không có sự kiện thì mới rơi về cách cũ.
   const file = await waitFor(
     `tệp tải về xuất hiện (${label})`,
-    () => newestDownload(before),
+    () => {
+      const d = page.downloads.find((x) => !knownGuids.has(x.guid) && x.state === 'completed');
+      if (d) {
+        const f = join(DOWNLOADS, d.guid);
+        try { if (statSync(f).isFile()) return f; } catch { /* chưa ghi xong */ }
+      }
+      const anyMine = page.downloads.some((x) => !knownGuids.has(x.guid));
+      return anyMine ? null : newestDownload(before);
+    },
     { timeoutMs: 20000, everyMs: 300 },
   );
   const out = verifyFileOpens(file);
@@ -201,7 +323,11 @@ async function main() {
   const port = await freePort();
   const base = `http://127.0.0.1:${port}`;
   process.stdout.write(`▸ dựng máy chủ: ${base}\n`);
-  const server = await startServer(port);
+  const env = serverEnv(port);
+  process.stdout.write('▸ gieo owner + 1 job nội dung vào SQLite e2e (xem chú thích SEED)…\n');
+  const seeded = await seedFixtures(env);
+  process.stdout.write(`  job gieo: ${seeded.jobId}\n`);
+  const server = await startServer(port, env);
 
   process.stdout.write('▸ bật Google Chrome thật (CDP)…\n');
   const chrome = await launchChrome({ port: 9444, downloadDir: DOWNLOADS });
@@ -221,12 +347,13 @@ async function main() {
     node: process.version,
     base,
     fixture: FIXTURE,
+    seeded: { owner_email: SEED.ownerEmail, member_email: SEED.memberEmail, job_id: SEED.jobId, note: 'owner + job nội dung gieo thẳng vào SQLite e2e; mật khẩu ngẫu nhiên mỗi lần chạy, không ghi ra file' },
   };
 
   // ───────────────────────────────────────────────────────────────────────────
   // LUỒNG 1 — 4 tab + Tài khoản + Quản trị đều render, không lỗi console
   // ───────────────────────────────────────────────────────────────────────────
-  await flow('f1', '4 tab render trên DOM thật, không lỗi console', async ({ expect, shot }) => {
+  await flow('f1', '6 tab + Tài khoản + Quản trị render trên DOM thật, không lỗi console', async ({ expect, shot }) => {
     await page.goto(base, { waitMs: 1500 });
     const ua = await page.eval('return navigator.userAgent;');
     expect(/Chrome\//.test(ua), 'trang chạy trong Chrome thật', ua);
@@ -241,6 +368,8 @@ async function main() {
       { hash: '#/imagelab', name: 'dich-anh', want: /Dịch (chữ )?Trung|ảnh sản phẩm/i, label: 'Dịch ảnh' },
       { hash: '#/taoanh', name: 'tao-anh', want: /Chọn ảnh sản phẩm|Tách nền/i, label: 'Tạo ảnh' },
       { hash: '#/video', name: 'video', want: /GIF|Video/i, label: 'Video' },
+      { hash: '#/dangbai', name: 'dang-bai', want: /Đăng bài|đăng nhập|Facebook/i, label: 'Đăng bài' },
+      { hash: '#/dangsan', name: 'dang-san', want: /Đăng sàn cần tài khoản/i, label: 'Đăng sàn (ẩn danh)' },
       { hash: '#/dangnhap', name: 'tai-khoan', want: /Đăng nhập|Đăng ký|mật khẩu/i, label: 'Tài khoản' },
       { hash: '#/quantri', name: 'quan-tri', want: /Quản trị|owner|admin/i, label: 'Quản trị' },
     ];
@@ -515,23 +644,176 @@ async function main() {
   });
 
   // ───────────────────────────────────────────────────────────────────────────
-  // LUỒNG 5 — gói xuất bản .zip: KHÔNG CÓ TRONG MÃ NGUỒN (xem báo cáo)
+  // LUỒNG 5 — Gói xuất bản .zip (đã gộp từ PR #26/#27): owner đăng nhập → màn job → TẢI GÓI
   // ───────────────────────────────────────────────────────────────────────────
-  results.push({
-    id: 'f5',
-    title: 'Gói xuất bản .zip ở màn job',
-    status: 'not_implemented',
-    error:
-      'CHƯA CÓ TRONG BASELINE NÀY. `grep -rni zip` toàn repo (trừ node_modules + package-lock.json) = 0 dòng ' +
-      'trên nhánh đang làm. Theo coordinator, tính năng đang nằm ở nhánh `feat/export-bundle` (chưa merge) ' +
-      'và còn đang vá lỗi phản biện ⇒ sẽ test sau khi PR gói xuất bản merge. ' +
-      'Màn job hiện chỉ có link tải MỘT tệp (<a download>): ảnh dịch · ảnh tạo · video GIF — cả ba ĐÃ được ' +
-      'tải thật qua trình duyệt và kiểm MỞ ĐƯỢC bằng python3 ở f2/f3/f4. ' +
-      'Hàm `verifyFileOpens()` trong file này ĐÃ hỗ trợ sẵn nhánh ZIP (zipfile.testzip()), nên khi tính năng ' +
-      'merge chỉ cần thêm một luồng bấm nút — không phải viết lại hạ tầng.',
-    checks: [],
-    shots: [],
+  await flow('f5', 'Gói xuất bản (.zip): owner đăng nhập bằng bàn phím thật → màn job nội dung → TẢI GÓI → zip mở được, có MANIFEST.json', async ({ expect, shot }) => {
+    await uiLogin(SEED.ownerEmail, SEED.ownerPassword);
+    expect(await page.eval('return Boolean(document.querySelector(\'[data-action="logout"]\'));'), 'đăng nhập owner bằng form thật thành công');
+    await page.eval(`location.hash = ${JSON.stringify(`#/job/${SEED.jobId}`)};`);
+    await waitFor('panel gói xuất bản hiện ra và nút TẢI GÓI bấm được',
+      () => page.eval('const b = document.querySelector(\'[data-action="exportbundle"]\'); return Boolean(b && !b.disabled);'),
+      { timeoutMs: 20000, everyMs: 400 });
+    await page.scrollTo('[data-action="exportbundle"]');
+    await shot('01-panel-goi-xuat-ban');
+    const dl = await clickDownload(page, '[data-action="exportbundle"]', { expect, label: 'gói xuất bản (.zip)' });
+    const names = execFileSync('python3', ['-I', '-c', 'import sys,zipfile,json; print(json.dumps(zipfile.ZipFile(sys.argv[1]).namelist()))', dl.file], { encoding: 'utf8' });
+    const list = JSON.parse(names);
+    expect(list.includes('MANIFEST.json'), 'gói có MANIFEST.json (tự khai bước nào là dữ liệu giả)', names.slice(0, 300));
+    const manifest = JSON.parse(execFileSync('python3', ['-I', '-c', 'import sys,zipfile; print(zipfile.ZipFile(sys.argv[1]).read("MANIFEST.json").decode())', dl.file], { encoding: 'utf8' }));
+    expect(String(manifest.job_id || manifest.job?.id || '') === SEED.jobId, 'MANIFEST.json khai đúng job_id của job đã mở', JSON.stringify(manifest).slice(0, 200));
+    results.at(-1).downloads = [{ what: 'gói xuất bản', ...dl, entries: list }];
+    await shot('02-sau-khi-tai-goi');
+  }, {
+    allowConsole: [/ERR_NAME_NOT_RESOLVED https:\/\/img\.example\.com\//],
+    allowReason: 'job gieo dùng ảnh https://img.example.com/… (tên miền DÀNH RIÊNG theo RFC 2606, không bao giờ phân giải) để e2e không tải ảnh từ CDN sàn thật; màn job vẽ ảnh sản phẩm nên Chrome ghi một dòng ERR_NAME_NOT_RESOLVED.',
   });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // LUỒNG 6 — Nạp credit thủ công (MVP-06): member gửi yêu cầu → owner XÁC NHẬN / TỪ CHỐI → ví đổi đúng
+  // ───────────────────────────────────────────────────────────────────────────
+  await flow('f6', 'Nạp credit (MVP-06): member gửi 2 yêu cầu → ví CHƯA đổi → owner XÁC NHẬN 1 + TỪ CHỐI 1 → member thấy +10 credit', async ({ expect, shot }) => {
+    await uiLogout();
+    await uiLogin(SEED.memberEmail, SEED.memberPassword, { register: true, name: 'Thành viên E2E' });
+    await page.eval('location.hash = "#/taikhoan";');
+    await waitFor('khối Nạp credit hiện ra', () => page.eval('return Boolean(document.querySelector("#topup-amount"));'), { timeoutMs: 15000 });
+    const panel = await page.text('#topup-panel');
+    expect(/Tiền vào ví chỉ sau khi quản trị xác nhận/.test(panel), 'câu nói thật "Tiền vào ví chỉ sau khi quản trị xác nhận" hiện ở tab Tài khoản', panel.slice(0, 200).replace(/\s+/g, ' '));
+    expect(panel.includes(SEED.bankName) && panel.includes(SEED.bankAccount), 'hướng dẫn chuyển khoản lấy từ CẤU HÌNH máy chủ (TOPUP_BANK_*)', panel.slice(0, 400).replace(/\s+/g, ' '));
+    expect(/26\.000/.test(panel), 'tỷ giá hiện đúng cấu hình 26.000 ₫ = 1 credit', '');
+
+    const send = async (amount, ref) => {
+      await page.eval('for (const id of ["topup-amount","topup-reference","topup-note"]) { const el = document.getElementById(id); if (el) el.value = ""; }');
+      await page.type('#topup-amount', String(amount));
+      await page.type('#topup-reference', ref);
+      await page.type('#topup-note', 'chuyển thử trong e2e');
+      await page.click('[data-action="topupsubmit"]');
+      await waitFor(`yêu cầu ${ref} hiện trong bảng của tôi`, () => page.eval(`return (document.querySelector('#app')?.innerText || '').includes(${JSON.stringify(ref)});`), { timeoutMs: 15000 });
+    };
+    await send(260000, 'E2E-FT-0001');
+    const notice = await page.text('#topup-notice');
+    expect(/ví CHƯA đổi/.test(notice), 'sau khi gửi: thông báo nói rõ "ví CHƯA đổi, chờ quản trị xác nhận"', notice);
+    await send(52000, 'E2E-FT-0002');
+    const bar1 = await page.text('#account-bar');
+    expect(/\b0 credit/.test(bar1), 'số dư VẪN 0 credit sau 2 yêu cầu (luật #1: không tự cộng tiền)', bar1.replace(/\s+/g, ' '));
+    expect((await page.text('#app')).split('Chờ quản trị xác nhận').length - 1 >= 2, 'bảng của tôi có 2 dòng "Chờ quản trị xác nhận"', '');
+    await page.scrollTo('#topup-panel');
+    await shot('01-member-gui-yeu-cau');
+
+    await uiLogout();
+    await uiLogin(SEED.ownerEmail, SEED.ownerPassword);
+    await page.eval('location.hash = "#/quantri";');
+    await waitFor('danh sách yêu cầu chờ duyệt có 2 dòng', () => page.eval('return document.querySelectorAll(\'[data-action="topupreview"]\').length >= 2;'), { timeoutMs: 15000 });
+    const idOf = (ref) => page.eval(`
+      const tr = [...document.querySelectorAll('tr')].find((r) => r.innerText.includes(${JSON.stringify(ref)}));
+      return tr ? tr.querySelector('[data-action="topupreview"]')?.dataset.id || null : null;`);
+    const okId = await idOf('E2E-FT-0001');
+    const noId = await idOf('E2E-FT-0002');
+    expect(okId && noId, 'tìm được hai yêu cầu theo mã giao dịch trên trang Quản trị', `${okId} · ${noId}`);
+    expect((await page.text('#app')).includes(SEED.memberEmail), 'bảng Quản trị hiện EMAIL người nạp (không phải UUID)', '');
+
+    await page.click(`[data-action="topupreview"][data-id="${okId}"]`);
+    await waitFor('hộp xác nhận hiện ra', () => page.eval('return Boolean(document.querySelector(\'[data-action="topupconfirm"]\'));'), { timeoutMs: 8000 });
+    const box = await page.eval('return document.querySelector(\'[data-action="topupconfirm"]\').closest(".notice").innerText;');
+    expect(/cộng 10 credit/.test(box) && /26\.000/.test(box), 'XÁC NHẬN hiện số credit sẽ cộng (10) + tỷ giá đang dùng (26.000 ₫)', box.replace(/\s+/g, ' '));
+    await shot('02-owner-hop-xac-nhan');
+    await page.click(`[data-action="topupconfirm"][data-id="${okId}"]`);
+    await waitFor('thông báo đã cộng credit', () => page.eval('return /Đã cộng 10 credit/.test(document.querySelector("#admin-notice")?.innerText || "");'), { timeoutMs: 15000 });
+    expect(true, 'owner XÁC NHẬN ⇒ "Đã cộng 10 credit"', await page.text('#admin-notice'));
+
+    await waitFor('nút TỪ CHỐI… của yêu cầu thứ hai còn đó', () => page.eval(`return Boolean(document.querySelector('[data-action="topuprejectopen"][data-id="${noId}"]'));`), { timeoutMs: 15000 });
+    await page.click(`[data-action="topuprejectopen"][data-id="${noId}"]`);
+    await waitFor('ô lý do từ chối hiện ra', () => page.eval('return Boolean(document.querySelector("#topup-reject-reason"));'), { timeoutMs: 8000 });
+    await page.type('#topup-reject-reason', 'không thấy giao dịch này trong sao kê');
+    await page.click(`[data-action="topupreject"][data-id="${noId}"]`);
+    await waitFor('thông báo đã từ chối', () => page.eval('return /TỪ CHỐI/.test(document.querySelector("#admin-notice")?.innerText || "");'), { timeoutMs: 15000 });
+    expect(/KHÔNG có dòng sổ nào/.test(await page.text('#admin-notice')), 'TỪ CHỐI ⇒ nói rõ KHÔNG có dòng sổ nào được ghi', await page.text('#admin-notice'));
+    await shot('03-owner-da-duyet');
+
+    await uiLogout();
+    await uiLogin(SEED.memberEmail, SEED.memberPassword);
+    await page.eval('location.hash = "#/taikhoan";');
+    await waitFor('bảng yêu cầu của tôi nạp xong', () => page.eval('return /Đã cộng credit/.test(document.querySelector("#app")?.innerText || "");'), { timeoutMs: 15000 });
+    const txt = await page.text('#app');
+    expect(/Đã cộng credit/.test(txt) && /Bị từ chối/.test(txt), 'member thấy một yêu cầu "Đã cộng credit" và một "Bị từ chối"', '');
+    const bar2 = await page.text('#account-bar');
+    expect(/\b10 credit/.test(bar2), 'số dư member = 10 credit (đúng 260.000 ₫ / 26.000)', bar2.replace(/\s+/g, ' '));
+    await page.scrollTo('#topup-panel');
+    await shot('04-member-thay-so-du');
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // LUỒNG 7 — Đăng bài Facebook (MVP-07, dry-run): owner tạo & gửi duyệt → DUYỆT → ĐĂNG ⇒ id thử
+  // ───────────────────────────────────────────────────────────────────────────
+  await flow('f7', 'Đăng bài (MVP-07): băng "CHẾ ĐỘ THỬ" → TẠO & GỬI DUYỆT → DUYỆT → ĐĂNG ⇒ "id thử — không có bài thật"', async ({ expect, shot }) => {
+    await uiLogout();
+    await uiLogin(SEED.ownerEmail, SEED.ownerPassword);
+    await page.eval('location.hash = "#/dangbai";');
+    await waitFor('ô chọn job nguồn có job đã gieo', () => page.eval(`return Boolean(document.querySelector('#pub-job option[value="${SEED.jobId}"]'));`), { timeoutMs: 15000 });
+    expect(/CHẾ ĐỘ THỬ — không đăng thật/.test(await page.text('#app')), 'băng "CHẾ ĐỘ THỬ — không đăng thật" hiện ở tab Đăng bài', '');
+    await page.setSelect('#pub-job', SEED.jobId);
+    await shot('01-tab-dang-bai');
+    await page.click('[data-action="pubcreatesubmit"]');
+    await waitFor('bài mới hiện với nút DUYỆT', () => page.eval('return Boolean(document.querySelector(\'[data-action="pubapprove"]:not([disabled])\'));'), { timeoutMs: 15000 });
+    const pid = await page.eval('return document.querySelector(\'[data-action="pubapprove"]:not([disabled])\').dataset.id;');
+    expect(pid, 'TẠO & GỬI DUYỆT tạo ra một bài chờ duyệt', pid);
+    await page.click(`[data-action="pubapprove"][data-id="${pid}"]`);
+    await waitFor('nút ĐĂNG bấm được sau khi duyệt', () => page.eval(`const b = document.querySelector('[data-action="pubpublish"][data-id="${pid}"]'); return Boolean(b && !b.disabled);`), { timeoutMs: 15000 });
+    await page.click(`[data-action="pubpublish"][data-id="${pid}"]`);
+    await waitFor('kết quả đăng hiện mã bài', () => page.eval('return /id thử — không có bài thật/.test(document.querySelector("#app")?.innerText || "");'), { timeoutMs: 20000 });
+    const card = await page.eval(`return document.querySelector('[data-pub-item="${pid}"]')?.innerText || document.querySelector('#app').innerText;`);
+    expect(/dry-[0-9a-f]+/.test(card), 'mã bài có tiền tố "dry-" và được ghi rõ "id thử — không có bài thật"', card.slice(0, 300).replace(/\s+/g, ' '));
+    expect(!/mở bài trên Facebook/.test(card), 'KHÔNG có link "mở bài trên Facebook" cho bài thử', '');
+    await page.scrollTo(`[data-pub-item="${pid}"]`);
+    await shot('02-da-dang-thu');
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // LUỒNG 8 — Đăng sàn (MVP-08, dry-run): thiếu trường ⇒ 422 từng dòng → bổ sung → DUYỆT → ĐĂNG → ĐỒNG BỘ → PAYLOAD
+  // ───────────────────────────────────────────────────────────────────────────
+  await flow('f8', 'Đăng sàn (MVP-08): TẠO BÀI thiếu trường ⇒ issues[] từng dòng → bổ sung → DUYỆT → ĐĂNG (dry-) → ĐỒNG BỘ → XEM PAYLOAD', async ({ expect, shot }) => {
+    // Luồng tự đăng nhập lại: không dựa vào trạng thái phiên do luồng trước để lại.
+    await uiLogout();
+    await uiLogin(SEED.ownerEmail, SEED.ownerPassword);
+    await page.eval('location.hash = "#/dangsan";');
+    await waitFor('ô chọn job nguồn của tab Đăng sàn có job đã gieo', () => page.eval(`return Boolean(document.querySelector('#mk-job-id option[value="${SEED.jobId}"]'));`), { timeoutMs: 15000 });
+    expect(Boolean(await page.eval('return document.querySelector(\'[data-mk-banner="dry-run"]\');')), 'băng "CHẾ ĐỘ THỬ — không đăng thật" (data-mk-banner=dry-run) hiện ở form', '');
+    const chips = await page.text('#app');
+    expect(/shopee · chưa có token/.test(chips) && /tiktokshop · chưa có token/.test(chips), 'Shopee/TikTok Shop hiện "chưa có token" — không giả vờ sẵn sàng', '');
+    await page.setSelect('#mk-job-id', SEED.jobId);
+    await page.click('[data-action="mkcreate"]');
+    await waitFor('422 hiện danh sách lỗi kiểm tra', () => page.eval('return document.querySelectorAll("#mk-error [data-mk-issue]").length > 0;'), { timeoutMs: 15000 });
+    const fields = await page.eval('return [...document.querySelectorAll("#mk-error [data-mk-issue]")].map((li) => li.dataset.mkIssue);');
+    for (const f of ['price_vnd', 'stock', 'weight_g', 'category_id']) expect(fields.includes(f), `issues[] nêu đúng trường thiếu "${f}" thành MỘT DÒNG riêng`, JSON.stringify(fields));
+    await page.scrollTo('#mk-error');
+    await shot('01-422-tung-dong');
+
+    await page.type('#mk-price-vnd', '199000');
+    await page.type('#mk-stock', '5');
+    await page.type('#mk-weight-g', '250');
+    await page.type('#mk-category-id', '100001');
+    await page.click('[data-action="mkcreate"]');
+    await waitFor('bài đăng sàn được tạo', () => page.eval('return /Đã tạo bài/.test(document.querySelector("#mk-notice")?.innerText || "");'), { timeoutMs: 15000 });
+    const lid = await waitFor('dòng listing hiện trong bảng', () => page.eval('return document.querySelector("[data-mk-listing]")?.dataset.mkListing || null;'), { timeoutMs: 10000 });
+    const reason = await page.eval(`return document.querySelector('[data-action="mkpublish"][data-id="${lid}"]').dataset.mkReason || '';`);
+    expect(/chưa được DUYỆT/.test(reason), 'nút ĐĂNG khoá kèm lý do "Bài chưa được DUYỆT"', reason);
+    await page.click(`[data-action="mkapprove"][data-id="${lid}"]`);
+    await waitFor('nút ĐĂNG mở khoá sau khi duyệt', () => page.eval(`const b = document.querySelector('[data-action="mkpublish"][data-id="${lid}"]'); return Boolean(b && !b.disabled);`), { timeoutMs: 15000 });
+    await page.click(`[data-action="mkpublish"][data-id="${lid}"]`);
+    await waitFor('thông báo đã "đăng" ở chế độ thử', () => page.eval('return /đã "đăng" ở chế độ thử/.test(document.querySelector("#mk-notice")?.innerText || "");'), { timeoutMs: 20000 });
+    const row = await page.eval(`return document.querySelector('[data-mk-listing="${lid}"]').innerText;`);
+    expect(/dry-[0-9a-f]{16}/.test(row) && /THỬ/.test(row), 'dòng listing có mã dry-… và nhãn THỬ', row.slice(0, 300).replace(/\s+/g, ' '));
+    await shot('02-da-dang-thu');
+    await page.click(`[data-action="mksync"][data-id="${lid}"]`);
+    await waitFor('đồng bộ xong', () => page.eval('return /Đã đọc từ sàn/.test(document.querySelector("#mk-notice")?.innerText || "");'), { timeoutMs: 15000 });
+    expect(/199\.000/.test(await page.text('#mk-notice')), 'ĐỒNG BỘ đọc về đúng giá 199.000 ₫ (chế độ thử)', await page.text('#mk-notice'));
+    await page.click(`[data-action="mkpayload"][data-id="${lid}"]`);
+    await waitFor('hộp payload nạp xong', () => page.eval('return /previews/.test(document.querySelector("#mk-payload")?.innerText || "");'), { timeoutMs: 15000 });
+    // textContent, không innerText: tiêu đề h3 bị CSS viết HOA nên innerText ra "ÁNH XẠ" (đã vấp lượt 2).
+    const pl = await page.eval('return document.querySelector("#mk-payload")?.textContent || "";');
+    expect(/KHÔNG ánh xạ được/.test(pl) && /logistic_info/.test(pl), 'XEM PAYLOAD hiện payload + danh sách trường KHÔNG ánh xạ được', '');
+    await page.scrollTo('#mk-payload');
+    await shot('03-xem-payload');
+  }, { allowConsole: [/status of 422/], allowReason: 'f8 CỐ Ý bấm TẠO BÀI khi thiếu trường để kiểm 422 PREFLIGHT_FAILED; Chrome tự ghi một dòng "Failed to load resource … 422".' });
 
   // ── Báo cáo ───────────────────────────────────────────────────────────────
   const summary = {
@@ -543,7 +825,9 @@ async function main() {
       not_implemented: results.filter((r) => r.status === 'not_implemented').length,
     },
     consoleAll: page.console,
-    consoleErrorsAll: page.realErrors({ ignore: IGNORED_CONSOLE }),
+    // Lỗi console toàn phiên, ĐÃ bỏ các dòng mà một luồng khai là cố ý gây ra (xem `flows[].allowedConsole`).
+    consoleErrorsAll: page.realErrors({ ignore: [...IGNORED_CONSOLE, ...INTENTIONAL_CONSOLE] }),
+    consoleErrorsIntentional: page.realErrors({ ignore: IGNORED_CONSOLE }).filter((e) => INTENTIONAL_CONSOLE.some((re) => re.test(e.text))),
     network4xx5xx: page.network.filter((n) => n.status >= 400),
     downloads: page.downloads,
     flows: results,

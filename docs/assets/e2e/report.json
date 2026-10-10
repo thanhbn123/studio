@@ -1,53 +1,94 @@
 {
   "meta": {
-    "at": "2026-10-09T08:10:12.576Z",
+    "at": "2026-10-10T02:23:51.105Z",
     "chrome": "Chrome/154.0.8037.98",
     "chromeBinary": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
-    "headless": false,
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/154.0.0.0 Safari/537.36",
+    "headless": true,
     "node": "v26.7.0",
-    "base": "http://127.0.0.1:56787",
-    "fixture": "/Users/viporder/orca/workspaces/vip-product-studio/e2e-browser-ui/test/fixtures/headphones.png"
+    "base": "http://127.0.0.1:59779",
+    "fixture": "/Users/viporder/code/vip-product-studio-tiep/test/fixtures/headphones.png",
+    "seeded": {
+      "owner_email": "owner-e2e@example.test",
+      "member_email": "member-e2e@example.test",
+      "job_id": "4071719a-9c84-4c85-ac40-67ad1cb29967",
+      "note": "owner + job nội dung gieo thẳng vào SQLite e2e; mật khẩu ngẫu nhiên mỗi lần chạy, không ghi ra file"
+    }
   },
   "totals": {
-    "flows": 5,
-    "passed": 4,
+    "flows": 8,
+    "passed": 8,
     "failed": 0,
-    "not_implemented": 1
+    "not_implemented": 0
   },
-  "consoleAll": [],
+  "consoleAll": [
+    {
+      "kind": "log.network",
+      "level": "error",
+      "text": "Failed to load resource: net::ERR_NAME_NOT_RESOLVED https://img.example.com/e2e/tai-nghe-1.jpg"
+    },
+    {
+      "kind": "log.network",
+      "level": "error",
+      "text": "Failed to load resource: the server responded with a status of 422 (Unprocessable Entity) http://127.0.0.1:59779/api/marketplace/listings"
+    }
+  ],
   "consoleErrorsAll": [],
-  "network4xx5xx": [],
+  "consoleErrorsIntentional": [
+    {
+      "kind": "log.network",
+      "level": "error",
+      "text": "Failed to load resource: net::ERR_NAME_NOT_RESOLVED https://img.example.com/e2e/tai-nghe-1.jpg"
+    },
+    {
+      "kind": "log.network",
+      "level": "error",
+      "text": "Failed to load resource: the server responded with a status of 422 (Unprocessable Entity) http://127.0.0.1:59779/api/marketplace/listings"
+    }
+  ],
+  "network4xx5xx": [
+    {
+      "url": "http://127.0.0.1:59779/api/marketplace/listings",
+      "status": 422,
+      "type": "Fetch"
+    }
+  ],
   "downloads": [
     {
-      "guid": "1695baab-38d8-498d-a40f-379c0492705d",
-      "url": "http://127.0.0.1:56787/api/imagelab/assets/71f418c3-caed-4c42-bf36-ca11c20a9632/file",
-      "suggested": "imagelab-rendered-71f418c3.png",
+      "guid": "219823f0-847b-49bf-97dd-b595bf4e7ba2",
+      "url": "http://127.0.0.1:59779/api/imagelab/assets/4aae2c23-7daa-42c5-b5e8-7c0988f81094/file",
+      "suggested": "imagelab-rendered-4aae2c23.png",
       "state": "completed"
     },
     {
-      "guid": "ffb1e095-7a39-4bec-8b14-078089687efd",
-      "url": "http://127.0.0.1:56787/api/videostudio/assets/33fe466a-b4a2-4f5b-b8d3-91bc3df0d382/file",
-      "suggested": "videostudio-rendered-33fe466a.gif",
+      "guid": "cedcf4cc-3eff-4301-8b05-e557ad869e61",
+      "url": "http://127.0.0.1:59779/api/videostudio/assets/4f3dacbf-3ea5-4a0e-a02b-ad6dcfb96e51/file",
+      "suggested": "videostudio-rendered-4f3dacbf.gif",
       "state": "completed"
     },
     {
-      "guid": "948805e8-1260-4445-8bc5-5f5d581cd31a",
-      "url": "http://127.0.0.1:56787/api/imagelab/assets/decf9a25-adbc-42c2-8fdb-6109e5ce9ee3/file",
-      "suggested": "imagelab-rendered-decf9a25.png",
+      "guid": "0c6ca892-7bcd-4494-86bf-f322e619ca24",
+      "url": "http://127.0.0.1:59779/api/imagelab/assets/a334395d-20d4-4e1c-b844-1d51a97dda1b/file",
+      "suggested": "imagelab-rendered-a334395d.png",
+      "state": "completed"
+    },
+    {
+      "guid": "4b52e3c9-8db8-4b09-b4e0-8b6c8a14e593",
+      "url": "http://127.0.0.1:59779/api/exports/jobs/4071719a-9c84-4c85-ac40-67ad1cb29967/bundle",
+      "suggested": "content-4071719a-20261010-0924.zip",
       "state": "completed"
     }
   ],
   "flows": [
     {
       "id": "f1",
-      "title": "4 tab render trên DOM thật, không lỗi console",
+      "title": "6 tab + Tài khoản + Quản trị render trên DOM thật, không lỗi console",
       "status": "passed",
       "checks": [
         {
           "ok": true,
           "label": "trang chạy trong Chrome thật",
-          "detail": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+          "detail": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/154.0.0.0 Safari/537.36"
         },
         {
           "ok": true,
@@ -96,6 +137,26 @@
         },
         {
           "ok": true,
+          "label": "tab Đăng bài (#/dangbai) vẽ ra nội dung",
+          "detail": "588 ký tự"
+        },
+        {
+          "ok": true,
+          "label": "tab Đăng bài có chữ đặc trưng",
+          "detail": "Đăng bài — Facebook Page Tạo bài từ job đã chạy → owner/admin duyệt tay → mới đăng. Hệ thống KHÔNG BAO GIỜ tự đăng: mỗi bài phải có owner/admin bấm DUYỆT trước"
+        },
+        {
+          "ok": true,
+          "label": "tab Đăng sàn (ẩn danh) (#/dangsan) vẽ ra nội dung",
+          "detail": "208 ký tự"
+        },
+        {
+          "ok": true,
+          "label": "tab Đăng sàn (ẩn danh) có chữ đặc trưng",
+          "detail": "Đăng sàn Đăng sàn cần tài khoản. Đăng lên Shopee/TikTok Shop là hành động ra ngoài, phải có người chịu trách nhiệm — khách ẩn danh không dùng được tab này (máy"
+        },
+        {
+          "ok": true,
           "label": "tab Tài khoản (#/dangnhap) vẽ ra nội dung",
           "detail": "395 ký tự"
         },
@@ -130,12 +191,14 @@
         "docs/assets/e2e/f1-dich-anh.png",
         "docs/assets/e2e/f1-tao-anh.png",
         "docs/assets/e2e/f1-video.png",
+        "docs/assets/e2e/f1-dang-bai.png",
+        "docs/assets/e2e/f1-dang-san.png",
         "docs/assets/e2e/f1-tai-khoan.png",
         "docs/assets/e2e/f1-quan-tri.png"
       ],
-      "started": "2026-10-09T08:10:12.595Z",
+      "started": "2026-10-10T02:23:51.106Z",
       "consoleErrors": [],
-      "finished": "2026-10-09T08:10:20.732Z"
+      "finished": "2026-10-10T02:24:00.984Z"
     },
     {
       "id": "f2",
@@ -160,7 +223,7 @@
         {
           "ok": true,
           "label": "bấm TẠO ẢNH tạo job và điều hướng tới màn job",
-          "detail": "#/taoanh/a91e59c5-53ed-41be-858e-9a0631751e0f"
+          "detail": "#/taoanh/511f1f6e-977a-476c-a77a-39fdca73ae80"
         },
         {
           "ok": true,
@@ -170,27 +233,27 @@
         {
           "ok": true,
           "label": "khối Trước/Sau có >= 2 ảnh",
-          "detail": "[{\"src\":\"/api/imagelab/assets/845b77be-1704-439d-ae2c-92d7072b4b61/file\",\"w\":320,\"h\":320},{\"src\":\"/api/imagelab/assets/71f418c3-caed-4c42-bf36-ca11c20a9632/file\",\"w\":320,\"h\":320}]"
+          "detail": "[{\"src\":\"/api/imagelab/assets/4e073804-6704-4a8c-9a3d-ac724495356b/file\",\"w\":320,\"h\":320},{\"src\":\"/api/imagelab/assets/4aae2c23-7daa-42c5-b5e8-7c0988f81094/file\",\"w\":320,\"h\":320}]"
         },
         {
           "ok": true,
           "label": "cả hai ảnh đều lấy từ endpoint asset thật của máy chủ",
-          "detail": "[\"/api/imagelab/assets/845b77be-1704-439d-ae2c-92d7072b4b61/file\",\"/api/imagelab/assets/71f418c3-caed-4c42-bf36-ca11c20a9632/file\"]"
+          "detail": "[\"/api/imagelab/assets/4e073804-6704-4a8c-9a3d-ac724495356b/file\",\"/api/imagelab/assets/4aae2c23-7daa-42c5-b5e8-7c0988f81094/file\"]"
         },
         {
           "ok": true,
           "label": "cả hai ảnh đều naturalWidth/Height > 0 — TRÌNH DUYỆT GIẢI MÃ THẬT, không phải link vỡ",
-          "detail": "[{\"src\":\"/api/imagelab/assets/845b77be-1704-439d-ae2c-92d7072b4b61/file\",\"w\":320,\"h\":320},{\"src\":\"/api/imagelab/assets/71f418c3-caed-4c42-bf36-ca11c20a9632/file\",\"w\":320,\"h\":320}]"
+          "detail": "[{\"src\":\"/api/imagelab/assets/4e073804-6704-4a8c-9a3d-ac724495356b/file\",\"w\":320,\"h\":320},{\"src\":\"/api/imagelab/assets/4aae2c23-7daa-42c5-b5e8-7c0988f81094/file\",\"w\":320,\"h\":320}]"
         },
         {
           "ok": true,
           "label": "ảnh SAU là BẢN GHI MỚI (asset id khác ảnh gốc) — ảnh gốc bất biến",
-          "detail": "[\"/api/imagelab/assets/845b77be-1704-439d-ae2c-92d7072b4b61/file\",\"/api/imagelab/assets/71f418c3-caed-4c42-bf36-ca11c20a9632/file\"]"
+          "detail": "[\"/api/imagelab/assets/4e073804-6704-4a8c-9a3d-ac724495356b/file\",\"/api/imagelab/assets/4aae2c23-7daa-42c5-b5e8-7c0988f81094/file\"]"
         },
         {
           "ok": true,
           "label": "tệp ảnh tạo (PNG) tải về MỞ ĐƯỢC bằng python3",
-          "detail": "/Users/viporder/orca/workspaces/vip-product-studio/e2e-browser-ui/.e2e-data/downloads/1695baab-38d8-498d-a40f-379c0492705d → PNG OK bytes=1964 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
+          "detail": "/Users/viporder/code/vip-product-studio-tiep/.e2e-data/downloads/219823f0-847b-49bf-97dd-b595bf4e7ba2 → PNG OK bytes=1964 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
         },
         {
           "ok": true,
@@ -204,16 +267,16 @@
         "docs/assets/e2e/f2-03-truoc-sau.png",
         "docs/assets/e2e/f2-04-sau-khi-tai.png"
       ],
-      "started": "2026-10-09T08:10:20.732Z",
+      "started": "2026-10-10T02:24:00.984Z",
       "downloads": [
         {
           "what": "ảnh tạo",
-          "file": "/Users/viporder/orca/workspaces/vip-product-studio/e2e-browser-ui/.e2e-data/downloads/1695baab-38d8-498d-a40f-379c0492705d",
+          "file": "/Users/viporder/code/vip-product-studio-tiep/.e2e-data/downloads/219823f0-847b-49bf-97dd-b595bf4e7ba2",
           "out": "PNG OK bytes=1964 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
         }
       ],
       "consoleErrors": [],
-      "finished": "2026-10-09T08:10:25.295Z"
+      "finished": "2026-10-10T02:24:05.490Z"
     },
     {
       "id": "f3",
@@ -228,7 +291,7 @@
         {
           "ok": true,
           "label": "trình duyệt GIẢI MÃ và PHÁT được GIF trong <img>",
-          "detail": "{\"src\":\"/api/videostudio/assets/33fe466a-b4a2-4f5b-b8d3-91bc3df0d382/file\",\"w\":720,\"h\":1280}"
+          "detail": "{\"src\":\"/api/videostudio/assets/4f3dacbf-3ea5-4a0e-a02b-ad6dcfb96e51/file\",\"w\":720,\"h\":1280}"
         },
         {
           "ok": true,
@@ -248,7 +311,7 @@
         {
           "ok": true,
           "label": "tệp video (GIF) tải về MỞ ĐƯỢC bằng python3",
-          "detail": "/Users/viporder/orca/workspaces/vip-product-studio/e2e-browser-ui/.e2e-data/downloads/ffb1e095-7a39-4bec-8b14-078089687efd → GIF OK bytes=636921 720x1280 frames=48 trailer=True"
+          "detail": "/Users/viporder/code/vip-product-studio-tiep/.e2e-data/downloads/cedcf4cc-3eff-4301-8b05-e557ad869e61 → GIF OK bytes=636921 720x1280 frames=48 trailer=True"
         },
         {
           "ok": true,
@@ -266,16 +329,16 @@
         "docs/assets/e2e/f3-02-gif-ket-qua.png",
         "docs/assets/e2e/f3-03-nhan-khong-co-tieng.png"
       ],
-      "started": "2026-10-09T08:10:25.295Z",
+      "started": "2026-10-10T02:24:05.490Z",
       "downloads": [
         {
           "what": "video GIF",
-          "file": "/Users/viporder/orca/workspaces/vip-product-studio/e2e-browser-ui/.e2e-data/downloads/ffb1e095-7a39-4bec-8b14-078089687efd",
+          "file": "/Users/viporder/code/vip-product-studio-tiep/.e2e-data/downloads/cedcf4cc-3eff-4301-8b05-e557ad869e61",
           "out": "GIF OK bytes=636921 720x1280 frames=48 trailer=True"
         }
       ],
       "consoleErrors": [],
-      "finished": "2026-10-09T08:10:29.902Z"
+      "finished": "2026-10-10T02:24:10.025Z"
     },
     {
       "id": "f4",
@@ -320,7 +383,7 @@
         {
           "ok": true,
           "label": "tệp ảnh dịch (PNG) tải về MỞ ĐƯỢC bằng python3",
-          "detail": "/Users/viporder/orca/workspaces/vip-product-studio/e2e-browser-ui/.e2e-data/downloads/948805e8-1260-4445-8bc5-5f5d581cd31a → PNG OK bytes=2344 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
+          "detail": "/Users/viporder/code/vip-product-studio-tiep/.e2e-data/downloads/0c6ca892-7bcd-4494-86bf-f322e619ca24 → PNG OK bytes=2344 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
         },
         {
           "ok": true,
@@ -334,24 +397,276 @@
         "docs/assets/e2e/f4-03-bang-duyet.png",
         "docs/assets/e2e/f4-04-anh-da-render.png"
       ],
-      "started": "2026-10-09T08:10:29.902Z",
+      "started": "2026-10-10T02:24:10.025Z",
       "downloads": [
         {
           "what": "ảnh dịch",
-          "file": "/Users/viporder/orca/workspaces/vip-product-studio/e2e-browser-ui/.e2e-data/downloads/948805e8-1260-4445-8bc5-5f5d581cd31a",
+          "file": "/Users/viporder/code/vip-product-studio-tiep/.e2e-data/downloads/0c6ca892-7bcd-4494-86bf-f322e619ca24",
           "out": "PNG OK bytes=2344 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
         }
       ],
       "consoleErrors": [],
-      "finished": "2026-10-09T08:10:36.540Z"
+      "finished": "2026-10-10T02:24:14.382Z"
     },
     {
       "id": "f5",
-      "title": "Gói xuất bản .zip ở màn job",
-      "status": "not_implemented",
-      "error": "CHƯA CÓ TRONG BASELINE NÀY. `grep -rni zip` toàn repo (trừ node_modules + package-lock.json) = 0 dòng trên nhánh đang làm. Theo coordinator, tính năng đang nằm ở nhánh `feat/export-bundle` (chưa merge) và còn đang vá lỗi phản biện ⇒ sẽ test sau khi PR gói xuất bản merge. Màn job hiện chỉ có link tải MỘT tệp (<a download>): ảnh dịch · ảnh tạo · video GIF — cả ba ĐÃ được tải thật qua trình duyệt và kiểm MỞ ĐƯỢC bằng python3 ở f2/f3/f4. Hàm `verifyFileOpens()` trong file này ĐÃ hỗ trợ sẵn nhánh ZIP (zipfile.testzip()), nên khi tính năng merge chỉ cần thêm một luồng bấm nút — không phải viết lại hạ tầng.",
-      "checks": [],
-      "shots": []
+      "title": "Gói xuất bản (.zip): owner đăng nhập bằng bàn phím thật → màn job nội dung → TẢI GÓI → zip mở được, có MANIFEST.json",
+      "status": "passed",
+      "checks": [
+        {
+          "ok": true,
+          "label": "đăng nhập owner bằng form thật thành công",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "tệp gói xuất bản (.zip) tải về MỞ ĐƯỢC bằng python3",
+          "detail": "/Users/viporder/code/vip-product-studio-tiep/.e2e-data/downloads/4b52e3c9-8db8-4b09-b4e0-8b6c8a14e593 → ZIP OK bytes=3652 entries=5 testzip=None"
+        },
+        {
+          "ok": true,
+          "label": "gói có MANIFEST.json (tự khai bước nào là dữ liệu giả)",
+          "detail": "[\"MANIFEST.json\", \"noi-dung/noi-dung.json\", \"noi-dung/noi-dung.txt\", \"bang-chung/usage.json\", \"bang-chung/evidence.json\"]\n"
+        },
+        {
+          "ok": true,
+          "label": "MANIFEST.json khai đúng job_id của job đã mở",
+          "detail": "{\"manifest_version\":1,\"generated_at\":\"2026-10-10T02:24:15.103Z\",\"filename\":\"content-4071719a-20261010-0924.zip\",\"job\":{\"id\":\"4071719a-9c84-4c85-ac40-67ad1cb29967\",\"kind\":\"content\",\"status\":\"succeeded\""
+        },
+        {
+          "ok": true,
+          "label": "không có lỗi console trong luồng này",
+          "detail": ""
+        }
+      ],
+      "shots": [
+        "docs/assets/e2e/f5-01-panel-goi-xuat-ban.png",
+        "docs/assets/e2e/f5-02-sau-khi-tai-goi.png"
+      ],
+      "started": "2026-10-10T02:24:14.382Z",
+      "allowedConsole": {
+        "patterns": [
+          "/ERR_NAME_NOT_RESOLVED https:\\/\\/img\\.example\\.com\\//"
+        ],
+        "reason": "job gieo dùng ảnh https://img.example.com/… (tên miền DÀNH RIÊNG theo RFC 2606, không bao giờ phân giải) để e2e không tải ảnh từ CDN sàn thật; màn job vẽ ảnh sản phẩm nên Chrome ghi một dòng ERR_NAME_NOT_RESOLVED."
+      },
+      "downloads": [
+        {
+          "what": "gói xuất bản",
+          "file": "/Users/viporder/code/vip-product-studio-tiep/.e2e-data/downloads/4b52e3c9-8db8-4b09-b4e0-8b6c8a14e593",
+          "out": "ZIP OK bytes=3652 entries=5 testzip=None",
+          "entries": [
+            "MANIFEST.json",
+            "noi-dung/noi-dung.json",
+            "noi-dung/noi-dung.txt",
+            "bang-chung/usage.json",
+            "bang-chung/evidence.json"
+          ]
+        }
+      ],
+      "consoleErrors": [],
+      "finished": "2026-10-10T02:24:15.657Z"
+    },
+    {
+      "id": "f6",
+      "title": "Nạp credit (MVP-06): member gửi 2 yêu cầu → ví CHƯA đổi → owner XÁC NHẬN 1 + TỪ CHỐI 1 → member thấy +10 credit",
+      "status": "passed",
+      "checks": [
+        {
+          "ok": true,
+          "label": "câu nói thật \"Tiền vào ví chỉ sau khi quản trị xác nhận\" hiện ở tab Tài khoản",
+          "detail": "Nạp credit (chuyển khoản tay) Tiền vào ví chỉ sau khi quản trị xác nhận — hệ thống không tự biết tiền đã về tài khoản (không có cổng thanh toán, không có webhook ngân hàng). Giai đoạn này CHƯA có cổn"
+        },
+        {
+          "ok": true,
+          "label": "hướng dẫn chuyển khoản lấy từ CẤU HÌNH máy chủ (TOPUP_BANK_*)",
+          "detail": "Nạp credit (chuyển khoản tay) Tiền vào ví chỉ sau khi quản trị xác nhận — hệ thống không tự biết tiền đã về tài khoản (không có cổng thanh toán, không có webhook ngân hàng). Giai đoạn này CHƯA có cổng thanh toán: bạn chuyển khoản TAY theo hướng dẫn bên dưới rồi gửi yêu cầu nạp; credit vào ví sau khi quản trị XÁC NHẬN. 1 · CHUYỂN KHOẢN THEO HƯỚNG DẪN CỦA QUẢN TRỊ Ngân hàng NGÂN HÀNG THỬ (E2E) Số "
+        },
+        {
+          "ok": true,
+          "label": "tỷ giá hiện đúng cấu hình 26.000 ₫ = 1 credit",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "sau khi gửi: thông báo nói rõ \"ví CHƯA đổi, chờ quản trị xác nhận\"",
+          "detail": "Đã gửi yêu cầu nạp 260.000 ₫ (≈ 10 credit) — ví CHƯA đổi, chờ quản trị xác nhận."
+        },
+        {
+          "ok": true,
+          "label": "số dư VẪN 0 credit sau 2 yêu cầu (luật #1: không tự cộng tiền)",
+          "detail": "member-e2e@example.test · 0 credit (USD) Tài khoản Đăng xuất"
+        },
+        {
+          "ok": true,
+          "label": "bảng của tôi có 2 dòng \"Chờ quản trị xác nhận\"",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "tìm được hai yêu cầu theo mã giao dịch trên trang Quản trị",
+          "detail": "0b7fd676-742e-4f07-b02c-31690464fc16 · ba686dcb-3469-4038-955f-7ed242042ad9"
+        },
+        {
+          "ok": true,
+          "label": "bảng Quản trị hiện EMAIL người nạp (không phải UUID)",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "XÁC NHẬN hiện số credit sẽ cộng (10) + tỷ giá đang dùng (26.000 ₫)",
+          "detail": "Xác nhận cộng 10 credit cho member-e2e@example.test? Tỷ giá đang dùng 26.000 ₫ = 1 credit, tiền đã chuyển 260.000 ₫. Hãy đối soát mã giao dịch E2E-FT-0001 với sao kê ngân hàng TRƯỚC khi xác nhận — hệ thống không tự biết tiền đã về. XÁC NHẬN CỘNG CREDIT Huỷ"
+        },
+        {
+          "ok": true,
+          "label": "owner XÁC NHẬN ⇒ \"Đã cộng 10 credit\"",
+          "detail": "Đã cộng 10 credit cho 2cbf41c4-691c-4167-8ba5-03e886d914f5 (số dư mới: 10 credit (USD))."
+        },
+        {
+          "ok": true,
+          "label": "TỪ CHỐI ⇒ nói rõ KHÔNG có dòng sổ nào được ghi",
+          "detail": "Đã TỪ CHỐI yêu cầu ba686dcb-3469-4038-955f-7ed242042ad9 — KHÔNG có dòng sổ nào được ghi."
+        },
+        {
+          "ok": true,
+          "label": "member thấy một yêu cầu \"Đã cộng credit\" và một \"Bị từ chối\"",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "số dư member = 10 credit (đúng 260.000 ₫ / 26.000)",
+          "detail": "member-e2e@example.test · 10 credit (USD) Tài khoản Đăng xuất"
+        },
+        {
+          "ok": true,
+          "label": "không có lỗi console trong luồng này",
+          "detail": ""
+        }
+      ],
+      "shots": [
+        "docs/assets/e2e/f6-01-member-gui-yeu-cau.png",
+        "docs/assets/e2e/f6-02-owner-hop-xac-nhan.png",
+        "docs/assets/e2e/f6-03-owner-da-duyet.png",
+        "docs/assets/e2e/f6-04-member-thay-so-du.png"
+      ],
+      "started": "2026-10-10T02:24:15.657Z",
+      "consoleErrors": [],
+      "finished": "2026-10-10T02:24:19.524Z"
+    },
+    {
+      "id": "f7",
+      "title": "Đăng bài (MVP-07): băng \"CHẾ ĐỘ THỬ\" → TẠO & GỬI DUYỆT → DUYỆT → ĐĂNG ⇒ \"id thử — không có bài thật\"",
+      "status": "passed",
+      "checks": [
+        {
+          "ok": true,
+          "label": "băng \"CHẾ ĐỘ THỬ — không đăng thật\" hiện ở tab Đăng bài",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "TẠO & GỬI DUYỆT tạo ra một bài chờ duyệt",
+          "detail": "927f53ea-1b15-4f7f-8e80-97b1277a83ae"
+        },
+        {
+          "ok": true,
+          "label": "mã bài có tiền tố \"dry-\" và được ghi rõ \"id thử — không có bài thật\"",
+          "detail": "Đã đăng facebook_page THỬ đã thử 1 lượt 2026-10-10T02:24:20.371Z Nghe rõ, đeo êm cả ngày Tai nghe chụp tai không dây, gập gọn. Dữ liệu gieo cho e2e. • Đệm tai mềm • Gập gọn bỏ túi Tai nghe chụp tai không dây — dữ liệu gieo e2e. #tainghe #e2e Bài chỉ có chữ (không kèm ảnh/video). Job nguồn 4071"
+        },
+        {
+          "ok": true,
+          "label": "KHÔNG có link \"mở bài trên Facebook\" cho bài thử",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "không có lỗi console trong luồng này",
+          "detail": ""
+        }
+      ],
+      "shots": [
+        "docs/assets/e2e/f7-01-tab-dang-bai.png",
+        "docs/assets/e2e/f7-02-da-dang-thu.png"
+      ],
+      "started": "2026-10-10T02:24:19.524Z",
+      "consoleErrors": [],
+      "finished": "2026-10-10T02:24:21.543Z"
+    },
+    {
+      "id": "f8",
+      "title": "Đăng sàn (MVP-08): TẠO BÀI thiếu trường ⇒ issues[] từng dòng → bổ sung → DUYỆT → ĐĂNG (dry-) → ĐỒNG BỘ → XEM PAYLOAD",
+      "status": "passed",
+      "checks": [
+        {
+          "ok": true,
+          "label": "băng \"CHẾ ĐỘ THỬ — không đăng thật\" (data-mk-banner=dry-run) hiện ở form",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "Shopee/TikTok Shop hiện \"chưa có token\" — không giả vờ sẵn sàng",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "issues[] nêu đúng trường thiếu \"price_vnd\" thành MỘT DÒNG riêng",
+          "detail": "[\"price_vnd\",\"stock\",\"weight_g\",\"category_id\",\"dimensions\"]"
+        },
+        {
+          "ok": true,
+          "label": "issues[] nêu đúng trường thiếu \"stock\" thành MỘT DÒNG riêng",
+          "detail": "[\"price_vnd\",\"stock\",\"weight_g\",\"category_id\",\"dimensions\"]"
+        },
+        {
+          "ok": true,
+          "label": "issues[] nêu đúng trường thiếu \"weight_g\" thành MỘT DÒNG riêng",
+          "detail": "[\"price_vnd\",\"stock\",\"weight_g\",\"category_id\",\"dimensions\"]"
+        },
+        {
+          "ok": true,
+          "label": "issues[] nêu đúng trường thiếu \"category_id\" thành MỘT DÒNG riêng",
+          "detail": "[\"price_vnd\",\"stock\",\"weight_g\",\"category_id\",\"dimensions\"]"
+        },
+        {
+          "ok": true,
+          "label": "nút ĐĂNG khoá kèm lý do \"Bài chưa được DUYỆT\"",
+          "detail": "Bài chưa được DUYỆT"
+        },
+        {
+          "ok": true,
+          "label": "dòng listing có mã dry-… và nhãn THỬ",
+          "detail": "Tai nghe chụp tai không dây (dữ liệu gieo e2e) 4071719a… dry-run thử Đã đăng THỬ dimensions · OPTIONAL_MISSING — Chưa có kích thước gói hàng (cm) — sàn có thể đòi khi tính phí vận chuyển. (cảnh báo, không chặn) 199.000 ₫ tồn 5 dry-8e84af3f23c47c86 XEM PAYLOAD DUYỆT TỪ CHỐI ĐĂNG ĐỒNG BỘ"
+        },
+        {
+          "ok": true,
+          "label": "ĐỒNG BỘ đọc về đúng giá 199.000 ₫ (chế độ thử)",
+          "detail": "Đã đọc từ sàn (chế độ thử): giá 199.000 ₫ · tồn 5. Hệ thống chỉ ĐỌC để đối chiếu, không sửa gì trên sàn."
+        },
+        {
+          "ok": true,
+          "label": "XEM PAYLOAD hiện payload + danh sách trường KHÔNG ánh xạ được",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "không có lỗi console trong luồng này",
+          "detail": ""
+        }
+      ],
+      "shots": [
+        "docs/assets/e2e/f8-01-422-tung-dong.png",
+        "docs/assets/e2e/f8-02-da-dang-thu.png",
+        "docs/assets/e2e/f8-03-xem-payload.png"
+      ],
+      "started": "2026-10-10T02:24:21.543Z",
+      "allowedConsole": {
+        "patterns": [
+          "/status of 422/"
+        ],
+        "reason": "f8 CỐ Ý bấm TẠO BÀI khi thiếu trường để kiểm 422 PREFLIGHT_FAILED; Chrome tự ghi một dòng \"Failed to load resource … 422\"."
+      },
+      "consoleErrors": [],
+      "finished": "2026-10-10T02:24:24.765Z"
     }
   ]
 }

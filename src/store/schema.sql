@@ -395,6 +395,7 @@ CREATE TABLE IF NOT EXISTS topup_requests (
 CREATE TABLE IF NOT EXISTS topup_events (
   id             TEXT PRIMARY KEY,
   request_id     TEXT NOT NULL,
+  seq            INTEGER NOT NULL DEFAULT 0,  -- thứ tự trong MỘT yêu cầu (nhiều sự kiện có thể cùng mili-giây)
   from_status    TEXT,              -- NULL = lúc tạo yêu cầu
   to_status      TEXT NOT NULL,
   actor_user_id  TEXT,
