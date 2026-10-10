@@ -278,6 +278,10 @@ const state = {
     rejectDraft: '',
   },
   creditAlert: null,
+  // Bản kê khai gói xuất bản đang mở { jobId, html } — giữ qua các lần vẽ lại của vòng poll.
+  exportManifest: null,
+  // Ô lọc danh sách Lịch sử (lọc tại trình duyệt trên trang đã tải).
+  historyFilter: { q: '', status: '' },
   // MVP-03 — Tạo ảnh (imagestudio). Tách riêng khỏi `il` để không giẫm chân MVP-02.
   is: {
     jobId: null,
@@ -642,7 +646,13 @@ function onGlobalClick(ev) {
     },
     // ── Gói xuất bản (.zip) — hợp đồng §4 ──
     exportbundle: () => downloadExportBundle(btn.dataset.exportId),
-    exportmanifest: () => openExportManifest(btn.dataset.exportId),
+    // Nhớ bản kê khai ĐANG MỞ: vòng poll 1,5 giây vẽ lại cả màn job, trước đây khối này bị đóng mỗi
+    // lần vẽ (UI-HANDOVER §5 mục 5). `exportPanelHtml` đọc lại `state.exportManifest` khi vẽ.
+    exportmanifest: () => openExportManifest(btn.dataset.exportId).then((r) => {
+      const id = String(btn.dataset.exportId || '');
+      state.exportManifest = r?.ok ? { jobId: id, html: exportManifestHtml(r.data) } : null;
+      return r;
+    }),
     // ── MVP-07 — Đăng bài Facebook Page (duyệt tay) ──
     publish: () => {
       location.hash = '#/dangbai';
@@ -752,7 +762,34 @@ function onGlobalClick(ev) {
       renderMarketplacePage();
     },
   };
-  if (handlers[action]) handlers[action](ev);
+  const handler = handlers[action];
+  if (!handler) return;
+  // CHỐNG BẤM HAI LẦN (UI-HANDOVER §5 mục 4) — một chỗ cho MỌI nút, kể cả nút thêm sau này:
+  // handler trả Promise ⇒ cùng (action, đối tượng) bị bỏ qua cho tới khi lượt đầu xong. Không nuốt
+  // lỗi: `finally` giữ nguyên lỗi của Promise gốc. Đo trước khi sửa: ~20 nút gọi API không có khoá
+  // riêng, trong đó `regenerate`/`vscreate` tốn credit.
+  const key = clickInflightKey(action, btn);
+  if (CLICK_INFLIGHT.has(key)) {
+    ev.preventDefault?.();
+    return;
+  }
+  const ret = handler(ev);
+  if (ret && typeof ret.then === 'function') {
+    CLICK_INFLIGHT.add(key);
+    btn.setAttribute('aria-busy', 'true');
+    ret.finally(() => {
+      CLICK_INFLIGHT.delete(key);
+      btn.removeAttribute('aria-busy');
+    });
+  }
+}
+
+/** Các lượt bấm đang chạy: khoá theo hành động + đối tượng (id bài, id job, id người dùng…). */
+const CLICK_INFLIGHT = new Set();
+
+function clickInflightKey(action, btn) {
+  const d = btn?.dataset || {};
+  return `${action}:${d.id || d.exportId || d.user || d.mode || d.filter || ''}`;
 }
 
 /* ─────────────────────────── Trang chủ (G01) ─────────────────────────── */
@@ -768,7 +805,7 @@ function renderHome() {
       <h1>Dán link sản phẩm, nhận nội dung bán hàng tiếng Việt</h1>
       <p class="sub">Hỗ trợ Taobao · 1688 · Pinduoduo — hệ thống tự nhận diện nguồn.</p>
       <div class="linkbox">
-        <input id="url" type="url" inputmode="url" autocomplete="off" spellcheck="false"
+        <input id="url" type="url" inputmode="url" autocomplete="off" spellcheck="false" aria-label="Link sản phẩm Taobao, 1688 hoặc Pinduoduo"
                placeholder="Dán link sản phẩm Taobao / 1688 / Pinduoduo" />
         <button class="btn primary" data-action="submit" id="go">PHÂN TÍCH SẢN PHẨM</button>
       </div>
@@ -875,16 +912,71 @@ async function submitLink() {
 async function renderHistory() {
   state.view = 'history';
   stopPolling();
-  app.innerHTML = `<section class="panel"><h2>Lịch sử sản phẩm</h2><div id="hist" class="hist"><p class="muted small">Đang tải…</p></div></section>`;
+  app.innerHTML = `<section class="panel"><h2>Lịch sử sản phẩm</h2><div id="hist-filter"></div><div id="hist" class="hist"><p class="muted small">Đang tải…</p></div></section>`;
   try {
-    const data = await api('/api/jobs?limit=100');
-    const box = $('#hist');
-    box.innerHTML = data.items.length
-      ? data.items.map(historyItemHtml).join('')
-      : '<p class="muted small">Chưa có sản phẩm nào.</p>';
+    const data = await api(`/api/jobs?limit=${HISTORY_PAGE}`);
+    state.historyItems = Array.isArray(data?.items) ? data.items : [];
+    state.historyTotal = Number.isFinite(Number(data?.total)) ? Number(data.total) : state.historyItems.length;
+    paintHistory();
   } catch (err) {
     $('#hist').innerHTML = `<div class="notice error">${esc(err.message)}</div>`;
   }
+}
+
+/** Số job tải về cho màn Lịch sử — lọc chỉ chạy TRÊN TRANG NÀY (nói rõ trên màn hình). */
+const HISTORY_PAGE = 100;
+
+/**
+ * LỌC LỊCH SỬ (UI-HANDOVER §5 mục 6) — hàm THUẦN, không đụng DOM: chữ tìm khớp tên sản phẩm, link
+ * nguồn, nguồn, mã job (không phân biệt hoa thường, bỏ dấu tiếng Việt); `status` rỗng = mọi trạng thái.
+ */
+function historyFilterItems(items, filter = {}) {
+  const fold = (v) => String(v ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g, 'd').replace(/Đ/g, 'D').toLowerCase();
+  const q = fold(filter.q).trim();
+  const st = String(filter.status || '');
+  return (Array.isArray(items) ? items : []).filter((it) => {
+    if (st && String(it?.status || '') !== st) return false;
+    if (!q) return true;
+    return [it?.product_name, it?.source_url, it?.source, it?.id].some((v) => fold(v).includes(q));
+  });
+}
+
+/** Thanh lọc + danh sách. Chỉ vẽ lại DANH SÁCH khi gõ, để ô tìm không mất con trỏ. */
+function historyFilterBarHtml(items, filter, total) {
+  const statuses = [...new Set((Array.isArray(items) ? items : []).map((it) => String(it?.status || '')).filter(Boolean))];
+  const opts = ['<option value="">Mọi trạng thái</option>', ...statuses.map((st) =>
+    `<option value="${esc(st)}"${st === filter.status ? ' selected' : ''}>${esc(STATUS_LABEL[st] || st)}</option>`)].join('');
+  const shown = Array.isArray(items) ? items.length : 0;
+  const more = Number(total) > shown
+    ? ` Máy chủ có ${esc(String(total))} job — chỉ lọc trong ${esc(String(shown))} job mới nhất đã tải.`
+    : '';
+  return `<div class="row" style="gap:8px;flex-wrap:wrap;margin:0 0 10px">
+    <label class="small muted" for="hist-q">Tìm</label>
+    <input class="text-input" id="hist-q" type="search" placeholder="tên sản phẩm, link, mã job…" value="${esc(filter.q)}" style="flex:1 1 220px;min-width:0" />
+    <label class="small muted" for="hist-status">Trạng thái</label>
+    <select class="text-input mini" id="hist-status">${opts}</select>
+  </div>
+  <p class="muted small" id="hist-count" style="margin:0 0 8px"></p>${more ? `<p class="muted small" style="margin:0 0 8px">${more}</p>` : ''}`;
+}
+
+function paintHistory({ listOnly = false } = {}) {
+  const items = Array.isArray(state.historyItems) ? state.historyItems : [];
+  const filter = state.historyFilter || { q: '', status: '' };
+  if (!listOnly) {
+    const bar = $('#hist-filter');
+    if (bar) bar.innerHTML = items.length ? historyFilterBarHtml(items, filter, state.historyTotal) : '';
+  }
+  const shown = historyFilterItems(items, filter);
+  const box = $('#hist');
+  if (box) {
+    box.innerHTML = !items.length
+      ? '<p class="muted small">Chưa có sản phẩm nào.</p>'
+      : shown.length
+        ? shown.map(historyItemHtml).join('')
+        : '<p class="muted small">Không có job nào khớp bộ lọc.</p>';
+  }
+  const count = $('#hist-count');
+  if (count) count.textContent = `Hiện ${shown.length} / ${items.length} job đã tải.`;
 }
 
 /* ─────────────────────────── Trang job (G10) ─────────────────────────── */
@@ -5267,6 +5359,9 @@ function exportPanelHtml(jobId, status, opts = {}) {
   // `GET /api/config` §3 chỉ khai `exports = { available, formats }` (KHÔNG có `reason`) ⇒ chỉ đọc cờ.
   if (unavailable) notes.push(`<p class="small" style="margin:6px 0 0">⚠️ ${esc(`${EXPORT_UNCONFIGURED_LINE}. Bấm nút vẫn thử và sẽ hiện đúng lỗi máy chủ trả.`)}</p>`);
   const kind = String(opts.kind || '').trim();
+  // Bản kê khai người dùng đã mở cho ĐÚNG job này (HTML đã escape lúc dựng bởi exportManifestHtml).
+  const memo = state?.exportManifest;
+  const openManifest = id && memo && memo.jobId === id && typeof memo.html === 'string' ? memo.html : '';
   return `<section class="panel export-panel" data-export-kind="${esc(kind)}">
     <div class="spread">
       <div style="min-width:0">
@@ -5279,7 +5374,7 @@ function exportPanelHtml(jobId, status, opts = {}) {
       </div>
     </div>
     <div data-export-error></div>
-    <div data-export-manifest hidden></div>
+    ${openManifest ? `<div data-export-manifest>${openManifest}</div>` : '<div data-export-manifest hidden></div>'}
   </section>`;
 }
 
@@ -6815,6 +6910,13 @@ function wireAuthGlobal() {
     else if (t.id === 'pub-text') state.pub.draft.text = String(t.value ?? '');
     else if (t.id === 'credit-amount') state.auth.creditDraft.amount = String(t.value ?? '');
     else if (t.id === 'credit-note') state.auth.creditDraft.note = String(t.value ?? '');
+    else if (t.id === 'hist-q') {
+      state.historyFilter = { ...(state.historyFilter || {}), q: String(t.value ?? '') };
+      paintHistory({ listOnly: true });
+    } else if (t.id === 'hist-status') {
+      state.historyFilter = { ...(state.historyFilter || {}), status: String(t.value ?? '') };
+      paintHistory({ listOnly: true });
+    }
     // MVP-08 — giữ bản nháp form đăng sàn (`mk-<ten-truong>` → `state.mk.draft.<ten_truong>`).
     else if (t.id === 'mk-reject-reason') state.mk.rejectDraft = String(t.value ?? '');
     else if (t.id.startsWith('mk-')) {
@@ -7559,7 +7661,7 @@ function renderMarketplaceBody() {
     <div class="spread">
       <h2 style="margin:0">Bài đăng sàn${m.total !== null && m.total !== undefined ? ` (${esc(fmtAmount(m.total))})` : ''}</h2>
       <div class="row">
-        <select class="text-input mini" id="mk-filter-status">${statuses}</select>
+        <select class="text-input mini" id="mk-filter-status" aria-label="Lọc bài đăng sàn theo trạng thái">${statuses}</select>
         <button class="btn ghost tiny" data-action="mkreload" type="button">Tải lại</button>
       </div>
     </div>

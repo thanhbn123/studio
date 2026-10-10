@@ -815,6 +815,168 @@ async function main() {
     await shot('03-xem-payload');
   }, { allowConsole: [/status of 422/], allowReason: 'f8 CỐ Ý bấm TẠO BÀI khi thiếu trường để kiểm 422 PREFLIGHT_FAILED; Chrome tự ghi một dòng "Failed to load resource … 422".' });
 
+  // ───────────────────────────────────────────────────────────────────────────
+  // LUỒNG 9 — Khoảng trống UI §5 mục 4/5/6: bản kê khai giữ qua lần vẽ lại · bấm đúp = 1 request · lọc Lịch sử
+  // ───────────────────────────────────────────────────────────────────────────
+  await flow('f9', 'UI §5: "Xem bản kê khai" KHÔNG đóng khi màn job vẽ lại · bấm đúp TẢI GÓI ⇒ đúng 1 request · lọc Lịch sử', async ({ expect, shot }) => {
+    await uiLogout();
+    await uiLogin(SEED.ownerEmail, SEED.ownerPassword);
+    await page.eval(`location.hash = ${JSON.stringify(`#/job/${SEED.jobId}`)};`);
+    await waitFor('nút Xem bản kê khai bấm được', () => page.eval('const b = document.querySelector(\'[data-action="exportmanifest"]\'); return Boolean(b && !b.disabled);'), { timeoutMs: 20000 });
+    await page.click('[data-action="exportmanifest"]');
+    await waitFor('bản kê khai hiện ra', () => page.eval('const b = document.querySelector("[data-export-manifest]"); return Boolean(b && !b.hidden && b.innerText.trim().length > 20);'), { timeoutMs: 15000 });
+    const before = await page.eval('return document.querySelector("[data-export-manifest]").innerText.length;');
+    // Vẽ lại màn job bằng ĐÚNG đường mà vòng poll dùng (route → openJob → renderJob): bắn hashchange.
+    for (let i = 0; i < 3; i += 1) {
+      await page.eval('window.dispatchEvent(new HashChangeEvent("hashchange")); return true;');
+      await sleep(500);
+    }
+    const after = await page.eval('const b = document.querySelector("[data-export-manifest]"); return { hidden: b ? b.hidden : null, len: b ? b.innerText.length : 0 };');
+    expect(after.hidden === false && after.len === before, 'sau 3 lần vẽ lại màn job, khối bản kê khai VẪN MỞ và giữ nguyên nội dung', JSON.stringify({ before, after }));
+    await page.scrollTo('[data-export-manifest]');
+    await shot('01-ban-ke-khai-van-mo');
+
+    // Bấm ĐÚP thật (hai lượt mousePressed/Released liên tiếp, không chờ) vào nút TẢI GÓI.
+    // Nút TẢI GÓI = gọi `/manifest` (fetch) rồi bấm <a download> tới `/bundle` (đường TẢI XUỐNG của Chrome,
+    // không hiện như phản hồi Fetch) ⇒ đếm CẢ hai: lượt gọi manifest + lượt tải xuống thật.
+    const isManifest = (n) => /\/api\/exports\/jobs\/[^/]+\/manifest/.test(n.url);
+    const manBefore = page.network.filter(isManifest).length;
+    const dlBefore = page.downloads.length;
+    const b = await page.box('[data-action="exportbundle"]');
+    for (const clickCount of [1, 2]) {
+      await page.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: b.x, y: b.y, button: 'left', clickCount, buttons: 1 });
+      await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: b.x, y: b.y, button: 'left', clickCount, buttons: 0 });
+    }
+    await waitFor('lượt tải gói bắt đầu', () => page.downloads.length > dlBefore, { timeoutMs: 20000 });
+    await sleep(2500);
+    const mans = page.network.filter(isManifest).slice(manBefore);
+    const dls = page.downloads.slice(dlBefore);
+    expect(mans.length === 1, 'bấm ĐÚP nút TẢI GÓI ⇒ ĐÚNG 1 lượt gọi /manifest (khoá chung trong onGlobalClick)', JSON.stringify(mans.map((x) => x.status)));
+    expect(dls.length === 1, 'bấm ĐÚP ⇒ ĐÚNG 1 lượt tải xuống gói', JSON.stringify(dls.map((d) => d.url)));
+    results.at(-1).doubleClick = { manifest_calls: mans.length, downloads: dls.length };
+
+    await page.eval('location.hash = "#/history";');
+    await waitFor('Lịch sử có thanh lọc', () => page.eval('return Boolean(document.querySelector("#hist-q"));'), { timeoutMs: 15000 });
+    const total = await page.eval('return document.querySelectorAll("#hist .hist-item").length;');
+    expect(total >= 1, 'Lịch sử có ít nhất 1 job', String(total));
+    await page.type('#hist-q', 'GIEO E2E');
+    await sleep(300);
+    const hit = await page.eval('return [...document.querySelectorAll("#hist .hist-item")].map((b) => b.innerText);');
+    expect(hit.length >= 1 && hit.every((t) => /gieo e2e/i.test(t)), 'gõ "GIEO E2E" (khác hoa thường) ⇒ chỉ còn job khớp', JSON.stringify(hit).slice(0, 200));
+    expect(await page.eval('return document.activeElement && document.activeElement.id === "hist-q";'), 'ô tìm GIỮ con trỏ khi danh sách vẽ lại (không vẽ lại cả trang)', '');
+    await page.eval('const el = document.getElementById("hist-q"); el.value = ""; el.dispatchEvent(new Event("input", { bubbles: true })); return true;');
+    await page.type('#hist-q', 'khong-co-job-nao-nhu-the-nay');
+    await sleep(300);
+    expect(/Không có job nào khớp bộ lọc/.test(await page.text('#hist')), 'không khớp ⇒ nói rõ "Không có job nào khớp bộ lọc"', '');
+    expect(/Hiện 0 \//.test(await page.text('#hist-count')), 'bộ đếm hiện "Hiện 0 / N job đã tải"', await page.text('#hist-count'));
+    await page.eval('const el = document.getElementById("hist-q"); el.value = ""; el.dispatchEvent(new Event("input", { bubbles: true })); return true;');
+    await shot('02-loc-lich-su');
+  }, {
+    allowConsole: [/ERR_NAME_NOT_RESOLVED https:\/\/img\.example\.com\//],
+    allowReason: 'màn job của job gieo vẽ ảnh https://img.example.com/… (tên miền dành riêng, không phân giải) — cùng lý do f5.',
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // LUỒNG 10 — Khổ điện thoại 375×812: mọi màn KHÔNG bị cuộn ngang cả trang
+  // ───────────────────────────────────────────────────────────────────────────
+  await flow('f10', 'Mobile 375×812: 11 màn (ẩn danh + owner) không cuộn ngang cả trang, thanh nav vẫn bấm được', async ({ expect, shot }) => {
+    await page.send('Emulation.setDeviceMetricsOverride', { width: 375, height: 812, deviceScaleFactor: 2, mobile: true });
+    try {
+      const screens = [
+        ['#/', 'trang-chu'], ['#/imagelab', 'dich-anh'], ['#/taoanh', 'tao-anh'], ['#/video', 'video'],
+        ['#/history', 'lich-su'], ['#/taikhoan', 'tai-khoan'], ['#/quantri', 'quan-tri'], ['#/dangbai', 'dang-bai'],
+        ['#/dangsan', 'dang-san'], [`#/job/${SEED.jobId}`, 'man-job'], ['#/dangnhap', 'dang-nhap'],
+      ];
+      const bad = [];
+      for (const [hash, name] of screens) {
+        await page.eval(`location.hash = ${JSON.stringify(hash)};`);
+        await sleep(1200);
+        const m = await page.eval(`
+          const de = document.documentElement;
+          const over = [...document.querySelectorAll('body *')].filter((el) => {
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return false;
+            // Bỏ qua phần tử nằm trong vùng ĐƯỢC PHÉP cuộn ngang (bảng trong .il-tablewrap, <pre>).
+            if (el.closest('.il-tablewrap, pre')) return false;
+            return r.right > de.clientWidth + 1;
+          }).slice(0, 3).map((el) => el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') + (el.className && typeof el.className === 'string' ? '.' + el.className.split(' ')[0] : ''));
+          // Chẩn đoán khi tràn: 5 phần tử có mép phải XA nhất (không loại trừ gì) để biết chỗ phải sửa.
+          const widest = de.scrollWidth > de.clientWidth + 1
+            ? [...document.querySelectorAll('body *')].map((el) => ({ el, r: el.getBoundingClientRect() }))
+              .filter((x) => x.r.width > 0).sort((a, b) => b.r.right - a.r.right).slice(0, 5)
+              .map((x) => x.el.tagName.toLowerCase() + (x.el.className && typeof x.el.className === 'string' ? '.' + x.el.className.trim().split(/\s+/).join('.') : '') + '@' + Math.round(x.r.right))
+            : [];
+          // Chữ dài không ngắt (link, mã job) tràn RA NGOÀI hộp của nó: hộp không vượt mà chữ vượt ⇒ dò theo nút chữ.
+          const texts = [];
+          if (de.scrollWidth > de.clientWidth + 1) {
+            const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+            while (w.nextNode() && texts.length < 4) {
+              const n = w.currentNode;
+              if (!n.textContent.trim()) continue;
+              const rg = document.createRange(); rg.selectNodeContents(n);
+              const r = rg.getBoundingClientRect();
+              if (r.right > de.clientWidth + 1) {
+                const host = n.parentElement;
+                texts.push((host.tagName.toLowerCase() + (host.className && typeof host.className === 'string' ? '.' + host.className.trim().split(/\s+/).join('.') : '')) + '@' + Math.round(r.right) + ' «' + n.textContent.trim().slice(0, 50) + '»');
+              }
+            }
+          }
+          return { sw: de.scrollWidth, cw: de.clientWidth, over, widest, texts };`);
+        if (m.sw > m.cw + 1) bad.push({ hash, ...m });
+        await shot(`mobile-${name}`);
+      }
+      expect(bad.length === 0, `cả ${screens.length} màn: scrollWidth ≤ clientWidth (không cuộn ngang cả trang)`, JSON.stringify(bad).slice(0, 400));
+      await page.eval('location.hash = "#/";');
+      await sleep(600);
+      await page.click('[data-action="video"]');
+      await sleep(600);
+      expect((await page.eval('return location.hash;')) === '#/video', 'ở khổ 375 px vẫn bấm CHUỘT THẬT được nút "Video" trên thanh nav', await page.eval('return location.hash;'));
+    } finally {
+      await page.send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
+    }
+  }, {
+    allowConsole: [/ERR_NAME_NOT_RESOLVED https:\/\/img\.example\.com\//],
+    allowReason: 'màn job của job gieo vẽ ảnh https://img.example.com/… — cùng lý do f5.',
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // LUỒNG 11 — A11y TĨNH cơ bản: ô nhập có nhãn, nút có tên, ảnh có alt, trang có lang
+  // ───────────────────────────────────────────────────────────────────────────
+  await flow('f11', 'A11y tĩnh: mọi ô nhập có nhãn, mọi nút có tên đọc được, mọi ảnh có alt, <html lang="vi"> — trên 11 màn', async ({ expect }) => {
+    expect((await page.eval('return document.documentElement.lang;')) === 'vi', '<html lang="vi">', '');
+    const screens = ['#/', '#/imagelab', '#/taoanh', '#/video', '#/history', '#/taikhoan', '#/quantri', '#/dangbai', '#/dangsan', `#/job/${SEED.jobId}`, '#/dangnhap'];
+    const problems = [];
+    for (const hash of screens) {
+      await page.eval(`location.hash = ${JSON.stringify(hash)};`);
+      await sleep(1200);
+      const p = await page.eval(`
+        const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden'; };
+        const nameOf = (el) => (el.getAttribute('aria-label') || el.getAttribute('title') || el.innerText || el.value || '').trim();
+        const labelled = (el) => {
+          if (el.getAttribute('aria-label') || el.getAttribute('aria-labelledby')) return true;
+          if (el.id && document.querySelector('label[for="' + CSS.escape(el.id) + '"]')) return true;
+          return Boolean(el.closest('label'));
+        };
+        const out = [];
+        for (const el of document.querySelectorAll('input:not([type=hidden]):not([type=file]), select, textarea')) {
+          if (visible(el) && !labelled(el)) out.push('ô nhập không nhãn: ' + el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') + (el.placeholder ? ' [placeholder=' + el.placeholder.slice(0, 30) + ']' : ''));
+        }
+        for (const el of document.querySelectorAll('button, [role=button], a[href]')) {
+          if (visible(el) && !nameOf(el)) out.push('nút/liên kết không tên: ' + el.outerHTML.slice(0, 80));
+        }
+        for (const el of document.querySelectorAll('img')) {
+          if (!el.hasAttribute('alt')) out.push('ảnh thiếu alt: ' + (el.getAttribute('src') || '').slice(0, 60));
+        }
+        return out;`);
+      for (const x of p) problems.push(`${hash} → ${x}`);
+    }
+    results.at(-1).a11y = problems;
+    expect(problems.length === 0, 'không có ô nhập thiếu nhãn / nút thiếu tên / ảnh thiếu alt trên 11 màn', problems.slice(0, 12).join(' | '));
+  }, {
+    allowConsole: [/ERR_NAME_NOT_RESOLVED https:\/\/img\.example\.com\//],
+    allowReason: 'màn job của job gieo vẽ ảnh https://img.example.com/… — cùng lý do f5.',
+  });
+
   // ── Báo cáo ───────────────────────────────────────────────────────────────
   const summary = {
     meta,

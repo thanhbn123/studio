@@ -2759,3 +2759,30 @@ thành phần Chrome tự tải (đầu `Cr24`) — nay bám sự kiện `Page.d
 3. Các truy vấn "lấy dòng mới nhất" của `job_queue` (`ORDER BY created_at DESC, id DESC LIMIT 1`) cùng dạng xếp theo
    thời gian + UUID — chưa đo có cần `seq` không (chúng không phải vết hiển thị cho người dùng).
 4. Xác minh tên trường Shopee/TikTok khi có token (§29.4 mục 1) — vẫn chờ Owner.
+
+## 31. Khoảng trống UI (UI-HANDOVER §5): bấm đúp, bản kê khai bị đóng, mobile, a11y tĩnh, lọc Lịch sử
+
+Nhánh `thanhbn123/ui-khoang-trong` · 10/10/2026 (MacBook, 09:38 → 09:54 theo `date`) · nền `develop` `67158a8`.
+
+| Phép đo | Kết quả |
+|---|---|
+| `env -u DATABASE_URL npm test` | **1376 test · 1337 pass · 0 fail · 39 skipped** (nền `67158a8`: 1365 · 1326 · 0 · 39; +11 ca `test/ui-khoang-trong.test.js`) |
+| `E2E_HEADLESS=1 npm run test:e2e` (Chrome 154) | **11/11 luồng PASS · 0 lỗi console** (f9–f11 mới; lỗi ảnh `img.example.com` khai cố ý theo luồng như f5) |
+| `node tools/verify.mjs` | "Kiểm chứng cục bộ hoàn tất." |
+
+**Đột biến (để chắc câu kiểm bắt được lỗi, không đạt nhờ may):**
+- gỡ khoá `CLICK_INFLIGHT` ⇒ f9 đỏ: bấm ĐÚP sinh **2** lượt gọi `/manifest` (`[200,200]`);
+- gỡ phần nhớ bản kê khai trong `exportPanelHtml` ⇒ f9 đỏ: sau vẽ lại `hidden: true, len: 0`.
+
+**Lỗi thật tìm ra khi đo:** (1) mở "Xem bản kê khai" trên điện thoại làm cả trang rộng **479px ở khổ 375px** (chuỗi JSON
+trong `<li>` không có chỗ ngắt) — sửa bằng `overflow-wrap: anywhere` cho `.panel`, `.notice`; (2) ô dán link trang chủ
+(`#url`) và ô lọc tab Đăng sàn chỉ có placeholder, không có nhãn — thêm `aria-label`.
+
+**Cách đo mobile (f10):** `Emulation.setDeviceMetricsOverride` 375×812, `mobile: true`; tiêu chí `scrollWidth ≤ clientWidth`
+trên 11 màn (ẩn danh + owner). Phạm vi: Chrome giả lập khổ điện thoại, **không phải** điện thoại thật, không phải Safari iOS.
+
+**Cách đo a11y (f11):** TĨNH — ô nhập có `<label for>`/`aria-label`/nằm trong `<label>`; nút/liên kết có tên đọc được;
+`<img>` có `alt`; `<html lang="vi">`. **Không** đo: thứ tự Tab, thao tác chỉ bằng bàn phím, tương phản màu, trình đọc màn hình.
+
+**Chưa làm:** Firefox/Safari (chưa có trình điều khiển) · thanh nav chiếm gần trọn màn hình đầu trên điện thoại ·
+spinner riêng từng nút · lọc Lịch sử phía máy chủ.

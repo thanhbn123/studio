@@ -1,23 +1,23 @@
 {
   "meta": {
-    "at": "2026-10-10T02:23:51.105Z",
+    "at": "2026-10-10T02:53:11.339Z",
     "chrome": "Chrome/154.0.8037.98",
     "chromeBinary": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/154.0.0.0 Safari/537.36",
     "headless": true,
     "node": "v26.7.0",
-    "base": "http://127.0.0.1:59779",
-    "fixture": "/Users/viporder/code/vip-product-studio-tiep/test/fixtures/headphones.png",
+    "base": "http://127.0.0.1:63781",
+    "fixture": "/Users/viporder/code/vip-product-studio-ui5/test/fixtures/headphones.png",
     "seeded": {
       "owner_email": "owner-e2e@example.test",
       "member_email": "member-e2e@example.test",
-      "job_id": "4071719a-9c84-4c85-ac40-67ad1cb29967",
+      "job_id": "2af61135-d106-4923-bbb5-9aafe72c23ca",
       "note": "owner + job nội dung gieo thẳng vào SQLite e2e; mật khẩu ngẫu nhiên mỗi lần chạy, không ghi ra file"
     }
   },
   "totals": {
-    "flows": 8,
-    "passed": 8,
+    "flows": 11,
+    "passed": 11,
     "failed": 0,
     "not_implemented": 0
   },
@@ -30,7 +30,37 @@
     {
       "kind": "log.network",
       "level": "error",
-      "text": "Failed to load resource: the server responded with a status of 422 (Unprocessable Entity) http://127.0.0.1:59779/api/marketplace/listings"
+      "text": "Failed to load resource: the server responded with a status of 422 (Unprocessable Entity) http://127.0.0.1:63781/api/marketplace/listings"
+    },
+    {
+      "kind": "log.network",
+      "level": "error",
+      "text": "Failed to load resource: net::ERR_NAME_NOT_RESOLVED https://img.example.com/e2e/tai-nghe-1.jpg"
+    },
+    {
+      "kind": "log.network",
+      "level": "error",
+      "text": "Failed to load resource: net::ERR_NAME_NOT_RESOLVED https://img.example.com/e2e/tai-nghe-1.jpg"
+    },
+    {
+      "kind": "log.network",
+      "level": "error",
+      "text": "Failed to load resource: net::ERR_NAME_NOT_RESOLVED https://img.example.com/e2e/tai-nghe-1.jpg"
+    },
+    {
+      "kind": "log.network",
+      "level": "error",
+      "text": "Failed to load resource: net::ERR_NAME_NOT_RESOLVED https://img.example.com/e2e/tai-nghe-1.jpg"
+    },
+    {
+      "kind": "log.network",
+      "level": "error",
+      "text": "Failed to load resource: net::ERR_NAME_NOT_RESOLVED https://img.example.com/e2e/tai-nghe-1.jpg"
+    },
+    {
+      "kind": "log.network",
+      "level": "error",
+      "text": "Failed to load resource: net::ERR_NAME_NOT_RESOLVED https://img.example.com/e2e/tai-nghe-1.jpg"
     }
   ],
   "consoleErrorsAll": [],
@@ -43,39 +73,75 @@
     {
       "kind": "log.network",
       "level": "error",
-      "text": "Failed to load resource: the server responded with a status of 422 (Unprocessable Entity) http://127.0.0.1:59779/api/marketplace/listings"
+      "text": "Failed to load resource: the server responded with a status of 422 (Unprocessable Entity) http://127.0.0.1:63781/api/marketplace/listings"
+    },
+    {
+      "kind": "log.network",
+      "level": "error",
+      "text": "Failed to load resource: net::ERR_NAME_NOT_RESOLVED https://img.example.com/e2e/tai-nghe-1.jpg"
+    },
+    {
+      "kind": "log.network",
+      "level": "error",
+      "text": "Failed to load resource: net::ERR_NAME_NOT_RESOLVED https://img.example.com/e2e/tai-nghe-1.jpg"
+    },
+    {
+      "kind": "log.network",
+      "level": "error",
+      "text": "Failed to load resource: net::ERR_NAME_NOT_RESOLVED https://img.example.com/e2e/tai-nghe-1.jpg"
+    },
+    {
+      "kind": "log.network",
+      "level": "error",
+      "text": "Failed to load resource: net::ERR_NAME_NOT_RESOLVED https://img.example.com/e2e/tai-nghe-1.jpg"
+    },
+    {
+      "kind": "log.network",
+      "level": "error",
+      "text": "Failed to load resource: net::ERR_NAME_NOT_RESOLVED https://img.example.com/e2e/tai-nghe-1.jpg"
+    },
+    {
+      "kind": "log.network",
+      "level": "error",
+      "text": "Failed to load resource: net::ERR_NAME_NOT_RESOLVED https://img.example.com/e2e/tai-nghe-1.jpg"
     }
   ],
   "network4xx5xx": [
     {
-      "url": "http://127.0.0.1:59779/api/marketplace/listings",
+      "url": "http://127.0.0.1:63781/api/marketplace/listings",
       "status": 422,
       "type": "Fetch"
     }
   ],
   "downloads": [
     {
-      "guid": "219823f0-847b-49bf-97dd-b595bf4e7ba2",
-      "url": "http://127.0.0.1:59779/api/imagelab/assets/4aae2c23-7daa-42c5-b5e8-7c0988f81094/file",
-      "suggested": "imagelab-rendered-4aae2c23.png",
+      "guid": "4e339c78-a4ca-4a26-b1ac-81d9eb854c1d",
+      "url": "http://127.0.0.1:63781/api/imagelab/assets/50c4e06e-606a-40bb-9a8e-ef8e8fab5a81/file",
+      "suggested": "imagelab-rendered-50c4e06e.png",
       "state": "completed"
     },
     {
-      "guid": "cedcf4cc-3eff-4301-8b05-e557ad869e61",
-      "url": "http://127.0.0.1:59779/api/videostudio/assets/4f3dacbf-3ea5-4a0e-a02b-ad6dcfb96e51/file",
-      "suggested": "videostudio-rendered-4f3dacbf.gif",
+      "guid": "d136a7b8-3e05-41fe-b486-f1c0738dd935",
+      "url": "http://127.0.0.1:63781/api/videostudio/assets/23f10e2c-3ad8-48e0-b031-ce3bb3806193/file",
+      "suggested": "videostudio-rendered-23f10e2c.gif",
       "state": "completed"
     },
     {
-      "guid": "0c6ca892-7bcd-4494-86bf-f322e619ca24",
-      "url": "http://127.0.0.1:59779/api/imagelab/assets/a334395d-20d4-4e1c-b844-1d51a97dda1b/file",
-      "suggested": "imagelab-rendered-a334395d.png",
+      "guid": "3a795b2b-ad22-447c-8848-b283d9ce88cd",
+      "url": "http://127.0.0.1:63781/api/imagelab/assets/43ffe5a7-ab17-462d-aab1-0f6bd85d418a/file",
+      "suggested": "imagelab-rendered-43ffe5a7.png",
       "state": "completed"
     },
     {
-      "guid": "4b52e3c9-8db8-4b09-b4e0-8b6c8a14e593",
-      "url": "http://127.0.0.1:59779/api/exports/jobs/4071719a-9c84-4c85-ac40-67ad1cb29967/bundle",
-      "suggested": "content-4071719a-20261010-0924.zip",
+      "guid": "2b95b798-732d-40e3-a8c8-cd61b1168b55",
+      "url": "http://127.0.0.1:63781/api/exports/jobs/2af61135-d106-4923-bbb5-9aafe72c23ca/bundle",
+      "suggested": "content-2af61135-20261010-0953.zip",
+      "state": "completed"
+    },
+    {
+      "guid": "8f1e6fcc-7729-418d-8922-289e94755a2d",
+      "url": "http://127.0.0.1:63781/api/exports/jobs/2af61135-d106-4923-bbb5-9aafe72c23ca/bundle",
+      "suggested": "content-2af61135-20261010-0953.zip",
       "state": "completed"
     }
   ],
@@ -196,9 +262,9 @@
         "docs/assets/e2e/f1-tai-khoan.png",
         "docs/assets/e2e/f1-quan-tri.png"
       ],
-      "started": "2026-10-10T02:23:51.106Z",
+      "started": "2026-10-10T02:53:11.339Z",
       "consoleErrors": [],
-      "finished": "2026-10-10T02:24:00.984Z"
+      "finished": "2026-10-10T02:53:21.338Z"
     },
     {
       "id": "f2",
@@ -223,7 +289,7 @@
         {
           "ok": true,
           "label": "bấm TẠO ẢNH tạo job và điều hướng tới màn job",
-          "detail": "#/taoanh/511f1f6e-977a-476c-a77a-39fdca73ae80"
+          "detail": "#/taoanh/60238a3b-4b0a-4c0f-81dd-f2cf6074d08a"
         },
         {
           "ok": true,
@@ -233,27 +299,27 @@
         {
           "ok": true,
           "label": "khối Trước/Sau có >= 2 ảnh",
-          "detail": "[{\"src\":\"/api/imagelab/assets/4e073804-6704-4a8c-9a3d-ac724495356b/file\",\"w\":320,\"h\":320},{\"src\":\"/api/imagelab/assets/4aae2c23-7daa-42c5-b5e8-7c0988f81094/file\",\"w\":320,\"h\":320}]"
+          "detail": "[{\"src\":\"/api/imagelab/assets/0d6f6cb0-2917-408c-b366-7b1db4e34500/file\",\"w\":320,\"h\":320},{\"src\":\"/api/imagelab/assets/50c4e06e-606a-40bb-9a8e-ef8e8fab5a81/file\",\"w\":320,\"h\":320}]"
         },
         {
           "ok": true,
           "label": "cả hai ảnh đều lấy từ endpoint asset thật của máy chủ",
-          "detail": "[\"/api/imagelab/assets/4e073804-6704-4a8c-9a3d-ac724495356b/file\",\"/api/imagelab/assets/4aae2c23-7daa-42c5-b5e8-7c0988f81094/file\"]"
+          "detail": "[\"/api/imagelab/assets/0d6f6cb0-2917-408c-b366-7b1db4e34500/file\",\"/api/imagelab/assets/50c4e06e-606a-40bb-9a8e-ef8e8fab5a81/file\"]"
         },
         {
           "ok": true,
           "label": "cả hai ảnh đều naturalWidth/Height > 0 — TRÌNH DUYỆT GIẢI MÃ THẬT, không phải link vỡ",
-          "detail": "[{\"src\":\"/api/imagelab/assets/4e073804-6704-4a8c-9a3d-ac724495356b/file\",\"w\":320,\"h\":320},{\"src\":\"/api/imagelab/assets/4aae2c23-7daa-42c5-b5e8-7c0988f81094/file\",\"w\":320,\"h\":320}]"
+          "detail": "[{\"src\":\"/api/imagelab/assets/0d6f6cb0-2917-408c-b366-7b1db4e34500/file\",\"w\":320,\"h\":320},{\"src\":\"/api/imagelab/assets/50c4e06e-606a-40bb-9a8e-ef8e8fab5a81/file\",\"w\":320,\"h\":320}]"
         },
         {
           "ok": true,
           "label": "ảnh SAU là BẢN GHI MỚI (asset id khác ảnh gốc) — ảnh gốc bất biến",
-          "detail": "[\"/api/imagelab/assets/4e073804-6704-4a8c-9a3d-ac724495356b/file\",\"/api/imagelab/assets/4aae2c23-7daa-42c5-b5e8-7c0988f81094/file\"]"
+          "detail": "[\"/api/imagelab/assets/0d6f6cb0-2917-408c-b366-7b1db4e34500/file\",\"/api/imagelab/assets/50c4e06e-606a-40bb-9a8e-ef8e8fab5a81/file\"]"
         },
         {
           "ok": true,
           "label": "tệp ảnh tạo (PNG) tải về MỞ ĐƯỢC bằng python3",
-          "detail": "/Users/viporder/code/vip-product-studio-tiep/.e2e-data/downloads/219823f0-847b-49bf-97dd-b595bf4e7ba2 → PNG OK bytes=1964 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
+          "detail": "/Users/viporder/code/vip-product-studio-ui5/.e2e-data/downloads/4e339c78-a4ca-4a26-b1ac-81d9eb854c1d → PNG OK bytes=1964 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
         },
         {
           "ok": true,
@@ -267,16 +333,16 @@
         "docs/assets/e2e/f2-03-truoc-sau.png",
         "docs/assets/e2e/f2-04-sau-khi-tai.png"
       ],
-      "started": "2026-10-10T02:24:00.984Z",
+      "started": "2026-10-10T02:53:21.338Z",
       "downloads": [
         {
           "what": "ảnh tạo",
-          "file": "/Users/viporder/code/vip-product-studio-tiep/.e2e-data/downloads/219823f0-847b-49bf-97dd-b595bf4e7ba2",
+          "file": "/Users/viporder/code/vip-product-studio-ui5/.e2e-data/downloads/4e339c78-a4ca-4a26-b1ac-81d9eb854c1d",
           "out": "PNG OK bytes=1964 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
         }
       ],
       "consoleErrors": [],
-      "finished": "2026-10-10T02:24:05.490Z"
+      "finished": "2026-10-10T02:53:25.847Z"
     },
     {
       "id": "f3",
@@ -291,7 +357,7 @@
         {
           "ok": true,
           "label": "trình duyệt GIẢI MÃ và PHÁT được GIF trong <img>",
-          "detail": "{\"src\":\"/api/videostudio/assets/4f3dacbf-3ea5-4a0e-a02b-ad6dcfb96e51/file\",\"w\":720,\"h\":1280}"
+          "detail": "{\"src\":\"/api/videostudio/assets/23f10e2c-3ad8-48e0-b031-ce3bb3806193/file\",\"w\":720,\"h\":1280}"
         },
         {
           "ok": true,
@@ -311,7 +377,7 @@
         {
           "ok": true,
           "label": "tệp video (GIF) tải về MỞ ĐƯỢC bằng python3",
-          "detail": "/Users/viporder/code/vip-product-studio-tiep/.e2e-data/downloads/cedcf4cc-3eff-4301-8b05-e557ad869e61 → GIF OK bytes=636921 720x1280 frames=48 trailer=True"
+          "detail": "/Users/viporder/code/vip-product-studio-ui5/.e2e-data/downloads/d136a7b8-3e05-41fe-b486-f1c0738dd935 → GIF OK bytes=636921 720x1280 frames=48 trailer=True"
         },
         {
           "ok": true,
@@ -329,16 +395,16 @@
         "docs/assets/e2e/f3-02-gif-ket-qua.png",
         "docs/assets/e2e/f3-03-nhan-khong-co-tieng.png"
       ],
-      "started": "2026-10-10T02:24:05.490Z",
+      "started": "2026-10-10T02:53:25.847Z",
       "downloads": [
         {
           "what": "video GIF",
-          "file": "/Users/viporder/code/vip-product-studio-tiep/.e2e-data/downloads/cedcf4cc-3eff-4301-8b05-e557ad869e61",
+          "file": "/Users/viporder/code/vip-product-studio-ui5/.e2e-data/downloads/d136a7b8-3e05-41fe-b486-f1c0738dd935",
           "out": "GIF OK bytes=636921 720x1280 frames=48 trailer=True"
         }
       ],
       "consoleErrors": [],
-      "finished": "2026-10-10T02:24:10.025Z"
+      "finished": "2026-10-10T02:53:31.419Z"
     },
     {
       "id": "f4",
@@ -383,7 +449,7 @@
         {
           "ok": true,
           "label": "tệp ảnh dịch (PNG) tải về MỞ ĐƯỢC bằng python3",
-          "detail": "/Users/viporder/code/vip-product-studio-tiep/.e2e-data/downloads/0c6ca892-7bcd-4494-86bf-f322e619ca24 → PNG OK bytes=2344 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
+          "detail": "/Users/viporder/code/vip-product-studio-ui5/.e2e-data/downloads/3a795b2b-ad22-447c-8848-b283d9ce88cd → PNG OK bytes=2344 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
         },
         {
           "ok": true,
@@ -397,16 +463,16 @@
         "docs/assets/e2e/f4-03-bang-duyet.png",
         "docs/assets/e2e/f4-04-anh-da-render.png"
       ],
-      "started": "2026-10-10T02:24:10.025Z",
+      "started": "2026-10-10T02:53:31.419Z",
       "downloads": [
         {
           "what": "ảnh dịch",
-          "file": "/Users/viporder/code/vip-product-studio-tiep/.e2e-data/downloads/0c6ca892-7bcd-4494-86bf-f322e619ca24",
+          "file": "/Users/viporder/code/vip-product-studio-ui5/.e2e-data/downloads/3a795b2b-ad22-447c-8848-b283d9ce88cd",
           "out": "PNG OK bytes=2344 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
         }
       ],
       "consoleErrors": [],
-      "finished": "2026-10-10T02:24:14.382Z"
+      "finished": "2026-10-10T02:53:36.404Z"
     },
     {
       "id": "f5",
@@ -421,7 +487,7 @@
         {
           "ok": true,
           "label": "tệp gói xuất bản (.zip) tải về MỞ ĐƯỢC bằng python3",
-          "detail": "/Users/viporder/code/vip-product-studio-tiep/.e2e-data/downloads/4b52e3c9-8db8-4b09-b4e0-8b6c8a14e593 → ZIP OK bytes=3652 entries=5 testzip=None"
+          "detail": "/Users/viporder/code/vip-product-studio-ui5/.e2e-data/downloads/2b95b798-732d-40e3-a8c8-cd61b1168b55 → ZIP OK bytes=3646 entries=5 testzip=None"
         },
         {
           "ok": true,
@@ -431,7 +497,7 @@
         {
           "ok": true,
           "label": "MANIFEST.json khai đúng job_id của job đã mở",
-          "detail": "{\"manifest_version\":1,\"generated_at\":\"2026-10-10T02:24:15.103Z\",\"filename\":\"content-4071719a-20261010-0924.zip\",\"job\":{\"id\":\"4071719a-9c84-4c85-ac40-67ad1cb29967\",\"kind\":\"content\",\"status\":\"succeeded\""
+          "detail": "{\"manifest_version\":1,\"generated_at\":\"2026-10-10T02:53:37.143Z\",\"filename\":\"content-2af61135-20261010-0953.zip\",\"job\":{\"id\":\"2af61135-d106-4923-bbb5-9aafe72c23ca\",\"kind\":\"content\",\"status\":\"succeeded\""
         },
         {
           "ok": true,
@@ -443,7 +509,7 @@
         "docs/assets/e2e/f5-01-panel-goi-xuat-ban.png",
         "docs/assets/e2e/f5-02-sau-khi-tai-goi.png"
       ],
-      "started": "2026-10-10T02:24:14.382Z",
+      "started": "2026-10-10T02:53:36.404Z",
       "allowedConsole": {
         "patterns": [
           "/ERR_NAME_NOT_RESOLVED https:\\/\\/img\\.example\\.com\\//"
@@ -453,8 +519,8 @@
       "downloads": [
         {
           "what": "gói xuất bản",
-          "file": "/Users/viporder/code/vip-product-studio-tiep/.e2e-data/downloads/4b52e3c9-8db8-4b09-b4e0-8b6c8a14e593",
-          "out": "ZIP OK bytes=3652 entries=5 testzip=None",
+          "file": "/Users/viporder/code/vip-product-studio-ui5/.e2e-data/downloads/2b95b798-732d-40e3-a8c8-cd61b1168b55",
+          "out": "ZIP OK bytes=3646 entries=5 testzip=None",
           "entries": [
             "MANIFEST.json",
             "noi-dung/noi-dung.json",
@@ -465,7 +531,7 @@
         }
       ],
       "consoleErrors": [],
-      "finished": "2026-10-10T02:24:15.657Z"
+      "finished": "2026-10-10T02:53:37.734Z"
     },
     {
       "id": "f6",
@@ -505,7 +571,7 @@
         {
           "ok": true,
           "label": "tìm được hai yêu cầu theo mã giao dịch trên trang Quản trị",
-          "detail": "0b7fd676-742e-4f07-b02c-31690464fc16 · ba686dcb-3469-4038-955f-7ed242042ad9"
+          "detail": "a9e8dc09-6e4b-4674-b733-a3dcb52880ac · 61e67853-6313-414d-8c0c-8357141baabb"
         },
         {
           "ok": true,
@@ -520,12 +586,12 @@
         {
           "ok": true,
           "label": "owner XÁC NHẬN ⇒ \"Đã cộng 10 credit\"",
-          "detail": "Đã cộng 10 credit cho 2cbf41c4-691c-4167-8ba5-03e886d914f5 (số dư mới: 10 credit (USD))."
+          "detail": "Đã cộng 10 credit cho 739f4448-0adf-430f-ac8f-bd5409d471b9 (số dư mới: 10 credit (USD))."
         },
         {
           "ok": true,
           "label": "TỪ CHỐI ⇒ nói rõ KHÔNG có dòng sổ nào được ghi",
-          "detail": "Đã TỪ CHỐI yêu cầu ba686dcb-3469-4038-955f-7ed242042ad9 — KHÔNG có dòng sổ nào được ghi."
+          "detail": "Đã TỪ CHỐI yêu cầu 61e67853-6313-414d-8c0c-8357141baabb — KHÔNG có dòng sổ nào được ghi."
         },
         {
           "ok": true,
@@ -549,9 +615,9 @@
         "docs/assets/e2e/f6-03-owner-da-duyet.png",
         "docs/assets/e2e/f6-04-member-thay-so-du.png"
       ],
-      "started": "2026-10-10T02:24:15.657Z",
+      "started": "2026-10-10T02:53:37.734Z",
       "consoleErrors": [],
-      "finished": "2026-10-10T02:24:19.524Z"
+      "finished": "2026-10-10T02:53:41.611Z"
     },
     {
       "id": "f7",
@@ -566,12 +632,12 @@
         {
           "ok": true,
           "label": "TẠO & GỬI DUYỆT tạo ra một bài chờ duyệt",
-          "detail": "927f53ea-1b15-4f7f-8e80-97b1277a83ae"
+          "detail": "32dcd91f-0ad8-4b30-b255-707fd0c79184"
         },
         {
           "ok": true,
           "label": "mã bài có tiền tố \"dry-\" và được ghi rõ \"id thử — không có bài thật\"",
-          "detail": "Đã đăng facebook_page THỬ đã thử 1 lượt 2026-10-10T02:24:20.371Z Nghe rõ, đeo êm cả ngày Tai nghe chụp tai không dây, gập gọn. Dữ liệu gieo cho e2e. • Đệm tai mềm • Gập gọn bỏ túi Tai nghe chụp tai không dây — dữ liệu gieo e2e. #tainghe #e2e Bài chỉ có chữ (không kèm ảnh/video). Job nguồn 4071"
+          "detail": "Đã đăng facebook_page THỬ đã thử 1 lượt 2026-10-10T02:53:42.460Z Nghe rõ, đeo êm cả ngày Tai nghe chụp tai không dây, gập gọn. Dữ liệu gieo cho e2e. • Đệm tai mềm • Gập gọn bỏ túi Tai nghe chụp tai không dây — dữ liệu gieo e2e. #tainghe #e2e Bài chỉ có chữ (không kèm ảnh/video). Job nguồn 2af6"
         },
         {
           "ok": true,
@@ -588,9 +654,9 @@
         "docs/assets/e2e/f7-01-tab-dang-bai.png",
         "docs/assets/e2e/f7-02-da-dang-thu.png"
       ],
-      "started": "2026-10-10T02:24:19.524Z",
+      "started": "2026-10-10T02:53:41.611Z",
       "consoleErrors": [],
-      "finished": "2026-10-10T02:24:21.543Z"
+      "finished": "2026-10-10T02:53:43.633Z"
     },
     {
       "id": "f8",
@@ -635,7 +701,7 @@
         {
           "ok": true,
           "label": "dòng listing có mã dry-… và nhãn THỬ",
-          "detail": "Tai nghe chụp tai không dây (dữ liệu gieo e2e) 4071719a… dry-run thử Đã đăng THỬ dimensions · OPTIONAL_MISSING — Chưa có kích thước gói hàng (cm) — sàn có thể đòi khi tính phí vận chuyển. (cảnh báo, không chặn) 199.000 ₫ tồn 5 dry-8e84af3f23c47c86 XEM PAYLOAD DUYỆT TỪ CHỐI ĐĂNG ĐỒNG BỘ"
+          "detail": "Tai nghe chụp tai không dây (dữ liệu gieo e2e) 2af61135… dry-run thử Đã đăng THỬ dimensions · OPTIONAL_MISSING — Chưa có kích thước gói hàng (cm) — sàn có thể đòi khi tính phí vận chuyển. (cảnh báo, không chặn) 199.000 ₫ tồn 5 dry-5de77c9b78534b3c XEM PAYLOAD DUYỆT TỪ CHỐI ĐĂNG ĐỒNG BỘ"
         },
         {
           "ok": true,
@@ -658,7 +724,7 @@
         "docs/assets/e2e/f8-02-da-dang-thu.png",
         "docs/assets/e2e/f8-03-xem-payload.png"
       ],
-      "started": "2026-10-10T02:24:21.543Z",
+      "started": "2026-10-10T02:53:43.633Z",
       "allowedConsole": {
         "patterns": [
           "/status of 422/"
@@ -666,7 +732,153 @@
         "reason": "f8 CỐ Ý bấm TẠO BÀI khi thiếu trường để kiểm 422 PREFLIGHT_FAILED; Chrome tự ghi một dòng \"Failed to load resource … 422\"."
       },
       "consoleErrors": [],
-      "finished": "2026-10-10T02:24:24.765Z"
+      "finished": "2026-10-10T02:53:46.724Z"
+    },
+    {
+      "id": "f9",
+      "title": "UI §5: \"Xem bản kê khai\" KHÔNG đóng khi màn job vẽ lại · bấm đúp TẢI GÓI ⇒ đúng 1 request · lọc Lịch sử",
+      "status": "passed",
+      "checks": [
+        {
+          "ok": true,
+          "label": "sau 3 lần vẽ lại màn job, khối bản kê khai VẪN MỞ và giữ nguyên nội dung",
+          "detail": "{\"before\":1202,\"after\":{\"hidden\":false,\"len\":1202}}"
+        },
+        {
+          "ok": true,
+          "label": "bấm ĐÚP nút TẢI GÓI ⇒ ĐÚNG 1 lượt gọi /manifest (khoá chung trong onGlobalClick)",
+          "detail": "[200]"
+        },
+        {
+          "ok": true,
+          "label": "bấm ĐÚP ⇒ ĐÚNG 1 lượt tải xuống gói",
+          "detail": "[\"http://127.0.0.1:63781/api/exports/jobs/2af61135-d106-4923-bbb5-9aafe72c23ca/bundle\"]"
+        },
+        {
+          "ok": true,
+          "label": "Lịch sử có ít nhất 1 job",
+          "detail": "1"
+        },
+        {
+          "ok": true,
+          "label": "gõ \"GIEO E2E\" (khác hoa thường) ⇒ chỉ còn job khớp",
+          "detail": "[\"Tai nghe chụp tai không dây (dữ liệu gieo e2e) 1688 · 09:53:10 10/10/2026\\nHoàn tất\"]"
+        },
+        {
+          "ok": true,
+          "label": "ô tìm GIỮ con trỏ khi danh sách vẽ lại (không vẽ lại cả trang)",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "không khớp ⇒ nói rõ \"Không có job nào khớp bộ lọc\"",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "bộ đếm hiện \"Hiện 0 / N job đã tải\"",
+          "detail": "Hiện 0 / 1 job đã tải."
+        },
+        {
+          "ok": true,
+          "label": "không có lỗi console trong luồng này",
+          "detail": ""
+        }
+      ],
+      "shots": [
+        "docs/assets/e2e/f9-01-ban-ke-khai-van-mo.png",
+        "docs/assets/e2e/f9-02-loc-lich-su.png"
+      ],
+      "started": "2026-10-10T02:53:46.724Z",
+      "allowedConsole": {
+        "patterns": [
+          "/ERR_NAME_NOT_RESOLVED https:\\/\\/img\\.example\\.com\\//"
+        ],
+        "reason": "màn job của job gieo vẽ ảnh https://img.example.com/… (tên miền dành riêng, không phân giải) — cùng lý do f5."
+      },
+      "doubleClick": {
+        "manifest_calls": 1,
+        "downloads": 1
+      },
+      "consoleErrors": [],
+      "finished": "2026-10-10T02:53:52.860Z"
+    },
+    {
+      "id": "f10",
+      "title": "Mobile 375×812: 11 màn (ẩn danh + owner) không cuộn ngang cả trang, thanh nav vẫn bấm được",
+      "status": "passed",
+      "checks": [
+        {
+          "ok": true,
+          "label": "cả 11 màn: scrollWidth ≤ clientWidth (không cuộn ngang cả trang)",
+          "detail": "[]"
+        },
+        {
+          "ok": true,
+          "label": "ở khổ 375 px vẫn bấm CHUỘT THẬT được nút \"Video\" trên thanh nav",
+          "detail": "#/video"
+        },
+        {
+          "ok": true,
+          "label": "không có lỗi console trong luồng này",
+          "detail": ""
+        }
+      ],
+      "shots": [
+        "docs/assets/e2e/f10-mobile-trang-chu.png",
+        "docs/assets/e2e/f10-mobile-dich-anh.png",
+        "docs/assets/e2e/f10-mobile-tao-anh.png",
+        "docs/assets/e2e/f10-mobile-video.png",
+        "docs/assets/e2e/f10-mobile-lich-su.png",
+        "docs/assets/e2e/f10-mobile-tai-khoan.png",
+        "docs/assets/e2e/f10-mobile-quan-tri.png",
+        "docs/assets/e2e/f10-mobile-dang-bai.png",
+        "docs/assets/e2e/f10-mobile-dang-san.png",
+        "docs/assets/e2e/f10-mobile-man-job.png",
+        "docs/assets/e2e/f10-mobile-dang-nhap.png"
+      ],
+      "started": "2026-10-10T02:53:52.860Z",
+      "allowedConsole": {
+        "patterns": [
+          "/ERR_NAME_NOT_RESOLVED https:\\/\\/img\\.example\\.com\\//"
+        ],
+        "reason": "màn job của job gieo vẽ ảnh https://img.example.com/… — cùng lý do f5."
+      },
+      "consoleErrors": [],
+      "finished": "2026-10-10T02:54:08.463Z"
+    },
+    {
+      "id": "f11",
+      "title": "A11y tĩnh: mọi ô nhập có nhãn, mọi nút có tên đọc được, mọi ảnh có alt, <html lang=\"vi\"> — trên 11 màn",
+      "status": "passed",
+      "checks": [
+        {
+          "ok": true,
+          "label": "<html lang=\"vi\">",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "không có ô nhập thiếu nhãn / nút thiếu tên / ảnh thiếu alt trên 11 màn",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "không có lỗi console trong luồng này",
+          "detail": ""
+        }
+      ],
+      "shots": [],
+      "started": "2026-10-10T02:54:08.463Z",
+      "allowedConsole": {
+        "patterns": [
+          "/ERR_NAME_NOT_RESOLVED https:\\/\\/img\\.example\\.com\\//"
+        ],
+        "reason": "màn job của job gieo vẽ ảnh https://img.example.com/… — cùng lý do f5."
+      },
+      "a11y": [],
+      "consoleErrors": [],
+      "finished": "2026-10-10T02:54:21.723Z"
     }
   ]
 }
