@@ -2686,3 +2686,76 @@ Lỗi tìm thấy nhờ trình duyệt và đã sửa: băng “CHẾ ĐỘ TH�
 6. **Chưa có luồng e2e CDP** cho tab này (`tools/e2e/**` nằm ở PR #29 chưa gộp); phần trình duyệt ở 27.3 (4) là đo
    TAY có ảnh, không phải script lặp lại được.
 7. `GET /api/marketplace/channels` công khai (chỉ cờ) — nếu Owner muốn giấu cả tên kênh thì cần thêm `requireUser`.
+
+## 30. E2E Chrome cho MVP-06/07/08 + gói .zip, và PostgreSQL THẬT cho 6 bảng mới — hai lỗi thật tìm ra
+
+Nhánh `thanhbn123/e2e-pg-mvp06-08` · 10/10/2026 (MacBook, 09:05 → 09:25 theo `date`) · nền `develop` `d5c4f1f`.
+
+### 30.1 Số đo
+
+| Phép đo | Lệnh | Kết quả |
+|---|---|---|
+| Bộ thử, SQLite | `env -u DATABASE_URL npm test` | **1365 test · 1326 pass · 0 fail · 39 skipped** (nền `d5c4f1f`: 1362 · 1323 · 0 · 39) |
+| Bộ thử, **PostgreSQL 16 thật** | `DATABASE_URL=postgresql://postgres@127.0.0.1:55788/studio_pg_test npm test` | **1380 test · 1379 pass · 0 fail · 1 skipped** (ca skip duy nhất là ca "thiếu DATABASE_URL", cố ý không chạy khi đã có URL) |
+| E2E Chrome 154 (headless) | `E2E_HEADLESS=1 npm run test:e2e` | **8/8 luồng PASS · 75 khẳng định · 0 lỗi console** (trừ dòng mà f5/f8 khai là cố ý — 30.3) · chạy 3 lượt liên tiếp đều đạt |
+| `verify.mjs` | `node tools/verify.mjs` | "Kiểm chứng cục bộ hoàn tất." |
+
+PostgreSQL dùng là cụm RIÊNG dựng trong `/private/tmp/claude-501/pgst13657` (initdb `--locale=C`, chỉ nghe `127.0.0.1`),
+không đụng DB của phiên khác. Phạm vi: chỉ đo trên MacBook, PostgreSQL 16.15 Homebrew — CI của repo chưa chạy job PG
+cho file mới (xem 30.5).
+
+### 30.2 Lỗi THẬT #1 — vết nạp credit có thể hiện SAI THỨ TỰ (cả hai dialect)
+
+- **Triệu chứng:** `test/topup-api.test.js` "TỪ CHỐI ⇒ …" hỏng chập chờn (đo: 1/33 lượt; chính là ca 1/45 không bắt
+  được tên ghi ở PR #33). Dòng hỏng là `events.at(-1).to_status` ra `pending` thay vì `rejected`.
+- **Nguyên nhân:** `listTopupEvents` xếp `ORDER BY created_at, id`. Sự kiện "tạo" và "từ chối" có thể cùng mili-giây ⇒
+  thứ tự rơi vào UUID ngẫu nhiên. Ghim đồng hồ (mọi sự kiện cùng mili-giây) ⇒ **24/40 lượt sai thứ tự** trên mã cũ.
+- **Đổi cấu trúc** (lần thứ hai cùng kiểu sau `wallet_ledger` ⇒ CLAUDE.md §12.2): cột `topup_events.seq` tăng dần theo
+  yêu cầu, đọc trong cùng transaction; migration `addColumnIfMissing` + index `(request_id, seq)` tạo sau migration;
+  dòng cũ giữ `seq = 0` (không UPDATE vết). `publish_logs` cùng nguy cơ ⇒ xếp theo `attempt` (cột tăng dần có sẵn).
+- **Bằng chứng sau sửa:** 0/40 lượt sai · `topup-api.test.js` 30 lượt liên tiếp 0 hỏng · `test/event-order.test.js`
+  (3 ca, ghim đồng hồ, 40 vòng) — **đỏ trên mã cũ, xanh trên mã mới**.
+
+### 30.3 Lỗi THẬT #2 — trên PostgreSQL, nạp credit mất tính NGUYÊN TỬ (chỉ PostgreSQL)
+
+- **Nguyên nhân:** `Store#inTransaction` trên PostgreSQL mở `BEGIN` ở MỘT kết nối của pool nhưng KHÔNG gắn transaction
+  vào ALS, trong khi `createTopupRequest` / `decideTopupRequest` ghi qua `#exec()` ⇒ các lệnh chạy ở kết nối KHÁC,
+  ngoài transaction. SQLite (một kết nối) không lộ lỗi này.
+- **Đo** (`test/pg-mvp06-08.test.js`, cho `appendTopupEvent` ném lỗi giữa chừng, CÙNG kịch bản hai dialect):
+  SQLite đúng cả hai ca; PostgreSQL trên mã cũ **để lại 1 yêu cầu nạp không có vết** và **đổi trạng thái sang
+  `rejected` mà không có vết** — trái luật #2 của `MVP-06-CONTRACT.md`.
+- **Sửa:** `#inTransaction` trên PostgreSQL chạy `fn` trong `#txAls.run({ tx })` ⇒ `#exec()` trả đúng kết nối của
+  transaction. Chỗ gọi thứ ba (claim hàng đợi) vốn dùng tham số `tx` nên không đổi hành vi; bộ `pg-queue` vẫn xanh.
+- **Đường XÁC NHẬN không bị lỗi này** (chạy trong `withLedgerLock`, vốn đã gắn ALS) — tiền vào ví vẫn đúng một lần.
+
+### 30.4 E2E — bốn luồng mới (`tools/e2e/run.mjs`)
+
+| Luồng | Đo gì |
+|---|---|
+| f1 | thêm 2 tab `#/dangbai`, `#/dangsan` (ẩn danh ⇒ "Đăng sàn cần tài khoản") |
+| f5 | **gói `.zip`** (thay mục cũ ghi "CHƯA CÓ TÍNH NĂNG" — tính năng đã gộp từ PR #26/#27): owner đăng nhập bằng bàn phím thật → màn job → TẢI GÓI → `zipfile.testzip()` sạch, có `MANIFEST.json`, `job_id` khớp |
+| f6 | **MVP-06**: member đăng ký qua form → hướng dẫn chuyển khoản lấy từ `TOPUP_BANK_*` → gửi 2 yêu cầu → số dư VẪN 0 → owner XÁC NHẬN (hộp hiện "10 credit" + "26.000 ₫") và TỪ CHỐI có lý do → member thấy "Đã cộng credit", "Bị từ chối", số dư 10 credit |
+| f7 | **MVP-07**: băng "CHẾ ĐỘ THỬ" → TẠO & GỬI DUYỆT → DUYỆT → ĐĂNG ⇒ mã `dry-…` + "id thử — không có bài thật", không có link Facebook |
+| f8 | **MVP-08**: TẠO BÀI thiếu trường ⇒ 422, `issues[]` từng dòng (price_vnd, stock, weight_g, category_id) → bổ sung → nút ĐĂNG khoá kèm lý do "chưa được DUYỆT" → DUYỆT → ĐĂNG `dry-…` + nhãn THỬ → ĐỒNG BỘ 199.000 ₫ → XEM PAYLOAD có trường không ánh xạ |
+
+**Dữ liệu gieo (nói thẳng):** owner tạo bằng ĐÚNG `accounts.bootstrapOwner()` của `npm run make-owner`; một job NỘI DUNG
+đã xong được ghi thẳng vào SQLite riêng của e2e trước khi bật máy chủ, vì tạo job qua giao diện bắt buộc tải trang
+Taobao/1688 thật. Mật khẩu ngẫu nhiên mỗi lần chạy, chỉ trong bộ nhớ. Hướng dẫn chuyển khoản dùng giá trị ghi rõ là THỬ.
+
+**Lỗi console được khai là CỐ Ý, theo từng luồng** (không nới bộ lọc chung; ghi ở `report.json → flows[].allowedConsole`):
+f5 — ảnh của job gieo trỏ `https://img.example.com/…` (tên miền dành riêng RFC 2606, không phân giải) ⇒ `ERR_NAME_NOT_RESOLVED`;
+f8 — cố ý bấm TẠO BÀI khi thiếu trường ⇒ Chrome ghi "Failed to load resource … 422".
+
+**Hai lỗi của chính bộ e2e đã sửa:** (1) form nhớ chế độ "Đăng ký" của lượt trước ⇒ lượt đăng nhập gửi nhầm
+`/api/auth/register` (409) — nay luôn chọn rõ chế độ; (2) bắt tệp tải về theo "tệp mới nhất trong thư mục" nhặt nhầm tệp
+thành phần Chrome tự tải (đầu `Cr24`) — nay bám sự kiện `Page.downloadProgress` của chính trang.
+
+### 30.5 CHƯA LÀM / CHƯA ĐO
+
+1. CI có sẵn job **"Test (PostgreSQL 16)"** (`.github/workflows/ci.yml`, `npm test` với `DATABASE_URL`) ⇒ hai file mới
+   tự chạy ở đó. Lỗi 30.3 lọt qua job này trước đây vì **chưa ca nào ép bước ghi vết hỏng giữa chừng** — chạy trên PG
+   thôi chưa đủ, phải có ca đo đúng tính chất (nguyên tử). Số đo ở 30.1 là của MacBook; số của CI xem PR.
+2. E2E chạy **headless**; chưa đo mobile/viewport nhỏ, Firefox/Safari, a11y (UI-HANDOVER §5 vẫn còn nguyên).
+3. Các truy vấn "lấy dòng mới nhất" của `job_queue` (`ORDER BY created_at DESC, id DESC LIMIT 1`) cùng dạng xếp theo
+   thời gian + UUID — chưa đo có cần `seq` không (chúng không phải vết hiển thị cho người dùng).
+4. Xác minh tên trường Shopee/TikTok khi có token (§29.4 mục 1) — vẫn chờ Owner.

@@ -527,9 +527,20 @@ export class Store {
     });
   }
 
-  /** Transaction theo driver: PostgreSQL ⇒ `driver.transaction`; SQLite ⇒ `BEGIN IMMEDIATE`. */
+  /**
+   * Transaction theo driver: PostgreSQL ⇒ `driver.transaction`; SQLite ⇒ `BEGIN IMMEDIATE`.
+   *
+   * ⚠️ PostgreSQL có POOL nhiều kết nối: `driver.transaction` mở BEGIN trên MỘT kết nối, nhưng mọi
+   * method store dùng `#exec()` (createTopupRequest, decideTopupRequest, appendTopupEvent…) sẽ chạy
+   * qua pool ở kết nối KHÁC — tức NGOÀI transaction — trừ khi transaction được gắn vào ALS. Đo được
+   * 10/10/2026 (`test/pg-mvp06-08.test.js`): ghi vết hỏng giữa chừng để lại yêu cầu nạp không có vết
+   * và trạng thái "rejected" không có vết trên PostgreSQL, trong khi SQLite (một kết nối) vẫn đúng.
+   * Gắn `tx` vào ALS ⇒ `#exec()` trả CHÍNH kết nối đó ⇒ nguyên tử trên cả hai dialect.
+   */
   async #inTransaction(fn) {
-    if (this.isPostgres) return this.driver.transaction(fn);
+    if (this.isPostgres) {
+      return this.driver.transaction((tx) => this.#txAls.run({ tx, userId: null }, () => fn(tx)));
+    }
     return this.#withSqliteTx(fn, { immediate: true });
   }
 
@@ -691,7 +702,13 @@ export class Store {
     // DB cũ thiếu cột sẽ chết `init()`). Lỗi ở đây chỉ ghi log, KHÔNG làm chết boot.
     await this.#createIndexIfPossible('idx_topup_requests_user', 'topup_requests', 'user_id, created_at');
     await this.#createIndexIfPossible('idx_topup_requests_status', 'topup_requests', 'status, created_at');
+    // Thứ tự vết: hai sự kiện của một yêu cầu có thể CÙNG `created_at` (độ phân giải 1 ms) ⇒ xếp theo
+    // UUID là xếp ngẫu nhiên (đo 10/10/2026: 24/40 lượt sai khi ghim đồng hồ). Cột `seq` tăng dần theo
+    // yêu cầu — CÙNG cách `wallet_ledger.seq` / `marketplace_events.seq`. DB cũ: dòng cũ giữ `seq = 0`
+    // (không UPDATE vết append-only) và rơi về thứ tự `created_at` như trước.
+    await this.#addColumnIfMissing('topup_events', 'seq', 'INTEGER NOT NULL DEFAULT 0');
     await this.#createIndexIfPossible('idx_topup_events_request', 'topup_events', 'request_id, created_at');
+    await this.#createIndexIfPossible('idx_topup_events_request_seq', 'topup_events', 'request_id, seq');
     // Chống KHAI KHỐNG: cùng một người dùng không được nộp hai yêu cầu mang CÙNG mã giao dịch
     // ngân hàng. Partial unique index (bỏ qua `reference` rỗng) chạy được trên cả hai dialect;
     // tầng store dịch lỗi UNIQUE thành `TOPUP_REFERENCE_DUPLICATE` (route trả 409).
@@ -2286,6 +2303,7 @@ export class Store {
     return {
       id: row.id,
       request_id: row.request_id,
+      seq: Number(toNum(row.seq, 0)),
       from_status: row.from_status ?? null,
       to_status: row.to_status,
       actor_user_id: row.actor_user_id ?? null,
@@ -2302,13 +2320,17 @@ export class Store {
       throw Object.assign(new Error('appendTopupEvent thiếu requestId/toStatus.'), { code: 'INVALID_TOPUP_EVENT' });
     }
     const ts = nowIso();
+    // `seq` đọc + ghi qua CÙNG `#exec()` ⇒ khi gọi trong transaction của create/decide thì nằm trong
+    // transaction đó (hai lượt quyết định đua nhau không cùng lấy được một số).
+    const last = await this.#exec().get('SELECT COALESCE(MAX(seq), 0) AS max_seq FROM topup_events WHERE request_id = ?', [rid]);
+    const seq = Number(toNum(last?.max_seq, 0)) + 1;
     await this.#exec().run(
-      `INSERT INTO topup_events (id, request_id, from_status, to_status, actor_user_id, reason, created_at)
-       VALUES (?,?,?,?,?,?,?)`,
-      [id, rid, fromStatus ?? from_status ?? null, to, actorUserId ?? actor_user_id ?? null, String(reason ?? ''), ts],
+      `INSERT INTO topup_events (id, request_id, seq, from_status, to_status, actor_user_id, reason, created_at)
+       VALUES (?,?,?,?,?,?,?,?)`,
+      [id, rid, seq, fromStatus ?? from_status ?? null, to, actorUserId ?? actor_user_id ?? null, String(reason ?? ''), ts],
     );
     return this.#hydrateTopupEvent({
-      id, request_id: rid, from_status: fromStatus ?? from_status ?? null, to_status: to,
+      id, request_id: rid, seq, from_status: fromStatus ?? from_status ?? null, to_status: to,
       actor_user_id: actorUserId ?? actor_user_id ?? null, reason: String(reason ?? ''), created_at: ts,
     });
   }
@@ -2415,7 +2437,7 @@ export class Store {
   async listTopupEvents(requestId, { limit = 100 } = {}) {
     if (!requestId) return [];
     const rows = await this.#exec().all(
-      'SELECT * FROM topup_events WHERE request_id = ? ORDER BY created_at ASC, id ASC LIMIT ?',
+      'SELECT * FROM topup_events WHERE request_id = ? ORDER BY seq ASC, created_at ASC, id ASC LIMIT ?',
       [String(requestId), clampInt(limit, 100, 1, 1000)],
     );
     return (rows || []).map((row) => this.#hydrateTopupEvent(row));
@@ -3354,7 +3376,9 @@ export class Store {
 
   async listPublishLogs(itemId, { limit = 50 } = {}) {
     const rows = await this.driver.all(
-      'SELECT * FROM publish_logs WHERE item_id = ? ORDER BY created_at ASC, id ASC LIMIT ?',
+      // `attempt` tăng dần theo từng lượt đăng ⇒ thứ tự ổn định kể cả khi nhiều dòng cùng mili-giây
+      // (xếp theo `created_at, id` là xếp theo UUID ngẫu nhiên — xem test/event-order.test.js).
+      'SELECT * FROM publish_logs WHERE item_id = ? ORDER BY attempt ASC, created_at ASC, id ASC LIMIT ?',
       [String(itemId ?? ''), clampInt(limit, 50, 1, 500)],
     );
     return (Array.isArray(rows) ? rows : []).map((row) => this.#hydratePublishLog(row));

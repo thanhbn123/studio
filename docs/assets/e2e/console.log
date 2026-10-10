@@ -1,1 +1,2 @@
-(trống — không có dòng console nào)
+[error] log.network: Failed to load resource: net::ERR_NAME_NOT_RESOLVED https://img.example.com/e2e/tai-nghe-1.jpg
+[error] log.network: Failed to load resource: the server responded with a status of 422 (Unprocessable Entity) http://127.0.0.1:59779/api/marketplace/listings

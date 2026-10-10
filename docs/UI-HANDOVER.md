@@ -48,6 +48,8 @@ npm run test:e2e                  # Chrome THẬT qua CDP; phải 0 lỗi consol
 - **Test trình duyệt thật**: thêm luồng vào `tools/e2e/run.mjs` cho màn mới (MVP-06/07/08) — mỗi luồng phải có **ảnh chụp** + **0 lỗi console**.
 - Bằng chứng phải là **output thật** dán vào báo cáo, không phải lời kể.
 
+> **Cập nhật 10/10/2026 (nhánh `thanhbn123/e2e-pg-mvp06-08`):** `npm run test:e2e` nay có 8 luồng — thêm gói `.zip` (f5), Nạp credit (f6), Đăng bài (f7), Đăng sàn (f8); 8/8 PASS, 0 lỗi console. Đăng nhập trong e2e dùng `uiLogin()`/`uiLogout()` (form thật); dữ liệu gieo xem `SEED` trong `tools/e2e/run.mjs` và `VERIFICATION.md` §30. Luồng mới nào cố ý gây lỗi HTTP thì khai `allowConsole` + `allowReason` cho RIÊNG luồng đó.
+
 ## 5. Khoảng trống đã biết của UI (chưa ai làm — đáng làm)
 
 1. **Mobile/viewport nhỏ** chưa từng đo (chỉ desktop).
