@@ -2786,3 +2786,28 @@ trên 11 màn (ẩn danh + owner). Phạm vi: Chrome giả lập khổ điện t
 
 **Chưa làm:** Firefox/Safari (chưa có trình điều khiển) · thanh nav chiếm gần trọn màn hình đầu trên điện thoại ·
 spinner riêng từng nút · lọc Lịch sử phía máy chủ.
+
+## 32. V-13660 — thanh nav trên điện thoại, bàn phím, tương phản WCAG AA, Firefox/Safari
+
+Nhánh `thanhbn123/v13660-mobile-a11y` · 10/10/2026 (MacBook, 10:15 → 10:27 theo `date`) · nền `develop` `7800aa0`.
+
+| Phép đo | TRƯỚC sửa | SAU sửa |
+|---|---|---|
+| Thanh trên cùng ở 375×812 (e2e f10) | **359px** (44% màn hình) | **148px** (nav gập sau "☰ Menu") |
+| Bàn phím (e2e f12): chỗ dừng Tab có viền / Enter / đăng nhập bằng phím | 24/24 có viền · đạt · đạt | không đổi (đạt sẵn) |
+| Tương phản WCAG AA (e2e f13), 11 màn | 706 đoạn đo, **2 loại hỏng**: nút chính chữ trắng **3.22:1** (< 4.5) trên 7 màn | 706 đoạn, **0 hỏng** |
+| `env -u DATABASE_URL npm test` | 1376 · 1337 · 0 · 39 | **1378 · 1339 pass · 0 fail · 39 skipped** |
+| `E2E_HEADLESS=1 npm run test:e2e` | — | **13/13 PASS · 0 lỗi console** |
+
+**Phạm vi đo tương phản:** chữ có nút văn bản riêng, đang hiện, không nằm trong phần tử đang khoá; nền là chồng các lớp màu
++ gradient (mỗi gradient thay bằng TỪNG điểm màu, lấy tỉ lệ XẤU NHẤT); chữ trên ảnh thật (`url(...)`) bỏ qua — lần đo này
+**0 đoạn** rơi vào loại đó. Phiên bản đầu của phép đo đã bỏ qua 244 đoạn trên gradient ⇒ đạt giả; đã sửa trước khi kết luận.
+**Không** đo: trình đọc màn hình, chế độ sáng, phóng to chữ, trạng thái hover/focus của từng phần tử.
+
+**Đột biến:** đổi gradient nút chính về màu cũ ⇒ `test/a11y-tuong-phan.test.js` đỏ đúng câu `#4f8cff: 3.22:1 < 4.5:1`.
+
+**Thêm lỗi CSS tìm thấy khi sửa:** luật ẩn phụ đề thương hiệu trên điện thoại viết `.topnav .brand-text small` — phụ đề
+không nằm trong `.topnav` nên luật này **chưa từng có tác dụng**; sửa thành `.brand-text small`.
+
+**Firefox/Safari — chưa đo, lý do đo được:** Firefox chưa cài; `safaridriver` từ chối mở phiên vì chưa bật
+"Allow remote automation" (cài đặt Safari, phiên Claude không tự bật). Đã dừng `safaridriver` dùng thử theo đúng PID.
