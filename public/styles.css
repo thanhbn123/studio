@@ -392,3 +392,11 @@ select.text-input.mini { min-width: 132px; }
   .account-bar { padding-bottom: 12px; }
   .text-input.mini { width: 100%; }
 }
+
+/* Chuỗi dài không có chỗ ngắt (link nguồn, mã job, JSON trong bản kê khai gói xuất bản) không được
+   đẩy cả trang tràn ngang trên điện thoại — đo 10/10/2026: màn job rộng 479px ở khổ 375px khi mở
+   "Xem bản kê khai" (tools/e2e/run.mjs luồng f10). `anywhere` chỉ ngắt khi KHÔNG còn cách nào khác. */
+.panel,
+.notice {
+  overflow-wrap: anywhere;
+}

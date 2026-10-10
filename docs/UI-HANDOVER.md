@@ -50,14 +50,14 @@ npm run test:e2e                  # Chrome THẬT qua CDP; phải 0 lỗi consol
 
 > **Cập nhật 10/10/2026 (nhánh `thanhbn123/e2e-pg-mvp06-08`):** `npm run test:e2e` nay có 8 luồng — thêm gói `.zip` (f5), Nạp credit (f6), Đăng bài (f7), Đăng sàn (f8); 8/8 PASS, 0 lỗi console. Đăng nhập trong e2e dùng `uiLogin()`/`uiLogout()` (form thật); dữ liệu gieo xem `SEED` trong `tools/e2e/run.mjs` và `VERIFICATION.md` §30. Luồng mới nào cố ý gây lỗi HTTP thì khai `allowConsole` + `allowReason` cho RIÊNG luồng đó.
 
-## 5. Khoảng trống đã biết của UI (chưa ai làm — đáng làm)
+## 5. Khoảng trống đã biết của UI (cập nhật 10/10/2026 — nhánh `thanhbn123/ui-khoang-trong`, `VERIFICATION.md` §31)
 
-1. **Mobile/viewport nhỏ** chưa từng đo (chỉ desktop).
-2. **Firefox/Safari** chưa đo (mới Chrome).
-3. **A11y** chưa soát: nhãn `aria-*`, thứ tự tab, tương phản màu, dùng được chỉ bằng bàn phím.
-4. **Trạng thái tải**: một số nút chưa có spinner/khoá khi đang gọi API (bấm 2 lần có thể gửi 2 request).
-5. **Poll 1,5 giây** vẽ lại cả khối ⇒ khối “Xem bản kê khai” bị đóng khi đang chạy (đã ghi nhận, chưa sửa).
-6. Chưa có **tìm kiếm/lọc** trong danh sách job (khi job nhiều sẽ khó dùng).
+1. ~~**Mobile/viewport nhỏ** chưa từng đo~~ — **ĐÃ ĐO**: e2e f10, 11 màn ở 375×812 không cuộn ngang. Tìm và sửa 1 lỗi thật: mở "Xem bản kê khai" làm trang rộng 479px (chuỗi JSON không ngắt) ⇒ `.panel, .notice { overflow-wrap: anywhere }`. **Còn:** trên điện thoại thanh nav chiếm gần trọn màn hình đầu (chưa gọn lại thành menu).
+2. **Firefox/Safari** chưa đo — máy chưa có trình điều khiển (geckodriver/safaridriver chưa bật); bộ e2e hiện chỉ nói chuyện CDP.
+3. ~~**A11y** chưa soát~~ — **ĐÃ SOÁT PHẦN TĨNH**: e2e f11 trên 11 màn (ô nhập có nhãn, nút có tên, ảnh có alt, `lang="vi"`); sửa 2 ô thiếu nhãn (`#url` trang chủ, `#mk-filter-status`). **Còn:** thứ tự Tab, dùng được chỉ bằng bàn phím, tương phản màu.
+4. ~~**Trạng thái tải**: bấm 2 lần có thể gửi 2 request~~ — **ĐÃ SỬA MỘT CHỖ cho mọi nút**: khoá trong `onGlobalClick` (handler trả Promise ⇒ lượt trùng cùng hành động + đối tượng bị bỏ qua, nút có `aria-busy`). Đo trước: ~20 nút gọi API không có khoá riêng (có `regenerate`, `vscreate` tốn credit). e2e f9: bấm ĐÚP thật ⇒ 1 lượt gọi + 1 lượt tải; gỡ khoá ⇒ 2 lượt (đột biến đỏ). **Còn:** chưa có spinner riêng từng nút.
+5. ~~**Poll 1,5 giây** đóng khối "Xem bản kê khai"~~ — **ĐÃ SỬA**: nhớ HTML bản kê khai đã mở trong `state.exportManifest`, `exportPanelHtml` vẽ lại (chỉ cho đúng job). e2e f9 + đột biến đỏ.
+6. ~~Chưa có **tìm kiếm/lọc** lịch sử~~ — **ĐÃ LÀM**: ô tìm (không phân biệt hoa thường, bỏ dấu) + lọc trạng thái, chỉ trong 100 job đã tải — màn hình nói rõ phạm vi khi máy chủ có nhiều hơn. **Còn:** lọc phía máy chủ / phân trang.
 
 ## 6. Định nghĩa XONG cho một PR UI
 
