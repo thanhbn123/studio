@@ -350,6 +350,8 @@ async function boot() {
   // `location.hash = ...` phát hashchange (không phải lúc nào cũng có popstate) — cần cả hai
   // để điều hướng bằng hash luôn đổi view đúng.
   window.addEventListener('hashchange', route);
+  // Điện thoại: chuyển trang thì gập lại thanh nav (V-13660). Không đụng `route()`.
+  window.addEventListener('hashchange', () => setMobileNav(false));
   wireImagelabGlobal();
   wireImagestudioGlobal();
   wireVideostudioGlobal();
@@ -729,6 +731,7 @@ function onGlobalClick(ev) {
     topupconfirm: () => decideTopup(btn.dataset.id, { reject: false }),
     topupreject: () => decideTopup(btn.dataset.id, { reject: true }),
     creditdismiss: () => dismissCreditAlert(),
+    navtoggle: () => setMobileNav($('#topnav')?.classList.contains('open') !== true),
     // ── MVP-08 — Đăng sàn ──
     marketplace: () => {
       if (String(location.hash || '').startsWith('#/dangsan')) openMarketplace();
@@ -782,6 +785,15 @@ function onGlobalClick(ev) {
       btn.removeAttribute('aria-busy');
     });
   }
+}
+
+/** Mở/gập thanh nav trên điện thoại; `aria-expanded` của nút ☰ luôn khớp trạng thái thật (V-13660). */
+function setMobileNav(open) {
+  const nav = $('#topnav');
+  const btn = document.querySelector('[data-action="navtoggle"]');
+  if (!nav || !btn) return;
+  nav.classList.toggle('open', Boolean(open));
+  btn.setAttribute('aria-expanded', open ? 'true' : 'false');
 }
 
 /** Các lượt bấm đang chạy: khoá theo hành động + đối tượng (id bài, id job, id người dùng…). */

@@ -1,23 +1,23 @@
 {
   "meta": {
-    "at": "2026-10-10T02:53:11.339Z",
+    "at": "2026-10-10T03:23:07.470Z",
     "chrome": "Chrome/154.0.8037.98",
     "chromeBinary": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/154.0.0.0 Safari/537.36",
     "headless": true,
     "node": "v26.7.0",
-    "base": "http://127.0.0.1:63781",
-    "fixture": "/Users/viporder/code/vip-product-studio-ui5/test/fixtures/headphones.png",
+    "base": "http://127.0.0.1:58381",
+    "fixture": "/Users/viporder/code/vip-product-studio-a11y/test/fixtures/headphones.png",
     "seeded": {
       "owner_email": "owner-e2e@example.test",
       "member_email": "member-e2e@example.test",
-      "job_id": "2af61135-d106-4923-bbb5-9aafe72c23ca",
+      "job_id": "816d9aad-9137-4665-b8a8-08ff69539dfa",
       "note": "owner + job nội dung gieo thẳng vào SQLite e2e; mật khẩu ngẫu nhiên mỗi lần chạy, không ghi ra file"
     }
   },
   "totals": {
-    "flows": 11,
-    "passed": 11,
+    "flows": 13,
+    "passed": 13,
     "failed": 0,
     "not_implemented": 0
   },
@@ -30,7 +30,7 @@
     {
       "kind": "log.network",
       "level": "error",
-      "text": "Failed to load resource: the server responded with a status of 422 (Unprocessable Entity) http://127.0.0.1:63781/api/marketplace/listings"
+      "text": "Failed to load resource: the server responded with a status of 422 (Unprocessable Entity) http://127.0.0.1:58381/api/marketplace/listings"
     },
     {
       "kind": "log.network",
@@ -73,7 +73,7 @@
     {
       "kind": "log.network",
       "level": "error",
-      "text": "Failed to load resource: the server responded with a status of 422 (Unprocessable Entity) http://127.0.0.1:63781/api/marketplace/listings"
+      "text": "Failed to load resource: the server responded with a status of 422 (Unprocessable Entity) http://127.0.0.1:58381/api/marketplace/listings"
     },
     {
       "kind": "log.network",
@@ -108,40 +108,40 @@
   ],
   "network4xx5xx": [
     {
-      "url": "http://127.0.0.1:63781/api/marketplace/listings",
+      "url": "http://127.0.0.1:58381/api/marketplace/listings",
       "status": 422,
       "type": "Fetch"
     }
   ],
   "downloads": [
     {
-      "guid": "4e339c78-a4ca-4a26-b1ac-81d9eb854c1d",
-      "url": "http://127.0.0.1:63781/api/imagelab/assets/50c4e06e-606a-40bb-9a8e-ef8e8fab5a81/file",
-      "suggested": "imagelab-rendered-50c4e06e.png",
+      "guid": "0c1a6833-6e7c-460f-9afc-4f4f715b7640",
+      "url": "http://127.0.0.1:58381/api/imagelab/assets/9940b94c-75aa-468e-8927-100ab9fd11c2/file",
+      "suggested": "imagelab-rendered-9940b94c.png",
       "state": "completed"
     },
     {
-      "guid": "d136a7b8-3e05-41fe-b486-f1c0738dd935",
-      "url": "http://127.0.0.1:63781/api/videostudio/assets/23f10e2c-3ad8-48e0-b031-ce3bb3806193/file",
-      "suggested": "videostudio-rendered-23f10e2c.gif",
+      "guid": "85f35892-6224-4961-b21c-084f06a95a36",
+      "url": "http://127.0.0.1:58381/api/videostudio/assets/20ae2ef8-d857-4a09-8e36-618777a6eb65/file",
+      "suggested": "videostudio-rendered-20ae2ef8.gif",
       "state": "completed"
     },
     {
-      "guid": "3a795b2b-ad22-447c-8848-b283d9ce88cd",
-      "url": "http://127.0.0.1:63781/api/imagelab/assets/43ffe5a7-ab17-462d-aab1-0f6bd85d418a/file",
-      "suggested": "imagelab-rendered-43ffe5a7.png",
+      "guid": "519d9396-6ba8-4d7d-ae53-a147f3e13afb",
+      "url": "http://127.0.0.1:58381/api/imagelab/assets/1bd50481-e62d-43e4-9784-df964d36ee3b/file",
+      "suggested": "imagelab-rendered-1bd50481.png",
       "state": "completed"
     },
     {
-      "guid": "2b95b798-732d-40e3-a8c8-cd61b1168b55",
-      "url": "http://127.0.0.1:63781/api/exports/jobs/2af61135-d106-4923-bbb5-9aafe72c23ca/bundle",
-      "suggested": "content-2af61135-20261010-0953.zip",
+      "guid": "c0deac3c-5fef-40bd-bf54-42c3aac2613b",
+      "url": "http://127.0.0.1:58381/api/exports/jobs/816d9aad-9137-4665-b8a8-08ff69539dfa/bundle",
+      "suggested": "content-816d9aad-20261010-1023.zip",
       "state": "completed"
     },
     {
-      "guid": "8f1e6fcc-7729-418d-8922-289e94755a2d",
-      "url": "http://127.0.0.1:63781/api/exports/jobs/2af61135-d106-4923-bbb5-9aafe72c23ca/bundle",
-      "suggested": "content-2af61135-20261010-0953.zip",
+      "guid": "8d4183b9-99cd-4c49-bba1-8518576392b4",
+      "url": "http://127.0.0.1:58381/api/exports/jobs/816d9aad-9137-4665-b8a8-08ff69539dfa/bundle",
+      "suggested": "content-816d9aad-20261010-1023.zip",
       "state": "completed"
     }
   ],
@@ -262,9 +262,9 @@
         "docs/assets/e2e/f1-tai-khoan.png",
         "docs/assets/e2e/f1-quan-tri.png"
       ],
-      "started": "2026-10-10T02:53:11.339Z",
+      "started": "2026-10-10T03:23:07.470Z",
       "consoleErrors": [],
-      "finished": "2026-10-10T02:53:21.338Z"
+      "finished": "2026-10-10T03:23:17.566Z"
     },
     {
       "id": "f2",
@@ -289,7 +289,7 @@
         {
           "ok": true,
           "label": "bấm TẠO ẢNH tạo job và điều hướng tới màn job",
-          "detail": "#/taoanh/60238a3b-4b0a-4c0f-81dd-f2cf6074d08a"
+          "detail": "#/taoanh/ab9db521-1108-4030-95f1-0f1f42279d62"
         },
         {
           "ok": true,
@@ -299,27 +299,27 @@
         {
           "ok": true,
           "label": "khối Trước/Sau có >= 2 ảnh",
-          "detail": "[{\"src\":\"/api/imagelab/assets/0d6f6cb0-2917-408c-b366-7b1db4e34500/file\",\"w\":320,\"h\":320},{\"src\":\"/api/imagelab/assets/50c4e06e-606a-40bb-9a8e-ef8e8fab5a81/file\",\"w\":320,\"h\":320}]"
+          "detail": "[{\"src\":\"/api/imagelab/assets/b355c159-4dfd-441e-abde-879a208b8583/file\",\"w\":320,\"h\":320},{\"src\":\"/api/imagelab/assets/9940b94c-75aa-468e-8927-100ab9fd11c2/file\",\"w\":320,\"h\":320}]"
         },
         {
           "ok": true,
           "label": "cả hai ảnh đều lấy từ endpoint asset thật của máy chủ",
-          "detail": "[\"/api/imagelab/assets/0d6f6cb0-2917-408c-b366-7b1db4e34500/file\",\"/api/imagelab/assets/50c4e06e-606a-40bb-9a8e-ef8e8fab5a81/file\"]"
+          "detail": "[\"/api/imagelab/assets/b355c159-4dfd-441e-abde-879a208b8583/file\",\"/api/imagelab/assets/9940b94c-75aa-468e-8927-100ab9fd11c2/file\"]"
         },
         {
           "ok": true,
           "label": "cả hai ảnh đều naturalWidth/Height > 0 — TRÌNH DUYỆT GIẢI MÃ THẬT, không phải link vỡ",
-          "detail": "[{\"src\":\"/api/imagelab/assets/0d6f6cb0-2917-408c-b366-7b1db4e34500/file\",\"w\":320,\"h\":320},{\"src\":\"/api/imagelab/assets/50c4e06e-606a-40bb-9a8e-ef8e8fab5a81/file\",\"w\":320,\"h\":320}]"
+          "detail": "[{\"src\":\"/api/imagelab/assets/b355c159-4dfd-441e-abde-879a208b8583/file\",\"w\":320,\"h\":320},{\"src\":\"/api/imagelab/assets/9940b94c-75aa-468e-8927-100ab9fd11c2/file\",\"w\":320,\"h\":320}]"
         },
         {
           "ok": true,
           "label": "ảnh SAU là BẢN GHI MỚI (asset id khác ảnh gốc) — ảnh gốc bất biến",
-          "detail": "[\"/api/imagelab/assets/0d6f6cb0-2917-408c-b366-7b1db4e34500/file\",\"/api/imagelab/assets/50c4e06e-606a-40bb-9a8e-ef8e8fab5a81/file\"]"
+          "detail": "[\"/api/imagelab/assets/b355c159-4dfd-441e-abde-879a208b8583/file\",\"/api/imagelab/assets/9940b94c-75aa-468e-8927-100ab9fd11c2/file\"]"
         },
         {
           "ok": true,
           "label": "tệp ảnh tạo (PNG) tải về MỞ ĐƯỢC bằng python3",
-          "detail": "/Users/viporder/code/vip-product-studio-ui5/.e2e-data/downloads/4e339c78-a4ca-4a26-b1ac-81d9eb854c1d → PNG OK bytes=1964 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
+          "detail": "/Users/viporder/code/vip-product-studio-a11y/.e2e-data/downloads/0c1a6833-6e7c-460f-9afc-4f4f715b7640 → PNG OK bytes=1964 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
         },
         {
           "ok": true,
@@ -333,16 +333,16 @@
         "docs/assets/e2e/f2-03-truoc-sau.png",
         "docs/assets/e2e/f2-04-sau-khi-tai.png"
       ],
-      "started": "2026-10-10T02:53:21.338Z",
+      "started": "2026-10-10T03:23:17.566Z",
       "downloads": [
         {
           "what": "ảnh tạo",
-          "file": "/Users/viporder/code/vip-product-studio-ui5/.e2e-data/downloads/4e339c78-a4ca-4a26-b1ac-81d9eb854c1d",
+          "file": "/Users/viporder/code/vip-product-studio-a11y/.e2e-data/downloads/0c1a6833-6e7c-460f-9afc-4f4f715b7640",
           "out": "PNG OK bytes=1964 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
         }
       ],
       "consoleErrors": [],
-      "finished": "2026-10-10T02:53:25.847Z"
+      "finished": "2026-10-10T03:23:22.212Z"
     },
     {
       "id": "f3",
@@ -357,7 +357,7 @@
         {
           "ok": true,
           "label": "trình duyệt GIẢI MÃ và PHÁT được GIF trong <img>",
-          "detail": "{\"src\":\"/api/videostudio/assets/23f10e2c-3ad8-48e0-b031-ce3bb3806193/file\",\"w\":720,\"h\":1280}"
+          "detail": "{\"src\":\"/api/videostudio/assets/20ae2ef8-d857-4a09-8e36-618777a6eb65/file\",\"w\":720,\"h\":1280}"
         },
         {
           "ok": true,
@@ -377,7 +377,7 @@
         {
           "ok": true,
           "label": "tệp video (GIF) tải về MỞ ĐƯỢC bằng python3",
-          "detail": "/Users/viporder/code/vip-product-studio-ui5/.e2e-data/downloads/d136a7b8-3e05-41fe-b486-f1c0738dd935 → GIF OK bytes=636921 720x1280 frames=48 trailer=True"
+          "detail": "/Users/viporder/code/vip-product-studio-a11y/.e2e-data/downloads/85f35892-6224-4961-b21c-084f06a95a36 → GIF OK bytes=636921 720x1280 frames=48 trailer=True"
         },
         {
           "ok": true,
@@ -395,16 +395,16 @@
         "docs/assets/e2e/f3-02-gif-ket-qua.png",
         "docs/assets/e2e/f3-03-nhan-khong-co-tieng.png"
       ],
-      "started": "2026-10-10T02:53:25.847Z",
+      "started": "2026-10-10T03:23:22.212Z",
       "downloads": [
         {
           "what": "video GIF",
-          "file": "/Users/viporder/code/vip-product-studio-ui5/.e2e-data/downloads/d136a7b8-3e05-41fe-b486-f1c0738dd935",
+          "file": "/Users/viporder/code/vip-product-studio-a11y/.e2e-data/downloads/85f35892-6224-4961-b21c-084f06a95a36",
           "out": "GIF OK bytes=636921 720x1280 frames=48 trailer=True"
         }
       ],
       "consoleErrors": [],
-      "finished": "2026-10-10T02:53:31.419Z"
+      "finished": "2026-10-10T03:23:26.874Z"
     },
     {
       "id": "f4",
@@ -449,7 +449,7 @@
         {
           "ok": true,
           "label": "tệp ảnh dịch (PNG) tải về MỞ ĐƯỢC bằng python3",
-          "detail": "/Users/viporder/code/vip-product-studio-ui5/.e2e-data/downloads/3a795b2b-ad22-447c-8848-b283d9ce88cd → PNG OK bytes=2344 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
+          "detail": "/Users/viporder/code/vip-product-studio-a11y/.e2e-data/downloads/519d9396-6ba8-4d7d-ae53-a147f3e13afb → PNG OK bytes=2344 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
         },
         {
           "ok": true,
@@ -463,16 +463,16 @@
         "docs/assets/e2e/f4-03-bang-duyet.png",
         "docs/assets/e2e/f4-04-anh-da-render.png"
       ],
-      "started": "2026-10-10T02:53:31.419Z",
+      "started": "2026-10-10T03:23:26.874Z",
       "downloads": [
         {
           "what": "ảnh dịch",
-          "file": "/Users/viporder/code/vip-product-studio-ui5/.e2e-data/downloads/3a795b2b-ad22-447c-8848-b283d9ce88cd",
+          "file": "/Users/viporder/code/vip-product-studio-a11y/.e2e-data/downloads/519d9396-6ba8-4d7d-ae53-a147f3e13afb",
           "out": "PNG OK bytes=2344 320x320 idat_raw=409920 chunks=IHDR,IDAT,IEND"
         }
       ],
       "consoleErrors": [],
-      "finished": "2026-10-10T02:53:36.404Z"
+      "finished": "2026-10-10T03:23:31.974Z"
     },
     {
       "id": "f5",
@@ -487,7 +487,7 @@
         {
           "ok": true,
           "label": "tệp gói xuất bản (.zip) tải về MỞ ĐƯỢC bằng python3",
-          "detail": "/Users/viporder/code/vip-product-studio-ui5/.e2e-data/downloads/2b95b798-732d-40e3-a8c8-cd61b1168b55 → ZIP OK bytes=3646 entries=5 testzip=None"
+          "detail": "/Users/viporder/code/vip-product-studio-a11y/.e2e-data/downloads/c0deac3c-5fef-40bd-bf54-42c3aac2613b → ZIP OK bytes=3647 entries=5 testzip=None"
         },
         {
           "ok": true,
@@ -497,7 +497,7 @@
         {
           "ok": true,
           "label": "MANIFEST.json khai đúng job_id của job đã mở",
-          "detail": "{\"manifest_version\":1,\"generated_at\":\"2026-10-10T02:53:37.143Z\",\"filename\":\"content-2af61135-20261010-0953.zip\",\"job\":{\"id\":\"2af61135-d106-4923-bbb5-9aafe72c23ca\",\"kind\":\"content\",\"status\":\"succeeded\""
+          "detail": "{\"manifest_version\":1,\"generated_at\":\"2026-10-10T03:23:32.690Z\",\"filename\":\"content-816d9aad-20261010-1023.zip\",\"job\":{\"id\":\"816d9aad-9137-4665-b8a8-08ff69539dfa\",\"kind\":\"content\",\"status\":\"succeeded\""
         },
         {
           "ok": true,
@@ -509,7 +509,7 @@
         "docs/assets/e2e/f5-01-panel-goi-xuat-ban.png",
         "docs/assets/e2e/f5-02-sau-khi-tai-goi.png"
       ],
-      "started": "2026-10-10T02:53:36.404Z",
+      "started": "2026-10-10T03:23:31.974Z",
       "allowedConsole": {
         "patterns": [
           "/ERR_NAME_NOT_RESOLVED https:\\/\\/img\\.example\\.com\\//"
@@ -519,8 +519,8 @@
       "downloads": [
         {
           "what": "gói xuất bản",
-          "file": "/Users/viporder/code/vip-product-studio-ui5/.e2e-data/downloads/2b95b798-732d-40e3-a8c8-cd61b1168b55",
-          "out": "ZIP OK bytes=3646 entries=5 testzip=None",
+          "file": "/Users/viporder/code/vip-product-studio-a11y/.e2e-data/downloads/c0deac3c-5fef-40bd-bf54-42c3aac2613b",
+          "out": "ZIP OK bytes=3647 entries=5 testzip=None",
           "entries": [
             "MANIFEST.json",
             "noi-dung/noi-dung.json",
@@ -531,7 +531,7 @@
         }
       ],
       "consoleErrors": [],
-      "finished": "2026-10-10T02:53:37.734Z"
+      "finished": "2026-10-10T03:23:33.243Z"
     },
     {
       "id": "f6",
@@ -571,7 +571,7 @@
         {
           "ok": true,
           "label": "tìm được hai yêu cầu theo mã giao dịch trên trang Quản trị",
-          "detail": "a9e8dc09-6e4b-4674-b733-a3dcb52880ac · 61e67853-6313-414d-8c0c-8357141baabb"
+          "detail": "78a5d559-ce6e-431f-b553-62aa6cf61e94 · 4cbe824b-462c-4985-aca6-fbc7d3811f84"
         },
         {
           "ok": true,
@@ -586,12 +586,12 @@
         {
           "ok": true,
           "label": "owner XÁC NHẬN ⇒ \"Đã cộng 10 credit\"",
-          "detail": "Đã cộng 10 credit cho 739f4448-0adf-430f-ac8f-bd5409d471b9 (số dư mới: 10 credit (USD))."
+          "detail": "Đã cộng 10 credit cho 15f4f0ec-f779-4a7f-8895-ab2e3bc33194 (số dư mới: 10 credit (USD))."
         },
         {
           "ok": true,
           "label": "TỪ CHỐI ⇒ nói rõ KHÔNG có dòng sổ nào được ghi",
-          "detail": "Đã TỪ CHỐI yêu cầu 61e67853-6313-414d-8c0c-8357141baabb — KHÔNG có dòng sổ nào được ghi."
+          "detail": "Đã TỪ CHỐI yêu cầu 4cbe824b-462c-4985-aca6-fbc7d3811f84 — KHÔNG có dòng sổ nào được ghi."
         },
         {
           "ok": true,
@@ -615,9 +615,9 @@
         "docs/assets/e2e/f6-03-owner-da-duyet.png",
         "docs/assets/e2e/f6-04-member-thay-so-du.png"
       ],
-      "started": "2026-10-10T02:53:37.734Z",
+      "started": "2026-10-10T03:23:33.243Z",
       "consoleErrors": [],
-      "finished": "2026-10-10T02:53:41.611Z"
+      "finished": "2026-10-10T03:23:37.232Z"
     },
     {
       "id": "f7",
@@ -632,12 +632,12 @@
         {
           "ok": true,
           "label": "TẠO & GỬI DUYỆT tạo ra một bài chờ duyệt",
-          "detail": "32dcd91f-0ad8-4b30-b255-707fd0c79184"
+          "detail": "c9482be9-3337-4a6c-8f54-f2c542c852f9"
         },
         {
           "ok": true,
           "label": "mã bài có tiền tố \"dry-\" và được ghi rõ \"id thử — không có bài thật\"",
-          "detail": "Đã đăng facebook_page THỬ đã thử 1 lượt 2026-10-10T02:53:42.460Z Nghe rõ, đeo êm cả ngày Tai nghe chụp tai không dây, gập gọn. Dữ liệu gieo cho e2e. • Đệm tai mềm • Gập gọn bỏ túi Tai nghe chụp tai không dây — dữ liệu gieo e2e. #tainghe #e2e Bài chỉ có chữ (không kèm ảnh/video). Job nguồn 2af6"
+          "detail": "Đã đăng facebook_page THỬ đã thử 1 lượt 2026-10-10T03:23:38.126Z Nghe rõ, đeo êm cả ngày Tai nghe chụp tai không dây, gập gọn. Dữ liệu gieo cho e2e. • Đệm tai mềm • Gập gọn bỏ túi Tai nghe chụp tai không dây — dữ liệu gieo e2e. #tainghe #e2e Bài chỉ có chữ (không kèm ảnh/video). Job nguồn 816d"
         },
         {
           "ok": true,
@@ -654,9 +654,9 @@
         "docs/assets/e2e/f7-01-tab-dang-bai.png",
         "docs/assets/e2e/f7-02-da-dang-thu.png"
       ],
-      "started": "2026-10-10T02:53:41.611Z",
+      "started": "2026-10-10T03:23:37.232Z",
       "consoleErrors": [],
-      "finished": "2026-10-10T02:53:43.633Z"
+      "finished": "2026-10-10T03:23:39.338Z"
     },
     {
       "id": "f8",
@@ -701,7 +701,7 @@
         {
           "ok": true,
           "label": "dòng listing có mã dry-… và nhãn THỬ",
-          "detail": "Tai nghe chụp tai không dây (dữ liệu gieo e2e) 2af61135… dry-run thử Đã đăng THỬ dimensions · OPTIONAL_MISSING — Chưa có kích thước gói hàng (cm) — sàn có thể đòi khi tính phí vận chuyển. (cảnh báo, không chặn) 199.000 ₫ tồn 5 dry-5de77c9b78534b3c XEM PAYLOAD DUYỆT TỪ CHỐI ĐĂNG ĐỒNG BỘ"
+          "detail": "Tai nghe chụp tai không dây (dữ liệu gieo e2e) 816d9aad… dry-run thử Đã đăng THỬ dimensions · OPTIONAL_MISSING — Chưa có kích thước gói hàng (cm) — sàn có thể đòi khi tính phí vận chuyển. (cảnh báo, không chặn) 199.000 ₫ tồn 5 dry-9b22ec491ad87c09 XEM PAYLOAD DUYỆT TỪ CHỐI ĐĂNG ĐỒNG BỘ"
         },
         {
           "ok": true,
@@ -724,7 +724,7 @@
         "docs/assets/e2e/f8-02-da-dang-thu.png",
         "docs/assets/e2e/f8-03-xem-payload.png"
       ],
-      "started": "2026-10-10T02:53:43.633Z",
+      "started": "2026-10-10T03:23:39.338Z",
       "allowedConsole": {
         "patterns": [
           "/status of 422/"
@@ -732,7 +732,7 @@
         "reason": "f8 CỐ Ý bấm TẠO BÀI khi thiếu trường để kiểm 422 PREFLIGHT_FAILED; Chrome tự ghi một dòng \"Failed to load resource … 422\"."
       },
       "consoleErrors": [],
-      "finished": "2026-10-10T02:53:46.724Z"
+      "finished": "2026-10-10T03:23:42.759Z"
     },
     {
       "id": "f9",
@@ -752,7 +752,7 @@
         {
           "ok": true,
           "label": "bấm ĐÚP ⇒ ĐÚNG 1 lượt tải xuống gói",
-          "detail": "[\"http://127.0.0.1:63781/api/exports/jobs/2af61135-d106-4923-bbb5-9aafe72c23ca/bundle\"]"
+          "detail": "[\"http://127.0.0.1:58381/api/exports/jobs/816d9aad-9137-4665-b8a8-08ff69539dfa/bundle\"]"
         },
         {
           "ok": true,
@@ -762,7 +762,7 @@
         {
           "ok": true,
           "label": "gõ \"GIEO E2E\" (khác hoa thường) ⇒ chỉ còn job khớp",
-          "detail": "[\"Tai nghe chụp tai không dây (dữ liệu gieo e2e) 1688 · 09:53:10 10/10/2026\\nHoàn tất\"]"
+          "detail": "[\"Tai nghe chụp tai không dây (dữ liệu gieo e2e) 1688 · 10:23:06 10/10/2026\\nHoàn tất\"]"
         },
         {
           "ok": true,
@@ -789,7 +789,7 @@
         "docs/assets/e2e/f9-01-ban-ke-khai-van-mo.png",
         "docs/assets/e2e/f9-02-loc-lich-su.png"
       ],
-      "started": "2026-10-10T02:53:46.724Z",
+      "started": "2026-10-10T03:23:42.759Z",
       "allowedConsole": {
         "patterns": [
           "/ERR_NAME_NOT_RESOLVED https:\\/\\/img\\.example\\.com\\//"
@@ -801,7 +801,7 @@
         "downloads": 1
       },
       "consoleErrors": [],
-      "finished": "2026-10-10T02:53:52.860Z"
+      "finished": "2026-10-10T03:23:48.978Z"
     },
     {
       "id": "f10",
@@ -815,8 +815,33 @@
         },
         {
           "ok": true,
-          "label": "ở khổ 375 px vẫn bấm CHUỘT THẬT được nút \"Video\" trên thanh nav",
+          "label": "thanh trên cùng ở khổ 375×812 cao ≤ 30% màn hình (244px)",
+          "detail": "148px"
+        },
+        {
+          "ok": true,
+          "label": "ở khổ 375 px thanh nav đang GẬP (nút \"Video\" chưa hiện)",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "nút ☰ Menu có aria-expanded=\"false\" khi gập",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "bấm ☰ Menu ⇒ aria-expanded=\"true\"",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "ở khổ 375 px mở menu rồi bấm CHUỘT THẬT nút \"Video\" ⇒ sang tab Video",
           "detail": "#/video"
+        },
+        {
+          "ok": true,
+          "label": "chuyển trang xong thanh nav TỰ GẬP lại",
+          "detail": ""
         },
         {
           "ok": true,
@@ -835,17 +860,19 @@
         "docs/assets/e2e/f10-mobile-dang-bai.png",
         "docs/assets/e2e/f10-mobile-dang-san.png",
         "docs/assets/e2e/f10-mobile-man-job.png",
-        "docs/assets/e2e/f10-mobile-dang-nhap.png"
+        "docs/assets/e2e/f10-mobile-dang-nhap.png",
+        "docs/assets/e2e/f10-mobile-menu-mo.png"
       ],
-      "started": "2026-10-10T02:53:52.860Z",
+      "started": "2026-10-10T03:23:48.978Z",
       "allowedConsole": {
         "patterns": [
           "/ERR_NAME_NOT_RESOLVED https:\\/\\/img\\.example\\.com\\//"
         ],
         "reason": "màn job của job gieo vẽ ảnh https://img.example.com/… — cùng lý do f5."
       },
+      "mobileHeaderPx": 148,
       "consoleErrors": [],
-      "finished": "2026-10-10T02:54:08.463Z"
+      "finished": "2026-10-10T03:24:05.359Z"
     },
     {
       "id": "f11",
@@ -869,7 +896,7 @@
         }
       ],
       "shots": [],
-      "started": "2026-10-10T02:54:08.463Z",
+      "started": "2026-10-10T03:24:05.359Z",
       "allowedConsole": {
         "patterns": [
           "/ERR_NAME_NOT_RESOLVED https:\\/\\/img\\.example\\.com\\//"
@@ -878,7 +905,320 @@
       },
       "a11y": [],
       "consoleErrors": [],
-      "finished": "2026-10-10T02:54:21.723Z"
+      "finished": "2026-10-10T03:24:18.702Z"
+    },
+    {
+      "id": "f12",
+      "title": "Bàn phím: Tab thật qua trang chủ có viền tiêu điểm ở MỌI chỗ dừng · Enter mở tab · đăng nhập chỉ bằng phím",
+      "status": "passed",
+      "checks": [
+        {
+          "ok": true,
+          "label": "không phần tử nào có tabindex dương (thứ tự Tab theo DOM)",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "Tab đi tới nút nav \"Video\", ô dán link #url và nút PHÂN TÍCH",
+          "detail": "home › home › imagelab › imagestudio › video › publish › marketplace › history › login › account › url › submit › style › length › login › history › openjob › openvideojob › openjob › home › home › imagelab › imagestudio › video"
+        },
+        {
+          "ok": true,
+          "label": "MỌI chỗ dừng Tab có viền tiêu điểm nhìn thấy (outline hoặc box-shadow)",
+          "detail": "[]"
+        },
+        {
+          "ok": true,
+          "label": "đi tới nút \"Video\" chỉ bằng Tab",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "Enter trên nút \"Video\" mở tab Video",
+          "detail": "#/video"
+        },
+        {
+          "ok": true,
+          "label": "Tab từ nút chế độ tới ô email",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "Tab tiếp tới ô mật khẩu",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "đăng nhập owner CHỈ BẰNG BÀN PHÍM (Tab + gõ + Enter)",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "không có lỗi console trong luồng này",
+          "detail": ""
+        }
+      ],
+      "shots": [
+        "docs/assets/e2e/f12-01-tab-co-vien.png"
+      ],
+      "started": "2026-10-10T03:24:18.702Z",
+      "tabStops": [
+        {
+          "tag": "a",
+          "id": "",
+          "action": "home",
+          "name": "V\nVIP Product Studio\nMVP-01 → MVP-08 · L",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "button",
+          "id": "",
+          "action": "home",
+          "name": "Sản phẩm mới",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "button",
+          "id": "",
+          "action": "imagelab",
+          "name": "Dịch ảnh Trung → Việt",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "button",
+          "id": "",
+          "action": "imagestudio",
+          "name": "Tạo ảnh",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "button",
+          "id": "",
+          "action": "video",
+          "name": "Video",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "button",
+          "id": "",
+          "action": "publish",
+          "name": "Đăng bài",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "button",
+          "id": "",
+          "action": "marketplace",
+          "name": "Đăng sàn",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "button",
+          "id": "",
+          "action": "history",
+          "name": "Lịch sử",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "button",
+          "id": "",
+          "action": "login",
+          "name": "Đăng nhập",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "button",
+          "id": "",
+          "action": "account",
+          "name": "Tài khoản",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "input",
+          "id": "url",
+          "action": "",
+          "name": "Link sản phẩm Taobao, 1688 hoặc Pinduodu",
+          "ring": true,
+          "outline": "solid 2px",
+          "shadow": "none"
+        },
+        {
+          "tag": "button",
+          "id": "go",
+          "action": "submit",
+          "name": "PHÂN TÍCH SẢN PHẨM",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "select",
+          "id": "style",
+          "action": "",
+          "name": "Bán hàng\nChuyên nghiệp\nNgắn gọn\nViral/Ti",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "select",
+          "id": "length",
+          "action": "",
+          "name": "Ngắn\nVừa\nChi tiết",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "button",
+          "id": "",
+          "action": "login",
+          "name": "Đăng nhập để lưu lịch sử và dùng credit",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "button",
+          "id": "",
+          "action": "history",
+          "name": "Xem tất cả",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "button",
+          "id": "",
+          "action": "openjob",
+          "name": "(chưa có tên) Thủ công · 10:23:28 10/10/",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "button",
+          "id": "",
+          "action": "openvideojob",
+          "name": "(chưa có tên) Thủ công · 10:23:23 10/10/",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "button",
+          "id": "",
+          "action": "openjob",
+          "name": "(chưa có tên) Thủ công · 10:23:19 10/10/",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "a",
+          "id": "",
+          "action": "home",
+          "name": "V\nVIP Product Studio\nMVP-01 → MVP-08 · L",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "button",
+          "id": "",
+          "action": "home",
+          "name": "Sản phẩm mới",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "button",
+          "id": "",
+          "action": "imagelab",
+          "name": "Dịch ảnh Trung → Việt",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "button",
+          "id": "",
+          "action": "imagestudio",
+          "name": "Tạo ảnh",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        },
+        {
+          "tag": "button",
+          "id": "",
+          "action": "video",
+          "name": "Video",
+          "ring": true,
+          "outline": "auto 1px",
+          "shadow": "none"
+        }
+      ],
+      "consoleErrors": [],
+      "finished": "2026-10-10T03:24:24.782Z"
+    },
+    {
+      "id": "f13",
+      "title": "Tương phản WCAG AA trên 11 màn: chữ thường ≥ 4.5:1, chữ lớn ≥ 3:1 (gradient: lấy điểm màu xấu nhất; bỏ qua nút đang khoá và chữ trên ẢNH)",
+      "status": "passed",
+      "checks": [
+        {
+          "ok": true,
+          "label": "đo được đủ nhiều đoạn chữ",
+          "detail": "706 đoạn, 0 đoạn trên ẢNH không đo"
+        },
+        {
+          "ok": true,
+          "label": "không loại chữ nào dưới ngưỡng WCAG AA",
+          "detail": ""
+        },
+        {
+          "ok": true,
+          "label": "không có lỗi console trong luồng này",
+          "detail": ""
+        }
+      ],
+      "shots": [],
+      "started": "2026-10-10T03:24:24.782Z",
+      "allowedConsole": {
+        "patterns": [
+          "/ERR_NAME_NOT_RESOLVED https:\\/\\/img\\.example\\.com\\//"
+        ],
+        "reason": "màn job của job gieo vẽ ảnh https://img.example.com/… — cùng lý do f5."
+      },
+      "contrast": {
+        "measured": 706,
+        "skipped_on_image": 0,
+        "failing_kinds": []
+      },
+      "consoleErrors": [],
+      "finished": "2026-10-10T03:24:38.109Z"
     }
   ]
 }

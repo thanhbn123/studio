@@ -60,7 +60,9 @@ body {
 .btn:hover { background: #24305a; border-color: #35426b; }
 .btn:active { transform: translateY(1px); }
 .btn:disabled { opacity: .5; cursor: not-allowed; }
-.btn.primary { background: linear-gradient(135deg, var(--accent), #3b6fe0); border-color: transparent; color: #fff; }
+/* Tương phản WCAG AA (đo e2e f13, 10/10/2026): gradient cũ `--accent → #3b6fe0` cho chữ trắng chỉ 3.22:1 ở điểm
+   sáng. Gradient mới: 5.47:1 → 6.83:1, vẫn ≥ 4.9:1 khi hover sáng 7%. `--accent` giữ nguyên cho viền/vòng tiêu điểm. */
+.btn.primary { background: linear-gradient(135deg, #2b63d4, #2453c0); border-color: transparent; color: #fff; }
 .btn.primary:hover { filter: brightness(1.07); }
 .btn.ghost { background: transparent; }
 .btn.tiny { padding: 5px 9px; font-size: 12.5px; border-radius: 7px; }
@@ -210,7 +212,8 @@ ul.bullets li { margin-bottom: 5px; }
   .kv { grid-template-columns: 1fr; }
   .kv dt { margin-top: 6px; }
   .linkbox .btn.primary { width: 100%; }
-  .topnav .brand-text small { display: none; }
+  /* Selector cũ `.topnav .brand-text small` KHÔNG khớp gì (phụ đề không nằm trong .topnav) ⇒ chưa từng có tác dụng. */
+  .brand-text small { display: none; }
 }
 
 /* ── MVP-02 · Dịch ảnh Trung → Việt ────────────────────────── */
@@ -399,4 +402,14 @@ select.text-input.mini { min-width: 132px; }
 .panel,
 .notice {
   overflow-wrap: anywhere;
+}
+
+/* Thanh điều hướng GẬP trên điện thoại (V-13660): đo e2e f10 — ở khổ 375×812 thanh trên cùng cao 359px (44% màn
+   hình) vì 7 nút nav xếp thành 6 dòng. ≤ 640px: hiện nút "☰ Menu", nav ẩn tới khi mở; chuyển trang thì tự đóng. */
+.nav-toggle { display: none; }
+@media (max-width: 640px) {
+  .topbar-inner { flex-wrap: wrap; gap: 10px; }
+  .nav-toggle { display: inline-flex; align-items: center; gap: 6px; }
+  .topnav { display: none; width: 100%; }
+  .topnav.open { display: flex; }
 }

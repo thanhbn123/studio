@@ -245,6 +245,16 @@ async function uiLogout() {
   await waitFor('đăng xuất xong', () => page.eval('return !document.querySelector(\'[data-action="logout"]\');'), { timeoutMs: 10000 });
 }
 
+/** PHÍM THẬT qua CDP (keyDown + keyUp) — Tab/Enter đi đúng đường bàn phím của trình duyệt. */
+async function pressKey(key) {
+  const map = { Tab: { code: 'Tab', vk: 9 }, Enter: { code: 'Enter', vk: 13, text: '\r' }, Escape: { code: 'Escape', vk: 27 } };
+  const k = map[key];
+  if (!k) throw new Error(`pressKey: phím chưa hỗ trợ ${key}`);
+  await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key, code: k.code, windowsVirtualKeyCode: k.vk, nativeVirtualKeyCode: k.vk, ...(k.text ? { text: k.text } : {}) });
+  await page.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code: k.code, windowsVirtualKeyCode: k.vk, nativeVirtualKeyCode: k.vk });
+  await sleep(60);
+}
+
 /** Kiểm tệp tải về có MỞ ĐƯỢC thật bằng python3 (không chỉ xem đuôi tệp). */
 function verifyFileOpens(file) {
   const script = `
@@ -928,9 +938,23 @@ async function main() {
       expect(bad.length === 0, `cả ${screens.length} màn: scrollWidth ≤ clientWidth (không cuộn ngang cả trang)`, JSON.stringify(bad).slice(0, 400));
       await page.eval('location.hash = "#/";');
       await sleep(600);
+      const headerH = await page.eval('return Math.round(document.querySelector(".topbar").getBoundingClientRect().height);');
+      results.at(-1).mobileHeaderPx = headerH;
+      expect(headerH <= 812 * 0.3, `thanh trên cùng ở khổ 375×812 cao ≤ 30% màn hình (${Math.round(812 * 0.3)}px)`, `${headerH}px`);
+      await page.eval('location.hash = "#/";');
+      await sleep(600);
+      // Thanh nav GẬP trên điện thoại (V-13660): nút nav ẩn tới khi bấm "☰ Menu".
+      expect(!(await page.box('[data-action="video"]').catch(() => null)), 'ở khổ 375 px thanh nav đang GẬP (nút "Video" chưa hiện)', '');
+      expect((await page.eval('return document.querySelector(\'[data-action="navtoggle"]\').getAttribute("aria-expanded");')) === 'false', 'nút ☰ Menu có aria-expanded="false" khi gập', '');
+      await page.click('[data-action="navtoggle"]');
+      await sleep(300);
+      expect((await page.eval('return document.querySelector(\'[data-action="navtoggle"]\').getAttribute("aria-expanded");')) === 'true', 'bấm ☰ Menu ⇒ aria-expanded="true"', '');
+      await shot('mobile-menu-mo');
       await page.click('[data-action="video"]');
       await sleep(600);
-      expect((await page.eval('return location.hash;')) === '#/video', 'ở khổ 375 px vẫn bấm CHUỘT THẬT được nút "Video" trên thanh nav', await page.eval('return location.hash;'));
+      expect((await page.eval('return location.hash;')) === '#/video', 'ở khổ 375 px mở menu rồi bấm CHUỘT THẬT nút "Video" ⇒ sang tab Video', await page.eval('return location.hash;'));
+      expect((await page.eval('return document.querySelector(\'[data-action="navtoggle"]\').getAttribute("aria-expanded");')) === 'false'
+        && !(await page.eval('return document.getElementById("topnav").classList.contains("open");')), 'chuyển trang xong thanh nav TỰ GẬP lại', '');
     } finally {
       await page.send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
     }
@@ -972,6 +996,151 @@ async function main() {
     }
     results.at(-1).a11y = problems;
     expect(problems.length === 0, 'không có ô nhập thiếu nhãn / nút thiếu tên / ảnh thiếu alt trên 11 màn', problems.slice(0, 12).join(' | '));
+  }, {
+    allowConsole: [/ERR_NAME_NOT_RESOLVED https:\/\/img\.example\.com\//],
+    allowReason: 'màn job của job gieo vẽ ảnh https://img.example.com/… — cùng lý do f5.',
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // LUỒNG 12 — CHỈ BẰNG BÀN PHÍM: Tab thật đi qua nav + ô link + nút; mỗi chỗ dừng có viền nhìn thấy;
+  //            Enter mở tab; đăng nhập chỉ bằng phím (Tab + gõ + Enter)
+  // ───────────────────────────────────────────────────────────────────────────
+  await flow('f12', 'Bàn phím: Tab thật qua trang chủ có viền tiêu điểm ở MỌI chỗ dừng · Enter mở tab · đăng nhập chỉ bằng phím', async ({ expect, shot }) => {
+    await uiLogout();
+    await page.goto(base, { waitMs: 1500 });
+    expect((await page.eval('return document.querySelectorAll("[tabindex]:not([tabindex=\\"-1\\"]):not([tabindex=\\"0\\"])").length;')) === 0,
+      'không phần tử nào có tabindex dương (thứ tự Tab theo DOM)', '');
+    const stops = [];
+    for (let i = 0; i < 25; i += 1) {
+      await pressKey('Tab');
+      const st = await page.eval(`
+        const el = document.activeElement;
+        if (!el || el === document.body) return null;
+        const cs = getComputedStyle(el);
+        const ring = (cs.outlineStyle !== 'none' && parseFloat(cs.outlineWidth) > 0) || (cs.boxShadow && cs.boxShadow !== 'none');
+        const name = (el.getAttribute('aria-label') || el.innerText || el.value || el.id || el.tagName).trim().slice(0, 40);
+        return { tag: el.tagName.toLowerCase(), id: el.id || '', action: el.dataset?.action || '', name, ring, outline: cs.outlineStyle + ' ' + cs.outlineWidth, shadow: (cs.boxShadow || '').slice(0, 40) };`);
+      if (st) stops.push(st);
+    }
+    results.at(-1).tabStops = stops;
+    const names = stops.map((s) => s.action || s.id || s.name);
+    expect(names.includes('video') && names.includes('url') && names.includes('submit'), 'Tab đi tới nút nav "Video", ô dán link #url và nút PHÂN TÍCH', names.join(' › '));
+    const noRing = stops.filter((s) => !s.ring);
+    expect(noRing.length === 0, 'MỌI chỗ dừng Tab có viền tiêu điểm nhìn thấy (outline hoặc box-shadow)', JSON.stringify(noRing.slice(0, 6)));
+    await shot('01-tab-co-vien');
+
+    // Enter trên nút nav "Video" (đi tới bằng Tab, không dùng chuột)
+    await page.goto(base, { waitMs: 1200 });
+    let reached = false;
+    for (let i = 0; i < 15 && !reached; i += 1) {
+      await pressKey('Tab');
+      reached = await page.eval('return document.activeElement?.dataset?.action === "video";');
+    }
+    expect(reached, 'đi tới nút "Video" chỉ bằng Tab', '');
+    await pressKey('Enter');
+    await sleep(700);
+    expect((await page.eval('return location.hash;')) === '#/video', 'Enter trên nút "Video" mở tab Video', await page.eval('return location.hash;'));
+
+    // Đăng nhập chỉ bằng phím: focus ô email bằng Tab từ đầu form, gõ, Tab sang mật khẩu, gõ, Enter.
+    await page.eval('location.hash = "#/dangnhap";');
+    await waitFor('form đăng nhập', () => page.eval('return Boolean(document.querySelector("#auth-email"));'), { timeoutMs: 10000 });
+    await page.eval('document.querySelector(\'[data-action="authmode"][data-mode="login"]\').focus(); return true;');
+    let onEmail = false;
+    for (let i = 0; i < 6 && !onEmail; i += 1) {
+      await pressKey('Tab');
+      onEmail = await page.eval('return document.activeElement?.id === "auth-email";');
+    }
+    expect(onEmail, 'Tab từ nút chế độ tới ô email', '');
+    await page.send('Input.insertText', { text: SEED.ownerEmail });
+    await pressKey('Tab');
+    expect(await page.eval('return document.activeElement?.id === "auth-password";'), 'Tab tiếp tới ô mật khẩu', '');
+    await page.send('Input.insertText', { text: SEED.ownerPassword });
+    await pressKey('Enter');
+    await waitFor('đăng nhập bằng Enter thành công', () => page.eval(`return (document.querySelector("#account-bar")?.innerText || "").includes(${JSON.stringify(SEED.ownerEmail)});`), { timeoutMs: 15000 });
+    expect(true, 'đăng nhập owner CHỈ BẰNG BÀN PHÍM (Tab + gõ + Enter)', '');
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // LUỒNG 13 — TƯƠNG PHẢN MÀU (WCAG 2.x, AA): 4.5:1 chữ thường · 3:1 chữ lớn — 11 màn
+  // ───────────────────────────────────────────────────────────────────────────
+  await flow('f13', 'Tương phản WCAG AA trên 11 màn: chữ thường ≥ 4.5:1, chữ lớn ≥ 3:1 (gradient: lấy điểm màu xấu nhất; bỏ qua nút đang khoá và chữ trên ẢNH)', async ({ expect }) => {
+    const screens = ['#/', '#/imagelab', '#/taoanh', '#/video', '#/history', '#/taikhoan', '#/quantri', '#/dangbai', '#/dangsan', `#/job/${SEED.jobId}`, '#/dangnhap'];
+    const fails = new Map();
+    let measured = 0;
+    let skippedImg = 0;
+    for (const hash of screens) {
+      await page.eval(`location.hash = ${JSON.stringify(hash)};`);
+      await sleep(1200);
+      const r = await page.eval(`
+        const parse = (c) => { const m = String(c).match(/rgba?\\(([^)]+)\\)/); if (!m) return null; const p = m[1].split(/[ ,/]+/).filter(Boolean).map(Number); return { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 }; };
+        const lin = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+        const lum = (c) => 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
+        const over = (fg, bg) => ({ r: fg.r * fg.a + bg.r * (1 - fg.a), g: fg.g * fg.a + bg.g * (1 - fg.a), b: fg.b * fg.a + bg.b * (1 - fg.a), a: 1 });
+        // Nền gồm các lớp màu + gradient; gradient được thay bằng TỪNG điểm màu của nó ⇒ trả MỌI nền có thể
+        // có dưới chữ, câu kiểm lấy tỉ lệ XẤU NHẤT. Chỉ bỏ qua khi nền là ẢNH thật (url(...)).
+        const bgOf = (el) => {
+          const layers = [];
+          for (let n = el; n; n = n.parentElement) {
+            const cs = getComputedStyle(n);
+            const bi = cs.backgroundImage || 'none';
+            if (/url\\(/.test(bi)) return { img: true };
+            const c = parse(cs.backgroundColor);
+            const stops = /gradient/.test(bi) ? (bi.match(/rgba?\\([^)]+\\)/g) || []).map(parse).filter(Boolean) : [];
+            if (stops.length) layers.push({ stops });
+            if (c && c.a > 0) layers.push({ stops: [c] });
+            if ((c && c.a >= 1) || (stops.length && stops.every((x) => x.a >= 1))) break;
+          }
+          let bases = [{ r: 255, g: 255, b: 255, a: 1 }];
+          for (let i = layers.length - 1; i >= 0; i -= 1) {
+            const next = [];
+            for (const b of bases) for (const st of layers[i].stops) next.push(over(st, b));
+            bases = next.slice(0, 24);
+          }
+          return { cs: bases };
+        };
+        const out = { fails: [], measured: 0, img: 0 };
+        for (const el of document.querySelectorAll('body *')) {
+          const own = [...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim());
+          if (!own) continue;
+          const rect = el.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) continue;
+          const cs = getComputedStyle(el);
+          if (cs.visibility === 'hidden' || Number(cs.opacity) === 0) continue;
+          if (el.closest('[disabled],[aria-disabled="true"]')) continue;
+          const bg = bgOf(el);
+          if (bg.img) { out.img += 1; continue; }
+          const fg0 = parse(cs.color); if (!fg0) continue;
+          let ratio = Infinity; let worstBg = bg.cs[0];
+          for (const b of bg.cs) {
+            const fg = over(fg0, b);
+            const L1 = lum(fg), L2 = lum(b);
+            const rr = (Math.max(L1, L2) + 0.05) / (Math.min(L1, L2) + 0.05);
+            if (rr < ratio) { ratio = rr; worstBg = b; }
+          }
+          bg.c = worstBg;
+          const size = parseFloat(cs.fontSize); const bold = Number(cs.fontWeight) >= 700;
+          const large = size >= 24 || (size >= 18.66 && bold);
+          const need = large ? 3 : 4.5;
+          out.measured += 1;
+          if (ratio + 1e-6 < need) {
+            const cls = (el.className && typeof el.className === 'string') ? '.' + el.className.trim().split(/\\s+/).join('.') : '';
+            out.fails.push({ key: cs.color + ' on ' + 'rgb(' + [bg.c.r, bg.c.g, bg.c.b].map(Math.round).join(',') + ')' + ' ' + size + 'px',
+              sel: el.tagName.toLowerCase() + cls, ratio: Math.round(ratio * 100) / 100, need, text: [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent.trim()).join(' ').slice(0, 40) });
+          }
+        }
+        return out;`);
+      measured += r.measured;
+      skippedImg += r.img;
+      for (const f of r.fails) {
+        const k = `${f.sel} | ${f.key}`;
+        if (!fails.has(k)) fails.set(k, { ...f, screens: [hash] });
+        else if (!fails.get(k).screens.includes(hash)) fails.get(k).screens.push(hash);
+      }
+    }
+    const list = [...fails.values()].sort((a, b) => a.ratio - b.ratio);
+    results.at(-1).contrast = { measured, skipped_on_image: skippedImg, failing_kinds: list };
+    expect(measured > 200, 'đo được đủ nhiều đoạn chữ', `${measured} đoạn, ${skippedImg} đoạn trên ẢNH không đo`);
+    expect(list.length === 0, 'không loại chữ nào dưới ngưỡng WCAG AA', list.slice(0, 10).map((f) => `${f.sel} ${f.ratio}/${f.need} «${f.text}» ${f.key}`).join(' | '));
   }, {
     allowConsole: [/ERR_NAME_NOT_RESOLVED https:\/\/img\.example\.com\//],
     allowReason: 'màn job của job gieo vẽ ảnh https://img.example.com/… — cùng lý do f5.',
